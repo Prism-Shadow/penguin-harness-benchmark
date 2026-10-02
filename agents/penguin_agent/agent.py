@@ -102,8 +102,13 @@ class PenguinOptions(InstalledAgentOptions):
             "container. Default: $PENGUIN_HOME, else ~/.penguin/data."
         ),
     )
-    host_project_id: str = Field(
-        default="default_project", description="Host Project whose model table is read."
+    host_project_id: str | None = Field(
+        default=None,
+        description=(
+            "Host Project whose model table is read. Default: $PENGUIN_PROJECT_ID (set in the "
+            "shell commands of a PenguinHarness session), else default_project, the CLI's "
+            "own default chain."
+        ),
     )
     agent_state_tar: str | None = Field(
         default=None,
@@ -142,7 +147,8 @@ class PenguinOptions(InstalledAgentOptions):
         if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer or -1")
         for name in ("project_id", "agent_id", "host_project_id"):
-            if not _ID.match(getattr(self, name)):
+            value = getattr(self, name)
+            if value is not None and not _ID.match(value):
                 raise ValueError(f"{name} must match {_ID.pattern}")
         return self
 
@@ -309,15 +315,26 @@ class PenguinAgent(BaseInstalledAgent):
             return Path(configured).expanduser()
         return Path.home() / ".penguin" / "data"
 
+    def _host_project_id(self) -> str:
+        project = (
+            self.options.host_project_id
+            or os.environ.get("PENGUIN_PROJECT_ID", "").strip()
+            or "default_project"
+        )
+        if not _ID.match(project):
+            raise ValueError(f"host Project id {project!r} must match {_ID.pattern}")
+        return project
+
     def _host_model_entry(self) -> dict[str, Any]:
         """The host's model entry for ``-m``; errors never include the credential."""
         provider, model_id = self._model_ref()
-        path = self._host_data_root() / self.options.host_project_id / ".project_config.toml"
+        project = self._host_project_id()
+        path = self._host_data_root() / project / ".project_config.toml"
         hint = (
             "Configure the model in this machine's PenguinHarness first (the Web App's model "
-            f"settings, or `penguin config model add --provider {provider} --model-id "
-            f"{model_id} --api-key <key>`), or point host_penguin_home / PENGUIN_HOME at the "
-            "data root that has it."
+            f"settings, or `penguin config model add --project-id {project} --provider "
+            f"{provider} --model-id {model_id} --api-key <key>`), or point host_penguin_home / "
+            "PENGUIN_HOME and host_project_id at the data root and Project that have it."
         )
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
