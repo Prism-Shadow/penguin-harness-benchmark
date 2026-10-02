@@ -7,6 +7,9 @@
 //   node helper.mjs abort <data root> <sessionId> <wait seconds>
 //       Aborts the session's running Task through the local server and waits until the
 //       session is idle. Prints one JSON line.
+//   node helper.mjs set-max-turns <data root> <projectId> <agentId> <n>
+//       Sets the Agent's max_turns through the local server and reads it back. Prints one
+//       JSON line; exits 1 when the value read back differs.
 //   node helper.mjs redact <.project_config.toml> <dir>
 //       Replaces every api_key value found in the config with "[REDACTED]" in all regular
 //       files under <dir>. Prints one JSON line with counts; never prints a key.
@@ -36,13 +39,36 @@ function runStatus(file) {
 
 // Same addressing as the CLI: localhost (the server reserves 127.0.0.1 for previews) and
 // the Bearer token the server writes to <root>/api-token at every boot.
-async function api(root, method, apiPath) {
+async function api(root, method, apiPath, body) {
   const lock = JSON.parse(fs.readFileSync(path.join(root, "server.lock"), "utf8"));
   const token = fs.readFileSync(path.join(root, "api-token"), "utf8").trim();
   return fetch(`http://localhost:${lock.port}${apiPath}`, {
     method,
-    headers: { authorization: `Bearer ${token}` },
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+}
+
+// Sets the Agent's max_turns (system_config.yaml) through the Agent config API, which
+// changes that one key and keeps the rest of the stock config, then reads it back.
+// Exits non-zero unless the value read back is the one requested.
+async function setMaxTurns(root, projectId, agentId, value) {
+  const result = { requested: Number(value) };
+  const configPath = `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/config`;
+  try {
+    const put = await api(root, "PUT", configPath, { config: { maxTurns: Number(value) } });
+    result.put_status = put.status;
+    const get = await api(root, "GET", configPath);
+    result.get_status = get.status;
+    if (get.ok) result.max_turns = (await get.json())?.config?.maxTurns ?? null;
+  } catch (err) {
+    result.error = err instanceof Error ? err.message : String(err);
+  }
+  out(result);
+  if (result.max_turns !== result.requested) process.exitCode = 1;
 }
 
 async function abort(root, sessionId, waitSeconds) {
@@ -150,6 +176,9 @@ switch (command) {
     break;
   case "abort":
     await abort(args[0], args[1], args[2] ?? "60");
+    break;
+  case "set-max-turns":
+    await setMaxTurns(args[0], args[1], args[2], args[3]);
     break;
   case "redact":
     redact(args[0], args[1]);

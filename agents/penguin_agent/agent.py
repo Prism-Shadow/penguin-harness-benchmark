@@ -85,6 +85,14 @@ class PenguinOptions(InstalledAgentOptions):
         ge=0,
         description="Seconds to wait for an aborted Task to wind down after the soft timeout.",
     )
+    max_turns: int | None = Field(
+        default=None,
+        description=(
+            "Turn cap: sets the Agent's max_turns (LLM requests per Task; -1 = unlimited) "
+            "through the Agent config API before the run. None keeps the stock value "
+            "(unlimited in v0.2.13). `penguin run` has no turn flag of its own."
+        ),
+    )
     project_id: str = Field(default="default_project", description="Project id in the container.")
     agent_id: str = Field(default="default_agent", description="Agent id in the container.")
     host_penguin_home: str | None = Field(
@@ -131,6 +139,8 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError(f"node_version {self.node_version!r} must look like 24.18.0")
         if not _DURATION.match(self.run_timeout):
             raise ValueError(f"run_timeout {self.run_timeout!r} must look like 30s, 25m, 2h or 900")
+        if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
+            raise ValueError("max_turns must be a positive integer or -1")
         for name in ("project_id", "agent_id", "host_project_id"):
             if not _ID.match(getattr(self, name)):
                 raise ValueError(f"{name} must match {_ID.pattern}")
@@ -436,11 +446,13 @@ class PenguinAgent(BaseInstalledAgent):
         state_dir = DATA_ROOT / opts.project_id / "agents" / opts.agent_id / "agent_state"
         remote = PREFIX / "agent-state.tar.gz"
         await environment.upload_file(tarball, str(remote))
+        logs = self.environment_logs_dir
         await self.exec_as_root(
             environment,
             command=(
                 f"mkdir -p {state_dir} && tar -xzf {remote} -C {state_dir} --no-same-owner && "
-                f"rm -f {state_dir}/.vault.toml {remote}"
+                f"rm -f {state_dir}/.vault.toml {remote} && mkdir -p {logs} && "
+                f"(cd {state_dir} && find . -type f | sort) > {logs}/penguin-agent-state.txt"
             ),
         )
 
@@ -473,6 +485,7 @@ class PenguinAgent(BaseInstalledAgent):
             "PB_THINKING": opts.thinking,
             "PB_TIMEOUT": opts.run_timeout,
             "PB_ABORT_WAIT": str(opts.abort_wait_sec),
+            "PB_MAX_TURNS": "" if opts.max_turns is None else str(opts.max_turns),
         }
         # Nothing secret here: the credential reaches the server through the copied config.
         await self.exec_as_agent(environment, command=f"bash {PREFIX}/run.sh", env=env)
@@ -515,12 +528,16 @@ class PenguinAgent(BaseInstalledAgent):
             "model_id": model_id,
             "thinking": self.options.thinking,
             "run_timeout": self.options.run_timeout,
+            "max_turns": self.options.max_turns,
             "agent_state": "custom" if self.options.agent_state_tar else "stock",
             "host_redacted_files": redacted,
         }
         if isinstance(run, dict):
             metadata["session_id"] = run.get("sessionId")
             metadata["run_status"] = run.get("status")
+            # The engine ends a capped Task with this assistant note (core context-engine).
+            text = run.get("text")
+            metadata["max_turns_reached"] = isinstance(text, str) and "[reached max turns (" in text
         if isinstance(outcome, dict):
             started, finished = outcome.get("started_at_ms"), outcome.get("finished_at_ms")
             if isinstance(started, (int, float)) and isinstance(finished, (int, float)):
