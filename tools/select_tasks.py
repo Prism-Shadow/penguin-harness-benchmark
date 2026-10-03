@@ -158,9 +158,19 @@ def check(benchmark: str) -> list[str]:
         agent = agents[0]
         kwargs = agent.get("kwargs") or {}
         try:
-            margin = float(agent.get("override_timeout_sec", 0)) - seconds(str(kwargs.get("run_timeout", "25m")))
-            if margin < 300:
-                problems.append(f"override_timeout_sec leaves {margin:.0f} s after run_timeout (needs >= 300)")
+            # The adapter's invariant (agents/penguin_agent/agent.py, CLEANUP_MARGIN_SEC):
+            # Harbor's agent timeout >= run_timeout + abort_wait_sec + 120 s. Without an
+            # explicit run_timeout the adapter derives one that fits, so only explicit
+            # values are checked here.
+            if kwargs.get("run_timeout") is not None:
+                needed = seconds(str(kwargs["run_timeout"])) + int(kwargs.get("abort_wait_sec", 90)) + 120
+                limit = float(agent.get("override_timeout_sec") or 0) * float(
+                    job.get("agent_timeout_multiplier") or job.get("timeout_multiplier") or 1
+                )
+                if limit < needed:
+                    problems.append(
+                        f"agent timeout {limit:.0f} s < run_timeout + abort_wait_sec + 120 s = {needed} s"
+                    )
         except ValueError as exc:
             problems.append(f"job.yaml: {exc}")
         closed = [
