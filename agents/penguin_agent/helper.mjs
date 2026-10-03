@@ -73,12 +73,19 @@ async function api(root, method, apiPath, body) {
 
 // Sets the Agent's max_turns (system_config.yaml) through the Agent config API, which
 // changes that one key and keeps the rest of the stock config, then reads it back.
-// Exits non-zero unless the value read back is the one requested.
+// Exits non-zero unless the value read back is the one requested. Right after boot, and
+// sooner under load, the server can answer before it has created the stock Agent: the
+// config API then says 404, so a 404 is retried for up to a minute.
 async function setMaxTurns(root, projectId, agentId, value) {
   const result = { requested: Number(value) };
   const configPath = `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/config`;
   try {
-    const put = await api(root, "PUT", configPath, { config: { maxTurns: Number(value) } });
+    let put;
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      put = await api(root, "PUT", configPath, { config: { maxTurns: Number(value) } });
+      if (put.status !== 404) break;
+      await sleep(1000);
+    }
     result.put_status = put.status;
     const get = await api(root, "GET", configPath);
     result.get_status = get.status;
