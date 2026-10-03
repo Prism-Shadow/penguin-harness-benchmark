@@ -37,19 +37,38 @@ function runStatus(file) {
   }
 }
 
+function readOr(file, fallback) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return fallback;
+  }
+}
+
 // Same addressing as the CLI: localhost (the server reserves 127.0.0.1 for previews) and
-// the Bearer token the server writes to <root>/api-token at every boot.
+// the Bearer token the server writes to <root>/api-token at every boot. Right after the
+// server reports ready the token file can still be empty, so the token is read fresh for
+// every attempt and a 401 is retried for a while, as the CLI itself re-reads it on a 401.
 async function api(root, method, apiPath, body) {
-  const lock = JSON.parse(fs.readFileSync(path.join(root, "server.lock"), "utf8"));
-  const token = fs.readFileSync(path.join(root, "api-token"), "utf8").trim();
-  return fetch(`http://localhost:${lock.port}${apiPath}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${token}`,
-      ...(body !== undefined ? { "content-type": "application/json" } : {}),
-    },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-  });
+  let last;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const lock = JSON.parse(readOr(path.join(root, "server.lock"), "{}"));
+    const token = readOr(path.join(root, "api-token"), "").trim();
+    if (lock.port && token) {
+      last = await fetch(`http://localhost:${lock.port}${apiPath}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+      if (last.status !== 401) return last;
+    }
+    await sleep(500);
+  }
+  if (last === undefined) throw new Error("the server wrote no API token");
+  return last;
 }
 
 // Sets the Agent's max_turns (system_config.yaml) through the Agent config API, which
