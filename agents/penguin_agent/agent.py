@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import atexit
 import datetime as dt
+import hashlib
 import json
 import math
 import os
 import re
 import shlex
+import tarfile
 import tempfile
 import tomllib
 from pathlib import Path, PurePosixPath
@@ -158,6 +160,14 @@ class PenguinOptions(InstalledAgentOptions):
     npm_registry: str | None = Field(
         default=None, description="npm registry URL; default: npm's own default."
     )
+    install_bundle: str | None = Field(
+        default=None,
+        description=(
+            "Host path of a bundle built by tools/make_install_bundle.sh (Node.js and the CLI "
+            "already installed). It is copied into the container and unpacked at "
+            "/opt/penguin-bench instead of installing packages and downloading there."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate(self) -> PenguinOptions:
@@ -267,6 +277,14 @@ def _secret_values(entry: dict[str, Any]) -> tuple[str, ...]:
     return (key,) if isinstance(key, str) and len(key) >= 8 else ()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def scrub_tree(root: Path, secrets: tuple[str, ...]) -> int:
     """Replace every secret with [REDACTED] in the regular files under root; returns the count."""
     if not secrets or not root.is_dir():
@@ -342,6 +360,7 @@ class PenguinAgent(BaseInstalledAgent):
         super().__init__(*args, **kwargs)
         self._secrets: tuple[str, ...] = ()
         self._pricing: dict[str, Any] | None = None
+        self._bundle_sha256: str | None = None
 
     @staticmethod
     def name() -> str:
@@ -446,36 +465,16 @@ class PenguinAgent(BaseInstalledAgent):
         pricing = entry.get("pricing")
         self._pricing = dict(pricing) if isinstance(pricing, dict) else None
 
-        await self.ensure_system_dependencies(environment, ("curl", "xz", "tar", "ca_certificates"))
+        if opts.install_bundle:
+            await self._install_from_bundle(environment, Path(opts.install_bundle).expanduser())
+        else:
+            await self._install_from_network(environment)
         await self.exec_as_root(environment, command=f"mkdir -p {PREFIX}/bin && chmod 755 {PREFIX}")
         for name in ASSET_FILES:
             await environment.upload_file(ASSETS / name, str(PREFIX / name))
         await self.exec_as_root(
             environment,
-            command=(
-                f"chmod 755 {PREFIX}/node_install.sh {PREFIX}/run.sh && chmod 644 {PREFIX}/helper.mjs && "
-                f"sh {PREFIX}/node_install.sh {shlex.quote(opts.node_version)} {NODE_DIR} "
-                f"{shlex.quote(opts.node_dist_url.rstrip('/'))}"
-            ),
-        )
-        registry = f"--registry {shlex.quote(opts.npm_registry)} " if opts.npm_registry else ""
-        package = shlex.quote(f"{PACKAGE}@{opts.penguin_version}")
-        # --ignore-scripts: the only install script in the tree builds node-pty, which only
-        # the Web App's terminal uses; headless runs never load it, and skipping it keeps a
-        # compiler out of the task container.
-        await self.exec_as_root(
-            environment,
-            command=(
-                f'export PATH="{NODE_DIR}/bin:$PATH" && '
-                f"npm install --global --prefix {NPM_PREFIX} --ignore-scripts --no-audit "
-                f"--no-fund --no-update-notifier --loglevel=error --cache {PREFIX}/npm-cache "
-                f"{registry}{package} && rm -rf {PREFIX}/npm-cache && "
-                f"cat > {PENGUIN_BIN} <<'SHIM'\n"
-                "#!/bin/sh\n"
-                f'exec {NODE_DIR}/bin/node {NPM_PREFIX}/lib/node_modules/{PACKAGE}/dist/penguin.js "$@"\n'
-                "SHIM\n"
-                f"chmod 755 {PENGUIN_BIN} && {PENGUIN_BIN} --version"
-            ),
+            command=f"chmod 755 {PREFIX}/node_install.sh {PREFIX}/run.sh && chmod 644 {PREFIX}/helper.mjs",
         )
 
         # The throw-away data root, owned by the user the agent runs as.
@@ -517,6 +516,65 @@ class PenguinAgent(BaseInstalledAgent):
             env={"PENGUIN_LANG": "en"},
         )
 
+    async def _install_from_network(self, environment: BaseEnvironment) -> None:
+        """Node.js from nodejs.org and the CLI from npm, inside the container."""
+        opts = self.options
+        await self.ensure_system_dependencies(environment, ("curl", "xz", "tar", "ca_certificates"))
+        await self.exec_as_root(environment, command=f"mkdir -p {PREFIX}/bin && chmod 755 {PREFIX}")
+        await environment.upload_file(ASSETS / "node_install.sh", str(PREFIX / "node_install.sh"))
+        await self.exec_as_root(
+            environment,
+            command=(
+                f"sh {PREFIX}/node_install.sh {shlex.quote(opts.node_version)} {NODE_DIR} "
+                f"{shlex.quote(opts.node_dist_url.rstrip('/'))}"
+            ),
+        )
+        registry = f"--registry {shlex.quote(opts.npm_registry)} " if opts.npm_registry else ""
+        package = shlex.quote(f"{PACKAGE}@{opts.penguin_version}")
+        # --ignore-scripts: the only install script in the tree builds node-pty, which only
+        # the Web App's terminal uses; headless runs never load it, and skipping it keeps a
+        # compiler out of the task container.
+        await self.exec_as_root(
+            environment,
+            command=(
+                f'export PATH="{NODE_DIR}/bin:$PATH" && '
+                f"npm install --global --prefix {NPM_PREFIX} --ignore-scripts --no-audit "
+                f"--no-fund --no-update-notifier --loglevel=error --cache {PREFIX}/npm-cache "
+                f"{registry}{package} && rm -rf {PREFIX}/npm-cache && "
+                f"cat > {PENGUIN_BIN} <<'SHIM'\n"
+                "#!/bin/sh\n"
+                f'exec {NODE_DIR}/bin/node {NPM_PREFIX}/lib/node_modules/{PACKAGE}/dist/penguin.js "$@"\n'
+                "SHIM\n"
+                f"chmod 755 {PENGUIN_BIN} && {PENGUIN_BIN} --version"
+            ),
+        )
+
+    async def _install_from_bundle(self, environment: BaseEnvironment, bundle: Path) -> None:
+        """Unpack a tools/make_install_bundle.sh bundle: no package manager or network needed."""
+        opts = self.options
+        if not bundle.is_file():
+            raise ValueError(f"install_bundle {bundle} is not a file")
+        with tarfile.open(bundle) as tar:
+            member = tar.extractfile("penguin-bench/bundle.json")
+            manifest = json.loads(member.read()) if member else {}
+        if (manifest.get("penguin_version"), manifest.get("node_version")) != (opts.penguin_version, opts.node_version):
+            raise ValueError(
+                f"install_bundle {bundle} holds penguin {manifest.get('penguin_version')} on Node "
+                f"{manifest.get('node_version')}, but this run asks for {opts.penguin_version} on "
+                f"{opts.node_version}"
+            )
+        self._bundle_sha256 = _sha256_file(bundle)
+        remote = "/opt/penguin-bench-bundle.tar.gz"
+        await self.exec_as_root(environment, command=f"mkdir -p /opt && rm -rf {PREFIX}")
+        await environment.upload_file(bundle, remote)
+        await self.exec_as_root(
+            environment,
+            command=(
+                f"tar -xzf {remote} -C /opt --no-same-owner && rm -f {remote} && "
+                f"chmod 755 {PREFIX} && {PENGUIN_BIN} --version"
+            ),
+        )
+
     def _install_record(self) -> dict[str, Any]:
         opts = self.options
         return {
@@ -528,6 +586,8 @@ class PenguinAgent(BaseInstalledAgent):
             "project_id": opts.project_id,
             "agent_id": opts.agent_id,
             "agent_state": "custom" if opts.agent_state_tar else "stock",
+            "install": "bundle" if opts.install_bundle else "network",
+            "bundle_sha256": self._bundle_sha256,
         }
 
     async def _install_agent_state(self, environment: BaseEnvironment, tarball: Path) -> None:
@@ -636,6 +696,7 @@ class PenguinAgent(BaseInstalledAgent):
             "harbor_agent_timeout_sec": self.harbor_agent_timeout_sec()[0],
             "pricing_usd_per_1m": self._pricing,
             "agent_state": "custom" if self.options.agent_state_tar else "stock",
+            "install": "bundle" if self.options.install_bundle else "network",
             "host_redacted_files": redacted,
         }
         if isinstance(run, dict):
