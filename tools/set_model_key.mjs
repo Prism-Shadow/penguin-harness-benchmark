@@ -14,7 +14,7 @@
 //     $(npm root -g)/@prismshadow/penguin-cli/node_modules/@prismshadow/penguin-core/dist/index.js.
 // <project> is usually default_project. Set PENGUIN_HOME on this one command (never export it):
 // without it the default data root is used. The key file holds the key on one line and should
-// be mode 0600. Prints one line naming the entry and the key's last four characters.
+// be mode 0600. Prints one line naming the entry it stored, and no part of the key.
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 
@@ -34,4 +34,4 @@ const key = fs.readFileSync(keyFile, "utf8").trim();
 if (key.length < 8) throw new Error("the key file looks empty");
 const root = resolveRoot();
 await addModel(root, projectId, { provider, model_id: modelId, api_key: key });
-process.stdout.write(`stored api_key ****${key.slice(-4)} on (${provider}, ${modelId}) in ${root}/${projectId}\n`);
+process.stdout.write(`stored the api_key of (${provider}, ${modelId}) in ${root}/${projectId}\n`);
