@@ -368,7 +368,7 @@ The usage table keeps a row for each such request, but with no tokens. For examp
 These are not done, because the instruction was to stop here.
 
 1. **`summarize.py`:** `summarize.py pilot`'s cut helper counts every trial of a task, so its "keeping every task" line ($22.31) includes the step-1 duplicate of sales-501. The figures above use one trial per task: the latest in which the agent ran. `summarize.py` should do the same.
-2. **Overlay documentation:** the README and the overlay's header name only TB/TB-Science for `shared-network.yaml`. AutomationBench and rag also qualify (single container, public agent phase), and the pilot used it for them.
+2. **Overlay documentation:** the README and the overlay's header name only TB/TB-Science for `shared-network.yaml`. AutomationBench and rag also qualify (single container, public agent phase), and the pilot used it for them. **Resolved (2026-10-04):** the README's rule 5 and Troubleshooting entry and the overlay's header now name all four, as single-container tasks with a public agent phase; DeepSWE never uses it.
 
 ## Files
 
