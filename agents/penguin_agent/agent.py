@@ -5,9 +5,12 @@ PenguinAgent runs the PenguinHarness CLI inside the task container:
 1. ``install`` (Harbor's setup phase) installs Node.js and ``@prismshadow/penguin-cli`` into
    the private prefix ``/opt/penguin-bench`` (the task's own PATH and toolchain are left
    alone), then copies the one model entry the run needs (provider, model id, credential,
-   endpoint, pricing) from the host's PenguinHarness configuration into a throw-away data
-   root at ``/opt/penguin-bench/home``. That root is outside ``/logs``, which Harbor
-   mirrors into the trial directory, so the credential never lands in a trial.
+   endpoint, protocol, pricing) from the host's PenguinHarness configuration into a
+   throw-away data root at ``/opt/penguin-bench/home``. The credential, endpoint and protocol
+   are resolved the way PenguinHarness does (the entry's own, else its provider group's) and
+   written in the format of the CLI version installed (see host_config). That root is outside
+   ``/logs``, which Harbor mirrors into the trial directory, so the credential never lands
+   in a trial.
 2. ``run`` starts a PenguinHarness server on that root and runs the instruction with
    ``penguin run --json`` (stock ``default_agent``, approvals allowed, the configured
    thinking level), then reads ``penguin cost --json``, stops the server and copies the
@@ -237,12 +240,18 @@ def _toml_value(value: Any) -> str:
     raise ValueError(f"unsupported value type {type(value).__name__} in the model entry")
 
 
-def render_project_config(entry: dict[str, Any]) -> str:
+def render_project_config(entry: dict[str, Any], shape: str = "rows") -> str:
     """The container's ``.project_config.toml``: the entry plus ``default_model`` naming it.
 
-    Everything else (other models, command policy, chat defaults) is left to the product's
-    defaults, as in a fresh install. The text is parsed back to prove it round-trips.
+    ``shape`` is host_config.container_entry's: "rows" writes the 0.2.13 file (the entry
+    alone), "groups" adds the empty ``[providers]`` table every later release writes, which
+    marks the file as already in the group-connection format (so the in-container CLI runs no
+    one-time migration on it); the entry's own connection then overrides any group. Everything
+    else (other models, command policy, chat defaults) is left to the product's defaults, as
+    in a fresh install. The text is parsed back to prove it round-trips.
     """
+    if shape not in ("rows", "groups"):
+        raise ValueError(f"unknown project config shape {shape!r}")
     provider = entry["provider"]
     model_id = entry["model_id"]
     lines = [
@@ -250,8 +259,10 @@ def render_project_config(entry: dict[str, Any]) -> str:
         "# host's PenguinHarness configuration. Lives outside /logs and is never copied out.",
         f"default_model = {{ provider = {_toml_string(provider)}, model_id = {_toml_string(model_id)} }}",
         "",
-        "[[models]]",
     ]
+    if shape == "groups":
+        lines += ["[providers]", ""]
+    lines.append("[[models]]")
     tables: list[tuple[str, dict[str, Any]]] = []
     for key, value in entry.items():
         if isinstance(value, dict):
@@ -269,6 +280,8 @@ def render_project_config(entry: dict[str, Any]) -> str:
     expected_ref = {"provider": provider, "model_id": model_id}
     if parsed.get("models") != [entry] or parsed.get("default_model") != expected_ref:
         raise ValueError("the copied model entry does not round-trip through TOML")
+    if (shape == "groups") != ("providers" in parsed) or parsed.get("providers", {}) != {}:
+        raise ValueError("the [providers] marker does not round-trip through TOML")
     return text
 
 
@@ -361,6 +374,7 @@ class PenguinAgent(BaseInstalledAgent):
         self._secrets: tuple[str, ...] = ()
         self._pricing: dict[str, Any] | None = None
         self._bundle_sha256: str | None = None
+        self._model_config: dict[str, Any] | None = None
 
     @staticmethod
     def name() -> str:
@@ -377,10 +391,11 @@ class PenguinAgent(BaseInstalledAgent):
     def _model_ref(self) -> tuple[str, str]:
         return host_config.split_model_name(self.model_name)
 
-    def _host_model_entry(self) -> dict[str, Any]:
-        """The host's model entry for ``-m``; errors never include the credential."""
+    def _host_model(self) -> tuple[dict[str, Any], dict[str, str]]:
+        """The host's effective model entry for ``-m`` and where its connection came from;
+        errors never include the credential."""
         provider, model_id = self._model_ref()
-        return host_config.read_model_entry(
+        return host_config.read_model(
             provider, model_id, self.options.host_penguin_home, self.options.host_project_id
         )
 
@@ -459,9 +474,16 @@ class PenguinAgent(BaseInstalledAgent):
         opts = self.options
         # Fail before any slow install step (and before any model call).
         self.check_timeout_budget()
-        entry = self._host_model_entry()
-        config_text = render_project_config(entry)
+        host_entry, sources = self._host_model()
+        entry, shape = host_config.container_entry(host_entry, sources["host_config"], opts.penguin_version)
+        config_text = render_project_config(entry, shape)
         self._secrets = _secret_values(entry)
+        self._model_config = {
+            "shape": shape,
+            "host_config": sources["host_config"],
+            "client_type": entry.get("client_type"),
+            "sources": {field: sources[field] for field in host_config.CONNECTION_FIELDS},
+        }
         pricing = entry.get("pricing")
         self._pricing = dict(pricing) if isinstance(pricing, dict) else None
 
@@ -588,6 +610,7 @@ class PenguinAgent(BaseInstalledAgent):
             "agent_state": "custom" if opts.agent_state_tar else "stock",
             "install": "bundle" if opts.install_bundle else "network",
             "bundle_sha256": self._bundle_sha256,
+            "model_config": self._model_config,
         }
 
     async def _install_agent_state(self, environment: BaseEnvironment, tarball: Path) -> None:
