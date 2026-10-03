@@ -7,8 +7,9 @@ Tasks whose agent phase has no network (DeepSWE) reach the model provider only t
 Harbor's egress allowlist. This reads the same host PenguinHarness model entry that
 PenguinAgent copies into the container (data root: --host-penguin-home, else $PENGUIN_HOME,
 else ~/.penguin/data; Project: --host-project-id, else $PENGUIN_PROJECT_ID, else
-default_project) and prints one line: the host of the entry's base_url, or, when it stores
-none, the default endpoint of its provider group (for example api.deepseek.com).
+default_project) and prints one line: the host of the model's base URL, which is the entry's
+own, else its provider group's (`[providers.<provider>]`, PenguinHarness after 0.2.13), else,
+when neither sets one, the default endpoint of the provider (for example api.deepseek.com).
 
     harbor run ... -a penguin_agent:PenguinAgent -m deepseek/deepseek-flash \\
         --allow-agent-host "$(python3 tools/agent_host.py -m deepseek/deepseek-flash)"
