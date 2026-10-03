@@ -38,7 +38,7 @@ cd "$PB_PREFIX" || exit 3
 PORT=0 HOST=127.0.0.1 "$PENGUIN" server >"$OUT/penguin/server.log" 2>&1 &
 SERVER_PID=$!
 SERVER_READY=false
-for _ in $(seq 1 240); do
+for _ in $(seq 1 60); do
   if "$PENGUIN" server status --root "$PENGUIN_HOME" 2>/dev/null | grep -q '"running":true'; then
     SERVER_READY=true
     break

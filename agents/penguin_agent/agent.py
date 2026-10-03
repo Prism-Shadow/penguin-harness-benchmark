@@ -24,6 +24,7 @@ Run from the repository root, with the model configured in the host's PenguinHar
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import json
 import math
@@ -41,6 +42,8 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext, ModelUsage
 from pydantic import Field, model_validator
 
+from penguin_agent import host_config
+
 PACKAGE = "@prismshadow/penguin-cli"
 DEFAULT_PENGUIN_VERSION = "0.2.13"
 # The runtime the v0.2.13 platform installer bundles; the CLI needs Node >= 24.
@@ -55,11 +58,35 @@ INSTRUCTION_PATH = PREFIX / "instruction.md"
 ASSETS = Path(__file__).resolve().parent
 ASSET_FILES = ("node_install.sh", "run.sh", "helper.mjs")
 
-_DURATION = re.compile(r"^[1-9][0-9]*[smh]?$")
-_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_DURATION = re.compile(r"^([1-9][0-9]*)([smh]?)$")
+_ID = host_config.ID_PATTERN
 _NPM_VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
 _SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# The soft timeout when run_timeout is not given and Harbor's cap allows it, and the
+# shortest one worth starting a trial for.
+DEFAULT_RUN_TIMEOUT_SEC = 25 * 60
+MIN_RUN_TIMEOUT_SEC = 60
+
+# What run.sh needs after `penguin run --timeout` expires, on top of `abort_wait_sec`: the
+# server start before the run (its wait loop allows 60 s), the turn-cap call, the two cost
+# reads, the server stop (up to 15 s, then 30 s of waiting), copying the Traces and the
+# key scrub. Harbor's agent timeout must leave this much, or Harbor kills run.sh first.
+CLEANUP_MARGIN_SEC = 120
+
+# The env var name under which the copied key is handed to Harbor's end-of-trial scrubber
+# (Trial._scrub_jobs_dir replaces the values of sensitive agent env vars in every file of
+# the trial directory). Set only after the agent phase, never during it.
+SCRUB_ENV_NAME = "PENGUIN_AGENT_COPIED_API_KEY"
+
+
+def duration_seconds(duration: str) -> int:
+    """`penguin run --timeout` syntax (30s / 5m / 2h / bare seconds) in seconds."""
+    match = _DURATION.match(duration)
+    if not match:
+        raise ValueError(f"bad duration {duration!r}")
+    return int(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[match.group(2)]
 
 
 class PenguinOptions(InstalledAgentOptions):
@@ -72,12 +99,15 @@ class PenguinOptions(InstalledAgentOptions):
         default=DEFAULT_PENGUIN_VERSION,
         description=f"npm version of {PACKAGE} to install (Harbor's `version` is an alias).",
     )
-    run_timeout: str = Field(
-        default="25m",
+    run_timeout: str | None = Field(
+        default=None,
         description=(
             "`penguin run --timeout` (30s / 5m / 2h or bare seconds). When it expires the "
-            "Task is aborted, its cost is read and the server is stopped; keep Harbor's "
-            "agent timeout at least 300 s longer."
+            "Task is aborted, its cost is read and the server is stopped. Harbor's agent "
+            "timeout (override_timeout_sec, or the task's, times the agent timeout "
+            f"multiplier) must be at least run_timeout + abort_wait_sec + {CLEANUP_MARGIN_SEC} s; "
+            "an explicit value that breaks this is refused. Default: that agent timeout minus "
+            f"abort_wait_sec and {CLEANUP_MARGIN_SEC} s, at most 25m (25m when Harbor sets none)."
         ),
     )
     abort_wait_sec: int = Field(
@@ -142,7 +172,7 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError(f"penguin_version {self.penguin_version!r} is not an npm version")
         if not _SEMVER.match(self.node_version):
             raise ValueError(f"node_version {self.node_version!r} must look like 24.18.0")
-        if not _DURATION.match(self.run_timeout):
+        if self.run_timeout is not None and not _DURATION.match(self.run_timeout):
             raise ValueError(f"run_timeout {self.run_timeout!r} must look like 30s, 25m, 2h or 900")
         if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer or -1")
@@ -237,6 +267,31 @@ def _secret_values(entry: dict[str, Any]) -> tuple[str, ...]:
     return (key,) if isinstance(key, str) and len(key) >= 8 else ()
 
 
+def scrub_tree(root: Path, secrets: tuple[str, ...]) -> int:
+    """Replace every secret with [REDACTED] in the regular files under root; returns the count."""
+    if not secrets or not root.is_dir():
+        return 0
+    needles = [secret.encode("utf-8") for secret in secrets]
+    changed = 0
+    for path in root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        scrubbed = data
+        for needle in needles:
+            scrubbed = scrubbed.replace(needle, b"[REDACTED]")
+        if scrubbed != data:
+            try:
+                path.write_bytes(scrubbed)
+            except OSError:
+                continue
+            changed += 1
+    return changed
+
+
 # ---------------------------------------------------------------------------------------
 # Output parsing.
 # ---------------------------------------------------------------------------------------
@@ -286,6 +341,7 @@ class PenguinAgent(BaseInstalledAgent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._secrets: tuple[str, ...] = ()
+        self._pricing: dict[str, Any] | None = None
 
     @staticmethod
     def name() -> str:
@@ -300,77 +356,95 @@ class PenguinAgent(BaseInstalledAgent):
     # -- host configuration --------------------------------------------------------------
 
     def _model_ref(self) -> tuple[str, str]:
-        name = self.model_name or ""
-        provider, _, model_id = name.partition("/")
-        if not provider or not model_id:
-            raise ValueError(
-                "PenguinAgent needs -m <provider>/<model_id>, e.g. -m deepseek/deepseek-flash "
-                "(the provider group and model id of an entry in PenguinHarness's model table)."
-            )
-        return provider, model_id
-
-    def _host_data_root(self) -> Path:
-        configured = self.options.host_penguin_home or os.environ.get("PENGUIN_HOME") or ""
-        if configured.strip():
-            return Path(configured).expanduser()
-        return Path.home() / ".penguin" / "data"
-
-    def _host_project_id(self) -> str:
-        project = (
-            self.options.host_project_id
-            or os.environ.get("PENGUIN_PROJECT_ID", "").strip()
-            or "default_project"
-        )
-        if not _ID.match(project):
-            raise ValueError(f"host Project id {project!r} must match {_ID.pattern}")
-        return project
+        return host_config.split_model_name(self.model_name)
 
     def _host_model_entry(self) -> dict[str, Any]:
         """The host's model entry for ``-m``; errors never include the credential."""
         provider, model_id = self._model_ref()
-        project = self._host_project_id()
-        path = self._host_data_root() / project / ".project_config.toml"
-        hint = (
-            "Configure the model in this machine's PenguinHarness first (the Web App's model "
-            f"settings, or `penguin config model add --project-id {project} --provider "
-            f"{provider} --model-id {model_id} --api-key <key>`), or point host_penguin_home / "
-            "PENGUIN_HOME and host_project_id at the data root and Project that have it."
+        return host_config.read_model_entry(
+            provider, model_id, self.options.host_penguin_home, self.options.host_project_id
         )
+
+    # -- Harbor's agent timeout ------------------------------------------------------------
+
+    def _trial_config(self) -> dict[str, Any] | None:
+        """The trial's config.json, which Harbor writes next to agent/ before setup."""
         try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            raise ValueError(f"No PenguinHarness project config at {path}. {hint}") from None
-        except tomllib.TOMLDecodeError as exc:
-            raise ValueError(f"Cannot parse {path}: {exc}") from None
-        models = data.get("models")
-        for entry in models if isinstance(models, list) else []:
-            if (
-                isinstance(entry, dict)
-                and entry.get("provider") == provider
-                and entry.get("model_id") == model_id
-            ):
-                break
-        else:
+            return json.loads((self.logs_dir.parent / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def harbor_agent_timeout_sec(self) -> tuple[float | None, str]:
+        """Harbor's hard cap on run() for this trial, and how it was derived.
+
+        Same rule as harbor 0.23.0 Trial._compute_agent_timeout_sec: (override_timeout_sec,
+        else the task's [agent].timeout_sec), capped by max_timeout_sec, times
+        agent_timeout_multiplier (else timeout_multiplier). None = no cap or unknown.
+        """
+        config = self._trial_config()
+        if config is None:
+            return None, "the trial config could not be read"
+        agent_cfg = config.get("agent") or {}
+        base = agent_cfg.get("override_timeout_sec")
+        source = "override_timeout_sec"
+        if not base:
+            task_path = (config.get("task") or {}).get("path")
+            try:
+                task = tomllib.loads((Path(task_path) / "task.toml").read_text(encoding="utf-8"))
+            except (TypeError, OSError, ValueError):
+                return None, "the task's agent timeout could not be read"
+            base = (task.get("agent") or {}).get("timeout_sec")
+            source = "the task's [agent].timeout_sec"
+        if not base:
+            return None, "neither override_timeout_sec nor the task sets an agent timeout"
+        capped = min(float(base), float(agent_cfg.get("max_timeout_sec") or math.inf))
+        multiplier = config.get("agent_timeout_multiplier")
+        multiplier_name = "agent_timeout_multiplier"
+        if multiplier is None:
+            multiplier = config.get("timeout_multiplier", 1.0)
+            multiplier_name = "timeout_multiplier"
+        effective = capped * float(multiplier)
+        return effective, f"{source} {capped:g} s x {multiplier_name} {float(multiplier):g}"
+
+    def run_timeout_sec(self) -> int:
+        """The soft timeout of `penguin run`: the explicit run_timeout, else what fits Harbor's cap."""
+        if self.options.run_timeout is not None:
+            return duration_seconds(self.options.run_timeout)
+        effective, _ = self.harbor_agent_timeout_sec()
+        if effective is None:
+            return DEFAULT_RUN_TIMEOUT_SEC
+        return max(0, min(DEFAULT_RUN_TIMEOUT_SEC, int(effective) - self.options.abort_wait_sec - CLEANUP_MARGIN_SEC))
+
+    def check_timeout_budget(self) -> None:
+        """Refuse a trial whose Harbor timeout would kill run.sh before its cleanup."""
+        run_timeout = self.run_timeout_sec()
+        needed = run_timeout + self.options.abort_wait_sec + CLEANUP_MARGIN_SEC
+        effective, how = self.harbor_agent_timeout_sec()
+        if effective is None:
+            self.logger.warning(f"Not checking the agent timeout budget: {how}.")
+            return
+        if effective < needed or run_timeout < MIN_RUN_TIMEOUT_SEC:
             raise ValueError(
-                f"Model (provider={provider}, model_id={model_id}) is not configured in {path}. {hint}"
+                f"Harbor's agent timeout for this trial is {effective:g} s ({how}), but "
+                f"PenguinAgent needs at least run_timeout {run_timeout} s "
+                f"+ abort_wait_sec {self.options.abort_wait_sec} s + {CLEANUP_MARGIN_SEC} s = {needed} s "
+                f"(and run_timeout at least {MIN_RUN_TIMEOUT_SEC} s) to abort the Task, read its cost, "
+                "stop the server and scrub the key before Harbor kills the agent. Raise "
+                "override_timeout_sec (and drop any agent timeout multiplier below 1), or lower "
+                "--ak run_timeout."
             )
-        api_key = entry.get("api_key")
-        if not isinstance(api_key, str) or not api_key.strip():
-            raise ValueError(
-                f"Model (provider={provider}, model_id={model_id}) in {path} has no stored "
-                "api_key. Without one PenguinHarness reads the provider's environment "
-                "variable of its own server process, which the task container does not have. "
-                f"{hint}"
-            )
-        return dict(entry)
 
     # -- install -------------------------------------------------------------------------
 
     async def install(self, environment: BaseEnvironment) -> None:
         opts = self.options
-        entry = self._host_model_entry()  # fail before any slow install step
+        # Fail before any slow install step (and before any model call).
+        self.check_timeout_budget()
+        entry = self._host_model_entry()
         config_text = render_project_config(entry)
         self._secrets = _secret_values(entry)
+        pricing = entry.get("pricing")
+        self._pricing = dict(pricing) if isinstance(pricing, dict) else None
 
         await self.ensure_system_dependencies(environment, ("curl", "xz", "tar", "ca_certificates"))
         await self.exec_as_root(environment, command=f"mkdir -p {PREFIX}/bin && chmod 755 {PREFIX}")
@@ -500,7 +574,7 @@ class PenguinAgent(BaseInstalledAgent):
             "PB_PROVIDER": provider,
             "PB_MODEL": model_id,
             "PB_THINKING": opts.thinking,
-            "PB_TIMEOUT": opts.run_timeout,
+            "PB_TIMEOUT": f"{self.run_timeout_sec()}s",
             "PB_ABORT_WAIT": str(opts.abort_wait_sec),
             "PB_MAX_TURNS": "" if opts.max_turns is None else str(opts.max_turns),
         }
@@ -509,30 +583,43 @@ class PenguinAgent(BaseInstalledAgent):
 
     # -- results -------------------------------------------------------------------------
 
+    @property
+    def trial_dir(self) -> Path:
+        return self.logs_dir.parent
+
     def _scrub_host_logs(self) -> int:
-        """Host-side backstop to run.sh's redaction: no credential stays in the trial dir."""
+        """Host-side backstop to run.sh's redaction, over the whole trial directory."""
+        return scrub_tree(self.trial_dir, self._secrets)
+
+    def _single_step_task(self) -> bool:
+        config = self._trial_config() or {}
+        task_path = (config.get("task") or {}).get("path")
+        try:
+            task = tomllib.loads((Path(task_path) / "task.toml").read_text(encoding="utf-8"))
+        except (TypeError, OSError, ValueError):
+            return False
+        return not task.get("steps")
+
+    def _register_late_scrub(self) -> None:
+        """Cover what is written into the trial after the agent phase (artifacts, verifier).
+
+        Harbor's own end-of-trial scrub (Trial._scrub_jobs_dir) redacts the values of the
+        agent's sensitive env vars in every trial file once the verifier has finished. The
+        key joins that env only now: Harbor passes agent env to `docker compose exec -e` in
+        agent phases, and a multi-step task would run another one, so this is done for
+        single-step tasks only. A process-exit scrub covers every case as a backstop.
+        """
         if not self._secrets:
-            return 0
-        needles = [secret.encode("utf-8") for secret in self._secrets]
-        changed = 0
-        for path in self.logs_dir.rglob("*"):
-            if not path.is_file() or path.is_symlink():
-                continue
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
-            scrubbed = data
-            for needle in needles:
-                scrubbed = scrubbed.replace(needle, b"[REDACTED]")
-            if scrubbed != data:
-                path.write_bytes(scrubbed)
-                changed += 1
-        return changed
+            return
+        if self._single_step_task():
+            for index, secret in enumerate(self._secrets):
+                self._extra_env[f"{SCRUB_ENV_NAME}_{index}"] = secret
+        atexit.register(scrub_tree, self.trial_dir, self._secrets)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         logs = self.logs_dir
         redacted = self._scrub_host_logs()
+        self._register_late_scrub()
         provider, model_id = self._model_ref()
         run = _read_json(logs / "penguin-run.json")
         outcome = _read_json(logs / "penguin-outcome.json")
@@ -544,8 +631,10 @@ class PenguinAgent(BaseInstalledAgent):
             "provider": provider,
             "model_id": model_id,
             "thinking": self.options.thinking,
-            "run_timeout": self.options.run_timeout,
+            "run_timeout_sec": self.run_timeout_sec(),
             "max_turns": self.options.max_turns,
+            "harbor_agent_timeout_sec": self.harbor_agent_timeout_sec()[0],
+            "pricing_usd_per_1m": self._pricing,
             "agent_state": "custom" if self.options.agent_state_tar else "stock",
             "host_redacted_files": redacted,
         }
