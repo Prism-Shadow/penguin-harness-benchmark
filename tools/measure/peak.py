@@ -100,7 +100,10 @@ def main() -> int:
     except Exception as exc:  # ZoneInfoNotFoundError, or a malformed key
         parser.error(f"unknown time zone {args.tz!r}: {exc}")
     if args.now:
-        now = dt.datetime.fromisoformat(args.now)
+        try:
+            now = dt.datetime.fromisoformat(args.now)
+        except ValueError:
+            parser.error(f"bad --now {args.now!r} (example: 2026-10-05T07:30:00+08:00)")
         now = now if now.tzinfo else now.replace(tzinfo=tz)
     else:
         now = dt.datetime.now(dt.timezone.utc)
