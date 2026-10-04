@@ -128,6 +128,14 @@ class PenguinOptions(InstalledAgentOptions):
             "(unlimited in v0.2.13). `penguin run` has no turn flag of its own."
         ),
     )
+    time_budget_note: str | None = Field(
+        default=None,
+        description=(
+            "Text placed before the task instruction, followed by a blank line: a way to tell "
+            "the agent its time budget when the instruction does not state the cap. Recorded in "
+            "the trial's metadata. None (the default) passes the instruction verbatim."
+        ),
+    )
     project_id: str = Field(default="default_project", description="Project id in the container.")
     agent_id: str = Field(default="default_agent", description="Agent id in the container.")
     host_penguin_home: str | None = Field(
@@ -189,6 +197,8 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError(f"run_timeout {self.run_timeout!r} must look like 30s, 25m, 2h or 900")
         if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer or -1")
+        if self.time_budget_note is not None and not self.time_budget_note.strip():
+            raise ValueError("time_budget_note must not be blank; leave it unset instead")
         for name in ("project_id", "agent_id", "host_project_id"):
             value = getattr(self, name)
             if value is not None and not _ID.match(value):
@@ -641,6 +651,8 @@ class PenguinAgent(BaseInstalledAgent):
     ) -> None:
         provider, model_id = self._model_ref()
         opts = self.options
+        if opts.time_budget_note is not None:
+            instruction = f"{opts.time_budget_note.strip()}\n\n{instruction}"
         with tempfile.TemporaryDirectory(prefix="penguin-agent-") as tmp:
             local = Path(tmp) / "instruction.md"
             local.write_text(instruction, encoding="utf-8")
@@ -716,6 +728,7 @@ class PenguinAgent(BaseInstalledAgent):
             "thinking": self.options.thinking,
             "run_timeout_sec": self.run_timeout_sec(),
             "max_turns": self.options.max_turns,
+            "time_budget_note": self.options.time_budget_note,
             "harbor_agent_timeout_sec": self.harbor_agent_timeout_sec()[0],
             "pricing_usd_per_1m": self._pricing,
             "agent_state": "custom" if self.options.agent_state_tar else "stock",
