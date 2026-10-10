@@ -16,13 +16,13 @@ The five built-in Benchmarks of [PenguinHarness](https://github.com/Prism-Shadow
 
 ```text
 <id>/
-├── benchmark.json            the manifest
+├── benchmark_config.toml     the manifest
 └── CASE-NNN-<task>/          one case per Harbor task, numbered in the order of the task list
     ├── statement/README.md   the statement: what the case asks
     └── rubric/README.md      the rubric: how a run is scored
 ```
 
-`benchmark.json` describes the Benchmark the way `plugin.json` describes a plugin: `id` (the folder name), `title`, `description`, `version` (a date version, `YYYY.MM.DD.N`), `status`, `runs` (runs per case) and `origin`, where a copy came from (`builtin` here; an import records its own). The format is documented under [Benchmark storage](https://penguin.ooo/docs/self-improvement#benchmark-storage) in the PenguinHarness docs.
+`benchmark_config.toml` describes the Benchmark the way `plugin.json` describes a plugin: `id` (the folder name), `title`, `description`, `version` (a date version, `YYYY.MM.DD.N`), `status`, `runs` (runs per case) and, last, an `[origin]` table recording where a copy came from (`kind = "builtin"` here; an import records its own). The format is documented under [Benchmark storage](https://penguin.ooo/docs/self-improvement#benchmark-storage) in the PenguinHarness docs.
 
 A package carries no results. The `scoreboard.yaml` that a Project keeps in each Benchmark and the `.jobs/` folder of Harbor trials belong to that copy and are never part of a package; a Benchmark imported from one starts with no evaluations.
 
@@ -36,7 +36,7 @@ In the Evaluation Center, choose **Import benchmark** and paste the link of a pa
 https://github.com/Prism-Shadow/penguin-harness-benchmark/tree/<commit>/packages/<id>
 ```
 
-The dialog prepares the request in a new conversation. Once you send it, the agent fetches that one folder at that commit (a branch or tag in the link is resolved to the commit it points to), reads every file before writing anything, and writes the package to the Project's `benchmarks/<id>/` with an empty scoreboard. It records the link, the commit and the folder as the copy's `origin`, and asks before replacing a Benchmark with the same id.
+The dialog prepares the request in a new conversation. Once you send it, the agent fetches that one folder at that commit (a branch or tag in the link is resolved to the commit it points to), reads every file before writing anything, and imports the package into the Project's `benchmarks/<id>/` with an empty scoreboard. It records the link, the commit and the folder as the copy's `origin`, and asks before replacing a Benchmark with the same id.
 
 Every new Project gets these five when it is created. Import one into a Project created before they shipped, or to bring back one that was deleted.
 
@@ -55,4 +55,4 @@ The matching release is the one whose built-in Benchmarks carry the same `versio
 ## What stays out of `packages/`
 
 - The Harbor task folders stay in [`benchmarks/`](../benchmarks/README.md), untouched: a statement links its task folder at a pinned commit and copies nothing from it.
-- Large files never enter `packages/`. Task data, documents, images and datasets stay in the task folders or upstream, where the statements link them; a package holds only `benchmark.json` and the two README files of each case.
+- Large files never enter `packages/`. Task data, documents, images and datasets stay in the task folders or upstream, where the statements link them; a package holds only `benchmark_config.toml` and the two README files of each case.
