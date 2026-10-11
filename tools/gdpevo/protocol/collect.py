@@ -14,9 +14,13 @@ for each of the two GDPevo Benchmarks of the root's default_project:
 
 and from the state dir the records replica.sh wrote: <step>.meta.json (Session id and window)
 and the usage dumps (cost-by-session.json, cost-by-model.json, cost-summary.json,
-sessions.json). A trial or host Session belongs to the step whose window holds its start;
-anything outside every window is listed as unassigned. Writes <out>/replica.json and
-<out>/summary.md and prints the summary. Standard library plus PyYAML.
+sessions.json). A trial or evaluation belongs to the step of its Benchmark whose window holds
+its start. A host Session belongs to the step whose Workspace it ran in (replica.sh gives each
+step's controller <root>/work/<step>, and the cells' subagents inherit it), so steps that run at
+the same time keep their Sessions apart; a Session in another Workspace (the first replicas ran
+every step in <root>/work) belongs to the step whose window holds its creation. Anything left
+over is listed as unassigned. Writes <out>/replica.json and <out>/summary.md and prints the
+summary. Standard library plus PyYAML.
 """
 
 from __future__ import annotations
@@ -401,6 +405,23 @@ def read_sessions(state: str) -> list[dict]:
     return sessions
 
 
+def steps_by_workspace(state: str, steps: list[Step]) -> dict[str, Step]:
+    """Session id -> the step whose own Workspace (<root>/work/<step>, as replica.sh names it)
+    the Session ran in; Sessions in any other Workspace are not listed."""
+    rows = load_json(os.path.join(state, "sessions.json"), [])
+    if isinstance(rows, dict):
+        rows = rows.get("sessions", [])
+    by_name = {s.name: s for s in steps}
+    owners = {}
+    for row in rows if isinstance(rows, list) else []:
+        workspace = row.get("workspace") if isinstance(row, dict) else None
+        if isinstance(workspace, str) and workspace:
+            step = by_name.get(os.path.basename(workspace.rstrip("/\\")))
+            if step is not None:
+                owners[row.get("sessionId")] = step
+    return owners
+
+
 def sum_cost(items: list[dict], key: str) -> tuple[float, bool]:
     """(sum of the known costs, every item priced). A trial whose agent never made a request (an
     install or container failure before the run, rerun under the README's retry rule) has nothing
@@ -448,9 +469,10 @@ def main() -> int:
             owner = next((s for s in steps if s.holds(when, benchmark)), None)
             (owner.trials if owner else unassigned_trials).append(t)
     sessions = read_sessions(args.state)
+    by_workspace = steps_by_workspace(args.state, steps)
     for s in sessions:
         when = parse_time(s["created"])
-        owner = next((st for st in steps if st.holds(when)), None)
+        owner = by_workspace.get(s["session_id"]) or next((st for st in steps if st.holds(when)), None)
         (owner.sessions if owner else unassigned_sessions).append(s)
 
     step_records = {}
