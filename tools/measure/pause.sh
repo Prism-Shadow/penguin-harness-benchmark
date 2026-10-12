@@ -57,7 +57,11 @@ for job in "$JOBS_DIR"/*/; do
   job=${job%/}
   matches "$(basename "$job")" || continue
   for trial in "$job"/*__*; do
-    [ -d "$trial" ] && [ ! -f "$trial/result.json" ] || continue
+    # Every trial, not only those without a result.json: on SIGTERM Harbor 0.23.0 writes a
+    # result.json (RuntimeError, cost_usd null) for each trial in flight but leaves its
+    # containers, and the agent in them, running. A trial Harbor finished has no container
+    # left, so the loop below still finds only what is running.
+    [ -d "$trial" ] || continue
     # Harbor names a trial's Compose projects after the lower-cased trial directory name.
     prefix=$(basename "$trial" | tr '[:upper:]' '[:lower:]')
     for container in $(docker ps --format '{{.Names}}' | awk -v p="${prefix}__" 'index($0, p) == 1' || true); do

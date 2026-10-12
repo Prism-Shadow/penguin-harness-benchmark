@@ -18,7 +18,7 @@ NODE_VERSION="${3:-24.18.0}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
+trap 'rm -rf "$STAGE" "$OUT.partial"' EXIT
 ROOT="$STAGE/penguin-bench"
 mkdir -p "$ROOT/bin"
 
@@ -41,5 +41,8 @@ printf '{"penguin_version": "%s", "node_version": "%s", "arch": "%s", "built_at"
   "$PENGUIN_VERSION" "$NODE_VERSION" "$(uname -m)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/bundle.json"
 
 mkdir -p "$(dirname "$OUT")"
-tar -czf "$OUT" -C "$STAGE" penguin-bench
+# Written beside the target and renamed into place, so that whoever waits for the file never
+# reads a half-written archive.
+tar -czf "$OUT.partial" -C "$STAGE" penguin-bench
+mv "$OUT.partial" "$OUT"
 sha256sum "$OUT"
