@@ -41,7 +41,7 @@
 #
 # Before the steps: the data root <root> (default ~/.penguin/gdpevo-rep-<id>) is created by a
 # first server boot (default_project; default_agent with the plugin library's preinstalled
-# plugins, rsi-default among them), the server is stopped, --model-config is copied over the
+# plugins, default-rsi-toolkit among them), the server is stopped, --model-config is copied over the
 # Project's .project_config.toml byte for byte at mode 600 (the saved model entries the Harbor
 # adapter copies into each trial container; nothing here reads or prints it), --test-thinking
 # rewrites default_agent's model.thinking_level when given, the server is started again, and
