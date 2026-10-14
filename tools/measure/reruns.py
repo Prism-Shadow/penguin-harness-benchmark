@@ -59,6 +59,10 @@ def valid_tasks(job_dirs: list[str]) -> set[str]:
                 if any(not never_ran(step) for step in trial["step_results"]):
                     valid.add(str(trial["task_name"]).split("/")[-1])
                 continue
+            if str(trial.get("task_name", "")).startswith("tg") and str(trial["task_name"]).endswith("-train"):
+                if not never_ran(trial):
+                    valid.add(trial["task_name"])
+                continue
             rewards = (trial.get("verifier_result") or {}).get("rewards") or {}
             meta = (trial.get("agent_result") or {}).get("metadata") or {}
             if rewards.get("reward") is not None and meta.get("status") in RAN and not never_ran(trial):

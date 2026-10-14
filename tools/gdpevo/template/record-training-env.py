@@ -1,4 +1,4 @@
-"""Record evidence that training steps kept the same container and service process."""
+"""Record the container and business service processes at final verification."""
 import json
 import os
 import pwd
