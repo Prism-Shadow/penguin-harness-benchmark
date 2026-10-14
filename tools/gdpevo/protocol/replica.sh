@@ -421,7 +421,12 @@ for job in os.listdir(jobs) if os.path.isdir(jobs) else []:
             continue
         if begun.tzinfo is None:
             begun = begun.replace(tzinfo=dt.timezone.utc)
-        if begun >= since and (result.get("agent_execution") or {}).get("started_at"):
+        steps = result.get("step_results")
+        complete = (len(steps) == 5 and all((s.get("agent_execution") or {}).get("started_at")
+                    and not s.get("exception_info")
+                    and isinstance(((s.get("verifier_result") or {}).get("rewards") or {}).get("reward"), (int, float))
+                    for s in steps)) if steps is not None else bool((result.get("agent_execution") or {}).get("started_at"))
+        if begun >= since and complete:
             ran.add(result.get("task_name"))
 try:
     report = open(final, encoding="utf-8").read().strip()

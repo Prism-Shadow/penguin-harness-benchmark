@@ -385,6 +385,7 @@ class PenguinAgent(BaseInstalledAgent):
         self._pricing: dict[str, Any] | None = None
         self._bundle_sha256: str | None = None
         self._model_config: dict[str, Any] | None = None
+        self._run_count = 0
 
     @staticmethod
     def name() -> str:
@@ -548,6 +549,13 @@ class PenguinAgent(BaseInstalledAgent):
             env={"PENGUIN_LANG": "en"},
         )
 
+        # Save the initial state outside logs for independent runs in multi-step trials.
+        if not self._single_step_task():
+            await self.exec_as_root(
+                environment,
+                command=f"cp -a {DATA_ROOT} {PREFIX}/initial-home && chmod 700 {PREFIX}/initial-home && chown root:root {PREFIX}/initial-home",
+            )
+
     async def _install_from_network(self, environment: BaseEnvironment) -> None:
         """Node.js from nodejs.org and the CLI from npm, inside the container."""
         opts = self.options
@@ -651,6 +659,15 @@ class PenguinAgent(BaseInstalledAgent):
     ) -> None:
         provider, model_id = self._model_ref()
         opts = self.options
+        if self._run_count:
+            ids = await self.exec_as_agent(environment, command="id -u && id -g")
+            uid, gid = (ids.stdout or "").split()[:2]
+            await self.exec_as_root(
+                environment,
+                command=(f"rm -rf {DATA_ROOT} && cp -a {PREFIX}/initial-home {DATA_ROOT} && "
+                         f"chown -R {uid}:{gid} {DATA_ROOT} && chmod 700 {DATA_ROOT}"),
+            )
+        self._run_count += 1
         if opts.time_budget_note is not None:
             instruction = f"{opts.time_budget_note.strip()}\n\n{instruction}"
         with tempfile.TemporaryDirectory(prefix="penguin-agent-") as tmp:

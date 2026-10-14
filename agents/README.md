@@ -76,3 +76,11 @@ The setup phase needs `nodejs.org` (or `node_dist_url`), the npm registry and th
 
 - glibc images only (official Node.js builds do not run on musl/Alpine); x86-64 and arm64.
 - The credential is readable inside the container while the agent runs, as with any in-container agent. Do not use a key you could not revoke.
+
+### Multi-step trials
+
+The CLI is installed once per container. For each subsequent Harbor step the adapter restores
+an initial, private PenguinHarness data-root snapshot, starting a fresh session with the same
+model configuration and Agent State. Business services outside that data root keep running.
+Step costs and traces therefore contain only that step's activity. This does not resume the
+previous step's conversation; `resume_trajectory` is unsupported by this adapter.

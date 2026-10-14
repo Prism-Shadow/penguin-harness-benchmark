@@ -62,6 +62,9 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
+
+from trial_steps import task_results
+from task_layout import task_members
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
@@ -161,8 +164,8 @@ def _failed_requests(trial_dir: Path) -> list[tuple[str, float]]:
     return failures
 
 
-def trial_record(result_path: Path) -> dict | None:
-    trial = _load(result_path)
+def trial_record(result_path: Path, trial: dict | None = None, logs_dir: Path | None = None) -> dict | None:
+    trial = _load(result_path) if trial is None else trial
     if not isinstance(trial, dict) or "task_name" not in trial:
         return None
     job_dir = result_path.parent.parent
@@ -201,7 +204,7 @@ def trial_record(result_path: Path) -> dict | None:
         "pricing_usd_per_1m": meta.get("pricing_usd_per_1m"),
         "started_at": trial.get("started_at"),
         "finished_at": trial.get("finished_at"),
-        "_failures": _failed_requests(result_path.parent),
+        "_failures": _failed_requests(logs_dir or result_path.parent),
     }
 
 
@@ -209,9 +212,13 @@ def job_records(job_dir: Path) -> list[dict]:
     """Every trial of a job, in trial-directory order."""
     records = []
     for path in sorted(job_dir.glob("*/result.json")):
-        record = trial_record(path)
-        if record is not None:
-            records.append(record)
+        result = _load(path)
+        if not isinstance(result, dict):
+            continue
+        for step, logs_dir in task_results(result, path.parent):
+            record = trial_record(path, step, logs_dir)
+            if record is not None:
+                records.append(record)
     return records
 
 
@@ -222,7 +229,7 @@ def job_tasks(job_dir: Path, records: list[dict]) -> list[str]:
     for dataset in config.get("datasets") or []:
         for name in dataset.get("task_names") or []:
             if not any(ch in name for ch in "*?["):
-                names.add(name)
+                names.update(task_members(name))
     return sorted(names)
 
 
