@@ -18,7 +18,8 @@ runuser -u taskenv -- env \
   sh -c 'cd "$GDPEVO_ENV_DIR" && exec $GDPEVO_START_CMD' >"$LOG" 2>&1 &
 SERVICE_PID=$!
 
-python3 - "http://127.0.0.1:${GDPEVO_PORT}${GDPEVO_HEALTH_PATH}" "$SERVICE_PID" <<'EOF'
+status=0
+python3 - "http://127.0.0.1:${GDPEVO_PORT}${GDPEVO_HEALTH_PATH}" "$SERVICE_PID" <<'EOF' || status=$?
 import os, sys, time, urllib.request
 url, pid = sys.argv[1], int(sys.argv[2])
 deadline = time.time() + 120
@@ -36,7 +37,6 @@ while time.time() < deadline:
     time.sleep(1)
 sys.exit(f"gdpevo-start: {url} did not answer within 120 s")
 EOF
-status=$?
 if [ "$status" -ne 0 ]; then
   echo "gdpevo-start: service log follows" >&2
   tail -n 50 "$LOG" >&2 || true

@@ -48,6 +48,7 @@ from harbor.models.agent.context import AgentContext, ModelUsage
 from pydantic import Field, model_validator
 
 from penguin_agent import host_config
+from penguin_agent.gdpevo_preflight import verify_gdpevo_environment
 
 PACKAGE = "@prismshadow/penguin-cli"
 DEFAULT_PENGUIN_VERSION = "0.2.13"
@@ -511,6 +512,7 @@ class PenguinAgent(BaseInstalledAgent):
         opts = self.options
         # Fail before any slow install step (and before any model call).
         self.check_timeout_budget()
+        await verify_gdpevo_environment(self, environment)
         host_entry, sources = self._host_model()
         entry, shape = host_config.container_entry(host_entry, sources["host_config"], opts.penguin_version)
         config_text = render_project_config(entry, shape)
