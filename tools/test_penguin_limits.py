@@ -27,7 +27,7 @@ from harbor.trial.trial import Trial
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'agents'), str(ROOT / 'tools/gdpevo')]
 from penguin_agent.agent import PenguinAgent, PenguinOptions
-from packages import load_job_caps
+from packages import load_job_caps, task_caps
 
 
 class LimitsTests(unittest.TestCase):
@@ -78,6 +78,7 @@ class LimitsTests(unittest.TestCase):
 
     def test_unlimited_is_explicit_and_zero_is_not_an_alias(self):
         self.assertEqual(PenguinOptions(run_timeout='unlimited', max_turns=-1).max_turns, -1)
+        self.assertEqual(PenguinOptions(run_timeout='task').run_timeout, 'task')
         for value in ['0', '-1', 'none']:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 PenguinOptions(run_timeout=value)
@@ -94,24 +95,78 @@ class LimitsTests(unittest.TestCase):
             self.assertEqual(env['PB_TIMEOUT'], '')
             self.assertEqual(env['PB_MAX_TURNS'], '-1')
 
-    def test_every_gdpevo_task_and_job_has_no_agent_cap(self):
+    def test_task_mode_uses_the_full_budget_and_respects_harbor_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent, config, task = self.make_agent(Path(tmp), run_timeout='task')
+            self.assertIsNone(agent.run_timeout_sec())
+            agent.check_timeout_budget()
+            (task / 'task.toml').write_text('[agent]\ntimeout_sec = 14610\n')
+            self.assertEqual(agent.run_timeout_sec(), 14400)
+            agent.check_timeout_budget()
+            config['agent']['override_timeout_sec'] = 21810
+            self.assertEqual(agent.run_timeout_sec(), 21600)
+            config['agent']['max_timeout_sec'] = 14610
+            self.assertEqual(agent.run_timeout_sec(), 14400)
+            config['agent_timeout_multiplier'] = 2
+            self.assertEqual(agent.run_timeout_sec(), 29010)
+            config['agent'].clear()
+            config['agent_timeout_multiplier'] = 1
+            (task / 'task.toml').write_text('[agent]\ntimeout_sec = 210\n')
+            with self.assertRaisesRegex(ValueError, 'needs at least'):
+                agent.check_timeout_budget()
+
+    def test_task_mode_does_not_treat_unreadable_config_as_unlimited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent, _, task = self.make_agent(Path(tmp), run_timeout='task')
+            (task / 'task.toml').unlink()
+            with self.assertRaisesRegex(ValueError, 'readable task.toml'):
+                agent.run_timeout_sec()
+            agent._trial_config = lambda: None
+            with self.assertRaisesRegex(ValueError, 'readable Harbor trial config'):
+                agent.run_timeout_sec()
+
+    def test_run_passes_four_hour_task_budget_to_the_shell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent, _, task = self.make_agent(Path(tmp), run_timeout='task')
+            (task / 'task.toml').write_text('[agent]\ntimeout_sec = 14610\n')
+            agent.exec_as_root = AsyncMock(return_value=ExecResult(return_code=0))
+            agent.exec_as_agent = AsyncMock(return_value=ExecResult(return_code=0))
+            asyncio.run(agent.run('Solve the task.', SimpleNamespace(upload_file=AsyncMock()), AgentContext()))
+            env = agent.exec_as_agent.call_args.kwargs['env']
+            self.assertEqual(env['PB_TIMEOUT'], '14400s')
+            self.assertEqual(env['PB_MAX_TURNS'], '-1')
+
+    def test_gdpevo_tasks_and_package_commands_use_their_own_budgets(self):
         raw = yaml.safe_load((ROOT / 'benchmarks/gdpevo/job.yaml').read_text())
         job = JobConfig.model_validate(raw)
-        self.assertEqual(load_job_caps(), ('unlimited', -1))
+        self.assertEqual(load_job_caps(), ('task', -1))
         self.assertIsNone(job.agents[0].override_timeout_sec)
         self.assertEqual(job.agents[0].kwargs['max_turns'], -1)
         configs = list((ROOT / 'benchmarks/gdpevo/tasks').rglob('task.toml'))
         self.assertEqual(len(configs), 66)
-        for path in configs:
-            with self.subTest(task=str(path.relative_to(ROOT))):
-                task = TaskConfig.model_validate(tomllib.loads(path.read_text()))
-                probe = SimpleNamespace(config=job, task=SimpleNamespace(config=task))
-                probe.config = SimpleNamespace(agent=job.agents[0], timeout_multiplier=1.0,
-                                               agent_timeout_multiplier=None)
-                probe._resolve_timeout_sec = MethodType(Trial._resolve_timeout_sec, probe)
-                self.assertIsNone(Trial._compute_agent_timeout_sec(probe))
-                self.assertGreater(task.verifier.timeout_sec, 0)
-                self.assertGreater(task.environment.build_timeout_sec, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            for path in configs:
+                with self.subTest(task=str(path.relative_to(ROOT))):
+                    data = tomllib.loads(path.read_text())
+                    task = TaskConfig.model_validate(data)
+                    expected = (21600 if data['metadata']['task_id'] == 'train_group' else
+                                14400 if data['metadata']['split'] == 'test' else None)
+                    probe = SimpleNamespace(config=job, task=SimpleNamespace(config=task))
+                    probe.config = SimpleNamespace(agent=job.agents[0], timeout_multiplier=1.0,
+                                                   agent_timeout_multiplier=None)
+                    probe._resolve_timeout_sec = MethodType(Trial._resolve_timeout_sec, probe)
+                    hard = None if expected is None else expected + 210
+                    self.assertEqual(Trial._compute_agent_timeout_sec(probe), hard)
+                    agent = PenguinAgent(logs_dir=Path(tmp)/'agent', model_name='deepseek/deepseek-flash',
+                                         run_timeout='task', max_turns=-1)
+                    agent._trial_config = lambda: {'agent': {}, 'task': {'path': str(path.parent)}}
+                    self.assertEqual(agent.run_timeout_sec(), expected)
+                    agent.check_timeout_budget()
+                    command_timeout, description = task_caps(data, 'task', -1)
+                    self.assertEqual(command_timeout, 'unlimited' if expected is None else f'{expected//3600}h')
+                    self.assertIn('no turn limit', description)
+                    self.assertGreater(task.verifier.timeout_sec, 0)
+                    self.assertGreater(task.environment.build_timeout_sec, 0)
 
     def run_shell(self, root, timeout, status):
         prefix, home, logs = root / 'prefix', root / 'home', root / 'logs'

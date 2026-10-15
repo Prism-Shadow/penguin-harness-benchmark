@@ -107,8 +107,10 @@ class PenguinOptions(InstalledAgentOptions):
     run_timeout: str | None = Field(
         default=None,
         description=(
-            "`penguin run --timeout` (30s / 5m / 2h or bare seconds), or `unlimited` "
-            "to wait until the Task finishes without a time limit. Unlimited requires "
+            "`penguin run --timeout` (30s / 5m / 2h or bare seconds), `task` to use "
+            "Harbor's per-task budget minus abort/cleanup time without the 25m default ceiling, "
+            "or `unlimited` to wait until the Task finishes without a time limit. "
+            "The `task` mode is unlimited when the task/job has no agent timeout. Unlimited requires "
             "Harbor's agent timeout to be unset in both the job and task. When a finite timeout expires the "
             "Task is aborted, its cost is read and the server is stopped. Harbor's agent "
             "timeout (override_timeout_sec, or the task's, times the agent timeout "
@@ -195,8 +197,8 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError(f"penguin_version {self.penguin_version!r} is not an npm version")
         if not _SEMVER.match(self.node_version):
             raise ValueError(f"node_version {self.node_version!r} must look like 24.18.0")
-        if self.run_timeout not in (None, "unlimited") and not _DURATION.match(self.run_timeout):
-            raise ValueError(f"run_timeout {self.run_timeout!r} must be unlimited, 30s, 25m, 2h or 900")
+        if self.run_timeout not in (None, "unlimited", "task") and not _DURATION.match(self.run_timeout):
+            raise ValueError(f"run_timeout {self.run_timeout!r} must be task, unlimited, 30s, 25m, 2h or 900")
         if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer or -1")
         if self.time_budget_note is not None and not self.time_budget_note.strip():
@@ -457,6 +459,19 @@ class PenguinAgent(BaseInstalledAgent):
         """The soft timeout of `penguin run`; None means explicitly unlimited."""
         if self.options.run_timeout == "unlimited":
             return None
+        if self.options.run_timeout == "task":
+            config = self._trial_config()
+            if config is None:
+                raise ValueError("run_timeout=task requires a readable Harbor trial config")
+            if not (config.get("agent") or {}).get("override_timeout_sec"):
+                task_path = (config.get("task") or {}).get("path")
+                try:
+                    tomllib.loads((Path(task_path) / "task.toml").read_text(encoding="utf-8"))
+                except (TypeError, OSError, ValueError) as exc:
+                    raise ValueError("run_timeout=task requires a readable task.toml") from exc
+            effective, _ = self.harbor_agent_timeout_sec()
+            return (None if effective is None else
+                    max(0, int(effective) - self.options.abort_wait_sec - CLEANUP_MARGIN_SEC))
         if self.options.run_timeout is not None:
             return duration_seconds(self.options.run_timeout)
         effective, _ = self.harbor_agent_timeout_sec()
