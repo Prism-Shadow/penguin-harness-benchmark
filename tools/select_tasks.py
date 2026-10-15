@@ -170,7 +170,14 @@ def check(benchmark: str) -> list[str]:
             # Harbor's agent timeout >= run_timeout + abort_wait_sec + 120 s. Without an
             # explicit run_timeout the adapter derives one that fits, so only explicit
             # values are checked here.
-            if kwargs.get("run_timeout") is not None:
+            if kwargs.get("run_timeout") == "unlimited":
+                if agent.get("override_timeout_sec") is not None:
+                    problems.append("unlimited run_timeout requires override_timeout_sec to be unset")
+                for task in runnable:
+                    path = tasks_dir / relative_task_path(benchmark, task) / "task.toml"
+                    if path.is_file() and tomllib.loads(path.read_text()).get("agent", {}).get("timeout_sec") is not None:
+                        problems.append(f"tasks/{task}: unlimited run_timeout requires [agent].timeout_sec to be unset")
+            elif kwargs.get("run_timeout") is not None:
                 needed = seconds(str(kwargs["run_timeout"])) + int(kwargs.get("abort_wait_sec", 90)) + 120
                 limit = float(agent.get("override_timeout_sec") or 0) * float(
                     job.get("agent_timeout_multiplier") or job.get("timeout_multiplier") or 1

@@ -107,7 +107,9 @@ class PenguinOptions(InstalledAgentOptions):
     run_timeout: str | None = Field(
         default=None,
         description=(
-            "`penguin run --timeout` (30s / 5m / 2h or bare seconds). When it expires the "
+            "`penguin run --timeout` (30s / 5m / 2h or bare seconds), or `unlimited` "
+            "to wait until the Task finishes without a time limit. Unlimited requires "
+            "Harbor's agent timeout to be unset in both the job and task. When a finite timeout expires the "
             "Task is aborted, its cost is read and the server is stopped. Harbor's agent "
             "timeout (override_timeout_sec, or the task's, times the agent timeout "
             f"multiplier) must be at least run_timeout + abort_wait_sec + {CLEANUP_MARGIN_SEC} s; "
@@ -193,8 +195,8 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError(f"penguin_version {self.penguin_version!r} is not an npm version")
         if not _SEMVER.match(self.node_version):
             raise ValueError(f"node_version {self.node_version!r} must look like 24.18.0")
-        if self.run_timeout is not None and not _DURATION.match(self.run_timeout):
-            raise ValueError(f"run_timeout {self.run_timeout!r} must look like 30s, 25m, 2h or 900")
+        if self.run_timeout not in (None, "unlimited") and not _DURATION.match(self.run_timeout):
+            raise ValueError(f"run_timeout {self.run_timeout!r} must be unlimited, 30s, 25m, 2h or 900")
         if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer or -1")
         if self.time_budget_note is not None and not self.time_budget_note.strip():
@@ -451,8 +453,10 @@ class PenguinAgent(BaseInstalledAgent):
         effective = capped * float(multiplier)
         return effective, f"{source} {capped:g} s x {multiplier_name} {float(multiplier):g}"
 
-    def run_timeout_sec(self) -> int:
-        """The soft timeout of `penguin run`: the explicit run_timeout, else what fits Harbor's cap."""
+    def run_timeout_sec(self) -> int | None:
+        """The soft timeout of `penguin run`; None means explicitly unlimited."""
+        if self.options.run_timeout == "unlimited":
+            return None
         if self.options.run_timeout is not None:
             return duration_seconds(self.options.run_timeout)
         effective, _ = self.harbor_agent_timeout_sec()
@@ -463,8 +467,15 @@ class PenguinAgent(BaseInstalledAgent):
     def check_timeout_budget(self) -> None:
         """Refuse a trial whose Harbor timeout would kill run.sh before its cleanup."""
         run_timeout = self.run_timeout_sec()
-        needed = run_timeout + self.options.abort_wait_sec + CLEANUP_MARGIN_SEC
         effective, how = self.harbor_agent_timeout_sec()
+        if run_timeout is None:
+            if effective is not None:
+                raise ValueError(
+                    f"run_timeout=unlimited conflicts with Harbor's agent timeout of {effective:g} s "
+                    f"({how}). Remove override_timeout_sec and the task's [agent].timeout_sec."
+                )
+            return
+        needed = run_timeout + self.options.abort_wait_sec + CLEANUP_MARGIN_SEC
         if effective is None:
             self.logger.warning(f"Not checking the agent timeout budget: {how}.")
             return
@@ -675,6 +686,7 @@ class PenguinAgent(BaseInstalledAgent):
             local.write_text(instruction, encoding="utf-8")
             await environment.upload_file(local, str(INSTRUCTION_PATH))
         await self.exec_as_root(environment, command=f"chmod 644 {INSTRUCTION_PATH}")
+        run_timeout = self.run_timeout_sec()
         env = {
             "PENGUIN_HOME": str(DATA_ROOT),
             "PENGUIN_LANG": "en",
@@ -686,7 +698,7 @@ class PenguinAgent(BaseInstalledAgent):
             "PB_PROVIDER": provider,
             "PB_MODEL": model_id,
             "PB_THINKING": opts.thinking,
-            "PB_TIMEOUT": f"{self.run_timeout_sec()}s",
+            "PB_TIMEOUT": "" if run_timeout is None else f"{run_timeout}s",
             "PB_ABORT_WAIT": str(opts.abort_wait_sec),
             "PB_MAX_TURNS": "" if opts.max_turns is None else str(opts.max_turns),
         }
