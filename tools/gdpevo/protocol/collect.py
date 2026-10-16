@@ -33,6 +33,10 @@ import os
 import re
 import sys
 
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from trial_steps import task_results
+
 STEPS = ["B0", "T0", "O1", "T1"]
 TITLES = {
     "B0": "Formal Baseline, stock agent on Train",
@@ -347,33 +351,38 @@ def read_trials(jobs_dir: str, benchmark: str) -> list[dict]:
         if not isinstance(result, dict):
             continue
         trial_dir = os.path.dirname(result_path)
-        agent_result = result.get("agent_result") or {}
-        metadata = agent_result.get("metadata") or {}
-        execution = result.get("agent_execution") or {}
-        rewards = (result.get("verifier_result") or {}).get("rewards") or {}
-        reward = rewards.get("reward")
-        record = load_json(os.path.join(trial_dir, "verifier", "score-record.json"), {}) or {}
-        exception = result.get("exception_info") or None
-        trials.append({
-            "benchmark": benchmark,
-            "job": os.path.basename(os.path.dirname(trial_dir)),
-            "trial": os.path.basename(trial_dir),
-            "task": result.get("task_name") or os.path.basename(trial_dir).split("__")[0],
-            "started": result.get("started_at"),
-            "finished": result.get("finished_at"),
-            "reward": reward if isinstance(reward, (int, float)) else None,
-            "answer_status": record.get("answer_status"),
-            "cost_usd": agent_result.get("cost_usd"),
-            "status": metadata.get("status"),
-            "requests": metadata.get("requests"),
-            "max_turns_reached": metadata.get("max_turns_reached"),
-            "input_tokens": agent_result.get("n_input_tokens"),
-            "cache_tokens": agent_result.get("n_cache_tokens"),
-            "output_tokens": agent_result.get("n_output_tokens"),
-            "agent_s": seconds(parse_time(execution.get("started_at")), parse_time(execution.get("finished_at"))),
-            "exception": (exception.get("exception_type") if isinstance(exception, dict) else str(exception)) if exception else None,
-            "network": scan_network(trial_dir),
-        })
+        job_name = os.path.basename(os.path.dirname(trial_dir))
+        for result, step_dir in task_results(result, Path(trial_dir)):
+            trial_dir = str(step_dir)
+            agent_result = result.get("agent_result") or {}
+            metadata = agent_result.get("metadata") or {}
+            execution = result.get("agent_execution") or {}
+            rewards = (result.get("verifier_result") or {}).get("rewards") or {}
+            reward = rewards.get("reward")
+            record = result.get("_score_record") or load_json(os.path.join(trial_dir, "verifier", "score-record.json"), {}) or {}
+            exception = result.get("exception_info") or None
+            trials.append({
+                "benchmark": benchmark,
+                "job": job_name,
+                "trial": os.path.basename(trial_dir),
+                "task": result.get("task_name") or os.path.basename(trial_dir).split("__")[0],
+                "started": result.get("started_at"),
+                "finished": result.get("finished_at"),
+                "reward": reward if isinstance(reward, (int, float)) else None,
+                "answer_status": record.get("answer_status"),
+                "cost_usd": agent_result.get("cost_usd"),
+                "cost_scope": result.get("cost_scope", result.get("task_name")),
+                "group_complete": result.get("group_complete"),
+                "status": metadata.get("status"),
+                "requests": metadata.get("requests"),
+                "max_turns_reached": metadata.get("max_turns_reached"),
+                "input_tokens": agent_result.get("n_input_tokens"),
+                "cache_tokens": agent_result.get("n_cache_tokens"),
+                "output_tokens": agent_result.get("n_output_tokens"),
+                "agent_s": seconds(parse_time(execution.get("started_at")), parse_time(execution.get("finished_at"))),
+                "exception": (exception.get("exception_type") if isinstance(exception, dict) else str(exception)) if exception else None,
+                "network": scan_network(trial_dir),
+            })
     return trials
 
 

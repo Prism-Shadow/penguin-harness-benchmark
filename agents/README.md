@@ -31,7 +31,7 @@ uvx --from harbor==0.23.0 harbor run -p benchmarks/terminal-bench/tasks -i music
      --provider <provider> --model-id <model_id> --thinking <thinking> \
      --approve allow-all --source benchmark --timeout <run_timeout> --json
    ```
-   With `max_turns` set, the Agent's turn cap is applied through the local API first (the run is skipped if that fails). If `--timeout` expires, the Task is aborted through the local API and the script waits (up to `abort_wait_sec`) for the session to go idle. It then reads `penguin cost --by session --json` and `--by model`, stops the server, copies every agent's Traces to `/logs/agent/penguin/traces/`, and scrubs the configured key from everything under `/logs/agent`. `populate_context_post_run` repeats that scrub on the host.
+   With `max_turns` set, the Agent's turn setting is applied through the local API first (the run is skipped if that fails); `-1` removes the turn cap, including one saved in a custom Agent State. With `run_timeout=unlimited`, the command omits `--timeout` and waits until the Task finishes. With a finite timeout, an expired `--timeout` aborts the Task through the local API and waits (up to `abort_wait_sec`) for the session to go idle. Both paths then read `penguin cost --by session --json` and `--by model`, stop the server, copy every agent's Traces to `/logs/agent/penguin/traces/`, and scrub the configured key from everything under `/logs/agent`. `populate_context_post_run` repeats that scrub on the host.
 4. **Verify**: Harbor runs the task's verifier as usual. A non-zero `penguin run` exit is reported to Harbor as an agent error after the cleanup; the verifier still runs.
 
 ## Options (`--ak key=value`)
@@ -40,9 +40,9 @@ uvx --from harbor==0.23.0 harbor run -p benchmarks/terminal-bench/tasks -i music
 | --- | --- | --- |
 | `thinking` | `max` | `penguin run --thinking`: `low`, `medium`, `high`, `xhigh` or `max` |
 | `penguin_version` | `0.2.13` | npm version of `@prismshadow/penguin-cli`; Harbor's `version` is an alias |
-| `run_timeout` | Harbor's agent timeout − `abort_wait_sec` − 120 s, at most `25m` | soft cap of the Task (`30s`, `25m`, `2h` or bare seconds). Harbor's agent timeout (`override_timeout_sec`, else the task's, times the agent timeout multiplier) must be at least `run_timeout` + `abort_wait_sec` + 120 s; the adapter checks an explicit value in the setup phase and refuses the trial otherwise, and derives one that fits when none is given |
+| `run_timeout` | Harbor's agent timeout − `abort_wait_sec` − 120 s, at most `25m` | `task` uses that per-task budget without the 25m default ceiling, or runs unlimited if the task/job has no agent timeout; unreadable configs are errors. GDPevo uses it to select test 4h, continuous train 6h, or independent train unlimited. `unlimited` explicitly removes the total time limit and requires both job/task agent timeouts to be unset. A finite soft cap (`30s`, `25m`, `4h` or bare seconds) requires Harbor to leave `abort_wait_sec` + 120 s for cleanup. Omitting this option still derives the shorter finite default. |
 | `abort_wait_sec` | `90` | how long an aborted Task may take to wind down |
-| `max_turns` | none (stock: unlimited) | turn cap: LLM requests per Task. `penguin run` has no turn flag; the adapter sets the Agent's `max_turns` (`system_config.yaml`) through the Agent config API before the run, leaving the rest of the stock config as is. A capped Task ends with `[reached max turns (N); stopping]` |
+| `max_turns` | none (keep the Agent State's value) | LLM requests per Task; `-1` explicitly removes the turn cap. `penguin run` has no turn flag; the adapter sets the Agent's `max_turns` (`system_config.yaml`) through the Agent config API before the run. A capped Task ends with `[reached max turns (N); stopping]` |
 | `time_budget_note` | none (the instruction is passed verbatim) | text placed before the task instruction, followed by a blank line, to tell the agent its time budget when the instruction does not state the cap (`terminal-bench-science` sets it in its `job.yaml`). The trial's `agent_result.metadata.time_budget_note` records it |
 | `host_penguin_home` | `$PENGUIN_HOME`, else `~/.penguin/data` | data root whose model entry is copied |
 | `host_project_id` | `$PENGUIN_PROJECT_ID`, else `default_project` | host Project whose model table is read (inside a PenguinHarness session the server sets `PENGUIN_PROJECT_ID`, so a `harbor run` started by an Agent reads its own Project) |
@@ -76,3 +76,15 @@ The setup phase needs `nodejs.org` (or `node_dist_url`), the npm registry and th
 
 - glibc images only (official Node.js builds do not run on musl/Alpine); x86-64 and arm64.
 - The credential is readable inside the container while the agent runs, as with any in-container agent. Do not use a key you could not revoke.
+
+### Multi-step trials
+
+The CLI is installed once per container. For each subsequent Harbor step the adapter restores
+an initial, private PenguinHarness data-root snapshot, starting a fresh session with the same
+model configuration and Agent State. Business services outside that data root keep running.
+Step costs and traces therefore contain only that step's activity. This does not resume the
+previous step's conversation; `resume_trajectory` is unsupported by this adapter.
+
+GDPevo group training does not use this multi-step path. It is one invocation with all
+five tasks available, so there is no between-question reset or conversation restart.
+The method controls its own training process within that continuing session.
