@@ -57,12 +57,29 @@ def main() -> int:
                     finished += 1
                     if result.get("exception_info"):
                         errors += 1
+                    if result.get("step_results") is not None:
+                        for step in result["step_results"]:
+                            cost = (step.get("agent_result") or {}).get("cost_usd")
+                            log = os.path.join(trial, "steps", step["step_name"], "agent", "penguin-cost-by-session.json")
+                            if isinstance(cost, (int, float)):
+                                total += cost
+                            elif os.path.exists(log):
+                                total += _session_cost(log)
+                                from_logs += 1
+                        continue
                     cost = (result.get("agent_result") or {}).get("cost_usd")
                     if isinstance(cost, (int, float)):
                         total += cost
                     elif os.path.exists(cost_path):
                         total += _session_cost(cost_path)
                         from_logs += 1
+                elif os.path.isdir(os.path.join(trial, "steps")):
+                    # Archived steps have disjoint, fresh data roots; add current usage once.
+                    for log in glob.glob(os.path.join(trial, "steps", "*", "agent", "penguin-cost-by-session.json")):
+                        total += _session_cost(log)
+                    if os.path.exists(cost_path):
+                        total += _session_cost(cost_path)
+                    in_agent += 1
                 elif os.path.exists(cost_path):
                     verifying += 1
                     total += _session_cost(cost_path)

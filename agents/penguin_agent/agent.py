@@ -107,7 +107,11 @@ class PenguinOptions(InstalledAgentOptions):
     run_timeout: str | None = Field(
         default=None,
         description=(
-            "`penguin run --timeout` (30s / 5m / 2h or bare seconds). When it expires the "
+            "`penguin run --timeout` (30s / 5m / 2h or bare seconds), `task` to use "
+            "Harbor's per-task budget minus abort/cleanup time without the 25m default ceiling, "
+            "or `unlimited` to wait until the Task finishes without a time limit. "
+            "The `task` mode is unlimited when the task/job has no agent timeout. Unlimited requires "
+            "Harbor's agent timeout to be unset in both the job and task. When a finite timeout expires the "
             "Task is aborted, its cost is read and the server is stopped. Harbor's agent "
             "timeout (override_timeout_sec, or the task's, times the agent timeout "
             f"multiplier) must be at least run_timeout + abort_wait_sec + {CLEANUP_MARGIN_SEC} s; "
@@ -193,8 +197,8 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError(f"penguin_version {self.penguin_version!r} is not an npm version")
         if not _SEMVER.match(self.node_version):
             raise ValueError(f"node_version {self.node_version!r} must look like 24.18.0")
-        if self.run_timeout is not None and not _DURATION.match(self.run_timeout):
-            raise ValueError(f"run_timeout {self.run_timeout!r} must look like 30s, 25m, 2h or 900")
+        if self.run_timeout not in (None, "unlimited", "task") and not _DURATION.match(self.run_timeout):
+            raise ValueError(f"run_timeout {self.run_timeout!r} must be task, unlimited, 30s, 25m, 2h or 900")
         if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer or -1")
         if self.time_budget_note is not None and not self.time_budget_note.strip():
@@ -385,6 +389,7 @@ class PenguinAgent(BaseInstalledAgent):
         self._pricing: dict[str, Any] | None = None
         self._bundle_sha256: str | None = None
         self._model_config: dict[str, Any] | None = None
+        self._run_count = 0
 
     @staticmethod
     def name() -> str:
@@ -450,8 +455,23 @@ class PenguinAgent(BaseInstalledAgent):
         effective = capped * float(multiplier)
         return effective, f"{source} {capped:g} s x {multiplier_name} {float(multiplier):g}"
 
-    def run_timeout_sec(self) -> int:
-        """The soft timeout of `penguin run`: the explicit run_timeout, else what fits Harbor's cap."""
+    def run_timeout_sec(self) -> int | None:
+        """The soft timeout of `penguin run`; None means explicitly unlimited."""
+        if self.options.run_timeout == "unlimited":
+            return None
+        if self.options.run_timeout == "task":
+            config = self._trial_config()
+            if config is None:
+                raise ValueError("run_timeout=task requires a readable Harbor trial config")
+            if not (config.get("agent") or {}).get("override_timeout_sec"):
+                task_path = (config.get("task") or {}).get("path")
+                try:
+                    tomllib.loads((Path(task_path) / "task.toml").read_text(encoding="utf-8"))
+                except (TypeError, OSError, ValueError) as exc:
+                    raise ValueError("run_timeout=task requires a readable task.toml") from exc
+            effective, _ = self.harbor_agent_timeout_sec()
+            return (None if effective is None else
+                    max(0, int(effective) - self.options.abort_wait_sec - CLEANUP_MARGIN_SEC))
         if self.options.run_timeout is not None:
             return duration_seconds(self.options.run_timeout)
         effective, _ = self.harbor_agent_timeout_sec()
@@ -462,8 +482,15 @@ class PenguinAgent(BaseInstalledAgent):
     def check_timeout_budget(self) -> None:
         """Refuse a trial whose Harbor timeout would kill run.sh before its cleanup."""
         run_timeout = self.run_timeout_sec()
-        needed = run_timeout + self.options.abort_wait_sec + CLEANUP_MARGIN_SEC
         effective, how = self.harbor_agent_timeout_sec()
+        if run_timeout is None:
+            if effective is not None:
+                raise ValueError(
+                    f"run_timeout=unlimited conflicts with Harbor's agent timeout of {effective:g} s "
+                    f"({how}). Remove override_timeout_sec and the task's [agent].timeout_sec."
+                )
+            return
+        needed = run_timeout + self.options.abort_wait_sec + CLEANUP_MARGIN_SEC
         if effective is None:
             self.logger.warning(f"Not checking the agent timeout budget: {how}.")
             return
@@ -547,6 +574,13 @@ class PenguinAgent(BaseInstalledAgent):
             ),
             env={"PENGUIN_LANG": "en"},
         )
+
+        # Save the initial state outside logs for independent runs in multi-step trials.
+        if not self._single_step_task():
+            await self.exec_as_root(
+                environment,
+                command=f"cp -a {DATA_ROOT} {PREFIX}/initial-home && chmod 700 {PREFIX}/initial-home && chown root:root {PREFIX}/initial-home",
+            )
 
     async def _install_from_network(self, environment: BaseEnvironment) -> None:
         """Node.js from nodejs.org and the CLI from npm, inside the container."""
@@ -651,6 +685,15 @@ class PenguinAgent(BaseInstalledAgent):
     ) -> None:
         provider, model_id = self._model_ref()
         opts = self.options
+        if self._run_count:
+            ids = await self.exec_as_agent(environment, command="id -u && id -g")
+            uid, gid = (ids.stdout or "").split()[:2]
+            await self.exec_as_root(
+                environment,
+                command=(f"rm -rf {DATA_ROOT} && cp -a {PREFIX}/initial-home {DATA_ROOT} && "
+                         f"chown -R {uid}:{gid} {DATA_ROOT} && chmod 700 {DATA_ROOT}"),
+            )
+        self._run_count += 1
         if opts.time_budget_note is not None:
             instruction = f"{opts.time_budget_note.strip()}\n\n{instruction}"
         with tempfile.TemporaryDirectory(prefix="penguin-agent-") as tmp:
@@ -658,6 +701,7 @@ class PenguinAgent(BaseInstalledAgent):
             local.write_text(instruction, encoding="utf-8")
             await environment.upload_file(local, str(INSTRUCTION_PATH))
         await self.exec_as_root(environment, command=f"chmod 644 {INSTRUCTION_PATH}")
+        run_timeout = self.run_timeout_sec()
         env = {
             "PENGUIN_HOME": str(DATA_ROOT),
             "PENGUIN_LANG": "en",
@@ -669,7 +713,7 @@ class PenguinAgent(BaseInstalledAgent):
             "PB_PROVIDER": provider,
             "PB_MODEL": model_id,
             "PB_THINKING": opts.thinking,
-            "PB_TIMEOUT": f"{self.run_timeout_sec()}s",
+            "PB_TIMEOUT": "" if run_timeout is None else f"{run_timeout}s",
             "PB_ABORT_WAIT": str(opts.abort_wait_sec),
             "PB_MAX_TURNS": "" if opts.max_turns is None else str(opts.max_turns),
         }

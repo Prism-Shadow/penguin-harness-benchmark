@@ -30,6 +30,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools"))
 from select_tasks import job_tasks, load  # noqa: E402
+from task_layout import execution_task_names
 
 RAN = ("completed", "aborted", "timeout")
 
@@ -45,6 +46,7 @@ def never_ran(trial: dict) -> bool:
 
 
 def valid_tasks(job_dirs: list[str]) -> set[str]:
+    """Tasks excluded from retries: valid singles, or groups whose agents already ran."""
     valid = set()
     for job in job_dirs:
         for path in glob.glob(os.path.join(job, "*", "result.json")):
@@ -52,6 +54,14 @@ def valid_tasks(job_dirs: list[str]) -> set[str]:
                 with open(path, encoding="utf-8") as f:
                     trial = json.load(f)
             except (OSError, ValueError):
+                continue
+            if trial.get("step_results") is not None:
+                if any(not never_ran(step) for step in trial["step_results"]):
+                    valid.add(str(trial["task_name"]).split("/")[-1])
+                continue
+            if str(trial.get("task_name", "")).startswith("tg") and str(trial["task_name"]).endswith("-train"):
+                if not never_ran(trial):
+                    valid.add(trial["task_name"])
                 continue
             rewards = (trial.get("verifier_result") or {}).get("rewards") or {}
             meta = (trial.get("agent_result") or {}).get("metadata") or {}
@@ -72,7 +82,7 @@ def main() -> int:
     base = os.path.join(args.jobs_dir, f"{args.job_prefix}{args.benchmark}-attempt-{args.attempt}")
     valid = valid_tasks([base, *sorted(glob.glob(f"{glob.escape(base)}-rerun*"))])
     tasks = [t for t in args.tasks.split(",") if t] if args.tasks else job_tasks(load(args.benchmark))
-    for task in tasks:
+    for task in execution_task_names(args.benchmark, tasks):
         if task not in valid:
             print(task)
     return 0
