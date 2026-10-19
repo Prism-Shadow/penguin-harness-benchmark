@@ -165,11 +165,17 @@ def main() -> int:
 
         job = BENCHMARKS / bench / "job.yaml"
         jtext = job.read_text(encoding="utf-8")
-        match = _TASK_NAMES.search(jtext)
-        if not match:
-            raise SystemExit(f"{job}: no task_names block")
-        items = "".join(f"{match.group('indent')}  - {t}\n" for t in final)
-        writes.append((job, jtext[: match.start("items")] + items + jtext[match.end("items"):]))
+        if bench == "gdpevo":
+            import sys
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from task_layout import dataset_yaml
+            writes.append((job, jtext.split("datasets:")[0] + dataset_yaml(sel, final)))
+        else:
+            match = _TASK_NAMES.search(jtext)
+            if not match:
+                raise SystemExit(f"{job}: no task_names block")
+            items = "".join(f"{match.group('indent')}  - {t}\n" for t in final)
+            writes.append((job, jtext[: match.start("items")] + items + jtext[match.end("items"):]))
         kept_note = f" ({len(kept)} kept)" if calibration else ""
         print(f"{bench}: {len(final)} final{kept_note}; dropped {dropped_now}")
 

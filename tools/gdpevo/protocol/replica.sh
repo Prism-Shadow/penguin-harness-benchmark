@@ -421,7 +421,22 @@ for job in os.listdir(jobs) if os.path.isdir(jobs) else []:
             continue
         if begun.tzinfo is None:
             begun = begun.replace(tzinfo=dt.timezone.utc)
-        if begun >= since and (result.get("agent_execution") or {}).get("started_at"):
+        steps = result.get("step_results")
+        complete = (len(steps) == 5 and all((s.get("agent_execution") or {}).get("started_at")
+                    and not s.get("exception_info")
+                    and isinstance(((s.get("verifier_result") or {}).get("rewards") or {}).get("reward"), (int, float))
+                    for s in steps)) if steps is not None else bool((result.get("agent_execution") or {}).get("started_at"))
+        if steps is None and str(result.get("task_name", "")).endswith("-train"):
+            try:
+                with open(os.path.join(job_dir, trial, "verifier", "training-summary.json")) as f:
+                    training = json.load(f)
+                complete = (complete and training.get("complete") is True
+                            and len(training.get("tasks", [])) == 5
+                            and not result.get("exception_info")
+                            and isinstance(((result.get("verifier_result") or {}).get("rewards") or {}).get("reward"), (int, float)))
+            except (OSError, ValueError):
+                complete = False
+        if begun >= since and complete:
             ran.add(result.get("task_name"))
 try:
     report = open(final, encoding="utf-8").read().strip()

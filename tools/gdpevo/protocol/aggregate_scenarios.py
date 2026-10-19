@@ -484,6 +484,68 @@ def grouped_fallback(root: Path) -> bool:
     return run(root, "grouped-collector-fallback", replicas, expected, scoreboard)
 
 
+def grouped_collector_scenarios(root: Path) -> list[bool]:
+    from collect import evaluation_record, read_trials
+
+    tasks = [f"tg003-train-{number:03d}" for number in range(1, 6)]
+    rewards = (0.2, 1.0, 1.0, 1.0, 1.0)
+    jobs = root / "collected-groups"
+    trial = jobs / "run" / "tg003-train__completed"
+    (trial / "verifier").mkdir(parents=True)
+    (trial / "result.json").write_text(json.dumps({
+        "task_name": "tg003-train", "started_at": "2026-10-19T09:00:00Z",
+        "agent_result": {"cost_usd": 0.25, "metadata": {"status": "completed", "requests": 10}},
+        "verifier_result": {"rewards": {"reward": 0.84}},
+    }), encoding="utf-8")
+    (trial / "verifier" / "training-summary.json").write_text(json.dumps({
+        "complete": True, "tasks": [{"task": task, "reward": reward} for task, reward in zip(tasks, rewards)],
+    }), encoding="utf-8")
+    trials = read_trials(str(jobs), "penguinharness-benchmark-gdpevo-train")
+    evaluation = evaluation_record({
+        "score": 84.0, "cases": [{"case": "CASE-001-tg003-train", "score": 84.0,
+                                   "cost": 0.25, "runs": [{"session_id": "harbor:group"}]}],
+    })
+    failures = []
+    expect(evaluation, ("cases",), [{"case": "CASE-001-tg003-train", "score": 84.0, "cost": 0.25,
+                                     "session_ids": ["harbor:group"], "task_roster": tasks}], failures)
+    expect([item["task"] for item in trials], (), tasks, failures)
+    expect([item["reward"] for item in trials], (), list(rewards), failures)
+    expect(sum(item["cost_usd"] for item in trials), (), 0.25, failures)
+    expect(sum(item["requests"] for item in trials), (), 10, failures)
+    print(f"{'FAIL' if failures else 'PASS'} current-group-collector")
+    for failure in failures:
+        print(f"  {failure}")
+    outcomes = [not failures]
+    replicas = fixtures()[0]
+    for replica in replicas:
+        replica["steps"] = {"O1": {
+            "status": "completed", "evaluation": copy.deepcopy(evaluation),
+            "evaluations": [copy.deepcopy(evaluation)], "trials": copy.deepcopy(trials),
+            "score_from_trials": 20.0, "trial_count": 5, "scored": 1,
+        }}
+        replica["totals"].update(trial_cost_usd=0.25, total_usd=0.25, trial_count=5)
+    expected = {"B0": {task: [None] * 3 for task in tasks}, "T0": {},
+                "O1": {task: [reward * 100] * 3 for task, reward in zip(tasks, rewards)}, "T1": {}}
+    scoreboard = {"B0": [None] * 3, "T0": [None] * 3, "O1": [84.0] * 3, "T1": [None] * 3}
+    outcomes.append(run(root, "current-group-aggregation", replicas, expected, scoreboard))
+    for name, missing in (("task", tasks[-1:]), ("whole-group", tasks)):
+        partial, partial_expected = copy.deepcopy(replicas), copy.deepcopy(expected)
+        partial[1]["steps"]["O1"]["trials"] = [item for item in trials if item["task"] not in missing]
+        for task in missing:
+            partial_expected["O1"][task][1] = None
+        outcomes.append(run(root, f"current-group-missing-{name}", partial, partial_expected, scoreboard))
+    reordered = copy.deepcopy(replicas)
+    reordered[0]["steps"]["O1"]["evaluation"]["cases"][0]["task_roster"].reverse()
+    outcomes.append(run(root, "current-group-roster-order", reordered, expected, scoreboard))
+    for name, roster in (("null", None), ("empty", []), ("partial", tasks[:-1]),
+                         ("duplicate", tasks[:-1] + tasks[:1]), ("foreign", tasks[:-1] + ["tg005-train-005"]),
+                         ("nonstring", tasks[:-1] + [{}]), ("scalar", "tg003-train-001")):
+        invalid = copy.deepcopy(replicas)
+        invalid[1]["steps"]["O1"]["evaluation"]["cases"][0]["task_roster"] = roster
+        outcomes.append(reject(root, f"invalid-group-roster-{name}", invalid, "tg003-train"))
+    return outcomes
+
+
 def remove_task(replicas, expected, scoreboard, step, task, index, *, reward_only=False):
     state = replicas[index]["steps"][step]
     if reward_only:
@@ -511,6 +573,7 @@ def main() -> int:
         outcomes.extend(retry_scenarios(root))
         outcomes.extend(numeric_scenarios(root))
         outcomes.append(grouped_fallback(root))
+        outcomes.extend(grouped_collector_scenarios(root))
         for source in ("current", "historical", "sibling"):
             replicas = fixtures()[0]
             state = replicas[1]["steps"]["B0" if source == "sibling" else "O1"]
