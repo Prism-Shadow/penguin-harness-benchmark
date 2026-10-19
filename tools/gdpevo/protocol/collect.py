@@ -35,6 +35,7 @@ import sys
 
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from task_layout import task_members
 from trial_steps import task_results
 
 STEPS = ["B0", "T0", "O1", "T1"]
@@ -121,6 +122,20 @@ def read_scoreboard(path: str) -> list[dict]:
 def evaluation_record(e: dict) -> dict:
     cases = e.get("cases") or []
     when = parse_time(e.get("time"))
+    recorded_cases = []
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        record = {
+            "case": case.get("case"),
+            "score": case.get("score"),
+            "cost": case.get("cost"),
+            "session_ids": [r.get("session_id") for r in (case.get("runs") or []) if isinstance(r, dict)],
+        }
+        name = case.get("case")
+        if isinstance(name, str) and re.fullmatch(r"CASE-\d+-tg\d+-train", name):
+            record["task_roster"] = task_members(name.split("-", 2)[2])
+        recorded_cases.append(record)
     return {
         "time": when.isoformat() if when else e.get("time"),
         "agent_id": e.get("agent_id"),
@@ -132,16 +147,7 @@ def evaluation_record(e: dict) -> dict:
         "cost": e.get("cost"),
         "duration_ms": e.get("duration_ms"),
         "summary_title": e.get("summary_title"),
-        "cases": [
-            {
-                "case": c.get("case"),
-                "score": c.get("score"),
-                "cost": c.get("cost"),
-                "session_ids": [r.get("session_id") for r in (c.get("runs") or []) if isinstance(r, dict)],
-            }
-            for c in cases
-            if isinstance(c, dict)
-        ],
+        "cases": recorded_cases,
     }
 
 
