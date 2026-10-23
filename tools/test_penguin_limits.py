@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'agents'), str(ROOT / 'tools/gdpevo')]
 from penguin_agent.agent import PenguinAgent, PenguinOptions
 from packages import load_job_caps, task_caps
+from gdpevo.catalog import group_directories, selected_groups, benchmark_dir
 
 
 class LimitsTests(unittest.TestCase):
@@ -137,12 +138,13 @@ class LimitsTests(unittest.TestCase):
             self.assertEqual(env['PB_MAX_TURNS'], '-1')
 
     def test_gdpevo_tasks_and_package_commands_use_their_own_budgets(self):
-        raw = yaml.safe_load((ROOT / 'benchmarks/gdpevo/job.yaml').read_text())
+        raw = yaml.safe_load((benchmark_dir('task_group_003') / 'job.yaml').read_text())
         job = JobConfig.model_validate(raw)
-        self.assertEqual(load_job_caps(), ('task', -1))
+        for group in selected_groups():
+            self.assertEqual(load_job_caps(benchmark_dir(group)), ('task', -1))
         self.assertIsNone(job.agents[0].override_timeout_sec)
         self.assertEqual(job.agents[0].kwargs['max_turns'], -1)
-        configs = list((ROOT / 'benchmarks/gdpevo/tasks').rglob('task.toml'))
+        configs = [p for group in group_directories() for p in group.rglob('task.toml')]
         self.assertEqual(len(configs), 66)
         with tempfile.TemporaryDirectory() as tmp:
             for path in configs:
