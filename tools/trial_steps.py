@@ -8,11 +8,16 @@ from task_layout import task_members
 def task_results(result: dict, trial_dir: Path):
     if result.get("step_results") is None:
         members = task_members(result.get("task_name", ""))
-        if len(members) > 1:
+        if len(members) > 1 or result.get("task_name") == "train_tasks":
             try:
                 summary = json.loads((trial_dir / "verifier/training-summary.json").read_text())
             except (OSError, ValueError):
                 summary = {}
+            if result.get("task_name") == "train_tasks":
+                task_path = Path(((result.get("config") or {}).get("task") or {}).get("path") or "")
+                members = task_members("train_tasks", task_path.parent.parent.name)
+                if members == ["train_tasks"] and summary.get("tasks"):
+                    members = [record["task"] for record in summary["tasks"]]
             records = {record["task"]: record for record in summary.get("tasks", [])}
             for index, name in enumerate(members):
                 record = records.get(name, {})

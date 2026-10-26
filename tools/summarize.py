@@ -229,9 +229,13 @@ def job_tasks(job_dir: Path, records: list[dict]) -> list[str]:
     names = {r["task"] for r in records}
     config = _load(job_dir / "config.json") or {}
     for dataset in config.get("datasets") or []:
+        path = Path(dataset.get("path") or "")
+        if path.name == "train_tasks":
+            path = path.parent
+        benchmark = path.parent.name if path.name == "tasks" else None
         for name in dataset.get("task_names") or []:
             if not any(ch in name for ch in "*?["):
-                names.update(task_members(name))
+                names.update(task_members(name, benchmark))
     return sorted(names)
 
 

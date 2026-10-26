@@ -426,7 +426,7 @@ for job in os.listdir(jobs) if os.path.isdir(jobs) else []:
                     and not s.get("exception_info")
                     and isinstance(((s.get("verifier_result") or {}).get("rewards") or {}).get("reward"), (int, float))
                     for s in steps)) if steps is not None else bool((result.get("agent_execution") or {}).get("started_at"))
-        if steps is None and str(result.get("task_name", "")).endswith("-train"):
+        if steps is None and (result.get("task_name") == "train_tasks" or str(result.get("task_name", "")).endswith("-train")):
             try:
                 with open(os.path.join(job_dir, trial, "verifier", "training-summary.json")) as f:
                     training = json.load(f)

@@ -145,7 +145,7 @@ class LimitsTests(unittest.TestCase):
         self.assertIsNone(job.agents[0].override_timeout_sec)
         self.assertEqual(job.agents[0].kwargs['max_turns'], -1)
         configs = [p for group in group_directories() for p in group.rglob('task.toml')]
-        self.assertEqual(len(configs), 66)
+        self.assertEqual(len(configs), 36)
         with tempfile.TemporaryDirectory() as tmp:
             for path in configs:
                 with self.subTest(task=str(path.relative_to(ROOT))):
