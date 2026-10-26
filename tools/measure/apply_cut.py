@@ -44,6 +44,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools"))
 from select_tasks import BENCHMARKS, benchmark_ids  # noqa: E402
+from gdpevo.catalog import is_gdpevo
 
 RAN = ("completed", "aborted", "timeout")
 _TASK_NAMES = re.compile(r"(?m)^(?P<indent> *)task_names:\n(?P<items>(?:(?P=indent)  - .*\n)+)")
@@ -165,7 +166,7 @@ def main() -> int:
 
         job = BENCHMARKS / bench / "job.yaml"
         jtext = job.read_text(encoding="utf-8")
-        if bench == "gdpevo":
+        if is_gdpevo(bench):
             import sys
             sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
             from task_layout import dataset_yaml

@@ -45,9 +45,9 @@
 # Project's .project_config.toml byte for byte at mode 600 (the saved model entries the Harbor
 # adapter copies into each trial container; nothing here reads or prints it), --test-thinking
 # rewrites default_agent's model.thinking_level when given, the server is started again, and
-# the two packages that `tools/gdpevo/packages.py --commit <commit>` writes under packages/
-# are imported with `penguin benchmark import` (written first when missing or at another
-# commit). --resume skips all of that: the root exists from an earlier run, the server is
+# the two historical packages already supplied under packages/ are imported with
+# `penguin benchmark import`. Export them from the matching PenguinHarness revision first.
+# --resume skips all of that: the root exists from an earlier run, the server is
 # started if needed, and only the listed --steps run.
 #
 # guard.sh runs beside the steps: every 30 s it adds the trials' list cost under both
@@ -189,9 +189,9 @@ packages_ready() {
 }
 if ! packages_ready; then
   if [ "$DRY_RUN" = 1 ]; then
-    log "[dry-run] python3 tools/gdpevo/packages.py --commit $COMMIT"
+    log "[dry-run] matching packages for $COMMIT are required; export them with PenguinHarness's scripts/benchmark-packages.mjs"
   else
-    (cd "$REPO" && python3 tools/gdpevo/packages.py --commit "$COMMIT") || die "packages.py failed"
+    die "matching packages for $COMMIT are missing; export them with PenguinHarness's scripts/benchmark-packages.mjs first"
   fi
 fi
 
@@ -426,7 +426,7 @@ for job in os.listdir(jobs) if os.path.isdir(jobs) else []:
                     and not s.get("exception_info")
                     and isinstance(((s.get("verifier_result") or {}).get("rewards") or {}).get("reward"), (int, float))
                     for s in steps)) if steps is not None else bool((result.get("agent_execution") or {}).get("started_at"))
-        if steps is None and str(result.get("task_name", "")).endswith("-train"):
+        if steps is None and (result.get("task_name") == "train_tasks" or str(result.get("task_name", "")).endswith("-train")):
             try:
                 with open(os.path.join(job_dir, trial, "verifier", "training-summary.json")) as f:
                     training = json.load(f)
