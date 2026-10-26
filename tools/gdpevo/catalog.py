@@ -31,4 +31,4 @@ def is_gdpevo(benchmark: str) -> bool:
 
 
 def group_directories() -> list[Path]:
-    return [benchmark_dir(group) / "tasks" / group for group in selected_groups()]
+    return [benchmark_dir(group) / "tasks" for group in selected_groups()]
