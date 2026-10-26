@@ -45,6 +45,7 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(task.config.artifacts[0].source, '/app/submission')
             self.assertEqual(task.config.artifacts[0].destination, 'submission')
             self.assertEqual(task.config.verifier.environment_mode.value, 'shared')
+        for task in tasks:
             compose = yaml.safe_load((task.paths.config_path.parent / 'environment/docker-compose.yaml').read_text())
             context = compose['services']['main']['build']['additional_contexts']['gdpevo_env']
             self.assertEqual((task.paths.config_path.parent / 'environment' / context).resolve(), task.paths.config_path.parent.parent / 'env')
@@ -65,7 +66,7 @@ class TrainingTests(unittest.TestCase):
             self.assertIn('TASK_ENV_ENABLE_JUDGE=1', (run / 'environment/start.sh').read_text())
             self.assertFalse((run / 'steps').exists())
             self.assertFalse(any(p.name in ('eval', 'output', 'test_tasks') for p in workspace.rglob('*')))
-            for test in (group / 'test_tasks').iterdir():
+            for test in group.glob('*-test-*'):
                 self.assertIn('TASK_ENV_ENABLE_JUDGE=0', (test / 'environment/start.sh').read_text())
 
     def test_final_scores_skill_export_and_failure_accounting(self):
