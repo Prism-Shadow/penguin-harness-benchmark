@@ -67,7 +67,7 @@ https://github.com/Prism-Shadow/penguin-harness-benchmark/tree/main/packages/pen
 
 These folders are the source of the built-in Benchmark content. Edit each package's manifest and Case Markdown here, and increment its date version when its content changes. They are no longer generated from a second catalogue in PenguinHarness.
 
-PenguinHarness fetches `packages/` from this repository's `main` branch when preparing a release and bundles the files with the application. Every artifact of that release uses the same snapshot. Creating a Project copies the bundled packages locally and starts with an empty scoreboard; it does not fetch GitHub or overwrite existing Project Benchmarks.
+PenguinHarness fetches the manifests and each Case's two Markdown files from this repository's `packages/` on `main` at build time and bundles them with the application. Creating a Project copies the bundled packages locally and starts with an empty scoreboard; it does not fetch GitHub or overwrite existing Project Benchmarks.
 
 For a source build of PenguinHarness, run `node scripts/build-benchmarks.mjs --refresh` to fetch the latest packages. To test changes in both repositories before merging, set `PENGUIN_BENCHMARKS_SOURCE` to the absolute path of this checkout's `packages/` directory when building Harness. The package format and import flow above are unchanged.
 

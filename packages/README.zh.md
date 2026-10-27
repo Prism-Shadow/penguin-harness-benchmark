@@ -67,7 +67,7 @@ https://github.com/Prism-Shadow/penguin-harness-benchmark/tree/main/packages/pen
 
 这些目录是内置 Benchmark 内容的维护来源。直接在这里修改包的清单和 Case Markdown，内容变动时递增包的日期版本。PenguinHarness 不再维护另一份清单来生成这些包。
 
-PenguinHarness 准备发版时，从本仓库的 `main` 获取 `packages/` 并随程序打包；同一次发布的各类安装包使用同一份快照。新建 Project 时从本地复制这些包并创建空评分记录，不访问 GitHub，也不覆盖已有 Project 的 Benchmark。
+PenguinHarness 构建时，从本仓库 `main` 的 `packages/` 获取清单和每个 Case 的两份 Markdown，随程序打包。新建 Project 时从本地复制这些包并创建空评分记录，不访问 GitHub，也不覆盖已有 Project 的 Benchmark。
 
 源码开发时，在 Harness 仓库运行 `node scripts/build-benchmarks.mjs --refresh` 可刷新到最新包。两个仓库的改动尚未合并时，可在构建 Harness 时将 `PENGUIN_BENCHMARKS_SOURCE` 设置为本检出的 `packages/` 绝对路径。包格式及上面的导入方式保持不变。
 
