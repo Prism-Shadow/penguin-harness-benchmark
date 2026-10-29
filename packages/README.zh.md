@@ -67,11 +67,11 @@ https://github.com/Prism-Shadow/penguin-harness-benchmark/tree/<package-commit>/
 
 这些目录是内置 Benchmark 内容的维护来源。直接在这里修改包的清单和 Case Markdown，内容变动时递增包的日期版本。PenguinHarness 不再维护另一份清单来生成这些包。
 
-PenguinHarness 构建时，从 `scripts/build-benchmarks.mjs` 指定的本仓库 commit 的 `packages/` 获取清单和每个 Case 的两份 Markdown，随程序打包。新建 Project 时从本地复制这些包并创建空评分记录，不访问 GitHub，也不覆盖已有 Project 的 Benchmark。
+PenguinHarness 构建时，从本仓库 `main` 的 `packages/` 获取清单和每个 Case 的两份 Markdown，随程序打包。新建 Project 时从本地复制这些包并创建空评分记录，不访问 GitHub，也不覆盖已有 Project 的 Benchmark。
 
-源码开发时，在 Harness 仓库运行 `node scripts/build-benchmarks.mjs --refresh` 会重新获取已配置的包 commit。更新内置内容时，先发布包的改动，再更新 Harness 中的 commit。构建不跟随 `main`，也不读取未提交的本地包目录。
+源码开发时，在 Harness 仓库运行 `node scripts/build-benchmarks.mjs --refresh` 可刷新到最新包。两个仓库的改动尚未合并时，可在构建 Harness 时将 `PENGUIN_BENCHMARKS_SOURCE` 设置为本检出的 `packages/` 绝对路径。包格式及上面的导入方式保持不变。
 
-包 commit 决定 Harness 打包哪份 Markdown 和 TOML；各包的 `ref` 决定评估使用哪份任务、适配器和评分器。Case 的任务链接、运行规则链接及检出说明必须与 `ref` 一致。先选一个已有的源码 commit，再发布引用它的包，因此两个 commit 可以不同。配对的 Train/Test 使用相同的任务 `ref`。`[origin].ref` 只记录包的导入来源，不替代任务 `ref`。
+各包的 `ref` 决定评估使用哪份任务、适配器和评分器。Case 的任务链接、运行规则链接及检出说明必须与 `ref` 一致。先选一个已有的源码 commit，再发布引用它的包。配对的 Train/Test 使用相同的任务 `ref`。`[origin].ref` 只记录包的导入来源，不替代任务 `ref`。
 
 ## 不进 `packages/` 的内容
 
