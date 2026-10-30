@@ -38,7 +38,7 @@ packages/<id>/           one built-in benchmark as a PenguinHarness Benchmark pa
 tools/                   vendoring, selection, conversion, summary (summarize.py), balance (balance.py), agent_host.py
                          and set_model_key.mjs; tools/measure/ runs a measurement (see its README.md)
 results/<version>/       measured runs of a PenguinHarness release (see results/README.md)
-results/gdpevo-rsi-calibration/  the GDPevo subset calibrated with the RSI protocol (tools/gdpevo/protocol/)
+results/gdpevo-rsi-calibration/  the GDPevo subset calibrated with the RSI protocol (historical checkout)
 ```
 
 ## Prerequisites

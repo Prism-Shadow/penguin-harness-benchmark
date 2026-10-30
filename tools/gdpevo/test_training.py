@@ -139,10 +139,7 @@ class TrainingTests(unittest.TestCase):
                 sys.executable, str(ROOT / 'tools/measure/spend.py'), tmp, '*'
             ]))
             self.assertEqual(spend['cost_usd'], 15)
-            spec = importlib.util.spec_from_file_location('collect', ROOT / 'tools/gdpevo/protocol/collect.py')
-            collect = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(collect)
-            self.assertEqual(len(collect.read_trials(tmp, 'train')), 5)
+
 
     def test_running_step_spend_and_single_task_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
