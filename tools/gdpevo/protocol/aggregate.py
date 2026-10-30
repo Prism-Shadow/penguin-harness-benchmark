@@ -17,6 +17,8 @@ Rubric access; no Traces, no keys). The numbers:
   definitions, k = the number of replicas), as percentages.
 - Per group and overall: the mean of the tasks' acc@k, the mean of their std@k, and the
   population standard deviation of the matrix score across replicas.
+Missing trials or steps keep a None slot in replica order. Means and standard deviations
+use observed scores only; each task's missing count includes absent trials and steps.
 
 Standard library only.
 """
@@ -146,7 +148,7 @@ def main() -> int:
     per_task: dict[str, dict] = {}
     matrix_scores: dict[str, list[float]] = {name: [] for name in STEPS}
     for name in STEPS:
-        for r in replicas:
+        for index, r in enumerate(replicas):
             s = r["steps"].get(name)
             if not s:
                 continue
@@ -155,7 +157,8 @@ def main() -> int:
             if score is not None:
                 matrix_scores[name].append(score)
             for task, reward in task_rewards(s).items():
-                per_task.setdefault(task, {}).setdefault(name, []).append(None if reward is None else reward * 100)
+                values = per_task.setdefault(task, {}).setdefault(name, [None] * k)
+                values[index] = None if reward is None else reward * 100
     tasks_out = {}
     for task, by_step in sorted(per_task.items()):
         tasks_out[task] = {}
@@ -176,14 +179,14 @@ def main() -> int:
         per_replica = []
         for i in range(k):
             vals = [tasks_out[t][name]["scores"][i] for t in tasks if name in tasks_out[t] and i < len(tasks_out[t][name]["scores"]) and tasks_out[t][name]["scores"][i] is not None]
-            if vals:
-                per_replica.append(round(statistics.fmean(vals), 2))
+            per_replica.append(round(statistics.fmean(vals), 2) if vals else None)
+        known_replica = [v for v in per_replica if v is not None]
         return {
             "n_tasks": len(accs),
             f"mean_acc@{k}": round(statistics.fmean(accs), 2),
             f"mean_std@{k}": round(statistics.fmean(stds), 2),
             "per_replica_mean": per_replica,
-            "replica_std": round(pstd(per_replica), 2) if per_replica else None,
+            "replica_std": round(pstd(known_replica), 2) if known_replica else None,
         }
 
     groups = sorted({t.split("-")[0] for t in tasks_out})
@@ -279,6 +282,8 @@ def main() -> int:
         f"Per task, acc@{k} is the mean of its {k} trial rewards (one per replica) and std@{k} their population standard deviation, "
         "as GDPevo defines them, in points of 100; a group's or the overall value is the mean over its tasks. "
         "\"Scoreboard\" is the evaluation score PenguinHarness recorded (mean of the case scores), with its standard deviation across replicas.",
+        "Missing trials or steps are null slots in `per_task` scores and `per_replica_mean`, in input replica order. "
+        "Each task's `missing` count includes absent trials and steps; means and standard deviations use observed scores only.",
         "",
         f"| Matrix | Tasks | mean acc@{k} | mean std@{k} | Scoreboard mean ± std | per replica |",
         "| --- | --- | --- | --- | --- | --- |",
