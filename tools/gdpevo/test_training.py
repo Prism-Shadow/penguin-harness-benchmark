@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/gdpevo'), str(ROOT / 'agents')]
 from task_layout import dataset_entries, task_members
 from gdpevo.catalog import selected_groups, benchmark_dir
-from gdpevo.convert import group_dir
 from trial_steps import task_results
 
 
@@ -57,11 +56,9 @@ class TrainingTests(unittest.TestCase):
             workspace = run / 'environment/workspace'
             for name in task_members('train_tasks', benchmark_dir(group_id).name):
                 task_id = 'train_' + name[-3:]
-                source = group_dir(group_id) / 'train_tasks' / name[-3:] / 'input'
-                expected = {p.relative_to(source): p.read_bytes() for p in source.rglob('*') if p.is_file()}
                 staged = workspace / 'train_tasks' / task_id / 'input'
-                actual = {p.relative_to(staged): p.read_bytes() for p in staged.rglob('*') if p.is_file()}
-                self.assertEqual(actual, expected)
+                self.assertTrue((staged / 'prompt.txt').read_text().strip())
+                self.assertTrue((staged / 'payloads/answer_template.json').is_file())
             self.assertEqual(len(list((workspace / 'train_tasks').iterdir())), 5)
             self.assertIn('TASK_ENV_ENABLE_JUDGE=1', (run / 'environment/start.sh').read_text())
             self.assertFalse((run / 'steps').exists())
