@@ -32,7 +32,7 @@ agents/penguin_agent/    在任务容器内运行 PenguinHarness CLI 的 Harbor 
 data/<benchmark-id>/     README.md、SOURCE.md、job.yaml、tasks/<task>/，与包 ID 一致
 packages/<id>/           一个内置 Benchmark 的 PenguinHarness Benchmark 包：benchmark_config.toml 及其用例
                          （见 packages/README.zh.md）
-tools/                   安装、模型与网络配置工具，以及运行测试
+tools/                   安装、模型与网络配置工具
 experiments/<leaderboard-id>/<experiment-id>/  实验元信息与各阶段结果
 leaderboards/<leaderboard-id>/leaderboard.yaml  榜单元信息与图表计算表达式
 ```

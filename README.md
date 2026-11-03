@@ -32,7 +32,7 @@ agents/penguin_agent/    Harbor installed agent running the PenguinHarness CLI (
 data/<benchmark-id>/     README.md, SOURCE.md, job.yaml, tasks/<task>/; matches the package ID
 packages/<id>/           one built-in benchmark as a PenguinHarness Benchmark package: benchmark_config.toml and its cases
                          (see packages/README.md)
-tools/                   installation, model/network configuration and runtime tests
+tools/                   installation and model/network configuration
 experiments/<leaderboard-id>/<experiment-id>/  experiment metadata and phase results
 leaderboards/<leaderboard-id>/leaderboard.yaml  leaderboard metadata and chart expressions
 ```
