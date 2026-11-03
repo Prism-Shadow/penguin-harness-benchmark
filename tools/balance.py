@@ -10,7 +10,7 @@ command line or the environment) and writes the response without the key:
 {"fetched_at", "endpoint", "is_available", "balance_infos": [{"currency",
 "total_balance", "granted_balance", "topped_up_balance"}]}. `delta` prints, per currency,
 {"currency", "amount"} with amount = after total - before total as a decimal string
-(negative = spent), the shape results/README.md uses for `balance_delta`.
+(negative = spent).
 
 The key is never printed: error messages have it replaced with [REDACTED]. Needs only
 Python >= 3.11 (urllib); honours the usual https_proxy environment variables.

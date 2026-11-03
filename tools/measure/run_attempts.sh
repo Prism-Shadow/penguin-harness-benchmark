@@ -29,8 +29,7 @@
 # Every listed task must be a `candidate` or `final` task of the benchmark's selection.json
 # with a task directory. Without --tasks, the jobs run job.yaml's task list.
 #
-# The defaults are the v0.2.13 measurement's settings (results/v0.2.13/REPRODUCE.md); the
-# benchmarks default to every task-data directory's job.yaml. Peak pricing windows (peak.py): the
+# The benchmarks default to every task-data directory's job.yaml. Peak pricing windows (peak.py): the
 # driver refuses to start, with exit code 3 and before anything runs (no job, no balance
 # reading), when a window is less than 3 hours away; later in the run it starts no job while
 # one is, and writes PAUSED and PAUSED_PEAK instead. --now <time> makes every such check also

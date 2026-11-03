@@ -18,7 +18,7 @@ the cut's reason appended to its notes; `final` becomes true and `target_count` 
 Each benchmark must end with exactly target_count final tasks, and every dropped task must be
 a candidate, or nothing is written. job.yaml `task_names` are rewritten to the final tasks in
 candidate order. selection.json is written as `json.dumps(indent=2, ensure_ascii=False)`, and
-a file that this would reformat is refused. The v0.2.13 cut is results/v0.2.13/pilot/cut.json.
+a file that this would reformat is refused.
 
 A calibration round (a later pilot of new candidates, after a measurement) adds a kept list:
 
