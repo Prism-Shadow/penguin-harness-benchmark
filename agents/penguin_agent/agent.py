@@ -178,7 +178,7 @@ class PenguinOptions(InstalledAgentOptions):
     install_bundle: str | None = Field(
         default=None,
         description=(
-            "Host path of a bundle built by tools/make_install_bundle.sh (Node.js and the CLI "
+            "Host path of a bundle built by agents/make_install_bundle.sh (Node.js and the CLI "
             "already installed). It is copied into the container and unpacked at "
             "/opt/penguin-bench instead of installing packages and downloading there."
         ),
@@ -616,7 +616,7 @@ class PenguinAgent(BaseInstalledAgent):
         )
 
     async def _install_from_bundle(self, environment: BaseEnvironment, bundle: Path) -> None:
-        """Unpack a tools/make_install_bundle.sh bundle: no package manager or network needed."""
+        """Unpack a agents/make_install_bundle.sh bundle: no package manager or network needed."""
         opts = self.options
         if not bundle.is_file():
             raise ValueError(f"install_bundle {bundle} is not a file")

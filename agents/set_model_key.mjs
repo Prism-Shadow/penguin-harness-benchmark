@@ -5,7 +5,7 @@
 // type, base URL) are kept; add the model first if it does not exist yet, e.g.
 // `PENGUIN_HOME=<data root> penguin config model add --provider deepseek --model-id deepseek-flash --set-default`.
 //
-//   PENGUIN_HOME=<data root> <node> tools/set_model_key.mjs <core index.js> <project> <provider> <model_id> <key file>
+//   PENGUIN_HOME=<data root> <node> agents/set_model_key.mjs <core index.js> <project> <provider> <model_id> <key file>
 //
 // <core index.js> is the installed PenguinHarness core:
 //   - official installer: ~/.penguin/lib/node_modules/@prismshadow/penguin-core/dist/index.js,
@@ -21,7 +21,7 @@ import { pathToFileURL } from "node:url";
 const args = process.argv.slice(2);
 if (args.length !== 5) {
   process.stderr.write(
-    "usage: PENGUIN_HOME=<data root> node tools/set_model_key.mjs <core index.js> <project> <provider> <model_id> <key file>\n",
+    "usage: PENGUIN_HOME=<data root> node agents/set_model_key.mjs <core index.js> <project> <provider> <model_id> <key file>\n",
   );
   process.exit(2);
 }

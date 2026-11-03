@@ -24,9 +24,9 @@ Run from the root of a checkout of the full 40-character lowercase commit named 
 
 The State archive contains the contents of `agents/<agent_id>/agent_state`, with its configuration and Skills at the archive root. Use the base State for a no-Skill comparison; otherwise add the frozen Skill and an instruction to use it. Host-side Skills are not automatically visible inside the container. The adapter installs this State for the Target Agent, dropping `.vault.toml`.
 
-The adapter installs Node.js and the selected published Penguin version during setup. A source build is optional. To use an existing installation bundle, add `--ak install_bundle=<bundle.tar.gz>`; `tools/make_install_bundle.sh <output.tar.gz> <penguin-version> <node-version>` builds one from a published version. Keep the executable version fixed throughout the experiment.
+The adapter installs Node.js and the selected published Penguin version during setup. A source build is optional. To use an existing installation bundle, add `--ak install_bundle=<bundle.tar.gz>`; `agents/make_install_bundle.sh <output.tar.gz> <penguin-version> <node-version>` builds one from a published version. Keep the executable version fixed throughout the experiment.
 
-The adapter reads the model connection from `host_penguin_home` / `host_project_id`, defaulting to `$PENGUIN_HOME` / `$PENGUIN_PROJECT_ID`, then `~/.penguin/data` / `default_project`. Pass these two `--ak` options when needed. It copies the selected model entry privately; do not put keys in commands or job files. `python3 tools/agent_host.py -m <provider>/<model_id>` prints the API host to allow.
+The adapter reads the model connection from `host_penguin_home` / `host_project_id`, defaulting to `$PENGUIN_HOME` / `$PENGUIN_PROJECT_ID`, then `~/.penguin/data` / `default_project`. Pass these two `--ak` options when needed. It copies the selected model entry privately; do not put keys in commands or job files. `python3 agents/agent_host.py -m <provider>/<model_id>` prints the API host to allow.
 
 ## Run testing
 

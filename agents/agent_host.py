@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print the API host a model's requests go to, for Harbor's --allow-agent-host.
 
-    python3 tools/agent_host.py -m <provider>/<model_id> [--host-penguin-home DIR] [--host-project-id ID]
+    python3 agents/agent_host.py -m <provider>/<model_id> [--host-penguin-home DIR] [--host-project-id ID]
 
 Tasks whose agent phase has no network (DeepSWE, GDPevo) reach the model provider only through
 Harbor's egress allowlist. This reads the same host PenguinHarness model entry that
@@ -12,7 +12,7 @@ own, else its provider group's (`[providers.<provider>]`, PenguinHarness after 0
 when neither sets one, the default endpoint of the provider (for example api.deepseek.com).
 
     harbor run ... -a penguin_agent:PenguinAgent -m deepseek/deepseek-flash \\
-        --allow-agent-host "$(python3 tools/agent_host.py -m deepseek/deepseek-flash)"
+        --allow-agent-host "$(python3 agents/agent_host.py -m deepseek/deepseek-flash)"
 
 Exit status 0 with the host on stdout; 1 with a reason on stderr. The credential is never
 read into the output. Needs only Python >= 3.11.
@@ -25,7 +25,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-HOST_CONFIG = Path(__file__).resolve().parent.parent / "agents" / "penguin_agent" / "host_config.py"
+HOST_CONFIG = Path(__file__).resolve().parent / "penguin_agent" / "host_config.py"
 
 
 def _load_host_config():

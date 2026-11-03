@@ -1,7 +1,7 @@
 """The host's PenguinHarness model configuration, read without Harbor.
 
 Shared by PenguinAgent (which copies one model entry into each task container) and
-tools/agent_host.py (which names the API host a no-network task must allow). Nothing here
+agents/agent_host.py (which names the API host a no-network task must allow). Nothing here
 returns or prints a credential except `read_model` / `read_model_entry`, whose result the
 caller must keep private.
 

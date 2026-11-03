@@ -6,7 +6,7 @@
 # containers cannot reach the Debian/Ubuntu mirrors, nodejs.org or the npm registry
 # reliably; it also saves about two minutes per trial.
 #
-#   tools/make_install_bundle.sh <out.tar.gz> [penguin_version (0.2.13)] [node_version (24.18.0)]
+#   agents/make_install_bundle.sh <out.tar.gz> [penguin_version (0.2.13)] [node_version (24.18.0)]
 #
 # Run it on a host with the same architecture as the containers (linux x64 or arm64), with
 # curl, tar, xz, gzip and sha256sum; it needs nodejs.org and the npm registry once.
@@ -22,7 +22,7 @@ trap 'rm -rf "$STAGE" "$OUT.partial"' EXIT
 ROOT="$STAGE/penguin-bench"
 mkdir -p "$ROOT/bin"
 
-sh "$HERE/../agents/penguin_agent/node_install.sh" "$NODE_VERSION" "$ROOT/node"
+sh "$HERE/penguin_agent/node_install.sh" "$NODE_VERSION" "$ROOT/node"
 PATH="$ROOT/node/bin:$PATH" npm install --global --prefix "$ROOT/npm" --ignore-scripts --no-audit \
   --no-fund --no-update-notifier --loglevel=error --cache "$STAGE/npm-cache" \
   "@prismshadow/penguin-cli@$PENGUIN_VERSION"
