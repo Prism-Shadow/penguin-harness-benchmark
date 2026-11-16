@@ -61,7 +61,7 @@ PENGUIN_BIN = PREFIX / "bin" / "penguin"
 DATA_ROOT = PREFIX / "home"
 INSTRUCTION_PATH = PREFIX / "instruction.md"
 ASSETS = Path(__file__).resolve().parent
-ASSET_FILES = ("node_install.sh", "run.sh", "helper.mjs")
+ASSET_FILES = ("node_install.sh", "run.sh", "helper.mjs", "deadline.mjs")
 
 _DURATION = re.compile(r"^([1-9][0-9]*)([smh]?)$")
 _ID = host_config.ID_PATTERN
@@ -140,6 +140,10 @@ class PenguinOptions(InstalledAgentOptions):
             "the trial's metadata. None (the default) passes the instruction verbatim."
         ),
     )
+    deadline_file: str | None = Field(
+        default=None,
+        description="Optional absolute container JSON path shared with the task timer. Uses an absolute supervised deadline instead of the CLI relative wait timeout.",
+    )
     project_id: str = Field(default="default_project", description="Project id in the container.")
     agent_id: str = Field(default="default_agent", description="Agent id in the container.")
     host_penguin_home: str | None = Field(
@@ -203,6 +207,11 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError("max_turns must be a positive integer or -1")
         if self.time_budget_note is not None and not self.time_budget_note.strip():
             raise ValueError("time_budget_note must not be blank; leave it unset instead")
+        if self.deadline_file is not None:
+            if not self.deadline_file.startswith("/") or ".." in Path(self.deadline_file).parts:
+                raise ValueError("deadline_file must be an absolute container path without '..'")
+            if self.run_timeout == "unlimited":
+                raise ValueError("deadline_file requires a finite run timeout")
         for name in ("project_id", "agent_id", "host_project_id"):
             value = getattr(self, name)
             if value is not None and not _ID.match(value):
@@ -702,6 +711,8 @@ class PenguinAgent(BaseInstalledAgent):
             await environment.upload_file(local, str(INSTRUCTION_PATH))
         await self.exec_as_root(environment, command=f"chmod 644 {INSTRUCTION_PATH}")
         run_timeout = self.run_timeout_sec()
+        if opts.deadline_file is not None and run_timeout is None:
+            raise ValueError("deadline_file requires a finite task budget")
         env = {
             "PENGUIN_HOME": str(DATA_ROOT),
             "PENGUIN_LANG": "en",
@@ -714,6 +725,7 @@ class PenguinAgent(BaseInstalledAgent):
             "PB_MODEL": model_id,
             "PB_THINKING": opts.thinking,
             "PB_TIMEOUT": "" if run_timeout is None else f"{run_timeout}s",
+            "PB_DEADLINE_FILE": opts.deadline_file or "",
             "PB_ABORT_WAIT": str(opts.abort_wait_sec),
             "PB_MAX_TURNS": "" if opts.max_turns is None else str(opts.max_turns),
         }
