@@ -1,0 +1,87 @@
+--- a/src/Paramore.Brighter.MessagingGateway.Kafka/KafkaMessageConsumer.cs
++++ b/src/Paramore.Brighter.MessagingGateway.Kafka/KafkaMessageConsumer.cs
+@@ -63,6 +63,7 @@
+         private readonly ITimer _sweeperTimer;
+         private bool _hasFatalError;
+         private bool _isClosed;
++        private readonly object _closeSync = new();
+         private readonly RoutingKey? _deadLetterRoutingKey;
+         private readonly RoutingKey? _invalidMessageRoutingKey;
+         private readonly Lazy<KafkaMessageProducer?>? _deadLetterProducer;
+@@ -129,7 +130,8 @@
+             RoutingKey? deadLetterRoutingKey = null,
+             RoutingKey? invalidMessageRoutingKey = null,
+             TimeProvider? timeProvider = null,
+-            IAmAMessageScheduler? scheduler = null
++            IAmAMessageScheduler? scheduler = null,
++            Func<ConsumerConfig, IConsumer<string, byte[]>>? consumerFactory = null
+             )
+         {
+             if (groupId is null)
+@@ -222,7 +224,7 @@
+                 SweepOffsets();
+             }, null, _sweepUncommittedInterval, _sweepUncommittedInterval);
+ 
+-            _consumer = new ConsumerBuilder<string, byte[]>(_consumerConfig)
++            var consumerBuilder = new ConsumerBuilder<string, byte[]>(_consumerConfig)
+                 .SetPartitionsAssignedHandler((_, list) =>
+                 {
+                     var partitions = list.Select(p => $"{p.Topic} : {p.Partition.Value}");
+@@ -258,8 +260,8 @@
+                         Log.FatalError(s_logger, error.Code, error.Reason, true);
+                     else
+                         Log.NonFatalError(s_logger, error.Code, error.Reason, false);
+-                })
+-                .Build();
++                });
++            _consumer = consumerFactory is null ? consumerBuilder.Build() : consumerFactory(_consumerConfig);
+ 
+             Log.SubscribingToTopic(s_logger, Topic);
+             _consumer.Subscribe([Topic.Value]);
+@@ -401,31 +403,23 @@
+         /// <remarks>Use this before disposing of the consumer, to ensure an orderly shutdown</remarks>
+         public void Close()
+         {
+-            //we will be called twice if explicitly disposed as well as closed, so just skip in that case
+-            if (_isClosed) return;
+-
+-            try
+-            {
+-                //wait for any in-flight background commit to finish before we commit remaining offsets
+-                if (_flushToken.Wait(s_commitSyncTimeout))
+-                {
+-                    //this will release the semaphore
++            lock (_closeSync)
++            {
++                if (_isClosed) return;
++                try
++                {
++                    _flushToken.Wait();
+                     CommitAllOffsets(_timeProvider.GetUtcNow().UtcDateTime);
+                 }
+-                else
+-                {
+-                    Log.SkippedCommittingOffsetsBeforeClose(s_logger);
+-                }
+-            }
+-            catch (Exception ex)
+-            {
+-                //Close anyway, we just will get replay of those messages
+-                Log.ErrorCommittingOffsetBeforeClosing(s_logger, ex.Message);
+-            }
+-            finally
+-            {
+-                _consumer.Close();
+-                _isClosed = true;
++                catch (Exception ex)
++                {
++                    Log.ErrorCommittingOffsetBeforeClosing(s_logger, ex.Message);
++                }
++                finally
++                {
++                    _consumer.Close();
++                    _isClosed = true;
++                }
+             }
+         }
+ 
