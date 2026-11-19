@@ -1,5 +1,0 @@
-<?php
-declare(strict_types=1);
-
-$node = 3397;
-require dirname(__DIR__) . '/contracts.php';
