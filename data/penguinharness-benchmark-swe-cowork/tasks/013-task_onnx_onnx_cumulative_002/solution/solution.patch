@@ -1,0 +1,4875 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4dd56b6e1e6488cb25f0166a4492c20fb279449f..9cd0e18a2cda7caea682e7d94442e868b04757c6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -55,10 +55,10 @@ else()
+   set(Protobuf_USE_STATIC_LIBS ON)
+ endif()
+ 
+-# Required to use /std:c++17 or higher on Windows
+-# For other platforms, set C++11 as standard for the whole project
++# Parser and printer use string_view, charconv, and constexpr type dispatch.
++# Require C++17 consistently across supported toolchains.
+ if(NOT MSVC)
+-  set(CMAKE_CXX_STANDARD 11)
++  set(CMAKE_CXX_STANDARD 17)
+ else()
+   string(APPEND CMAKE_CXX_FLAGS " /std:c++17")
+ endif()
+diff --git a/onnx/checker.cc b/onnx/checker.cc
+index 1dd67a54d254a67886f9edafe2be7c9ebb5a9f68..9df1a7fb4390241c4b2e7f355c6c47e6e927ba59 100644
+--- a/onnx/checker.cc
++++ b/onnx/checker.cc
+@@ -4,25 +4,54 @@
+ 
+ #include "onnx/checker.h"
+ #include "onnx/common/file_utils.h"
+-#include "onnx/common/path.h"
+ #include "onnx/defs/schema.h"
++#include "onnx/common/path.h"
++#include "onnx/common/scoped_resource.h"
+ #include "onnx/defs/tensor_proto_util.h"
+ #include "onnx/proto_utils.h"
+ #include "onnx/shape_inference/implementation.h"
+ #include "onnx/string_utils.h"
+ 
++#include <filesystem>
+ #include <fstream>
+ #include <iterator>
+ #include <unordered_set>
+ 
+ #ifdef _WIN32
+-#include <direct.h>
+-#include <filesystem>
+-
+-#else // POSIX
++#include <Windows.h>
++#include <fcntl.h>
++#include <io.h>
++#else
++#include <fcntl.h>
+ #include <sys/stat.h>
++#include <unistd.h>
++
++// Kernel-level path containment: prefer openat2 (Linux 5.6+) or
++// O_RESOLVE_BENEATH (FreeBSD 13+, macOS 15+) when available.
++#ifdef __linux__
++#include <sys/syscall.h>
++#ifdef SYS_openat2
++#define ONNX_HAS_OPENAT2
++#if __has_include(<linux/openat2.h>)
++#include <linux/openat2.h>
++#else
++struct open_how {
++  uint64_t flags;
++  uint64_t mode;
++  uint64_t resolve;
++};
++#define RESOLVE_NO_SYMLINKS 0x04
++#define RESOLVE_BENEATH 0x08
++#endif
++#endif // SYS_openat2
++#endif // __linux__
++
++#ifdef O_RESOLVE_BENEATH
++#define ONNX_HAS_RESOLVE_BENEATH
+ #endif
+ 
++#endif // _WIN32
++
+ namespace ONNX_NAMESPACE {
+ namespace checker {
+ 
+@@ -129,80 +158,7 @@ void check_tensor(const TensorProto& tensor, const CheckerContext& ctx) {
+     for (const StringStringEntryProto& entry : tensor.external_data()) {
+       if (entry.has_key() && entry.has_value() && entry.key() == "location") {
+         has_location = true;
+-#ifdef _WIN32
+-        auto file_path = std::filesystem::path(utf8str_to_wstring(entry.value()));
+-        if (file_path.is_absolute()) {
+-          fail_check(
+-              "Location of external TensorProto ( tensor name: ",
+-              tensor.name(),
+-              ") should be a relative path, but it is an absolute path: ",
+-              entry.value());
+-        }
+-        auto relative_path = file_path.lexically_normal().make_preferred().wstring();
+-        // Check that normalized relative path contains ".." on Windows.
+-        if (relative_path.find(L"..", 0) != std::string::npos) {
+-          fail_check(
+-              "Data of TensorProto ( tensor name: ",
+-              tensor.name(),
+-              ") should be file inside the ",
+-              ctx.get_model_dir(),
+-              ", but the '",
+-              entry.value(),
+-              "' points outside the directory");
+-        }
+-        std::wstring data_path = path_join(utf8str_to_wstring(ctx.get_model_dir()), relative_path);
+-        struct _stat buff;
+-        if (_wstat(data_path.c_str(), &buff) != 0) {
+-          fail_check(
+-              "Data of TensorProto ( tensor name: ",
+-              tensor.name(),
+-              ") should be stored in ",
+-              entry.value(),
+-              ", but it doesn't exist or is not accessible.");
+-        }
+-#else // POSIX
+-        if (entry.value().empty()) {
+-          fail_check("Location of external TensorProto ( tensor name: ", tensor.name(), ") should not be empty.");
+-        } else if (entry.value()[0] == '/') {
+-          fail_check(
+-              "Location of external TensorProto ( tensor name: ",
+-              tensor.name(),
+-              ") should be a relative path, but it is an absolute path: ",
+-              entry.value());
+-        }
+-        std::string relative_path = clean_relative_path(entry.value());
+-        // Check that normalized relative path contains ".." on POSIX
+-        if (relative_path.find("..", 0) != std::string::npos) {
+-          fail_check(
+-              "Data of TensorProto ( tensor name: ",
+-              tensor.name(),
+-              ") should be file inside the ",
+-              ctx.get_model_dir(),
+-              ", but the '",
+-              entry.value(),
+-              "' points outside the directory");
+-        }
+-        std::string data_path = path_join(ctx.get_model_dir(), relative_path);
+-        // use stat to check whether the file exists
+-        struct stat buffer;
+-        if (stat((data_path).c_str(), &buffer) != 0) {
+-          fail_check(
+-              "Data of TensorProto ( tensor name: ",
+-              tensor.name(),
+-              ") should be stored in ",
+-              data_path,
+-              ", but it doesn't exist or is not accessible.");
+-        }
+-        // Do not allow symlinks or directories.
+-        if (!S_ISREG(buffer.st_mode)) {
+-          fail_check(
+-              "Data of TensorProto ( tensor name: ",
+-              tensor.name(),
+-              ") should be stored in ",
+-              data_path,
+-              ", but it is not regular file.");
+-        }
+-#endif
++        resolve_external_data_location(ctx.get_model_dir(), entry.value(), tensor.name());
+       }
+     }
+     if (!has_location) {
+@@ -938,7 +894,8 @@ void check_function(const FunctionProto& function, const CheckerContext& ctx, co
+ 
+     // check whether the opset version imported for a domain by function and model are
+     // compatible
+-    check_opset_compatibility(node, ctx_copy, func_opset_imports, model_opset_imports);
++    if (!ctx_copy.skip_opset_compatibility_check())
++      check_opset_compatibility(node, ctx_copy, func_opset_imports, model_opset_imports);
+     if (check_is_experimental_op(node)) {
+       used_experimental_ops.insert(node.op_type());
+     }
+@@ -1005,7 +962,7 @@ void check_model(const ModelProto& model, CheckerContext& ctx) {
+   }
+ }
+ 
+-void check_model(const std::string& model_path, bool full_check) {
++void check_model(const std::string& model_path, bool full_check, bool skip_opset_compatibility_check) {
+   ModelProto model;
+   LoadProtoFromPath(model_path, model);
+ 
+@@ -1016,6 +973,7 @@ void check_model(const std::string& model_path, bool full_check) {
+     model_dir = model_path.substr(0, pos + 1);
+   }
+   ctx.set_model_dir(model_dir);
++  ctx.set_skip_opset_compatibility_check(skip_opset_compatibility_check);
+   check_model(model, ctx);
+ 
+   if (full_check) {
+@@ -1024,8 +982,9 @@ void check_model(const std::string& model_path, bool full_check) {
+   }
+ }
+ 
+-void check_model(const ModelProto& model, bool full_check) {
++void check_model(const ModelProto& model, bool full_check, bool skip_opset_compatibility_check) {
+   CheckerContext ctx;
++  ctx.set_skip_opset_compatibility_check(skip_opset_compatibility_check);
+   check_model(model, ctx);
+   if (full_check) {
+     ShapeInferenceOptions options{true, 1, false};
+@@ -1036,7 +995,296 @@ void check_model(const ModelProto& model, bool full_check) {
+   }
+ }
+ 
+-std::set<std::string> experimental_ops = {
++using ONNX_NAMESPACE::ScopedFd;
++using ONNX_NAMESPACE::utf8_to_path;
++#ifdef _WIN32
++using ONNX_NAMESPACE::ScopedHandle;
++#endif
++
++#ifdef _WIN32
++// Compare two BY_HANDLE_FILE_INFORMATION structs by volume + file index (inode equivalent).
++static bool same_file(const BY_HANDLE_FILE_INFORMATION& a, const BY_HANDLE_FILE_INFORMATION& b) {
++  return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber && a.nFileIndexHigh == b.nFileIndexHigh &&
++      a.nFileIndexLow == b.nFileIndexLow;
++}
++#endif
++
++// Canonicalize data_path, verify containment within base_dir.
++static std::filesystem::path verify_path_containment(
++    const std::filesystem::path& data_path,
++    const std::string& base_dir,
++    const std::string& tensor_name) {
++  std::error_code ec;
++  auto canonical_data = std::filesystem::weakly_canonical(data_path, ec);
++  if (ec) {
++    fail_check("Tensor ", tensor_name, " external data path could not be canonicalized: ", ec.message());
++  }
++  auto canonical_base = std::filesystem::weakly_canonical(utf8_to_path(base_dir), ec);
++  if (ec) {
++    fail_check("Tensor ", tensor_name, " base directory could not be canonicalized: ", ec.message());
++  }
++  auto base_str = canonical_base.native();
++  if (!base_str.empty() && base_str.back() != std::filesystem::path::preferred_separator) {
++    base_str += std::filesystem::path::preferred_separator;
++  }
++  if (canonical_data.native().find(base_str) != 0 && canonical_data != canonical_base) { // NOSONAR
++    fail_check("Tensor ", tensor_name, " external data resolves outside model directory.");
++  }
++  return canonical_data;
++}
++
++static std::filesystem::path validate_relative_external_path(
++    const std::string& base_dir,
++    const std::string& location,
++    const std::string& tensor_name) {
++  auto path = utf8_to_path(location);
++  if (location.find('\0') != std::string::npos || path.empty() || path.is_absolute()) {
++    fail_check("External data location for tensor ", tensor_name, " must be a non-empty relative file path.");
++  }
++  auto current = utf8_to_path(base_dir);
++  for (const auto& component : path) {
++    if (component == std::filesystem::path("..")) {
++      fail_check("External data location for tensor ", tensor_name, " contains parent traversal.");
++    }
++    current /= component;
++    std::error_code ec;
++    auto status = std::filesystem::symlink_status(current, ec);
++    if (std::filesystem::is_symlink(status)) {
++      fail_check("External data location for tensor ", tensor_name, " contains a symbolic link.");
++    }
++  }
++  return path.lexically_normal().make_preferred();
++}
++
++std::filesystem::path resolve_external_data_location(
++    const std::string& base_dir,
++    const std::string& location,
++    const std::string& tensor_name) {
++  auto base_dir_path = utf8_to_path(base_dir);
++  auto relative_path = validate_relative_external_path(base_dir, location, tensor_name);
++  auto data_path = base_dir_path / relative_path;
++  auto data_path_str = data_path.string();
++  // Do not allow symlinks or directories.
++  if (data_path.empty() || std::filesystem::is_symlink(data_path)) {
++    fail_check(
++        "Data of TensorProto ( tensor name: ",
++        tensor_name,
++        ") should be stored in ",
++        data_path_str,
++        ", but it is a symbolic link.");
++  }
++  // Verify canonical containment (catches parent-dir symlinks).
++  if (data_path_str[0] != '#') {
++    verify_path_containment(data_path, base_dir, tensor_name);
++  }
++  if (data_path_str[0] != '#' && !std::filesystem::is_regular_file(data_path)) {
++    fail_check(
++        "Data of TensorProto ( tensor name: ",
++        tensor_name,
++        ") should be stored in ",
++        data_path_str,
++        ", but it is not regular file.");
++  }
++  return data_path;
++}
++
++static std::filesystem::path
++validate_write_location(const std::string& base_dir, const std::string& location, const std::string& tensor_name) {
++  auto rel = validate_relative_external_path(base_dir, location, tensor_name);
++  if (rel == std::filesystem::path(".")) {
++    fail_check("External data location for tensor ", tensor_name, " is invalid: ", location);
++  }
++  return utf8_to_path(base_dir) / rel;
++}
++
++#ifdef _WIN32
++
++int64_t open_external_data(
++    const std::string& base_dir,
++    const std::string& location,
++    const std::string& tensor_name,
++    bool read_only) {
++  std::filesystem::path data_path;
++  if (read_only) {
++    data_path = resolve_external_data_location(base_dir, location, tensor_name);
++  } else {
++    data_path = validate_write_location(base_dir, location, tensor_name);
++    // Pre-open parent-dir check (final-component-only flags don't protect parents).
++    verify_path_containment(data_path.parent_path(), base_dir, tensor_name);
++  }
++
++  // CreateFileW with FILE_FLAG_OPEN_REPARSE_POINT: opens reparse point itself
++  // (symlink/junction) without following, and returns CRT-independent HANDLE.
++  DWORD access = read_only ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
++  DWORD creation = read_only ? OPEN_EXISTING : OPEN_ALWAYS;
++  HANDLE h = CreateFileW(
++      data_path.native().c_str(),
++      access,
++      FILE_SHARE_READ,
++      nullptr,
++      creation,
++      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
++      nullptr);
++  if (h == INVALID_HANDLE_VALUE) {
++    fail_check("Cannot open external data for tensor ", tensor_name);
++  }
++  ScopedHandle guard(h);
++
++  // Reject symlinks/junctions.
++  BY_HANDLE_FILE_INFORMATION file_info;
++  if (!GetFileInformationByHandle(h, &file_info)) {
++    fail_check("Tensor ", tensor_name, " external data: cannot query file information.");
++  }
++  if (file_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
++    fail_check("Tensor ", tensor_name, " external data is a reparse point (symlink/junction).");
++  }
++
++  // Inode comparison: open canonical path, compare volume + file index.
++  auto canonical_data = verify_path_containment(data_path, base_dir, tensor_name);
++  HANDLE h2 = CreateFileW(
++      canonical_data.native().c_str(),
++      0,
++      FILE_SHARE_READ | FILE_SHARE_WRITE,
++      nullptr,
++      OPEN_EXISTING,
++      FILE_FLAG_OPEN_REPARSE_POINT,
++      nullptr);
++  if (h2 == INVALID_HANDLE_VALUE) {
++    fail_check("Tensor ", tensor_name, " external data: cannot open canonical path for verification.");
++  }
++  ScopedHandle guard2(h2);
++  BY_HANDLE_FILE_INFORMATION canon_info;
++  if (!GetFileInformationByHandle(h2, &canon_info)) {
++    fail_check("Tensor ", tensor_name, " external data: cannot query canonical path file information.");
++  }
++  if (!same_file(file_info, canon_info)) {
++    fail_check("Tensor ", tensor_name, " external data: fd/path mismatch (possible TOCTOU attack).");
++  }
++
++  // Convert HANDLE → CRT fd so callers get a uniform fd on all platforms.
++  HANDLE h_released = guard.release();
++  int flags = read_only ? (_O_RDONLY | _O_BINARY) : (_O_RDWR | _O_BINARY);
++  int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h_released), flags);
++  if (fd < 0) {
++    CloseHandle(h_released);
++    fail_check("Cannot convert handle to fd for tensor ", tensor_name);
++  }
++  return static_cast<int64_t>(fd);
++}
++
++#else // POSIX
++
++// Try kernel-level contained open.
++// Returns fd >= 0 on success, -1 if feature unavailable (fall through to legacy).
++// Calls fail_check on kernel rejection (symlink, escape) — does NOT fall through.
++static int try_kernel_contained_open(
++    const std::string& base_dir,
++    const std::string& location,
++    const std::string& tensor_name,
++    bool read_only) {
++  int raw_dirfd = open(base_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++  if (raw_dirfd < 0) {
++    return -1;
++  }
++  ScopedFd dirfd_guard(raw_dirfd);
++  auto rel = std::filesystem::path(location).lexically_normal().string();
++  int fd = -1;
++
++#ifdef ONNX_HAS_OPENAT2
++  static thread_local bool openat2_supported = true;
++  if (openat2_supported) {
++    struct open_how how = {};
++    how.flags =
++        read_only ? static_cast<uint64_t>(O_RDONLY | O_CLOEXEC) : static_cast<uint64_t>(O_CREAT | O_RDWR | O_CLOEXEC);
++    how.mode = read_only ? 0 : 0600;
++    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS;
++    fd = static_cast<int>(syscall(SYS_openat2, raw_dirfd, rel.c_str(), &how, sizeof(how)));
++    if (fd < 0) {
++      if (errno == ENOSYS) {
++        openat2_supported = false; // kernel too old, fall through
++      } else {
++        fail_check("Cannot open external data for tensor ", tensor_name, " (kernel rejected path)");
++      }
++    }
++  }
++#elif defined(ONNX_HAS_RESOLVE_BENEATH)
++  int flags = O_RESOLVE_BENEATH | O_CLOEXEC;
++#ifdef O_NOFOLLOW
++  flags |= O_NOFOLLOW;
++#endif
++  if (read_only) {
++    fd = openat(raw_dirfd, rel.c_str(), flags | O_RDONLY);
++  } else {
++    fd = openat(raw_dirfd, rel.c_str(), flags | O_CREAT | O_RDWR, 0600);
++  }
++  if (fd < 0) {
++    fail_check("Cannot open external data for tensor ", tensor_name);
++  }
++#endif
++
++  return fd;
++}
++
++int64_t open_external_data(
++    const std::string& base_dir,
++    const std::string& location,
++    const std::string& tensor_name,
++    bool read_only) {
++  // Pre-open validation (defense-in-depth).
++  std::filesystem::path data_path;
++  if (read_only) {
++    data_path = resolve_external_data_location(base_dir, location, tensor_name);
++  } else {
++    data_path = validate_write_location(base_dir, location, tensor_name);
++    // Pre-open parent-dir check (final-component-only flags don't protect parents).
++    verify_path_containment(data_path.parent_path(), base_dir, tensor_name);
++  }
++
++  // Try kernel-level contained open (openat2 or O_RESOLVE_BENEATH).
++  int fd = try_kernel_contained_open(base_dir, location, tensor_name, read_only);
++  bool kernel_verified = (fd >= 0);
++
++  // Fallback: open() + O_NOFOLLOW + post-open inode verification.
++  if (fd < 0) {
++    int flags = read_only ? O_RDONLY : (O_CREAT | O_RDWR);
++#ifdef O_CLOEXEC
++    flags |= O_CLOEXEC;
++#endif
++#ifdef O_NOFOLLOW
++    flags |= O_NOFOLLOW;
++#endif
++    fd = read_only ? open(data_path.c_str(), flags) : open(data_path.c_str(), flags, 0600);
++    if (fd == -1) {
++      fail_check("Cannot open external data for tensor ", tensor_name);
++    }
++  }
++  ScopedFd guard(fd);
++
++  // Post-open checks (fail closed).
++  struct stat fd_stat{};
++  if (fstat(fd, &fd_stat) != 0) {
++    fail_check("Tensor ", tensor_name, " external data: fstat failed.");
++  }
++  if (!S_ISREG(fd_stat.st_mode)) {
++    fail_check("Tensor ", tensor_name, " external data is not a regular file.");
++  }
++  if (!kernel_verified) {
++    // Verify containment via canonical path + inode comparison.
++    auto canonical_data = verify_path_containment(data_path, base_dir, tensor_name);
++    struct stat path_stat{};
++    if (stat(canonical_data.c_str(), &path_stat) != 0) {
++      fail_check("Tensor ", tensor_name, " external data: cannot stat canonical path.");
++    }
++    if (path_stat.st_dev != fd_stat.st_dev || path_stat.st_ino != fd_stat.st_ino) {
++      fail_check("Tensor ", tensor_name, " external data: fd/path mismatch (possible TOCTOU attack).");
++    }
++  }
++  return guard.release();
++}
++
++#endif
++
++static std::unordered_set<std::string> experimental_ops = {
+     "ATen",
+     "Affine",
+     "ConstantFill",
+diff --git a/onnx/checker.h b/onnx/checker.h
+index 05eeaad01ad58bd70b9f3983f4036e51ad167462..8990072e3e30ec54c0c9959b4be7163dd4421068 100644
+--- a/onnx/checker.h
++++ b/onnx/checker.h
+@@ -4,7 +4,9 @@
+ 
+ #pragma once
+ 
++#include <filesystem>
+ #include <stdexcept>
++#include <string>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include "onnx/defs/function.h"
+@@ -73,6 +75,14 @@ class CheckerContext final {
+     return model_dir_;
+   }
+ 
++  bool skip_opset_compatibility_check() const {
++    return skip_opset_compatibility_check_;
++  }
++
++  void set_skip_opset_compatibility_check(bool value) {
++    skip_opset_compatibility_check_ = value;
++  }
++
+   explicit CheckerContext() : ir_version_(-1) {}
+ 
+  private:
+@@ -81,6 +91,7 @@ class CheckerContext final {
+   bool is_main_graph_ = true;
+   const ISchemaRegistry* schema_registry_ = OpSchemaRegistry::Instance();
+   std::string model_dir_;
++  bool skip_opset_compatibility_check_ = false;
+ };
+ 
+ class LexicalScopeContext final {
+@@ -146,9 +157,18 @@ void check_model_local_functions(
+     const CheckerContext& ctx,
+     const LexicalScopeContext& parent_lex);
+ 
+-void check_model(const ModelProto& model, bool full_check = false);
+-void check_model(const std::string& model_path, bool full_check = false);
+-
++void check_model(const ModelProto& model, bool full_check = false, bool skip_opset_compatibility_check = false);
++void check_model(const std::string& model_path, bool full_check = false, bool skip_opset_compatibility_check = false);
++std::filesystem::path resolve_external_data_location(
++    const std::string& base_dir,
++    const std::string& location,
++    const std::string& tensor_name);
++// Returns a CRT file descriptor on all platforms. The caller owns the fd.
++int64_t open_external_data(
++    const std::string& base_dir,
++    const std::string& location,
++    const std::string& tensor_name,
++    bool read_only);
+ bool check_is_experimental_op(const NodeProto& node);
+ 
+ } // namespace checker
+diff --git a/onnx/checker.py b/onnx/checker.py
+index bc0d60becf4d76b55fd40ae44920f3ce12e46bd3..20e9cdd920672eaef8d1b5edb89400f0f1405737 100644
+--- a/onnx/checker.py
++++ b/onnx/checker.py
+@@ -111,7 +111,11 @@ def check_sparse_tensor(
+     C.check_sparse_tensor(sparse.SerializeToString(), ctx)
+ 
+ 
+-def check_model(model: Union[ModelProto, str, bytes], full_check: bool = False) -> None:
++def check_model(
++    model: Union[ModelProto, str, bytes],
++    full_check: bool = False,
++    skip_opset_compatibility_check: bool = False,
++) -> None:
+     """Check the consistency of a model. An exception is raised if the test fails.
+ 
+     Arguments:
+@@ -120,7 +124,7 @@ def check_model(model: Union[ModelProto, str, bytes], full_check: bool = False)
+     """
+     # If model is a path instead of ModelProto
+     if isinstance(model, str):
+-        C.check_model_path(model, full_check)
++        C.check_model_path(model, full_check, skip_opset_compatibility_check)
+     else:
+         protobuf_string = (
+             model if isinstance(model, bytes) else model.SerializeToString()
+@@ -131,7 +135,7 @@ def check_model(model: Union[ModelProto, str, bytes], full_check: bool = False)
+             raise ValueError(
+                 "This protobuf of onnx model is too large (>2GB). Call check_model with model path instead."
+             )
+-        C.check_model(protobuf_string, full_check)
++        C.check_model(protobuf_string, full_check, skip_opset_compatibility_check)
+ 
+ 
+ ValidationError = C.ValidationError
+diff --git a/onnx/common/constants.h b/onnx/common/constants.h
+index 2678d3fc21c86f18bec541f896f55f8f59e973e3..d336cf48be4a04a717a1f785c31c025d3ef787cc 100644
+--- a/onnx/common/constants.h
++++ b/onnx/common/constants.h
+@@ -13,7 +13,18 @@ namespace ONNX_NAMESPACE {
+ constexpr const char* AI_ONNX_ML_DOMAIN = "ai.onnx.ml";
+ constexpr const char* AI_ONNX_TRAINING_DOMAIN = "ai.onnx.training";
+ constexpr const char* AI_ONNX_PREVIEW_TRAINING_DOMAIN = "ai.onnx.preview.training";
++// The following two are equivalent in an onnx proto representation.
+ constexpr const char* ONNX_DOMAIN = "";
++constexpr const char* AI_ONNX_DOMAIN = "ai.onnx";
++
++inline std::string NormalizeDomain(const std::string& domain) {
++  return (domain == AI_ONNX_DOMAIN) ? ONNX_DOMAIN : domain;
++}
++
++inline bool IsOnnxDomain(const std::string& domain) {
++  return (domain == AI_ONNX_DOMAIN) || ((domain == ONNX_DOMAIN));
++}
++
+ constexpr bool OPTIONAL_VALUE = false;
+ 
+ // For dimension denotation.
+diff --git a/onnx/common/file_utils.h b/onnx/common/file_utils.h
+index 82e09093eec15329467c0651a9d8f5da70488775..f284e2ebe9f2be49aac0caa23cdf5b702c0c2225 100644
+--- a/onnx/common/file_utils.h
++++ b/onnx/common/file_utils.h
+@@ -18,6 +18,9 @@ void LoadProtoFromPath(const std::string proto_path, T& proto) {
+     fail_check("Unable to open proto file: ", proto_path, ". Please check if it is a valid proto. ");
+   }
+   std::string data{std::istreambuf_iterator<char>{proto_stream}, std::istreambuf_iterator<char>{}};
++  if (!proto_stream.good()) {
++    fail_check("Unable to read proto file: ", proto_path, ". Please check if it is a valid proto. ");
++  }
+   if (!ParseProtoFromBytes(&proto, data.c_str(), data.size())) {
+     fail_check(
+         "Unable to parse proto from file: ", proto_path, ". Please check if it is a valid protobuf file of proto. ");
+diff --git a/onnx/common/ir.h b/onnx/common/ir.h
+index 45c3c915925e5a53bd4cf7506f3bb1f1d3271980..a3a73cdd4eb085fad60229baa548e44b313722bc 100644
+--- a/onnx/common/ir.h
++++ b/onnx/common/ir.h
+@@ -428,6 +428,8 @@ struct Node : public Attributes<Node> {
+   std::string domain_;
+   bool has_doc_string_;
+   std::string doc_string_;
++  bool has_overload_;
++  std::string overload_;
+ 
+  protected:
+   Node(Graph* graph_, NodeKind kind_); // defined after graph
+@@ -453,6 +455,16 @@ struct Node : public Attributes<Node> {
+     has_domain_ = true;
+     domain_ = std::move(domain);
+   }
++  bool has_overload() const {
++    return has_overload_;
++  }
++  const std::string& overload() const {
++    return overload_;
++  }
++  void setOverload(std::string overload) {
++    has_overload_ = true;
++    overload_ = std::move(overload);
++  }
+   bool has_doc_string() const {
+     return has_doc_string_;
+   }
+@@ -1334,7 +1346,8 @@ inline Node::Node(Graph* graph_, NodeKind kind_)
+       stage_(graph_->new_node_stage_),
+       has_name_(false),
+       has_domain_(false),
+-      has_doc_string_(false) {
++      has_doc_string_(false),
++      has_overload_(false) {
+   graph_->all_nodes.emplace(this);
+ }
+ 
+diff --git a/onnx/common/ir_pb_converter.cc b/onnx/common/ir_pb_converter.cc
+index 99ab310264393db746bfe59fe8718ef1e066b5c7..20336b93005fe7eaa6f521ae4af232a4fe8dba2a 100644
+--- a/onnx/common/ir_pb_converter.cc
++++ b/onnx/common/ir_pb_converter.cc
+@@ -313,6 +313,9 @@ std::unique_ptr<Graph> graphProtoToGraph(const ONNX_NAMESPACE::GraphProto& gp, b
+     if (np.has_domain()) {
+       n->setDomain(np.domain());
+     }
++    if (np.has_overload()) {
++      n->setOverload(np.overload());
++    }
+   }
+ 
+   for (auto n : g->nodes()) {
+@@ -625,6 +628,9 @@ void encodeGraph(GraphProto* p_g, const std::shared_ptr<Graph>& g) {
+     if (node->has_domain()) {
+       p_n->set_domain(node->domain());
+     }
++    if (node->has_overload()) {
++      p_n->set_overload(node->overload());
++    }
+   }
+ 
+   auto num_initializers = g->initializers().size();
+diff --git a/onnx/common/path.h b/onnx/common/path.h
+index d06eef90b6d5fa3939031ae72d172a5c268ee787..74ced3ee31a3f1e039498cab9e84132c2c2c2d69 100644
+--- a/onnx/common/path.h
++++ b/onnx/common/path.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <filesystem>
+ #include <string>
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -29,11 +30,22 @@ inline std::wstring utf8str_to_wstring(const std::string& utf8str) {
+   if (utf8str.size() > INT_MAX) {
+     fail_check("utf8str_to_wstring: string is too long for converting to wstring.");
+   }
+-  int size_required = MultiByteToWideChar(CP_UTF8, 0, utf8str.c_str(), (int)utf8str.size(), NULL, 0);
++  int size_required = MultiByteToWideChar(CP_UTF8, 0, utf8str.c_str(), static_cast<int>(utf8str.size()), NULL, 0);
+   std::wstring ws_str(size_required, 0);
+-  MultiByteToWideChar(CP_UTF8, 0, utf8str.c_str(), (int)utf8str.size(), &ws_str[0], size_required);
++  MultiByteToWideChar(CP_UTF8, 0, utf8str.c_str(), static_cast<int>(utf8str.size()), &ws_str[0], size_required);
+   return ws_str;
+ }
++inline std::string wstring_to_utf8str(const std::wstring& ws_str) {
++  if (ws_str.size() > INT_MAX) {
++    fail_check("wstring_to_utf8str: string is too long for converting to UTF-8.");
++  }
++  int size_required =
++      WideCharToMultiByte(CP_UTF8, 0, ws_str.c_str(), static_cast<int>(ws_str.size()), NULL, 0, NULL, NULL);
++  std::string utf8str(size_required, 0);
++  WideCharToMultiByte(
++      CP_UTF8, 0, ws_str.c_str(), static_cast<int>(ws_str.size()), &utf8str[0], size_required, NULL, NULL);
++  return utf8str;
++}
+ 
+ #else
+ std::string path_join(const std::string& origin, const std::string& append);
+@@ -43,4 +55,20 @@ std::string path_join(const std::string& origin, const std::string& append);
+ std::string clean_relative_path(const std::string& path);
+ #endif
+ 
++inline std::filesystem::path utf8_to_path(const std::string& utf8) {
++#ifdef _WIN32
++  return std::filesystem::path(utf8str_to_wstring(utf8));
++#else
++  return std::filesystem::path(utf8);
++#endif
++}
++
++inline std::string path_to_utf8(const std::filesystem::path& path) {
++#ifdef _WIN32
++  return wstring_to_utf8str(path.wstring());
++#else
++  return path.string();
++#endif
++}
++
+ } // namespace ONNX_NAMESPACE
+diff --git a/onnx/common/scoped_resource.h b/onnx/common/scoped_resource.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b67f392a3c2b5749b4bde26eedaa3074378b39aa
+--- /dev/null
++++ b/onnx/common/scoped_resource.h
+@@ -0,0 +1,68 @@
++// Copyright (c) ONNX Project Contributors
++//
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <io.h>
++#include <windows.h>
++#else
++#include <unistd.h>
++#endif
++
++namespace ONNX_NAMESPACE {
++
++// Generic RAII guard for resources identified by a sentinel "invalid" value and
++// a free-function closer.  Non-copyable, non-movable.
++//
++// Usage:
++//   using ScopedFd = ScopedResource<-1, close_fd>;
++//   ScopedFd guard(fd);          // destructor calls close_fd(fd)
++//   int raw = guard.release();   // relinquish ownership
++template <auto Invalid, void (*Close)(decltype(Invalid))>
++class ScopedResource {
++  using T = decltype(Invalid);
++  T val_;
++
++ public:
++  explicit ScopedResource(T v) : val_(v) {}
++  ~ScopedResource() {
++    if (val_ != Invalid) {
++      Close(val_);
++    }
++  }
++  T get() const {
++    return val_;
++  }
++  T release() {
++    T tmp = val_;
++    val_ = Invalid;
++    return tmp;
++  }
++  ScopedResource(const ScopedResource&) = delete;
++  ScopedResource& operator=(const ScopedResource&) = delete;
++};
++
++// Platform-specific type aliases.
++
++#ifdef _WIN32
++inline void close_handle(HANDLE h) {
++  CloseHandle(h);
++}
++using ScopedHandle = ScopedResource<INVALID_HANDLE_VALUE, close_handle>;
++#endif
++
++inline void close_fd(int fd) {
++#ifdef _WIN32
++  _close(fd);
++#else
++  close(fd);
++#endif
++}
++using ScopedFd = ScopedResource<-1, close_fd>;
++
++} // namespace ONNX_NAMESPACE
+diff --git a/onnx/common/visitor.h b/onnx/common/visitor.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..312969dadb7bb568a7cbdc1462a0954b6087359b
+--- /dev/null
++++ b/onnx/common/visitor.h
+@@ -0,0 +1,129 @@
++// Copyright (c) ONNX Project Contributors
++
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#pragma once
++#include "onnx/common/common.h"
++#include "onnx/onnx_pb.h"
++
++namespace ONNX_NAMESPACE {
++namespace internal {
++
++// Visitor: A readonly visitor class for ONNX Proto objects.
++// This class is restricted to Nodes, Graphs, Attributes, and Functions.
++// The VisitX methods invoke ProcessX, and if that returns true, will
++// continue to visit all children of the X.
++
++struct Visitor {
++  virtual void VisitGraph(const GraphProto& graph) {
++    if (ProcessGraph(graph))
++      for (auto& node : graph.node())
++        VisitNode(node);
++  }
++
++  virtual void VisitFunction(const FunctionProto& function) {
++    if (ProcessFunction(function))
++      for (auto& node : function.node())
++        VisitNode(node);
++  }
++
++  virtual void VisitNode(const NodeProto& node) {
++    if (ProcessNode(node)) {
++      for (auto& attr : node.attribute()) {
++        VisitAttribute(attr);
++      }
++    }
++  }
++
++  virtual void VisitAttribute(const AttributeProto& attr) {
++    if (ProcessAttribute(attr)) {
++      if (attr.has_g()) {
++        VisitGraph(attr.g());
++      }
++      for (auto& graph : attr.graphs())
++        VisitGraph(graph);
++    }
++  }
++
++  virtual bool ProcessGraph(const GraphProto& graph) {
++    ONNX_UNUSED_PARAMETER(graph);
++    return true;
++  }
++
++  virtual bool ProcessFunction(const FunctionProto& function) {
++    ONNX_UNUSED_PARAMETER(function);
++    return true;
++  }
++
++  virtual bool ProcessNode(const NodeProto& node) {
++    ONNX_UNUSED_PARAMETER(node);
++    return true;
++  }
++
++  virtual bool ProcessAttribute(const AttributeProto& attr) {
++    ONNX_UNUSED_PARAMETER(attr);
++    return true;
++  }
++
++  virtual ~Visitor() {}
++};
++
++// MutableVisitor: A version of Visitor that allows mutation of the visited objects.
++struct MutableVisitor {
++  virtual void VisitGraph(GraphProto* graph) {
++    if (ProcessGraph(graph))
++      for (auto& node : *(graph->mutable_node()))
++        VisitNode(&node);
++  }
++
++  virtual void VisitFunction(FunctionProto* function) {
++    if (ProcessFunction(function))
++      for (auto& node : *(function->mutable_node()))
++        VisitNode(&node);
++  }
++
++  virtual void VisitNode(NodeProto* node) {
++    if (ProcessNode(node)) {
++      for (auto& attr : *(node->mutable_attribute())) {
++        VisitAttribute(&attr);
++      }
++    }
++  }
++
++  virtual void VisitAttribute(AttributeProto* attr) {
++    if (ProcessAttribute(attr)) {
++      if (attr->has_g()) {
++        VisitGraph(attr->mutable_g());
++      }
++      for (auto& graph : *(attr->mutable_graphs()))
++        VisitGraph(&graph);
++    }
++  }
++
++  virtual bool ProcessGraph(GraphProto* graph) {
++    ONNX_UNUSED_PARAMETER(graph);
++    return true;
++  }
++
++  virtual bool ProcessFunction(FunctionProto* function) {
++    ONNX_UNUSED_PARAMETER(function);
++    return true;
++  }
++
++  virtual bool ProcessNode(NodeProto* node) {
++    ONNX_UNUSED_PARAMETER(node);
++    return true;
++  }
++
++  virtual bool ProcessAttribute(AttributeProto* attr) {
++    ONNX_UNUSED_PARAMETER(attr);
++    return true;
++  }
++
++  virtual ~MutableVisitor() {}
++};
++
++} // namespace internal
++} // namespace ONNX_NAMESPACE
+diff --git a/onnx/cpp2py_export.cc b/onnx/cpp2py_export.cc
+index fd37f840359496514d9b1e6818b69bdc6de11a06..a37d2d5593bcbc97ad80f7b6b94ef6a55741186f 100644
+--- a/onnx/cpp2py_export.cc
++++ b/onnx/cpp2py_export.cc
+@@ -14,6 +14,7 @@
+ #include "onnx/defs/parser.h"
+ #include "onnx/defs/printer.h"
+ #include "onnx/defs/schema.h"
++#include "onnx/inliner/inliner.h"
+ #include "onnx/py_utils.h"
+ #include "onnx/shape_inference/implementation.h"
+ #include "onnx/version_converter/convert.h"
+@@ -23,9 +24,9 @@ namespace py = pybind11;
+ using namespace pybind11::literals;
+ 
+ template <typename ProtoType>
+-static std::tuple<bool, py::bytes, py::bytes> Parse(const char* cstr) {
++static std::tuple<bool, py::bytes, py::bytes> Parse(const std::string& text) {
+   ProtoType proto{};
+-  OnnxParser parser(cstr);
++  OnnxParser parser(text);
+   auto status = parser.Parse(proto);
+   std::string out;
+   proto.SerializeToString(&out);
+@@ -77,8 +78,11 @@ std::unordered_map<std::string, py::bytes> CallNodeInferenceFunction(
+   shape_inference::GraphInferenceContext graphInferenceContext(
+       valueTypes.second, opsetImports, nullptr, {}, OpSchemaRegistry::Instance(), nullptr, irVersion);
+   // Construct inference context and get results - may throw InferenceError
++  // TODO: if it is desirable for infer_node_outputs to provide check_type, strict_mode, data_prop,
++  // we can add them to the Python API. For now we just assume the default options.
++  ShapeInferenceOptions options{false, 0, false};
+   shape_inference::InferenceContextImpl ctx(
+-      node, valueTypes.second, inputData.second, inputSparseData.second, nullptr, &graphInferenceContext);
++      node, valueTypes.second, inputData.second, inputSparseData.second, options, &graphInferenceContext);
+   schema->GetTypeAndShapeInferenceFunction()(ctx);
+   // Verify the inference succeeded - may also throw ValidationError
+   // Note that input types were not validated until now (except that their count was correct)
+@@ -387,19 +391,23 @@ PYBIND11_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) {
+ 
+   checker.def(
+       "check_model",
+-      [](const py::bytes& bytes, bool full_check) -> void {
++      [](const py::bytes& bytes, bool full_check, bool skip_opset_compatibility_check) -> void {
+         ModelProto proto{};
+         ParseProtoFromPyBytes(&proto, bytes);
+-        checker::check_model(proto, full_check);
++        checker::check_model(proto, full_check, skip_opset_compatibility_check);
+       },
+       "bytes"_a,
+-      "full_check"_a = false);
++      "full_check"_a = false,
++      "skip_opset_compatibility_check"_a = false);
+ 
+   checker.def(
+       "check_model_path",
+-      (void (*)(const std::string& path, bool full_check)) & checker::check_model,
++      (void (*)(const std::string& path, bool full_check, bool skip_opset_compatibility_check)) & checker::check_model,
+       "path"_a,
+-      "full_check"_a = false);
++      "full_check"_a = false,
++      "skip_opset_compatibility_check"_a = false);
++
++  checker.def("_open_external_data", &checker::open_external_data);
+ 
+   // Submodule `version_converter`
+   auto version_converter = onnx_cpp2py_export.def_submodule("version_converter");
+@@ -416,6 +424,34 @@ PYBIND11_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) {
+     return py::bytes(out);
+   });
+ 
++  // Submodule `inliner`
++  auto inliner = onnx_cpp2py_export.def_submodule("inliner");
++  inliner.doc() = "Inliner submodule";
++
++  inliner.def("inline_local_functions", [](const py::bytes& bytes, bool convert_version) {
++    ModelProto model{};
++    ParseProtoFromPyBytes(&model, bytes);
++    inliner::InlineLocalFunctions(model, convert_version);
++    std::string out;
++    model.SerializeToString(&out);
++    return py::bytes(out);
++  });
++
++  // inline_selected_functions: Inlines all functions specified in function_ids, unless
++  // exclude is true, in which case it inlines all functions except those specified in
++  // function_ids.
++  inliner.def(
++      "inline_selected_functions",
++      [](const py::bytes& bytes, std::vector<std::pair<std::string, std::string>> function_ids, bool exclude) {
++        ModelProto model{};
++        ParseProtoFromPyBytes(&model, bytes);
++        auto function_id_set = inliner::FunctionIdSet::Create(std::move(function_ids), exclude);
++        inliner::InlineSelectedFunctions(model, *function_id_set);
++        std::string out;
++        model.SerializeToString(&out);
++        return py::bytes(out);
++      });
++
+   // Submodule `shape_inference`
+   auto shape_inference = onnx_cpp2py_export.def_submodule("shape_inference");
+   shape_inference.doc() = "Shape Inference submodule";
+@@ -490,6 +526,7 @@ PYBIND11_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) {
+   parser.def("parse_model", Parse<ModelProto>);
+   parser.def("parse_graph", Parse<GraphProto>);
+   parser.def("parse_function", Parse<FunctionProto>);
++  parser.def("parse_node", Parse<NodeProto>);
+ 
+   // Submodule `printer`
+   auto printer = onnx_cpp2py_export.def_submodule("printer");
+@@ -498,6 +535,7 @@ PYBIND11_MODULE(onnx_cpp2py_export, onnx_cpp2py_export) {
+   printer.def("model_to_text", ProtoBytesToText<ModelProto>);
+   printer.def("function_to_text", ProtoBytesToText<FunctionProto>);
+   printer.def("graph_to_text", ProtoBytesToText<GraphProto>);
++  printer.def("node_to_text", ProtoBytesToText<NodeProto>);
+ }
+ 
+ } // namespace ONNX_NAMESPACE
+diff --git a/onnx/defs/data_type_utils.cc b/onnx/defs/data_type_utils.cc
+index a801aea019f4a61da90130ab3c19daeec20fd24f..b1ae44ea5c24abda950e1fdec01fa912aa921e1d 100644
+--- a/onnx/defs/data_type_utils.cc
++++ b/onnx/defs/data_type_utils.cc
+@@ -2,16 +2,24 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
+-#include <cctype>
+ #include <iostream>
+ #include <iterator>
+ #include <sstream>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <unordered_set>
+ 
+ #include "data_type_utils.h"
+ 
+ namespace ONNX_NAMESPACE {
+ namespace Utils {
+ 
++// ASCII-only whitespace check; isspace is locale-dependent.
++constexpr bool IsAsciiSpace(char c) {
++  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
++}
++
+ // Singleton wrapper around allowed data types.
+ // This implements construct on first use which is needed to ensure
+ // static objects are initialized before use. Ops registration does not work
+@@ -309,10 +317,8 @@ bool StringRange::EndsWith(const StringRange& str) const {
+ 
+ bool StringRange::LStrip() {
+   size_t count = 0;
+-  const char* ptr = data_;
+-  while (count < size_ && isspace(*ptr)) {
+-    count++;
+-    ptr++;
++  while (count < size_ && IsAsciiSpace(data_[count])) {
++    ++count;
+   }
+ 
+   if (count > 0) {
+@@ -340,10 +346,8 @@ bool StringRange::LStrip(StringRange str) {
+ 
+ bool StringRange::RStrip() {
+   size_t count = 0;
+-  const char* ptr = data_ + size_ - 1;
+-  while (count < size_ && isspace(*ptr)) {
++  while (count < size_ && IsAsciiSpace(data_[size_ - 1 - count])) {
+     ++count;
+-    --ptr;
+   }
+ 
+   if (count > 0) {
+diff --git a/onnx/defs/parser.cc b/onnx/defs/parser.cc
+index c4d6ea76bf8b7ba61c3bf920895044fdbc7f8cea..2c3afcab4d90171db59d99981416e375ac6cf749 100644
+--- a/onnx/defs/parser.cc
++++ b/onnx/defs/parser.cc
+@@ -5,15 +5,152 @@
+ // Experimental language syntax and parser for ONNX. Please note that the syntax as formalized
+ // by this parser is preliminary and may change.
+ 
++// POSIX locale extensions (newlocale, freelocale, strtof_l, strtod_l) are used
++// to parse floating-point literals independently of the global locale.
++#include <locale.h> // NOLINT(modernize-deprecated-headers)
++
++#include <cerrno>
++#include <charconv>
++#include <cmath>
++#include <cstdlib>
++#include <limits>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
++#include <system_error>
+ #include <unordered_map>
+ 
++#include "onnx/common/common.h"
+ #include "onnx/onnx_pb.h"
+ #include "onnx/string_utils.h"
+ 
+ #include "onnx/defs/parser.h"
+ 
++// Locale-independent float/double parsing implementation.
++// Uses std::from_chars when the stdlib supports it (__cpp_lib_to_chars >= 201611L),
++// otherwise strtof_l/strtod_l with an explicit "C" locale. The strto*_l helpers
++// also resolve from_chars range errors: underflow rounds to zero or a subnormal
++// and is accepted; only overflow is an error.
++
++namespace {
++
++#ifdef _WIN32
++struct CLocale {
++  _locale_t loc;
++  CLocale() : loc(_create_locale(LC_ALL, "C")) {}
++  ~CLocale() {
++    if (loc)
++      _free_locale(loc);
++  }
++  CLocale(const CLocale&) = delete;
++  CLocale& operator=(const CLocale&) = delete;
++};
++#else // POSIX (Linux, macOS)
++struct CLocale {
++  locale_t loc;
++  CLocale() : loc(newlocale(LC_ALL_MASK, "C", nullptr)) {}
++  ~CLocale() {
++    if (loc)
++      freelocale(loc);
++  }
++  CLocale(const CLocale&) = delete;
++  CLocale& operator=(const CLocale&) = delete;
++};
++#endif
++
++const CLocale& GetCLocale() {
++  static const CLocale instance;
++  return instance;
++}
++
++float StrtofC(const std::string& s) {
++  const auto& cloc = GetCLocale();
++  if (!cloc.loc) {
++    ONNX_THROW("Failed to create C locale for float parsing");
++  }
++  char* end = nullptr;
++  errno = 0;
++#ifdef _WIN32
++  const float val = _strtof_l(s.c_str(), &end, cloc.loc);
++#else
++  const float val = strtof_l(s.c_str(), &end, cloc.loc);
++#endif
++  // ERANGE with a finite result is underflow: the value is still the correctly
++  // rounded zero or subnormal. Only overflow (±inf) is an error.
++  if (end == s.c_str() || end != s.c_str() + s.size() || (errno == ERANGE && std::isinf(val))) {
++    ONNX_THROW("Failed to parse float from string: " + s);
++  }
++  return val;
++}
++
++double StrtodC(const std::string& s) {
++  const auto& cloc = GetCLocale();
++  if (!cloc.loc) {
++    ONNX_THROW("Failed to create C locale for double parsing");
++  }
++  char* end = nullptr;
++  errno = 0;
++#ifdef _WIN32
++  const double val = _strtod_l(s.c_str(), &end, cloc.loc);
++#else
++  const double val = strtod_l(s.c_str(), &end, cloc.loc);
++#endif
++  if (end == s.c_str() || end != s.c_str() + s.size() || (errno == ERANGE && std::isinf(val))) {
++    ONNX_THROW("Failed to parse double from string: " + s);
++  }
++  return val;
++}
++
++} // anonymous namespace
++
++namespace ONNX_NAMESPACE {
++
++#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
++
++float LocaleIndependentStof(const std::string& s) {
++  float val = 0.0f;
++  const char* const begin = s.data();
++  const char* const end = begin + s.size();
++  const auto result = std::from_chars(begin, end, val);
++  if (result.ec == std::errc::result_out_of_range && result.ptr == end) {
++    // from_chars leaves val unspecified on range errors; re-parse to accept
++    // underflow (rounds to zero/subnormal) and reject only overflow.
++    return StrtofC(s);
++  }
++  if (result.ec != std::errc{} || result.ptr != end) {
++    ONNX_THROW("Failed to parse float from string: " + s);
++  }
++  return val;
++}
++
++double LocaleIndependentStod(const std::string& s) {
++  double val = 0.0;
++  const char* const begin = s.data();
++  const char* const end = begin + s.size();
++  const auto result = std::from_chars(begin, end, val);
++  if (result.ec == std::errc::result_out_of_range && result.ptr == end) {
++    return StrtodC(s);
++  }
++  if (result.ec != std::errc{} || result.ptr != end) {
++    ONNX_THROW("Failed to parse double from string: " + s);
++  }
++  return val;
++}
++
++#else // No floating-point from_chars (e.g. Apple Clang)
++
++float LocaleIndependentStof(const std::string& s) {
++  return StrtofC(s);
++}
++
++double LocaleIndependentStod(const std::string& s) {
++  return StrtodC(s);
++}
++
++#endif // __cpp_lib_to_chars
++
++} // namespace ONNX_NAMESPACE
++
+ #define PARSE_TOKEN(x) CHECK_PARSER_STATUS(ParserBase::Parse(x))
+ #define PARSE(...) CHECK_PARSER_STATUS(Parse(__VA_ARGS__))
+ #define MATCH(...) CHECK_PARSER_STATUS(Match(__VA_ARGS__))
+@@ -23,75 +160,139 @@ namespace ONNX_NAMESPACE {
+ Status ParserBase::Parse(Literal& result) {
+   bool decimal_point = false;
+   auto nextch = NextChar();
+-  auto from = next_;
++  size_t from = pos_;
+   if (nextch == '"') {
+-    ++next_;
++    ++pos_;
+     bool has_escape = false;
+-    while ((next_ < end_) && (*next_ != '"')) {
+-      if (*next_ == '\\') {
++    while (!AtEnd() && (Cur() != '"')) {
++      if (Cur() == '\\') {
+         has_escape = true;
+-        ++next_;
+-        if (next_ >= end_)
++        ++pos_;
++        if (AtEnd())
+           return ParseError("Incomplete string literal.");
+       }
+-      ++next_;
++      ++pos_;
+     }
+-    if (next_ >= end_)
++    if (AtEnd())
+       return ParseError("Incomplete string literal.");
+-    ++next_;
++    ++pos_;
+     result.type = LiteralType::STRING_LITERAL;
+     if (has_escape) {
+       std::string& target = result.value;
+       target.clear();
+-      target.reserve(next_ - from - 2); // upper bound
+-      // *from is the starting quote. *(next_-1) is the ending quote.
++      target.reserve(pos_ - from - 2); // upper bound
++      // input_[from] is the starting quote. input_[pos_-1] is the ending quote.
+       // Copy what is in-between, except for the escape character
+-      while (++from < next_ - 1) {
++      while (++from < pos_ - 1) {
+         // Copy current char, if not escape, or next char otherwise.
+-        target.push_back(*from != '\\' ? (*from) : *(++from));
++        target.push_back(input_[from] != '\\' ? input_[from] : input_[++from]);
+       }
+-    } else
+-      result.value = std::string(from + 1, next_ - from - 2); // skip enclosing quotes
+-  } else if ((isdigit(nextch) || (nextch == '-'))) {
+-    ++next_;
++    } else {
++      result.value = std::string(input_.substr(from + 1, pos_ - from - 2)); // skip enclosing quotes
++    }
++    return Status::OK();
++  }
+ 
+-    while ((next_ < end_) && (isdigit(*next_) || (*next_ == '.'))) {
+-      if (*next_ == '.') {
++  // Simplify the next ifs by consuming a possible negative sign.
++  if (nextch == '-') {
++    ++pos_;
++    nextch = NextChar();
++  }
++
++  // Check for float literals that start with alphabet characters.
++  if (IsAlpha(nextch)) {
++    // Has to be a special float literal now: (-)*(nan|inf|infinity).
++    if (NextIsValidFloatString()) {
++      while (!AtEnd() && IsAlpha(Cur())) {
++        ++pos_;
++      }
++      ONNX_TRY {
++        static_cast<void>(LocaleIndependentStof(std::string(input_.substr(from, pos_ - from))));
++        result.type = LiteralType::FLOAT_LITERAL;
++        result.value = std::string(input_.substr(from, pos_ - from));
++      }
++      ONNX_CATCH(...) {
++        ONNX_HANDLE_EXCEPTION([&]() { return ParseError("Encountered invalid float literal!"); });
++      }
++    } else {
++      return ParseError("Encountered invalid float literal!");
++    }
++    return Status::OK();
++  }
++
++  // Checking for numeric ints or float literal.
++  if (IsDigit(nextch)) {
++    ++pos_;
++
++    while (!AtEnd() && (IsDigit(Cur()) || (Cur() == '.'))) {
++      if (Cur() == '.') {
+         if (decimal_point)
+           break; // Only one decimal point allowed in numeric literal
+         decimal_point = true;
+       }
+-      ++next_;
++      ++pos_;
+     }
+ 
+-    if (next_ == from)
++    if (pos_ == from)
+       return ParseError("Value expected but not found.");
+ 
+     // Optional exponent syntax: (e|E)(+|-)?[0-9]+
+-    if ((next_ < end_) && ((*next_ == 'e') || (*next_ == 'E'))) {
++    if (!AtEnd() && ((Cur() == 'e') || (Cur() == 'E'))) {
+       decimal_point = true; // treat as float-literal
+-      ++next_;
+-      if ((next_ < end_) && ((*next_ == '+') || (*next_ == '-')))
+-        ++next_;
+-      while ((next_ < end_) && (isdigit(*next_)))
+-        ++next_;
++      ++pos_;
++      if (!AtEnd() && ((Cur() == '+') || (Cur() == '-')))
++        ++pos_;
++      while (!AtEnd() && IsDigit(Cur()))
++        ++pos_;
+     }
+ 
+-    result.value = std::string(from, next_ - from);
++    result.value = std::string(input_.substr(from, pos_ - from));
+     result.type = decimal_point ? LiteralType::FLOAT_LITERAL : LiteralType::INT_LITERAL;
+   }
+   return Status::OK();
+ }
+ 
++bool ParserBase::NextIsValidFloatString() {
++  auto nextch = NextChar();
++  const size_t from = pos_;
++  constexpr int INFINITY_LENGTH = 8;
++
++  if (IsAlpha(nextch)) {
++    while (!AtEnd() && IsAlpha(Cur()) && (pos_ - from) <= INFINITY_LENGTH) {
++      ++pos_;
++    }
++
++    if (!AtEnd() && IsDigit(Cur())) { // No trailing digits
++      pos_ = from;
++      return false;
++    }
++
++    std::string candidate = std::string(input_.substr(from, pos_ - from));
++
++    // Reset parser location before continuing.
++    pos_ = from;
++
++    std::transform(candidate.begin(), candidate.end(), candidate.begin(), [](char c) {
++      // ASCII-only lowercasing; std::tolower is locale-dependent.
++      return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
++    });
++    if (candidate == std::string_view("inf") || candidate == std::string_view("infinity") ||
++        candidate == std::string_view("nan")) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ Status OnnxParser::Parse(IdList& idlist) {
+   idlist.Clear();
+   std::string id;
+-  ParseOptionalIdentifier(id);
++  ParseQuotableIdentifier(id);
+   if (id.empty())
+     return Status::OK(); // Treat as empty list of identifiers
+   *idlist.Add() = id;
+   while (Matches(',')) {
+-    ParseOptionalIdentifier(id);
++    ParseQuotableIdentifier(id);
+     *idlist.Add() = id;
+   }
+   return Status::OK();
+@@ -111,7 +312,7 @@ Status OnnxParser::Parse(IdList& idlist, AttrList& attrlist) {
+   attrlist.Clear();
+   do {
+     std::string id;
+-    ParseIdentifier(id);
++    ParseQuotableIdentifier(id);
+     auto next = NextChar();
+     if (next == ':' || next == '=')
+       Parse(*attrlist.Add(), id);
+@@ -247,17 +448,49 @@ Status OnnxParser::Parse(ValueInfoProto& valueinfo) {
+   if (NextIsType())
+     PARSE(*valueinfo.mutable_type());
+   std::string name;
+-  CHECK_PARSER_STATUS(ParseIdentifier(name));
++  CHECK_PARSER_STATUS(ParseQuotableIdentifier(name));
+   valueinfo.set_name(name);
+   return Status::OK();
+ }
+ 
+-Status OnnxParser::Parse(ValueInfoList& vilist) {
++Status OnnxParser::Parse(char open, ValueInfoList& vilist, char close) {
++  MATCH(open);
++  if (!Matches(close)) {
++    do {
++      PARSE(*vilist.Add());
++    } while (Matches(','));
++    MATCH(close);
++  }
++  return Status::OK();
++}
++
++Status OnnxParser::ParseGraphInputOutput(ValueInfoList& vilist) {
+   vilist.Clear();
++  PARSE('(', vilist, ')');
++  return Status::OK();
++}
++
++Status OnnxParser::ParseFunctionInputOutput(IdList& idlist, ValueInfoList& vilist) {
++  // Do not clear vilist, as it accumulates values over inputs and outputs.
++  idlist.Clear();
+   MATCH('(');
+   if (!Matches(')')) {
+     do {
+-      PARSE(*vilist.Add());
++      // Function inputs/outputs can be optionally typed.
++      // Syntax: Name | Type Name
++      // The name is added to idlist. If the optional type is present, an entry is
++      // added to vilist.
++
++      std::string* name = idlist.Add();
++      ValueInfoProto* vi = nullptr;
++
++      if (NextIsType()) {
++        vi = vilist.Add();
++        PARSE(*(vi->mutable_type()));
++      }
++      CHECK_PARSER_STATUS(ParseQuotableIdentifier(*name));
++      if (vi != nullptr)
++        vi->set_name(*name);
+     } while (Matches(','));
+     MATCH(')');
+   }
+@@ -354,6 +587,8 @@ Status OnnxParser::Parse(TensorProto& tensorProto, const TypeProto& tensorTypePr
+       switch (static_cast<TensorProto::DataType>(elem_type)) {
+         case TensorProto::DataType::TensorProto_DataType_INT8:
+         case TensorProto::DataType::TensorProto_DataType_INT16:
++        case TensorProto::DataType::TensorProto_DataType_FLOAT16:
++        case TensorProto::DataType::TensorProto_DataType_BFLOAT16:
+         case TensorProto::DataType::TensorProto_DataType_INT32:
+         case TensorProto::DataType::TensorProto_DataType_UINT8:
+         case TensorProto::DataType::TensorProto_DataType_UINT16:
+@@ -392,6 +627,12 @@ Status OnnxParser::Parse(TensorProto& tensorProto, const TypeProto& tensorTypePr
+   return Status::OK();
+ }
+ 
++bool OnnxParser::NextIsIdentifier() {
++  std::string id("");
++  (void)PeekIdentifier(id);
++  return !(id.empty());
++}
++
+ bool OnnxParser::NextIsType() {
+   std::string id("");
+   (void)PeekIdentifier(id);
+@@ -408,32 +649,58 @@ bool OnnxParser::NextIsType() {
+   }
+ }
+ 
+-Status OnnxParser::ParseSingleAttributeValue(AttributeProto& attr) {
++Status OnnxParser::ParseSingleAttributeValue(
++    AttributeProto& attr,
++    AttributeProto_AttributeType expected) {
+   // Parse a single-value
+   auto next = NextChar();
+-  if (isalpha(next) || next == '_') {
++  if (IsAlpha(next) || next == '_') {
+     if (NextIsType()) {
+-      attr.set_type(AttributeProto_AttributeType_TENSOR);
+-      Parse(*attr.mutable_t());
++      TypeProto typeProto;
++      Parse(typeProto);
++      next = NextChar();
++      if ((next == '{') || (next == '=') || (NextIsIdentifier())) {
++        attr.set_type(AttributeProto_AttributeType_TENSOR);
++        auto& tensorProto = *attr.mutable_t();
++        ParseQuotableIdentifier(*tensorProto.mutable_name());
++        (void)Matches('='); // Optional, to unify handling of initializers
++        Parse(tensorProto, typeProto);
++      } else {
++        attr.set_type(AttributeProto_AttributeType_TYPE_PROTO);
++        attr.mutable_tp()->CopyFrom(typeProto);
++      }
+     } else {
+-      attr.set_type(AttributeProto_AttributeType_GRAPH);
+-      Parse(*attr.mutable_g());
++      if (NextIsValidFloatString()) {
++        Literal literal;
++        PARSE_TOKEN(literal);
++        attr.set_type(AttributeProto_AttributeType_FLOAT);
++        attr.set_f(LocaleIndependentStof(literal.value));
++      } else {
++        attr.set_type(AttributeProto_AttributeType_GRAPH);
++        PARSE(*attr.mutable_g());
++      }
+     }
+   } else if (Matches('@')) {
+     std::string name;
+-    CHECK_PARSER_STATUS(ParseIdentifier(name));
++    CHECK_PARSER_STATUS(ParseQuotableIdentifier(name));
+     attr.set_ref_attr_name(name);
+   } else {
+     Literal literal;
+     PARSE_TOKEN(literal);
+     switch (literal.type) {
+       case LiteralType::INT_LITERAL:
+-        attr.set_type(AttributeProto_AttributeType_INT);
+-        attr.set_i(std::stol(literal.value));
++        if (expected == AttributeProto_AttributeType_FLOAT) {
++          // Implicit INT->FLOAT cast; parse the text as float to preserve "-0".
++          attr.set_type(AttributeProto_AttributeType_FLOAT);
++          attr.set_f(LocaleIndependentStof(literal.value));
++        } else {
++          attr.set_type(AttributeProto_AttributeType_INT);
++          attr.set_i(std::stoll(literal.value));
++        }
+         break;
+       case LiteralType::FLOAT_LITERAL:
+         attr.set_type(AttributeProto_AttributeType_FLOAT);
+-        attr.set_f(static_cast<float>(std::stof(literal.value)));
++        attr.set_f(LocaleIndependentStof(literal.value));
+         break;
+       case LiteralType::STRING_LITERAL:
+         attr.set_type(AttributeProto_AttributeType_STRING);
+@@ -443,6 +710,13 @@ Status OnnxParser::ParseSingleAttributeValue(AttributeProto& attr) {
+         return ParseError("Unexpected literal type.");
+     }
+   }
++  if ((expected != AttributeProto_AttributeType_UNDEFINED) && (expected != attr.type())) {
++    return ParseError(
++        "Mismatch between expected type ",
++        AttributeProto_AttributeType_Name(expected),
++        " and specified value's type",
++        AttributeProto_AttributeType_Name(attr.type()));
++  }
+   return Status::OK();
+ }
+ 
+@@ -453,6 +727,27 @@ Status OnnxParser::Parse(AttributeProto& attr) {
+   return Parse(attr, name);
+ }
+ 
++static AttributeProto_AttributeType ToSingletonType(AttributeProto_AttributeType type) {
++  switch (type) {
++    case AttributeProto_AttributeType_FLOATS:
++      return AttributeProto_AttributeType_FLOAT;
++    case AttributeProto_AttributeType_INTS:
++      return AttributeProto_AttributeType_INT;
++    case AttributeProto_AttributeType_STRINGS:
++      return AttributeProto_AttributeType_STRING;
++    case AttributeProto_AttributeType_TENSORS:
++      return AttributeProto_AttributeType_TENSOR;
++    case AttributeProto_AttributeType_GRAPHS:
++      return AttributeProto_AttributeType_GRAPH;
++    case AttributeProto_AttributeType_SPARSE_TENSORS:
++      return AttributeProto_AttributeType_SPARSE_TENSOR;
++    case AttributeProto_AttributeType_TYPE_PROTOS:
++      return AttributeProto_AttributeType_TYPE_PROTO;
++    default:
++      return type;
++  }
++}
++
+ Status OnnxParser::Parse(AttributeProto& attr, std::string& name) {
+   attr.set_name(name);
+   if (Matches(':')) {
+@@ -466,13 +761,25 @@ Status OnnxParser::Parse(AttributeProto& attr, std::string& name) {
+   }
+   MATCH('=');
+   if (NextChar() == '[') {
+-    // Parse a list of values. For now, empty list is not allowed, as we need to
+-    // figure out a type for the attribute.
++    // Empty lists require an explicit repeated attribute type.
+     std::vector<Literal> vals;
+     MATCH('[');
++    if (Matches(']')) {
++      switch (attr.type()) {
++        case AttributeProto_AttributeType_INTS:
++        case AttributeProto_AttributeType_FLOATS:
++        case AttributeProto_AttributeType_STRINGS:
++        case AttributeProto_AttributeType_TENSORS:
++        case AttributeProto_AttributeType_GRAPHS:
++        case AttributeProto_AttributeType_TYPE_PROTOS:
++          return Status::OK();
++        default:
++          return ParseError("Empty attribute list requires a repeated type.");
++      }
++    }
+     do {
+       AttributeProto nextval;
+-      CHECK_PARSER_STATUS(ParseSingleAttributeValue(nextval));
++      CHECK_PARSER_STATUS(ParseSingleAttributeValue(nextval, ToSingletonType(attr.type())));
+       switch (nextval.type()) {
+         case AttributeProto_AttributeType_INT:
+           attr.set_type(AttributeProto_AttributeType_INTS);
+@@ -486,13 +793,25 @@ Status OnnxParser::Parse(AttributeProto& attr, std::string& name) {
+           attr.add_strings(nextval.s());
+           attr.set_type(AttributeProto_AttributeType_STRINGS);
+           break;
++        case AttributeProto_AttributeType_TENSOR:
++          attr.set_type(AttributeProto_AttributeType_TENSORS);
++          attr.add_tensors()->CopyFrom(nextval.t());
++          break;
++        case AttributeProto_AttributeType_GRAPH:
++          attr.set_type(AttributeProto_AttributeType_GRAPHS);
++          attr.add_graphs()->CopyFrom(nextval.g());
++          break;
++        case AttributeProto_AttributeType_TYPE_PROTO:
++          attr.set_type(AttributeProto_AttributeType_TYPE_PROTOS);
++          attr.add_type_protos()->CopyFrom(nextval.tp());
++          break;
+         default:
+           break;
+       }
+     } while (Matches(','));
+     MATCH(']');
+   } else {
+-    CHECK_PARSER_STATUS(ParseSingleAttributeValue(attr));
++    CHECK_PARSER_STATUS(ParseSingleAttributeValue(attr, attr.type()));
+   }
+   return Status::OK();
+ }
+@@ -522,6 +841,12 @@ Status OnnxParser::Parse(NodeProto& node) {
+   }
+   node.set_domain(domain);
+   node.set_op_type(id);
++
++  if (Matches(':')) {
++    std::string overload;
++    ParseIdentifier(overload);
++    node.set_overload(overload);
++  }
+   PARSE(*node.mutable_attribute());
+   MATCH('(');
+   PARSE(*node.mutable_input());
+@@ -544,7 +869,7 @@ Status OnnxParser::Parse(NodeList& nodelist) {
+ 
+ Status OnnxParser::Parse(GraphProto& graph) {
+   std::string id;
+-  ParseIdentifier(id);
++  ParseQuotableIdentifier(id);
+   return Parse(id, graph);
+ }
+ 
+@@ -554,7 +879,7 @@ Status OnnxParser::Parse(std::string name, GraphProto& graph) {
+   CHECK_PARSER_STATUS(ParseInput(*graph.mutable_input(), *graph.mutable_initializer()));
+   MATCH('=');
+   MATCH('>', false);
+-  PARSE(*graph.mutable_output());
++  CHECK_PARSER_STATUS(ParseGraphInputOutput(*graph.mutable_output()));
+   CHECK_PARSER_STATUS(ParseValueInfo(*graph.mutable_value_info(), *graph.mutable_initializer()));
+   return Parse(*graph.mutable_node());
+ }
+@@ -579,6 +904,10 @@ Status OnnxParser::Parse(FunctionProto& fn) {
+           PARSE_TOKEN(strval);
+           fn.set_domain(strval);
+           break;
++        case KeyWordMap::KeyWord::OVERLOAD_KW:
++          PARSE_TOKEN(strval);
++          fn.set_overload(strval);
++          break;
+         default:
+           return ParseError("Unhandled keyword.");
+       }
+@@ -586,14 +915,18 @@ Status OnnxParser::Parse(FunctionProto& fn) {
+     MATCH('>');
+   }
+   std::string id;
+-  ParseIdentifier(id);
++  ParseQuotableIdentifier(id);
+   fn.set_name(id);
+ 
+   PARSE('<', *fn.mutable_attribute(), *fn.mutable_attribute_proto(), '>');
+-  PARSE('(', *fn.mutable_input(), ')');
++  fn.mutable_value_info()->Clear();
++  CHECK_PARSER_STATUS(ParseFunctionInputOutput(*fn.mutable_input(), *fn.mutable_value_info()));
+   MATCH('=');
+   MATCH('>', false);
+-  PARSE('(', *fn.mutable_output(), ')');
++  CHECK_PARSER_STATUS(ParseFunctionInputOutput(*fn.mutable_output(), *fn.mutable_value_info()));
++  if (NextChar() == '<') {
++    PARSE('<', *fn.mutable_value_info(), '>');
++  }
+   return Parse(*fn.mutable_node());
+ }
+ 
+diff --git a/onnx/defs/parser.h b/onnx/defs/parser.h
+index 0888a51a1776028088222d083e7c5e90b51f3738..c55206c7c3c322f3f821b1bb7532e06eef2efec4 100644
+--- a/onnx/defs/parser.h
++++ b/onnx/defs/parser.h
+@@ -7,12 +7,14 @@
+ 
+ #pragma once
+ 
+-#include <ctype.h>
++#include <algorithm>
+ #include <iostream>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <unordered_map>
+ 
++#include "onnx/common/common.h"
+ #include "onnx/onnx_pb.h"
+ 
+ #include "onnx/common/status.h"
+@@ -22,6 +24,10 @@ namespace ONNX_NAMESPACE {
+ 
+ using namespace ONNX_NAMESPACE::Common;
+ 
++// Locale-independent string-to-float/double conversion (defined in parser.cc).
++ONNX_API float LocaleIndependentStof(const std::string& s);
++ONNX_API double LocaleIndependentStod(const std::string& s);
++
+ using IdList = google::protobuf::RepeatedPtrField<std::string>;
+ 
+ using NodeList = google::protobuf::RepeatedPtrField<NodeProto>;
+@@ -130,7 +136,8 @@ class KeyWordMap {
+     SEQ_TYPE,
+     MAP_TYPE,
+     OPTIONAL_TYPE,
+-    SPARSE_TENSOR_TYPE
++    SPARSE_TENSOR_TYPE,
++    OVERLOAD_KW
+   };
+ 
+   KeyWordMap() {
+@@ -146,6 +153,7 @@ class KeyWordMap {
+     map_["map"] = KeyWord::MAP_TYPE;
+     map_["optional"] = KeyWord::OPTIONAL_TYPE;
+     map_["sparse_tensor"] = KeyWord::SPARSE_TENSOR_TYPE;
++    map_["overload"] = KeyWord::OVERLOAD_KW;
+   }
+ 
+   static const std::unordered_map<std::string, KeyWord>& Instance() {
+@@ -173,25 +181,41 @@ class KeyWordMap {
+   std::unordered_map<std::string, KeyWord> map_;
+ };
+ 
++// Locale-independent ASCII classification, so that the text format does not
++// vary with the process locale. Accepts char or the int returned by
++// ParserBase::NextChar; non-ASCII bytes classify as false either way.
++constexpr bool IsSpace(int c) {
++  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
++}
++
++constexpr bool IsAlpha(int c) {
++  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
++}
++
++constexpr bool IsDigit(int c) {
++  return c >= '0' && c <= '9';
++}
++
++constexpr bool IsAlnum(int c) {
++  return IsAlpha(c) || IsDigit(c);
++}
++
+ class ParserBase {
+  public:
+-  ParserBase(const std::string& str)
+-      : start_(str.data()), next_(str.data()), end_(str.data() + str.length()), saved_pos_(next_) {}
+-
+-  ParserBase(const char* cstr) : start_(cstr), next_(cstr), end_(cstr + strlen(cstr)), saved_pos_(next_) {}
++  explicit ParserBase(std::string_view input) : input_(input) {}
+ 
+   void SavePos() {
+-    saved_pos_ = next_;
++    saved_pos_ = pos_;
+   }
+ 
+   void RestorePos() {
+-    next_ = saved_pos_;
++    pos_ = saved_pos_;
+   }
+ 
+   std::string GetCurrentPos() {
+     uint32_t line = 1, col = 1;
+-    for (const char* p = start_; p < next_; ++p) {
+-      if (*p == '\n') {
++    for (size_t i = 0; i < pos_; ++i) {
++      if (input_[i] == '\n') {
+         ++line;
+         col = 1;
+       } else {
+@@ -204,17 +228,20 @@ class ParserBase {
+   // Return a suitable suffix of what has been parsed to provide error message context:
+   // return the line containing the last non-space character preceding the error (if it exists).
+   std::string GetErrorContext() {
+-    // Special cases: empty input string, and parse-error at first character.
+-    const char* p = next_ < end_ ? next_ : next_ - 1;
+-    while ((p > start_) && isspace(*p))
++    if (input_.empty())
++      return std::string();
++    // Special case: a parse-error at end of input starts from the last character.
++    size_t p = (pos_ < input_.size()) ? pos_ : input_.size() - 1;
++    while ((p > 0) && IsSpace(input_[p]))
+       --p;
+-    while ((p > start_) && (*p != '\n'))
++    while ((p > 0) && (input_[p] != '\n'))
+       --p;
+     // Start at character after '\n' unless we are at start of input
+-    const char* context_start = (p > start_) ? (p + 1) : start_;
+-    for (p = context_start; (p < end_) && (*p != '\n'); ++p)
+-      ;
+-    return std::string(context_start, p - context_start);
++    size_t context_start = (p > 0) ? (p + 1) : 0;
++    size_t context_end = context_start;
++    while ((context_end < input_.size()) && (input_[context_end] != '\n'))
++      ++context_end;
++    return std::string(input_.substr(context_start, context_end - context_start));
+   }
+ 
+   template <typename... Args>
+@@ -228,27 +255,27 @@ class ParserBase {
+ 
+   void SkipWhiteSpace() {
+     do {
+-      while ((next_ < end_) && (isspace(*next_)))
+-        ++next_;
+-      if ((next_ >= end_) || ((*next_) != '#'))
++      while (!AtEnd() && IsSpace(Cur()))
++        ++pos_;
++      if (AtEnd() || (Cur() != '#'))
+         return;
+-      // Skip rest of the line:
+-      while ((next_ < end_) && ((*next_) != '\n'))
+-        ++next_;
++      // Skip rest of the line; the loop then consumes the newline as whitespace.
++      pos_ = std::min(input_.find('\n', pos_), input_.size());
+     } while (true);
+   }
+ 
+   int NextChar(bool skipspace = true) {
+     if (skipspace)
+       SkipWhiteSpace();
+-    return (next_ < end_) ? *next_ : 0;
++    // Return as unsigned char so byte values are non-negative.
++    return AtEnd() ? 0 : static_cast<unsigned char>(Cur());
+   }
+ 
+   bool Matches(char ch, bool skipspace = true) {
+     if (skipspace)
+       SkipWhiteSpace();
+-    if ((next_ < end_) && (*next_ == ch)) {
+-      ++next_;
++    if (!AtEnd() && (Cur() == ch)) {
++      ++pos_;
+       return true;
+     }
+     return false;
+@@ -262,7 +289,7 @@ class ParserBase {
+ 
+   bool EndOfInput() {
+     SkipWhiteSpace();
+-    return (next_ >= end_);
++    return AtEnd();
+   }
+ 
+   enum class LiteralType { INT_LITERAL, FLOAT_LITERAL, STRING_LITERAL };
+@@ -279,8 +306,7 @@ class ParserBase {
+     CHECK_PARSER_STATUS(Parse(literal));
+     if (literal.type != LiteralType::INT_LITERAL)
+       return ParseError("Integer value expected, but not found.");
+-    std::string s = literal.value;
+-    val = std::stoll(s);
++    val = std::stoll(literal.value);
+     return Status::OK();
+   }
+ 
+@@ -289,8 +315,7 @@ class ParserBase {
+     CHECK_PARSER_STATUS(Parse(literal));
+     if (literal.type != LiteralType::INT_LITERAL)
+       return ParseError("Integer value expected, but not found.");
+-    std::string s = literal.value;
+-    val = std::stoull(s);
++    val = std::stoull(literal.value);
+     return Status::OK();
+   }
+ 
+@@ -300,7 +325,7 @@ class ParserBase {
+     switch (literal.type) {
+       case LiteralType::INT_LITERAL:
+       case LiteralType::FLOAT_LITERAL:
+-        val = std::stof(literal.value);
++        val = LocaleIndependentStof(literal.value);
+         break;
+       default:
+         return ParseError("Unexpected literal type.");
+@@ -314,7 +339,7 @@ class ParserBase {
+     switch (literal.type) {
+       case LiteralType::INT_LITERAL:
+       case LiteralType::FLOAT_LITERAL:
+-        val = std::stod(literal.value);
++        val = LocaleIndependentStod(literal.value);
+         break;
+       default:
+         return ParseError("Unexpected literal type.");
+@@ -336,13 +361,13 @@ class ParserBase {
+   // return an empty-string identifier.
+   Status ParseOptionalIdentifier(std::string& id) {
+     SkipWhiteSpace();
+-    auto from = next_;
+-    if ((next_ < end_) && (isalpha(*next_) || (*next_ == '_'))) {
+-      ++next_;
+-      while ((next_ < end_) && (isalnum(*next_) || (*next_ == '_')))
+-        ++next_;
++    size_t from = pos_;
++    if (!AtEnd() && (IsAlpha(Cur()) || (Cur() == '_'))) {
++      ++pos_;
++      while (!AtEnd() && (IsAlnum(Cur()) || (Cur() == '_')))
++        ++pos_;
+     }
+-    id = std::string(from, next_ - from);
++    id = std::string(input_.substr(from, pos_ - from));
+     return Status::OK();
+   }
+ 
+@@ -353,6 +378,13 @@ class ParserBase {
+     return Status::OK();
+   }
+ 
++  Status ParseQuotableIdentifier(std::string& id) {
++    if (NextChar() == '"') {
++      return Parse(id);
++    }
++    return ParseIdentifier(id);
++  }
++
+   Status PeekIdentifier(std::string& id) {
+     SavePos();
+     ParseOptionalIdentifier(id);
+@@ -368,15 +400,24 @@ class ParserBase {
+   }
+ 
+  protected:
+-  const char* start_;
+-  const char* next_;
+-  const char* end_;
+-  const char* saved_pos_;
++  // True when the cursor has consumed all input.
++  bool AtEnd() const {
++    return pos_ >= input_.size();
++  }
++  // Character at the cursor; only valid when !AtEnd().
++  char Cur() const {
++    return input_[pos_];
++  }
++  std::string_view input_;
++  size_t pos_ = 0;
++  size_t saved_pos_ = 0;
++
++  bool NextIsValidFloatString();
+ };
+ 
+ class OnnxParser : public ParserBase {
+  public:
+-  OnnxParser(const char* cstr) : ParserBase(cstr) {}
++  using ParserBase::ParserBase;
+ 
+   Status Parse(TensorShapeProto& shape);
+ 
+@@ -401,7 +442,7 @@ class OnnxParser : public ParserBase {
+   Status Parse(ModelProto& model);
+ 
+   template <typename T>
+-  static Status Parse(T& parsedData, const char* input) {
++  static Status Parse(T& parsedData, std::string_view input) {
+     OnnxParser parser(input);
+     return parser.Parse(parsedData);
+   }
+@@ -417,11 +458,15 @@ class OnnxParser : public ParserBase {
+ 
+   Status Parse(char open, IdList& idlist, AttrList& attrlist, char close);
+ 
+-  Status ParseSingleAttributeValue(AttributeProto& attr);
++  Status ParseSingleAttributeValue(AttributeProto& attr, AttributeProto_AttributeType expected);
+ 
+   Status Parse(ValueInfoProto& valueinfo);
+ 
+-  Status Parse(ValueInfoList& vilist);
++  Status ParseGraphInputOutput(ValueInfoList& vilist);
++
++  Status ParseFunctionInputOutput(IdList& idlist, ValueInfoList& vilist);
++
++  Status Parse(char open, ValueInfoList& vilist, char close);
+ 
+   Status ParseInput(ValueInfoList& vilist, TensorList& initializers);
+ 
+@@ -432,6 +477,8 @@ class OnnxParser : public ParserBase {
+   Status Parse(OpsetIdList& opsets);
+ 
+   bool NextIsType();
++
++  bool NextIsIdentifier();
+ };
+ 
+ } // namespace ONNX_NAMESPACE
+diff --git a/onnx/defs/printer.cc b/onnx/defs/printer.cc
+index d68e9ff47e993c1eff516160ba4d139b93cf2c95..437b068b116ebf33352459f2581962fb54d1d80c 100644
+--- a/onnx/defs/printer.cc
++++ b/onnx/defs/printer.cc
+@@ -3,7 +3,16 @@
+  */
+ 
+ #include "onnx/defs/printer.h"
++
++#include <array>
++#include <charconv>
++#include <cmath>
++#include <cstdint>
+ #include <iomanip>
++#include <string>
++#include <type_traits>
++#include <vector>
++
+ #include "onnx/defs/tensor_proto_util.h"
+ 
+ namespace ONNX_NAMESPACE {
+@@ -11,6 +20,44 @@ namespace ONNX_NAMESPACE {
+ using MetaDataProp = StringStringEntryProto;
+ using MetaDataProps = google::protobuf::RepeatedPtrField<StringStringEntryProto>;
+ 
++// Widen a decoded raw_data element to the field type the printer emits.
++template <typename Element, typename Widened>
++std::vector<Widened> ParseRawIntData(const TensorProto& tensor) {
++  const std::vector<Element> elements = ParseRawData<Element>(tensor, /*exact_fit=*/true);
++  return std::vector<Widened>(elements.begin(), elements.end());
++}
++
++// Format numbers with std::to_chars: locale-independent and, for floating
++// point, the shortest form that round-trips through the parser.
++template <typename T>
++void PrintNumber(std::ostream& os, T value) {
++  if constexpr (std::is_floating_point_v<T>) {
++    // Normalize NaN: MSVC's to_chars emits payload forms like "nan(ind)"
++    // that the parser does not accept.
++    if (std::isnan(value)) {
++      os << (std::signbit(value) ? "-nan" : "nan");
++      return;
++    }
++  }
++  std::array<char, 32> buf{};
++  const auto res = std::to_chars(buf.data(), buf.data() + buf.size(), value);
++  os.write(buf.data(), res.ptr - buf.data());
++}
++
++bool IsValidIdentifier(const std::string& str) {
++  // Check if str is a valid identifier
++  const char* next_ = str.c_str();
++  const char* end_ = next_ + str.size();
++  if (next_ == end_)
++    return false; // empty string is not a valid identifier
++  if (!IsAlpha(*next_) && (*next_ != '_'))
++    return false; // first character must be a letter or '_'
++  ++next_;
++  while ((next_ < end_) && (IsAlnum(*next_) || (*next_ == '_')))
++    ++next_;
++  return next_ == end_;
++}
++
+ class ProtoPrinter {
+  public:
+   ProtoPrinter(std::ostream& os) : output_(os) {}
+@@ -31,7 +78,7 @@ class ProtoPrinter {
+ 
+   void print(const TypeProto_SparseTensor& sparseType);
+ 
+-  void print(const TensorProto& tensor);
++  void print(const TensorProto& tensor, bool is_initializer = false);
+ 
+   void print(const ValueInfoProto& value_info);
+ 
+@@ -66,17 +113,28 @@ class ProtoPrinter {
+   }
+ 
+  private:
++  void printId(const std::string& str) {
++    if (IsValidIdentifier(str))
++      output_ << str;
++    else
++      printQuoted(str);
++  }
++
+   template <typename T>
+-  inline void print(T prim) {
+-    output_ << prim;
++  void print(const T& prim) {
++    if constexpr (std::is_arithmetic_v<T>) {
++      PrintNumber(output_, prim);
++    } else {
++      output_ << prim;
++    }
+   }
+ 
+   void printQuoted(const std::string& str) {
+     output_ << "\"";
+-    for (const char* p = str.c_str(); *p; ++p) {
+-      if ((*p == '\\') || (*p == '"'))
++    for (char c : str) {
++      if ((c == '\\') || (c == '"'))
+         output_ << '\\';
+-      output_ << *p;
++      output_ << c;
+     }
+     output_ << "\"";
+   }
+@@ -107,6 +165,18 @@ class ProtoPrinter {
+     output_ << close;
+   }
+ 
++  template <typename Collection>
++  inline void printIdSet(const char* open, const char* separator, const char* close, Collection coll) {
++    const char* sep = "";
++    output_ << open;
++    for (auto& elt : coll) {
++      output_ << sep;
++      printId(elt);
++      sep = separator;
++    }
++    output_ << close;
++  }
++
+   std::ostream& output_;
+   int indent_level = 3;
+ 
+@@ -120,12 +190,16 @@ class ProtoPrinter {
+ };
+ 
+ void ProtoPrinter::print(const TensorShapeProto_Dimension& dim) {
+-  if (dim.has_dim_value())
+-    output_ << dim.dim_value();
+-  else if (dim.has_dim_param())
+-    output_ << dim.dim_param();
+-  else
++  if (dim.has_dim_value()) {
++    print(dim.dim_value());
++  } else if (dim.has_dim_param()) {
++    if (IsValidIdentifier(dim.dim_param()))
++      output_ << dim.dim_param();
++    else
++      printQuoted(dim.dim_param());
++  } else {
+     output_ << "?";
++  }
+ }
+ 
+ void ProtoPrinter::print(const TensorShapeProto& shape) {
+@@ -183,31 +257,60 @@ void ProtoPrinter::print(const TypeProto& type) {
+     print(type.sparse_tensor_type());
+ }
+ 
+-void ProtoPrinter::print(const TensorProto& tensor) {
++void ProtoPrinter::print(const TensorProto& tensor, bool is_initializer) {
+   output_ << PrimitiveTypeNameMap::ToString(tensor.data_type());
+   if (tensor.dims_size() > 0)
+     printSet("[", ",", "]", tensor.dims());
+ 
+   if (!tensor.name().empty()) {
+-    output_ << " " << tensor.name();
++    output_ << " ";
++    printId(tensor.name());
++  }
++  if (is_initializer) {
++    output_ << " = ";
+   }
+   // TODO: does not yet handle all types or externally stored data.
+   if (tensor.has_raw_data()) {
+     switch (static_cast<TensorProto::DataType>(tensor.data_type())) {
++      case TensorProto::DataType::TensorProto_DataType_INT8:
++        printSet(" {", ",", "}", ParseRawIntData<int8_t, int32_t>(tensor));
++        break;
++      case TensorProto::DataType::TensorProto_DataType_UINT8:
++      case TensorProto::DataType::TensorProto_DataType_BOOL:
++        printSet(" {", ",", "}", ParseRawIntData<uint8_t, int32_t>(tensor));
++        break;
++      case TensorProto::DataType::TensorProto_DataType_INT16:
++        printSet(" {", ",", "}", ParseRawIntData<int16_t, int32_t>(tensor));
++        break;
++      case TensorProto::DataType::TensorProto_DataType_UINT16:
++      // FLOAT16/BFLOAT16 print the unsigned 16-bit pattern, which the parser accepts.
++      case TensorProto::DataType::TensorProto_DataType_FLOAT16:
++      case TensorProto::DataType::TensorProto_DataType_BFLOAT16:
++        printSet(" {", ",", "}", ParseRawIntData<uint16_t, int32_t>(tensor));
++        break;
+       case TensorProto::DataType::TensorProto_DataType_INT32:
+-        printSet(" {", ",", "}", ParseData<int32_t>(&tensor));
++        printSet(" {", ",", "}", ParseRawData<int32_t>(tensor, /*exact_fit=*/true));
++        break;
++      // UINT32/UINT64 print into uint64_data, matching the non-raw branch.
++      case TensorProto::DataType::TensorProto_DataType_UINT32:
++        printSet(" {", ",", "}", ParseRawIntData<uint32_t, uint64_t>(tensor));
+         break;
+       case TensorProto::DataType::TensorProto_DataType_INT64:
+-        printSet(" {", ",", "}", ParseData<int64_t>(&tensor));
++        printSet(" {", ",", "}", ParseRawData<int64_t>(tensor, /*exact_fit=*/true));
++        break;
++      case TensorProto::DataType::TensorProto_DataType_UINT64:
++        printSet(" {", ",", "}", ParseRawData<uint64_t>(tensor, /*exact_fit=*/true));
+         break;
+       case TensorProto::DataType::TensorProto_DataType_FLOAT:
+-        printSet(" {", ",", "}", ParseData<float>(&tensor));
++        printSet(" {", ",", "}", ParseRawData<float>(tensor, /*exact_fit=*/true));
+         break;
+       case TensorProto::DataType::TensorProto_DataType_DOUBLE:
+-        printSet(" {", ",", "}", ParseData<double>(&tensor));
++        printSet(" {", ",", "}", ParseRawData<double>(tensor, /*exact_fit=*/true));
+         break;
+       default:
+-        output_ << "..."; // ParseData not instantiated for other types.
++        // Sub-byte packed types need an element count sizeof() cannot express;
++        // complex and string need a different element form.
++        output_ << "...";
+         break;
+     }
+   } else {
+@@ -218,6 +321,8 @@ void ProtoPrinter::print(const TensorProto& tensor) {
+       case TensorProto::DataType::TensorProto_DataType_UINT8:
+       case TensorProto::DataType::TensorProto_DataType_UINT16:
+       case TensorProto::DataType::TensorProto_DataType_BOOL:
++      case TensorProto::DataType::TensorProto_DataType_FLOAT16:
++      case TensorProto::DataType::TensorProto_DataType_BFLOAT16:
+         printSet(" {", ",", "}", tensor.int32_data());
+         break;
+       case TensorProto::DataType::TensorProto_DataType_INT64:
+@@ -244,6 +349,7 @@ void ProtoPrinter::print(const TensorProto& tensor) {
+         break;
+       }
+       default:
++        output_ << "...";
+         break;
+     }
+   }
+@@ -251,7 +357,8 @@ void ProtoPrinter::print(const TensorProto& tensor) {
+ 
+ void ProtoPrinter::print(const ValueInfoProto& value_info) {
+   print(value_info.type());
+-  output_ << " " << value_info.name();
++  output_ << " ";
++  printId(value_info.name());
+ }
+ 
+ void ProtoPrinter::print(const ValueInfoList& vilist) {
+@@ -265,27 +372,29 @@ void ProtoPrinter::print(const AttributeProto& attr) {
+     return;
+   }
+   // General case:
+-  output_ << attr.name() << " = ";
++  output_ << attr.name() << ": " << AttributeTypeNameMap::ToString(attr.type()) << " = ";
+   switch (attr.type()) {
+     case AttributeProto_AttributeType_INT:
+-      output_ << attr.i();
++      print(attr.i());
+       break;
+     case AttributeProto_AttributeType_INTS:
+       printSet("[", ", ", "]", attr.ints());
+       break;
+     case AttributeProto_AttributeType_FLOAT:
+-      output_ << attr.f();
++      print(attr.f());
+       break;
+     case AttributeProto_AttributeType_FLOATS:
+       printSet("[", ", ", "]", attr.floats());
+       break;
+     case AttributeProto_AttributeType_STRING:
+-      output_ << "\"" << attr.s() << "\"";
++      printQuoted(attr.s());
+       break;
+     case AttributeProto_AttributeType_STRINGS: {
+-      const char* sep = "[";
++      output_ << "[";
++      const char* sep = "";
+       for (auto& elt : attr.strings()) {
+-        output_ << sep << "\"" << elt << "\"";
++        output_ << sep;
++        printQuoted(elt);
+         sep = ", ";
+       }
+       output_ << "]";
+@@ -307,6 +416,12 @@ void ProtoPrinter::print(const AttributeProto& attr) {
+     case AttributeProto_AttributeType_TENSORS:
+       printSet("[", ", ", "]", attr.tensors());
+       break;
++    case AttributeProto_AttributeType_TYPE_PROTO:
++      print(attr.tp());
++      break;
++    case AttributeProto_AttributeType_TYPE_PROTOS:
++      printSet("[", ", ", "]", attr.type_protos());
++      break;
+     default:
+       break;
+   }
+@@ -318,18 +433,20 @@ void ProtoPrinter::print(const AttrList& attrlist) {
+ 
+ void ProtoPrinter::print(const NodeProto& node) {
+   output_ << std::setw(indent_level) << ' ';
+-  printSet("", ", ", "", node.output());
++  printIdSet("", ", ", "", node.output());
+   output_ << " = ";
+   if (node.domain() != "")
+     output_ << node.domain() << ".";
+   output_ << node.op_type();
++  if (node.overload() != "")
++    output_ << ":" << node.overload();
+   bool has_subgraph = false;
+   for (auto attr : node.attribute())
+     if (attr.has_g() || (attr.graphs_size() > 0))
+       has_subgraph = true;
+   if ((!has_subgraph) && (node.attribute_size() > 0))
+     print(node.attribute());
+-  printSet(" (", ", ", ")", node.input());
++  printIdSet(" (", ", ", ")", node.input());
+   if ((has_subgraph) && (node.attribute_size() > 0))
+     print(node.attribute());
+   output_ << "\n";
+@@ -346,7 +463,23 @@ void ProtoPrinter::print(const NodeList& nodelist) {
+ }
+ 
+ void ProtoPrinter::print(const GraphProto& graph) {
+-  output_ << graph.name() << " " << graph.input() << " => " << graph.output() << " ";
++  printId(graph.name());
++  output_ << " " << graph.input() << " => " << graph.output() << " ";
++  if ((graph.initializer_size() > 0) || (graph.value_info_size() > 0)) {
++    output_ << std::endl << std::setw(indent_level) << ' ' << '<';
++    const char* sep = "";
++    for (auto& init : graph.initializer()) {
++      output_ << sep;
++      print(init, true);
++      sep = ", ";
++    }
++    for (auto& vi : graph.value_info()) {
++      output_ << sep;
++      print(vi);
++      sep = ", ";
++    }
++    output_ << ">" << std::endl;
++  }
+   print(graph.node());
+ }
+ 
+@@ -376,7 +509,9 @@ void ProtoPrinter::print(const ModelProto& model) {
+ }
+ 
+ void ProtoPrinter::print(const OperatorSetIdProto& opset) {
+-  output_ << "\"" << opset.domain() << "\" : " << opset.version();
++  printQuoted(opset.domain());
++  output_ << " : ";
++  print(opset.version());
+ }
+ 
+ void ProtoPrinter::print(const OpsetIdList& opsets) {
+@@ -385,19 +520,43 @@ void ProtoPrinter::print(const OpsetIdList& opsets) {
+ 
+ void ProtoPrinter::print(const FunctionProto& fn) {
+   output_ << "<\n";
+-  output_ << "  "
+-          << "domain: \"" << fn.domain() << "\",\n";
+-  output_ << "  "
+-          << "opset_import: ";
++  output_ << "  " << "domain: ";
++  printQuoted(fn.domain());
++  output_ << ",\n";
++  if (!fn.overload().empty()) {
++    output_ << "  " << "overload: ";
++    printQuoted(fn.overload());
++    output_ << ",\n";
++  }
++
++  output_ << "  " << "opset_import: ";
+   printSet("[", ",", "]", fn.opset_import());
+   output_ << "\n>\n";
+-  output_ << fn.name() << " ";
+-  if (fn.attribute_size() > 0)
+-    printSet("<", ",", ">", fn.attribute());
+-  printSet("(", ", ", ")", fn.input());
++  printId(fn.name());
++  output_ << " ";
++  if (fn.attribute_size() > 0 || fn.attribute_proto_size() > 0) {
++    output_ << "<";
++    bool first = true;
++    for (const auto& name : fn.attribute()) {
++      if (!first) output_ << ", ";
++      printId(name);
++      first = false;
++    }
++    for (const auto& attribute : fn.attribute_proto()) {
++      if (!first) output_ << ", ";
++      print(attribute);
++      first = false;
++    }
++    output_ << ">";
++  }
++  printIdSet("(", ", ", ")", fn.input());
+   output_ << " => ";
+-  printSet("(", ", ", ")", fn.output());
++  printIdSet("(", ", ", ")", fn.output());
+   output_ << "\n";
++  if (fn.value_info_size() > 0) {
++    printSet("<", ", ", ">", fn.value_info());
++    output_ << "\n";
++  }
+   print(fn.node());
+ }
+ 
+diff --git a/onnx/defs/tensor_proto_util.cc b/onnx/defs/tensor_proto_util.cc
+index eadffeff711cef5c150c2e9716b1def64358e430..5214d7b4d9227cd4be9f0883d661a5db0218d6e7 100644
+--- a/onnx/defs/tensor_proto_util.cc
++++ b/onnx/defs/tensor_proto_util.cc
+@@ -3,13 +3,51 @@
+  */
+ 
+ #include "tensor_proto_util.h"
++
++#include <limits>
++#include <string>
+ #include <vector>
+-#include "onnx/common/platform_helpers.h"
++
+ #include "onnx/defs/data_type_utils.h"
+ #include "onnx/defs/shape_inference.h"
+ 
+ namespace ONNX_NAMESPACE {
+ 
++namespace {
++
++int64_t TensorElementCount(const TensorProto& tensor) {
++  int64_t num_elements = 1;
++  for (const int64_t dim : tensor.dims()) {
++    if (dim < 0 || (dim != 0 && num_elements > std::numeric_limits<int64_t>::max() / dim)) {
++      fail_shape_inference("Invalid or overflowing dimensions for tensor: ", tensor.name());
++    }
++    num_elements *= dim;
++  }
++  return num_elements;
++}
++
++} // namespace
++
++int64_t RawDataElementCount(const TensorProto& tensor, size_t element_size, bool exact_fit) {
++  const int64_t num_elements = TensorElementCount(tensor);
++  const size_t size = tensor.raw_data().size();
++  // Divide rather than multiply so no product can overflow.
++  const auto available = static_cast<uint64_t>(size / element_size);
++  const auto required = static_cast<uint64_t>(num_elements);
++  if (exact_fit ? (available != required || size % element_size != 0) : available < required) {
++    fail_shape_inference(
++        "Data size mismatch. Tensor: ",
++        tensor.name(),
++        " has ",
++        size,
++        " bytes of raw_data for ",
++        num_elements,
++        " elements of size ",
++        element_size);
++  }
++  return num_elements;
++}
++
+ #define DEFINE_TO_TENSOR_ONE(type, enumType, field) \
+   template <>                                       \
+   TensorProto ToTensor<type>(const type& value) {   \
+@@ -36,7 +74,7 @@ namespace ONNX_NAMESPACE {
+   const std::vector<type> ParseData(const TensorProto* tensor_proto) {                                             \
+     if (!tensor_proto->has_data_type() || tensor_proto->data_type() == TensorProto_DataType_UNDEFINED) {           \
+       fail_shape_inference("The type of tensor: ", tensor_proto->name(), " is undefined so it cannot be parsed."); \
+-    } else if (tensor_proto->data_type() != tensorproto_datatype) {                                                \
++    } else if (tensor_proto->data_type() != (tensorproto_datatype)) {                                              \
+       fail_shape_inference(                                                                                        \
+           "ParseData type mismatch for tensor: ",                                                                  \
+           tensor_proto->name(),                                                                                    \
+@@ -45,25 +83,22 @@ namespace ONNX_NAMESPACE {
+           " Actual:",                                                                                              \
+           Utils::DataTypeUtils::ToDataTypeString(tensor_proto->data_type()));                                      \
+     }                                                                                                              \
+-    std::vector<type> res;                                                                                         \
+     if (tensor_proto->has_data_location() && tensor_proto->data_location() == TensorProto_DataLocation_EXTERNAL) { \
+       fail_shape_inference(                                                                                        \
+           "Cannot parse data from external tensors. Please ",                                                      \
+           "load external data into raw data for tensor: ",                                                         \
+           tensor_proto->name());                                                                                   \
+     } else if (!tensor_proto->has_raw_data()) {                                                                    \
++      const int64_t num_elements = TensorElementCount(*tensor_proto);                                             \
++      std::vector<type> res;                                                                                       \
+       const auto& data = tensor_proto->typed_data_fetch();                                                         \
+-      int expected_size = 1;                                                                                       \
+-      for (int i = 0; i < tensor_proto->dims_size(); ++i) {                                                        \
+-        expected_size *= tensor_proto->dims(i);                                                                    \
+-      }                                                                                                            \
+-      if (tensor_proto->dims_size() != 0 && data.size() != expected_size) {                                        \
++      if (data.size() != num_elements) {                                                                           \
+         fail_shape_inference(                                                                                      \
+             "Data size mismatch. Tensor: ",                                                                        \
+             tensor_proto->name(),                                                                                  \
+-            " expected size ",                                                                                     \
+-            expected_size,                                                                                         \
+-            " does not match the actual size",                                                                     \
++            " expected num elements ",                                                                             \
++            num_elements,                                                                                          \
++            " does not match the actual num elements ",                                                            \
+             data.size());                                                                                          \
+       }                                                                                                            \
+       res.insert(res.end(), data.begin(), data.end());                                                             \
+@@ -76,40 +111,7 @@ namespace ONNX_NAMESPACE {
+           " content is required to be stored in repeated bytes string_data field.",                                \
+           " raw_data type cannot be string.");                                                                     \
+     }                                                                                                              \
+-    /* The given tensor does have raw_data itself so parse it by given type */                                     \
+-    /* make copy as we may have to reverse bytes */                                                                \
+-    std::string raw_data = tensor_proto->raw_data();                                                               \
+-    if (raw_data.empty()) {                                                                                        \
+-      return res;                                                                                                  \
+-    }                                                                                                              \
+-    /* okay to remove const qualifier as we have already made a copy */                                            \
+-    char* bytes = const_cast<char*>(raw_data.c_str());                                                             \
+-    /* onnx is little endian serialized always-tweak byte order if needed */                                       \
+-    if (!is_processor_little_endian()) {                                                                           \
+-      const size_t element_size = sizeof(type);                                                                    \
+-      const size_t num_elements = raw_data.size() / element_size;                                                  \
+-      for (size_t i = 0; i < num_elements; ++i) {                                                                  \
+-        char* start_byte = bytes + i * element_size;                                                               \
+-        char* end_byte = start_byte + element_size - 1;                                                            \
+-        /* keep swapping */                                                                                        \
+-        for (size_t count = 0; count < element_size / 2; ++count) {                                                \
+-          char temp = *start_byte;                                                                                 \
+-          *start_byte = *end_byte;                                                                                 \
+-          *end_byte = temp;                                                                                        \
+-          ++start_byte;                                                                                            \
+-          --end_byte;                                                                                              \
+-        }                                                                                                          \
+-      }                                                                                                            \
+-    }                                                                                                              \
+-    /* raw_data.c_str()/bytes is a byte array and may not be properly  */                                          \
+-    /* aligned for the underlying type */                                                                          \
+-    /* We need to copy the raw_data.c_str()/bytes as byte instead of  */                                           \
+-    /* copying as the underlying type, otherwise we may hit memory   */                                            \
+-    /* misalignment issues on certain platforms, such as arm32-v7a */                                              \
+-    const size_t raw_data_size = raw_data.size();                                                                  \
+-    res.resize(raw_data_size / sizeof(type));                                                                      \
+-    memcpy(reinterpret_cast<char*>(res.data()), bytes, raw_data_size);                                             \
+-    return res;                                                                                                    \
++    return ParseRawData<type>(*tensor_proto);                                                                      \
+   }
+ 
+ DEFINE_TO_TENSOR_ONE(float, TensorProto_DataType_FLOAT, float)
+diff --git a/onnx/defs/tensor_proto_util.h b/onnx/defs/tensor_proto_util.h
+index 862b29c4010a4ce226ea3331d4c8d61551a685fe..5acdcdf43a01f2c699199860b137843e881da205 100644
+--- a/onnx/defs/tensor_proto_util.h
++++ b/onnx/defs/tensor_proto_util.h
+@@ -4,6 +4,14 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <type_traits>
++#include <vector>
++
++#include "onnx/common/platform_helpers.h"
+ #include "onnx/onnx-operators_pb.h"
+ 
+ namespace ONNX_NAMESPACE {
+@@ -17,4 +25,32 @@ TensorProto ToTensor(const std::vector<T>& values);
+ template <typename T>
+ const std::vector<T> ParseData(const TensorProto* tensor_proto);
+ 
++// Elements that dims implies, checked against raw_data's length. With exact_fit
++// the two must agree exactly; otherwise raw_data may hold trailing bytes, which
++// are ignored. Kept out of the template below so the error path is emitted once,
++// not per element type.
++ONNX_API int64_t RawDataElementCount(const TensorProto& tensor, size_t element_size, bool exact_fit);
++
++// Decode a tensor's raw_data as values of type T. Defined here rather than in
++// the .cc so callers can instantiate it for element types ParseData does not
++// cover. raw_data may be unaligned for T, so it is copied byte-wise.
++template <typename T>
++std::vector<T> ParseRawData(const TensorProto& tensor, bool exact_fit = false) {
++  static_assert(std::is_arithmetic_v<T>, "T must be an arithmetic type");
++  // num_elements <= raw_data.size(), so the cast cannot truncate.
++  const auto num_elements = static_cast<size_t>(RawDataElementCount(tensor, sizeof(T), exact_fit));
++  std::vector<T> values(num_elements);
++  if (num_elements != 0) {
++    std::memcpy(values.data(), tensor.raw_data().data(), num_elements * sizeof(T));
++    // raw_data is little-endian per the ONNX spec.
++    if (!is_processor_little_endian()) {
++      for (T& value : values) {
++        auto* start = reinterpret_cast<std::byte*>(&value);
++        std::reverse(start, start + sizeof(T));
++      }
++    }
++  }
++  return values;
++}
++
+ } // namespace ONNX_NAMESPACE
+diff --git a/onnx/external_data_helper.py b/onnx/external_data_helper.py
+index 0de5d501808b17ef49f425b3a402639913033236..30db877ac9757d31859a451906a439fa62c52994 100644
+--- a/onnx/external_data_helper.py
++++ b/onnx/external_data_helper.py
+@@ -3,12 +3,62 @@ import os
+ import re
+ import sys
+ import uuid
++import warnings
+ from itertools import chain
+-from typing import Callable, Iterable, Optional
++from typing import IO, Callable, Iterable, Optional
+ 
++import onnx.onnx_cpp2py_export.checker as c_checker
+ from onnx.onnx_pb import AttributeProto, GraphProto, ModelProto, TensorProto
+ 
+ 
++def _open_external_data_fd(
++    base_dir: str, location: str, tensor_name: str, read_only: bool
++) -> int:
++    """Open external data via C++ and return a CRT file descriptor."""
++    return c_checker._open_external_data(base_dir, location, tensor_name, read_only)
++
++
++# Security: 3-layer defense against malicious external_data entries (GHSA-538c-55jv-c5g9)
++#
++# Layer 1 (here) — Attribute whitelist: Only spec-defined keys are accepted.
++#   Unknown keys are warned and ignored, preventing arbitrary attribute injection (CWE-915).
++#
++# Layer 2 (ExternalDataInfo.__init__) — Bounds validation: offset and length must be
++#   non-negative integers. Catches invalid values at parse time (CWE-400).
++#
++# Layer 3 (load_external_data_for_tensor) — File-size validation: offset and length are
++#   checked against actual file size before reading. This is the critical safety net that
++#   prevents memory exhaustion regardless of how the model was constructed (CWE-400).
++#
++# 'basepath' is included because set_external_data() and model_container
++# write it to protobuf entries; it must survive save/load round-trips.
++_ALLOWED_EXTERNAL_DATA_KEYS = frozenset(
++    {"location", "offset", "length", "checksum", "basepath"}
++)
++_SORTED_ALLOWED_KEYS = sorted(_ALLOWED_EXTERNAL_DATA_KEYS)
++_MAX_UNKNOWN_KEYS_IN_WARNING = 10
++_MAX_KEY_DISPLAY_LENGTH = 100
++
++# Largest alignment boundary offsets may use; see `ExternalData.md`
++_MAX_EXTERNAL_DATA_PADDING = 64 * 1024
++
++
++def _parse_external_integer(value: str, field: str) -> int:
++    """Parse metadata without changing Python's process-wide decimal limit."""
++    text = value.strip()
++    if not re.fullmatch(r"[+-]?\d+(?:_\d+)*", text):
++        raise ValueError(f"External data {field} must be an integer")
++    negative = text.startswith("-")
++    digits = text.lstrip("+-").replace("_", "")
++    result = 0
++    for start in range(0, len(digits), 9):
++        chunk = digits[start : start + 9]
++        result = result * (10 ** len(chunk)) + int(chunk)
++    if negative and result:
++        raise ValueError(f"External data {field} must be non-negative")
++    return result
++
++
+ class ExternalDataInfo:
+     def __init__(self, tensor: TensorProto) -> None:
+         self.location = ""
+@@ -17,14 +67,72 @@ class ExternalDataInfo:
+         self.checksum = None
+         self.basepath = ""
+ 
++        unknown_keys: set[str] = set()
++        unknown_key_count = 0
+         for entry in tensor.external_data:
+-            setattr(self, entry.key, entry.value)
++            # Layer 1: reject unknown keys (CWE-915 defense-in-depth)
++            if entry.key in _ALLOWED_EXTERNAL_DATA_KEYS:
++                setattr(self, entry.key, entry.value)
++            else:
++                unknown_key_count += 1
++                if len(unknown_keys) < _MAX_UNKNOWN_KEYS_IN_WARNING:
++                    truncated = entry.key[:_MAX_KEY_DISPLAY_LENGTH]
++                    if len(entry.key) > _MAX_KEY_DISPLAY_LENGTH:
++                        truncated += "..."
++                    unknown_keys.add(truncated)
++
++        if unknown_keys:
++            shown = sorted(unknown_keys)
++            extra = unknown_key_count - len(shown)
++            key_list = repr(shown)
++            if extra > 0:
++                key_list += f" and {extra} more"
++            warnings.warn(
++                f"Ignoring unknown external data key(s) {key_list} "
++                f"for tensor {tensor.name!r}. "
++                f"Allowed keys: {_SORTED_ALLOWED_KEYS}",
++                stacklevel=2,
++            )
++
++        if self.offset is not None:
++            self.offset = _parse_external_integer(self.offset, "offset")
++        if self.length is not None:
++            self.length = _parse_external_integer(self.length, "length")
++
++
++def _validate_external_data_file_bounds(
++    data_file: IO[bytes],
++    info: ExternalDataInfo,
++    tensor_name: str,
++) -> bytes:
++    """Validate offset/length against actual file size and read data.
+ 
+-        if self.offset:
+-            self.offset = int(self.offset)
++    Layer 3 defense-in-depth (CWE-400): prevents memory exhaustion even if the
++    model was crafted via direct protobuf APIs that bypass Python parsing.
+ 
+-        if self.length:
+-            self.length = int(self.length)
++    Returns the raw bytes read from the file.
++    """
++    file_size = os.fstat(data_file.fileno()).st_size
++
++    if info.offset is not None:
++        if info.offset > file_size:
++            raise ValueError(
++                f"External data offset exceeds file size "
++                f"({file_size}) for tensor {tensor_name!r}"
++            )
++        data_file.seek(info.offset)
++
++    if info.length is not None:
++        read_start = info.offset if info.offset is not None else 0
++        available = file_size - read_start
++        if info.length > available:
++            raise ValueError(
++                f"External data length exceeds available data "
++                f"({available} bytes from offset {read_start}) "
++                f"for tensor {tensor_name!r}"
++            )
++        return data_file.read(info.length)
++    return data_file.read()
+ 
+ 
+ def load_external_data_for_tensor(tensor: TensorProto, base_dir: str) -> None:
+@@ -37,17 +145,11 @@ def load_external_data_for_tensor(tensor: TensorProto, base_dir: str) -> None:
+         base_dir: directory that contains the external data.
+     """
+     info = ExternalDataInfo(tensor)
+-    file_location = _sanitize_path(info.location)
+-    external_data_file_path = os.path.join(base_dir, file_location)
+-
+-    with open(external_data_file_path, "rb") as data_file:
+-        if info.offset:
+-            data_file.seek(info.offset)
+-
+-        if info.length:
+-            tensor.raw_data = data_file.read(info.length)
+-        else:
+-            tensor.raw_data = data_file.read()
++    fd = _open_external_data_fd(base_dir, info.location, tensor.name, True)
++    with os.fdopen(fd, "rb") as data_file:
++        tensor.raw_data = _validate_external_data_file_bounds(
++            data_file, info, tensor.name
++        )
+ 
+ 
+ def load_external_data_for_model(model: ModelProto, base_dir: str) -> None:
+@@ -79,7 +181,7 @@ def set_external_data(
+         raise ValueError(
+             "Tensor "
+             + tensor.name
+-            + "does not have raw_data field. Cannot set external data for this tensor."
++            + " does not have raw_data field. Cannot set external data for this tensor."
+         )
+ 
+     del tensor.external_data[:]
+@@ -163,33 +265,40 @@ def convert_model_from_external_data(model: ModelProto) -> None:
+ 
+ 
+ def save_external_data(tensor: TensorProto, base_path: str) -> None:
+-    """
+-    Writes tensor data to an external file according to information in the `external_data` field.
++    """Writes tensor data to an external file according to information in the `external_data` field.
++    The function checks the external is a valid name and located in folder `base_path`.
+ 
+     Arguments:
+         tensor (TensorProto): Tensor object to be serialized
+         base_path: System path of a folder where tensor data is to be stored
++
++    Raises:
++        ValueError: If the external file is invalid.
+     """
+     info = ExternalDataInfo(tensor)
+-    external_data_file_path = os.path.join(base_path, info.location)
+ 
+-    # Retrieve the tensor's data from raw_data or load external file
+     if not tensor.HasField("raw_data"):
+-        raise ValueError("raw_data field doesn't exist.")
+-
+-    # Create file if it doesn't exist
+-    if not os.path.isfile(external_data_file_path):
+-        with open(external_data_file_path, "ab"):
+-            pass
++        raise c_checker.ValidationError("raw_data field doesn't exist.")
+ 
+-    # Open file for reading and writing at random locations ('r+b')
+-    with open(external_data_file_path, "r+b") as data_file:
++    fd = _open_external_data_fd(base_path, info.location, tensor.name, False)
++    with os.fdopen(fd, "r+b") as data_file:
+         data_file.seek(0, 2)
+         if info.offset is not None:
+-            # Pad file to required offset if needed
++            # A tensor is written at the end of the file, optionally bumped forward by
++            # an alignment gap. The gap only aligns tensors that share a file, so it is
++            # always under one boundary. An offset before the end would overwrite data
++            # already in the file; one far past it would pad with an unbounded, untrusted
++            # amount of zeros. Reject both instead of writing.
+             file_size = data_file.tell()
+-            if info.offset > file_size:
+-                data_file.write(b"\0" * (info.offset - file_size))
++            padding = info.offset - file_size
++            if not 0 <= padding <= _MAX_EXTERNAL_DATA_PADDING:
++                raise c_checker.ValidationError(
++                    f"External data offset for tensor {tensor.name!r} "
++                    f"must be between the current file size ({file_size}) and "
++                    f"{file_size + _MAX_EXTERNAL_DATA_PADDING}."
++                )
++            if padding > 0:
++                data_file.write(b"\0" * padding)
+ 
+             data_file.seek(info.offset)
+         offset = data_file.tell()
+@@ -216,12 +325,10 @@ def _recursive_attribute_processor(
+             yield from func(graph)
+ 
+ 
+-def _get_initializer_tensors_from_graph(
+-    onnx_model_proto_graph: GraphProto,
+-) -> Iterable[TensorProto]:
++def _get_initializer_tensors_from_graph(graph: GraphProto, /) -> Iterable[TensorProto]:
+     """Create an iterator of initializer tensors from ONNX model graph."""
+-    yield from onnx_model_proto_graph.initializer
+-    for node in onnx_model_proto_graph.node:
++    yield from graph.initializer
++    for node in graph.node:
+         for attribute in node.attribute:
+             yield from _recursive_attribute_processor(
+                 attribute, _get_initializer_tensors_from_graph
+@@ -252,14 +359,6 @@ def _get_attribute_tensors(onnx_model_proto: ModelProto) -> Iterable[TensorProto
+     yield from _get_attribute_tensors_from_graph(onnx_model_proto.graph)
+ 
+ 
+-def _sanitize_path(path: str) -> str:
+-    """Remove path components which would allow traversing up a directory tree from a base path.
+-
+-    Note: This method is currently very basic and should be expanded.
+-    """
+-    return path.lstrip("/.")
+-
+-
+ def _is_valid_filename(filename: str) -> bool:
+     """Utility to check whether the provided filename is valid."""
+     exp = re.compile('^[^<>:;,?"*|/]+$')
+diff --git a/onnx/helper.py b/onnx/helper.py
+index cd251725117aa21b88175df30855aa0e47a8e687..0f68958ddf0437e0220813be62a94583bfc7444d 100644
+--- a/onnx/helper.py
++++ b/onnx/helper.py
+@@ -127,6 +127,7 @@ def make_node(
+     name: Optional[str] = None,
+     doc_string: Optional[str] = None,
+     domain: Optional[str] = None,
++    overload: Optional[str] = None,
+     **kwargs: Any,
+ ) -> NodeProto:
+     """Construct a NodeProto.
+@@ -139,6 +140,8 @@ def make_node(
+         doc_string (string, default None): optional documentation string for NodeProto
+         domain (string, default None): optional domain for NodeProto.
+             If it's None, we will just use default domain (which is empty)
++        overload (string, default None): optional field, used to
++            resolve calls to model-local functions
+         **kwargs (dict): the attributes of the node.  The acceptable values
+             are documented in :func:`make_attribute`.
+     Returns:
+@@ -155,6 +158,8 @@ def make_node(
+         node.doc_string = doc_string
+     if domain is not None:
+         node.domain = domain
++    if overload is not None:
++        node.overload = overload
+     if kwargs:
+         node.attribute.extend(
+             make_attribute(key, value)
+@@ -250,11 +255,15 @@ def make_function(
+     attributes: Optional[Sequence[str]] = None,
+     attribute_protos: Optional[Sequence[AttributeProto]] = None,
+     doc_string: Optional[str] = None,
++    overload: Optional[str] = None,
++    value_info: Optional[Sequence[ValueInfoProto]] = None,
+ ) -> FunctionProto:
+     if attributes is None:
+         attributes = []
+     if attribute_protos is None:
+         attribute_protos = []
++    if value_info is None:
++        value_info = []
+     f = FunctionProto()
+     f.domain = domain
+     f.name = fname
+@@ -266,6 +275,9 @@ def make_function(
+     f.attribute_proto.extend(attribute_protos)
+     if doc_string:
+         f.doc_string = doc_string
++    if overload is not None:
++        f.overload = overload
++    f.value_info.extend(value_info)
+     return f
+ 
+ 
+@@ -679,6 +691,15 @@ def get_attribute_value(attr: AttributeProto) -> Any:
+     raise ValueError(f"Unsupported ONNX attribute: {attr}")
+ 
+ 
++def get_node_attr_value(node: NodeProto, attr_name: str) -> Any:
++    matching = [x for x in node.attribute if x.name == attr_name]
++    if len(matching) > 1:
++        raise ValueError(f"Node has multiple attributes with name {attr_name}")
++    if len(matching) < 1:
++        raise ValueError(f"Node has no attribute with name {attr_name}")
++    return get_attribute_value(matching[0])
++
++
+ def make_empty_tensor_value_info(name: str) -> ValueInfoProto:
+     value_info_proto = ValueInfoProto()
+     value_info_proto.name = name
+diff --git a/onnx/inliner.py b/onnx/inliner.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..57880fbb611b43ceb8d0d5a0531cb69a03bb4879
+--- /dev/null
++++ b/onnx/inliner.py
+@@ -0,0 +1,48 @@
++# Copyright (c) ONNX Project Contributors
++#
++# SPDX-License-Identifier: Apache-2.0
++
++from __future__ import annotations
++
++import onnx
++import onnx.onnx_cpp2py_export.inliner as C  # noqa: N812
++
++
++def inline_local_functions(
++    model: onnx.ModelProto, convert_version: bool = False
++) -> onnx.ModelProto:
++    """Inline model-local functions in given model.
++
++    Arguments:
++        model: an ONNX ModelProto
++        convert_version: if true, try to apply automatic version-conversion to functions requiring a
++            different (ONNX) opset version from the model.
++    Returns:
++        ModelProto with all calls to model-local functions inlined (recursively)
++    """
++    result = C.inline_local_functions(model.SerializeToString(), convert_version)
++    inlined_model = onnx.ModelProto()
++    inlined_model.ParseFromString(result)
++    return inlined_model
++
++
++def inline_selected_functions(
++    model: onnx.ModelProto, function_ids: list[tuple[str, str]], exclude: bool = False
++) -> onnx.ModelProto:
++    """Inline selected model-local functions in given model.
++
++    Arguments:
++        model: an ONNX ModelProto
++        function_ids: list of functions to include/exclude when inlining. Each
++            element is a tuple of (function domain, function name).
++        exclude: if true, inlines all functions except those specified in function_ids.
++           if false, inlines all functions specified in function_ids.
++    Returns:
++        ModelProto with all calls to model-local functions inlined (recursively)
++    """
++    result = C.inline_selected_functions(
++        model.SerializeToString(), function_ids, exclude
++    )
++    inlined_model = onnx.ModelProto()
++    inlined_model.ParseFromString(result)
++    return inlined_model
+diff --git a/onnx/inliner/inliner.cc b/onnx/inliner/inliner.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3a39583738cec681ff970ffdbc4e865d2c69bc2
+--- /dev/null
++++ b/onnx/inliner/inliner.cc
+@@ -0,0 +1,592 @@
++// Copyright (c) ONNX Project Contributors
++
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <functional>
++
++#include "onnx/common/assertions.h"
++#include "onnx/common/constants.h"
++#include "onnx/common/interned_strings.h"
++#include "onnx/common/visitor.h"
++#include "onnx/inliner/inliner.h"
++#include "onnx/shape_inference/attribute_binder.h"
++#include "onnx/shape_inference/implementation.h"
++#include "onnx/version_converter/convert.h"
++
++namespace ONNX_NAMESPACE {
++namespace inliner {
++
++namespace { // internal/private API
++
++using namespace internal;
++
++// We use a string of the form "domain::name" as the key for a function id.
++using FunctionIdKey = std::string;
++
++FunctionIdKey GetFunctionId(const std::string& domain, const std::string& op, const std::string& overload) {
++  if (overload.empty())
++    return NormalizeDomain(domain) + "::" + op;
++  return NormalizeDomain(domain) + "::" + op + "::" + overload;
++}
++
++FunctionIdKey GetFunctionId(const FunctionProto& function) {
++  return GetFunctionId(function.domain(), function.name(), function.overload());
++}
++
++FunctionIdKey GetCalleeId(const NodeProto& node) {
++  return GetFunctionId(node.domain(), node.op_type(), node.overload());
++}
++
++using OpsetMapBase = std::unordered_map<std::string, int64_t>;
++
++// A representation of the opset versions required by a model or a function.
++// Used to check for compatibility between a model and a function or between
++// two functions.
++struct OpsetMap : public OpsetMapBase {
++ public:
++  // Construct a map representing the opset versions required by a model.
++  explicit OpsetMap(const ModelProto& model) {
++    (void)Add(model.opset_import());
++  }
++
++  // Adds the opset versions required by a function to the map. Returns true
++  // iff the function is compatible with the map, i.e., if the function does
++  // not require a different version for any domain already in the map.
++  bool Add(const FunctionProto& function) {
++    return Add(function.opset_import());
++  }
++
++  // Returns the set of mismatches in the opset requirements of given
++  // function and the map.
++  OpsetMapBase Mismatches(const FunctionProto& function) const {
++    return Mismatches(function.opset_import());
++  }
++
++ private:
++  OpsetMapBase Mismatches(const google::protobuf::RepeatedPtrField<OperatorSetIdProto>& list) const {
++    OpsetMapBase result;
++    for (const auto& pair : list) {
++      auto iter = this->find(NormalizeDomain(pair.domain()));
++      if ((iter != this->end()) && (iter->second != pair.version()))
++        result.insert(*iter);
++    }
++    return result;
++  }
++
++  bool Add(const google::protobuf::RepeatedPtrField<OperatorSetIdProto>& list) {
++    OpsetMapBase result;
++    for (const auto& pair : list) {
++      auto domain = NormalizeDomain(pair.domain());
++      auto version = pair.version();
++      auto iter = this->find(domain);
++      if (iter != this->end()) {
++        if (iter->second != version)
++          return false;
++      } else {
++        (*this)[domain] = version;
++      }
++    }
++    return true;
++  }
++};
++
++using RepeatedNodeProto = google::protobuf::RepeatedPtrField<NodeProto>;
++
++class NameGenerator : private Visitor {
++ public:
++  explicit NameGenerator(const GraphProto& graph) : index_(0) {
++    VisitGraph(graph);
++  }
++
++  explicit NameGenerator(const FunctionProto& function) : index_(0) {
++    VisitFunction(function);
++  }
++
++  // Creates a new unique name, based on a suggested name, and adds it to the set
++  // of existing names. Returns the newly created name.
++  std::string CreateNew(const std::string& suggested) {
++    std::string name = suggested;
++    while (existing_names_.count(name) > 0) {
++      name = suggested + "_" + std::to_string(index_++);
++    }
++    existing_names_.insert(name);
++    return name;
++  }
++
++  void Add(const std::string& name) {
++    // We don't bother to check for empty string names. Ok to add them.
++    existing_names_.insert(name);
++  }
++
++  bool ProcessGraph(const GraphProto& graph) override {
++    for (const auto& x : graph.input())
++      Add(x.name());
++    for (const auto& x : graph.initializer())
++      Add(x.name());
++    // Adding graph outputs is redundant for a valid graph, but we do it anyway,
++    // to produce better results for invalid graphs.
++    for (const auto& x : graph.output())
++      Add(x.name());
++    return true;
++  }
++
++  bool ProcessFunction(const FunctionProto& function) override {
++    for (const auto& x : function.input())
++      Add(x);
++    for (const auto& x : function.output())
++      Add(x);
++    return true;
++  }
++
++  bool ProcessNode(const NodeProto& node) override {
++    // We use a single name-space for node names and variable names, to keep name-generation simple.
++    Add(node.name());
++    for (const std::string& name : node.input()) {
++      Add(name);
++    }
++    for (const std::string& name : node.output()) {
++      Add(name);
++    }
++    return true;
++  }
++
++ private:
++  unsigned int index_;
++  std::unordered_set<std::string> existing_names_;
++};
++
++class InliningRenamer : private MutableVisitor {
++ private:
++  std::string suffix;
++  NameGenerator& generator;
++  std::vector<std::unordered_map<std::string, std::string>> rename_scopes{};
++
++  InliningRenamer(std::string suffix_, NameGenerator& generator_) : suffix(std::move(suffix_)), generator(generator_) {
++    // Create an empty mapping for the top-level scope.
++    rename_scopes.emplace_back();
++  }
++
++  // We use a two-level renaming scheme to generate names for variables when inlined in the
++  // main graph. First, we add a suffix (specific to the call-site being inlined).
++  // Thus, "temp" in called-function becomes "temp__1" for the first inlined function-call
++  // and "temp__2" for the second inlined function-call. In addition, there is a subsequent
++  // iterative check that ensures that this names does not clash with any pre-existing names,
++  // and tries another counter-based suffix in the case of a clash, stopping when successful.
++  std::string MakeUnique(const std::string& name) {
++    return generator.CreateNew(name + suffix);
++  }
++
++  // Replace given name with a unique version of the name, and cache the
++  // renaming-binding in current scope.
++  void Rename(std::string& name) {
++    auto new_name = MakeUnique(name);
++    auto& current_scope = rename_scopes.back();
++    current_scope[name] = new_name;
++    name = new_name;
++  }
++
++  void LookupOrRename(std::string& name, bool is_new_def) {
++    if (name.empty())
++      return;
++    for (auto i = rename_scopes.size(); i > 0; --i) {
++      const auto& map = rename_scopes[i - 1];
++      auto iter = map.find(name);
++      if (iter != map.end()) {
++        name = iter->second;
++        return;
++      }
++    }
++    if (is_new_def) {
++      Rename(name);
++    }
++    // Otherwise, it is a reference to an outer-scope variable that should not be renamed.
++  }
++
++  template <bool isOutput>
++  void Bind(
++      google::protobuf::RepeatedPtrField<std::string>& formals,
++      const google::protobuf::RepeatedPtrField<std::string>& actuals) {
++    // Every formal parameter name FP should be replace by the corresponding actual parameter name AP.
++    // However, if AP is empty, it is a missing optional parameter. This does not make any difference
++    // for inputs. However, for outputs we use a unique dummy name to handle the case that it
++    // is used in an output-context where it is not optional.
++    ONNX_ASSERTM(
++        actuals.size() <= formals.size(), "Number of actual parameters cannot exceed number of formal parameters");
++    auto& current_scope = rename_scopes.back();
++    int i = 0;
++    for (; i < actuals.size(); ++i) {
++      std::string& formal = *formals.Mutable(i);
++      std::string rename_as = actuals.Get(i);
++      if (isOutput)
++        if (rename_as.empty())
++          rename_as = MakeUnique(formal);
++      current_scope[formal] = rename_as;
++      if (!rename_as.empty())
++        formal = rename_as;
++    }
++    for (; i < formals.size(); ++i) {
++      std::string& formal = *formals.Mutable(i);
++      std::string rename_as = isOutput ? MakeUnique(formal) : std::string("");
++      current_scope[formal] = rename_as;
++      if (!rename_as.empty())
++        formal = rename_as;
++    }
++  }
++
++  // Process a node:
++  bool ProcessNode(NodeProto* node) override {
++    if (!node->name().empty())
++      node->set_name(MakeUnique(node->name()));
++
++    for (auto& x : *node->mutable_input()) {
++      LookupOrRename(x, false);
++    }
++    for (auto& y : *node->mutable_output()) {
++      LookupOrRename(y, true);
++    }
++    return true; // Process attribute subgraphs in traversal
++  }
++
++  // Process a sub-graph, contained as an attribute in a control-flow op node.
++  // Since we need both pre-processing and post-processing in the traversal, we
++  // override the VisitGraph method.
++  void VisitGraph(GraphProto* graph) override {
++    rename_scopes.emplace_back();
++    for (auto& x : *graph->mutable_input())
++      Rename(*x.mutable_name());
++    for (auto& init : *graph->mutable_initializer())
++      Rename(*init.mutable_name());
++    for (auto& y : *graph->mutable_output())
++      Rename(*y.mutable_name());
++    for (auto& n : *graph->mutable_node())
++      VisitNode(&n);
++    rename_scopes.pop_back();
++  }
++
++ public:
++  // Renames variables in a FunctionProto for inlining a particular call-site. This does the following:
++  // (i)  Rename all intermediate variables in the function to ensure that they are unique (wrt the main graph).
++  // (ii) Rename inputs and outputs using names of actual parameters.
++  static void
++  Rename(const NodeProto& callnode, FunctionProto& callee, std::string unique_suffix, NameGenerator& generator) {
++    InliningRenamer renamer(std::move(unique_suffix), generator);
++
++    renamer.Bind<false>(*callee.mutable_input(), callnode.input());
++    renamer.Bind<true>(*callee.mutable_output(), callnode.output());
++
++    renamer.VisitFunction(&callee);
++  }
++};
++
++// Identify the set of all "input" variables used by a given node.
++// This includes the variables listed as node.input, as well as
++// implicit inputs referred to in any graph-valued-attribute of the node.
++// In the case of variables referenced in sub-graphs, only non-local variables
++// are treated as implicit inputs.
++
++class ComputeInputs : private Visitor {
++ private:
++  std::vector<std::unordered_set<std::string>> namescopes;
++
++  bool InNestedScope() const {
++    return !namescopes.empty();
++  }
++
++  std::unordered_set<std::string>& CurrentScope() {
++    return namescopes.back();
++  }
++
++  bool IsLocalVar(const std::string& name) const {
++    for (auto& scope : namescopes) {
++      if (scope.count(name) > 0) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  void VisitGraph(const GraphProto& graph) override {
++    namescopes.emplace_back();
++    for (auto& x : graph.input())
++      CurrentScope().insert(x.name());
++    for (auto& init : graph.initializer())
++      CurrentScope().insert(init.name());
++    for (auto& n : graph.node())
++      VisitNode(n);
++    namescopes.pop_back();
++  }
++
++  bool ProcessNode(const NodeProto& node) override {
++    for (auto& var : node.input()) {
++      if (!var.empty() && !IsLocalVar(var)) {
++        result.push_back(var);
++      }
++    }
++    if (InNestedScope()) {
++      for (auto& var : node.output()) {
++        if (!var.empty()) {
++          CurrentScope().insert(var);
++        }
++      }
++    }
++    return true; // process sub-graphs
++  }
++
++ public:
++  std::vector<std::string> result;
++
++  ComputeInputs(const NodeProto& node) {
++    result.reserve(node.input_size());
++    VisitNode(node);
++  }
++};
++
++std::vector<std::string> GetUsedVars(const NodeProto& node) {
++  return ComputeInputs(node).result;
++}
++
++using ConstNodeMap = std::unordered_map<std::string, const NodeProto*>;
++
++ConstNodeMap FindConstantNodes(const GraphProto& graph) {
++  ConstNodeMap result;
++  for (const NodeProto& node : graph.node()) {
++    if (IsOnnxDomain(node.domain()) && (node.op_type() == "Constant")) {
++      result[node.output(0)] = &node;
++    }
++  }
++  return result;
++}
++
++const TypeProto& GetType(const ModelProto& model, std::string var) {
++  for (auto& vi : model.graph().value_info()) {
++    if (vi.name() == var)
++      return vi.type();
++  }
++  for (auto& vi : model.graph().input()) {
++    if (vi.name() == var)
++      return vi.type();
++  }
++  for (auto& vi : model.graph().output()) {
++    if (vi.name() == var)
++      return vi.type();
++  }
++  ONNX_ASSERTM(false, "Type unknown for %s", var.c_str());
++}
++
++void ConvertVersion(ModelProto& model, const NodeProto& call_node, FunctionProto& function, int target_version) {
++  shape_inference::InferShapes(model);
++
++  ModelProto function_as_model;
++  function_as_model.set_ir_version(model.ir_version());
++  *function_as_model.mutable_opset_import() = function.opset_import();
++
++  GraphProto& graph = *function_as_model.mutable_graph();
++  // The graph's inputs are all the variables used in the call_node.
++  auto used_vars = GetUsedVars(call_node);
++  auto constant_node_map = FindConstantNodes(model.graph());
++
++  RepeatedNodeProto& function_nodes = *function.mutable_node();
++  RepeatedNodeProto& nodes = *graph.mutable_node();
++  nodes.Reserve(function_nodes.size() + used_vars.size());
++
++  auto* inputs = graph.mutable_input();
++  for (const auto& var : used_vars) {
++    auto* new_input = inputs->Add();
++    new_input->set_name(var);
++    *new_input->mutable_type() = GetType(model, var);
++    // Create a copy of constants used by the call_node.
++    // We do not handle initializers-as-constants for now.
++    auto it = constant_node_map.find(var);
++    if (it != constant_node_map.end()) {
++      *nodes.Add() = *(it->second);
++    }
++  }
++
++  // outputs: from call_node node outputs
++  auto* outputs = graph.mutable_output();
++  for (const auto& var : call_node.output()) {
++    if (!var.empty()) {
++      auto* new_output = outputs->Add();
++      new_output->set_name(var);
++      *new_output->mutable_type() = GetType(model, var);
++    }
++  }
++
++  // TODO: Use std::move when it is fully supported on all protobuf platforms used
++  for (auto& function_node : function_nodes)
++    *nodes.Add() = function_node;
++  function_nodes.Clear();
++
++  auto converted = ONNX_NAMESPACE::version_conversion::ConvertVersion(function_as_model, target_version);
++
++  function_nodes.Swap(converted.mutable_graph()->mutable_node());
++
++  // Append new initializers to main graph initializers
++  for (auto& added_initializer : converted.graph().initializer())
++    *model.mutable_graph()->mutable_initializer()->Add() = added_initializer;
++  for (auto& added_initializer : converted.graph().sparse_initializer())
++    *model.mutable_graph()->mutable_sparse_initializer()->Add() = added_initializer;
++}
++
++constexpr int64_t kNoConversion = -1;
++using FunctionMap = std::unordered_map<FunctionIdKey, std::pair<const FunctionProto*, int64_t>>;
++
++using NodeList = google::protobuf::RepeatedPtrField<NodeProto>;
++
++// Shared utility used for inlining into either a GraphProto or a FunctionProto.
++void InlineFunctions(NodeList& nodes, const FunctionMap& map, NameGenerator& name_generator, ModelProto* model) {
++  NodeList original_nodes;
++  // Move all nodes into original_nodes
++  original_nodes.Swap(&nodes);
++
++  int inline_count = 0;
++  std::function<void(NodeProto & node)> append_node = [&](NodeProto& node) {
++    FunctionProto callee;
++    auto iter = map.find(GetCalleeId(node));
++    if (iter != map.end()) {
++      callee = *iter->second.first;
++      int64_t target_version = iter->second.second;
++      // Bind attribute parameters
++      internal::AttributeBinder::BindAttributes(node, callee);
++
++      // Rename variable names in callee
++      InliningRenamer::Rename(node, callee, "__" + std::to_string(++inline_count), name_generator);
++      if (target_version != kNoConversion) {
++        ONNX_ASSERTM(
++            model != nullptr,
++            "Internal Error: Inlining function %s::%s requires version conversion, "
++            "but version conversion is supported only for models, not functions.",
++            callee.domain().c_str(),
++            callee.name().c_str());
++        ConvertVersion(*model, node, callee, target_version);
++      }
++      // Append nodes of called function
++      for (auto& callee_node : *callee.mutable_node())
++        append_node(callee_node);
++    } else {
++      // Append node without inlining.
++      // TODO: use std::move instead of copying. Use of move doesn't seem to work with
++      // protobuf in some platforms/settings. [nodes->Add(std::move(node));]
++      *nodes.Add() = node;
++    }
++  };
++  for (auto& node : original_nodes) {
++    append_node(node);
++  }
++}
++
++void InlineFunctions(ModelProto& model, FunctionMap& map) {
++  auto* graph = model.mutable_graph();
++  NameGenerator name_generator(*graph);
++  auto* nodes = graph->mutable_node();
++  InlineFunctions(*nodes, map, name_generator, &model);
++}
++
++void InlineFunctions(FunctionProto& function, FunctionMap& map) {
++  NameGenerator name_generator(function);
++  InlineFunctions(*function.mutable_node(), map, name_generator, nullptr);
++}
++
++class VectorSet : public FunctionIdSet {
++ public:
++  VectorSet(FunctionIdVector&& function_ids, bool invert) : function_ids_(std::move(function_ids)), invert_(invert) {}
++
++  bool Contains(const std::string& function_domain, const std::string& function_name) const override {
++    bool found =
++        std::find(function_ids_.begin(), function_ids_.end(), std::make_pair(function_domain, function_name)) !=
++        function_ids_.end();
++    return invert_ ? !found : found;
++  }
++
++ private:
++  FunctionIdVector function_ids_;
++  bool invert_;
++};
++
++} // namespace
++
++// Public API implementation:
++
++std::unique_ptr<FunctionIdSet> ONNX_NAMESPACE::inliner::FunctionIdSet::Create(
++    FunctionIdVector&& function_ids,
++    bool invert) {
++  auto* p = new VectorSet(std::move(function_ids), invert);
++  return std::unique_ptr<FunctionIdSet>(p);
++}
++
++void InlineLocalFunctions(ModelProto& model, bool convert_version) {
++  OpsetMap model_imports(model);
++  FunctionMap map;
++
++  // For every function, we check if there is a mismatch between the opset versions
++  // required for the function and the model. If there is no mismatch, we can inline
++  // this function. If there is a mismatch only for the standard ONNX domain, we
++  // can inline after version-conversion (if the version-conversion is successful).
++  // Otherwise, we cannot inline, since currently version-conversion supports only
++  // standard ONNX domain.
++
++  for (auto& function : model.functions()) {
++    auto mismatches = model_imports.Mismatches(function);
++    auto iter = mismatches.find(ONNX_DOMAIN);
++    int64_t target_onnx_version = kNoConversion;
++    if (convert_version && (iter != mismatches.end())) {
++      target_onnx_version = iter->second;
++      mismatches.erase(iter);
++    }
++    if (mismatches.empty()) {
++      map[GetFunctionId(function)] = std::pair<const FunctionProto*, int64_t>(&function, target_onnx_version);
++    }
++  }
++
++  InlineFunctions(model, map);
++
++  // Remove all model-local functions. We do not remove functions with a mis-matched
++  // opset version. They need to be handled some other way, eg., using a version-adapter.
++  auto* local_functions = model.mutable_functions();
++  for (auto it = local_functions->begin(); it != local_functions->end();) {
++    if (map.count(GetFunctionId(*it)) > 0)
++      it = local_functions->erase(it);
++    else
++      ++it;
++  }
++}
++
++void InlineSelectedFunctions(ModelProto& model, const FunctionIdSet& to_inline) {
++  OpsetMap model_imports(model);
++  FunctionMap map;
++  std::vector<FunctionProto*> non_inlined_functions;
++
++  // If there is any mismatch between the opset versions required for any of the
++  // functions and the model, the inliner will fail.
++
++  for (auto& function : *model.mutable_functions()) {
++    // auto& function = *function_ptr;
++    if (!model_imports.Add(function))
++      ONNX_THROW("Model has functions with incompatible opset versions.");
++    if (to_inline.Contains(function.domain(), function.name())) {
++      map[GetFunctionId(function)] = std::pair<const FunctionProto*, int64_t>(&function, kNoConversion);
++    } else {
++      non_inlined_functions.push_back(&function);
++    }
++  }
++
++  InlineFunctions(model, map);
++
++  for (auto* function_ptr : non_inlined_functions) {
++    InlineFunctions(*function_ptr, map);
++  }
++
++  // Remove all inlined model-local functions.
++  auto* local_functions = model.mutable_functions();
++  for (auto it = local_functions->begin(); it != local_functions->end();) {
++    if (map.count(GetFunctionId(*it)) > 0)
++      it = local_functions->erase(it);
++    else
++      ++it;
++  }
++}
++
++} // namespace inliner
++} // namespace ONNX_NAMESPACE
+diff --git a/onnx/inliner/inliner.h b/onnx/inliner/inliner.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c4c5179f884c9aefe421eb010fc42b25b88a6b3
+--- /dev/null
++++ b/onnx/inliner/inliner.h
+@@ -0,0 +1,53 @@
++// Copyright (c) ONNX Project Contributors
++
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "onnx/onnx_pb.h"
++
++namespace ONNX_NAMESPACE {
++namespace inliner {
++
++// IR version 10 introduces overloaded function names. The following APIs to specify
++// functions to be inlined currently allow only specifying (domain, name). Thus,
++// either all overloads of a function are inlined or none.
++
++// A FunctionId is a pair of strings (domain, function name).
++using FunctionId = std::pair<std::string, std::string>;
++
++// A vector of FunctionIds.
++using FunctionIdVector = std::vector<FunctionId>;
++
++// Interface used to represent a set of function ids for the inliner.
++class FunctionIdSet {
++ public:
++  virtual bool Contains(const std::string& function_domain, const std::string& function_name) const = 0;
++  virtual ~FunctionIdSet() = default;
++
++  // Factory methods for creating FunctionIdSet instances.
++
++  // Creates a set representing the elements in the given vector, if invert is false.
++  // Otherwise, creates a set representing elements not in the given vector.
++  static std::unique_ptr<FunctionIdSet> Create(FunctionIdVector&& function_ids, bool invert = false);
++};
++
++// Inlines the model-local functions in the given model that are in the given set.
++// The inlined functions are removed from the model's list of functions as well.
++
++void InlineSelectedFunctions(ModelProto& model, const FunctionIdSet& to_inline);
++
++// Inlines all model-local functions in the given model. This supports version
++// conversion, an advanced feature that is not enabled by default. When enabled,
++// the inliner will attempt to convert the version of the inlined function to
++// match the version of the model. If not enabled, the inliner will only inline
++// functions that use opset versions that are compatible with the model.
++void InlineLocalFunctions(ModelProto& model, bool convert_version = false);
++
++} // namespace inliner
++} // namespace ONNX_NAMESPACE
+diff --git a/onnx/onnx-ml.proto b/onnx/onnx-ml.proto
+index a45893f177be37d77c275d5d574419a679d7167b..d60587ca2915abc39208e1582ad5ee61ac33ea1b 100644
+--- a/onnx/onnx-ml.proto
++++ b/onnx/onnx-ml.proto
+@@ -210,6 +210,8 @@ message NodeProto {
+   optional string op_type = 4;  // namespace Operator
+   // The domain of the OperatorSet that specifies the operator named by op_type.
+   optional string domain = 7;   // namespace Domain
++  // Overload identifier, used only to map this to a model-local function.
++  optional string overload = 8;
+ 
+   // Additional named attributes.
+   repeated AttributeProto attribute = 5;
+@@ -400,7 +402,7 @@ message ModelProto {
+ 
+   // A list of function protos local to the model.
+   //
+-  // Name of the function "FunctionProto.name" should be unique within the domain "FunctionProto.domain".
++  // The (domain, name, overload) tuple must be unique across the function protos in this list.
+   // In case of any conflicts the behavior (whether the model local functions are given higher priority,
+   // or standard opserator sets are given higher priotity or this is treated as error) is defined by
+   // the runtimes.
+@@ -779,9 +781,8 @@ enum OperatorStatus {
+ }
+ 
+ message FunctionProto {
+-  // The name of the function, similar usage of op_type in OperatorProto.
+-  // Combined with FunctionProto.domain, this forms the unique identity of
+-  // the FunctionProto.
++  // The name of the function, similar to op_type in NodeProto.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   optional string name = 1;
+ 
+   // Deprecated since IR Version 8
+@@ -828,9 +829,19 @@ message FunctionProto {
+ 
+   repeated OperatorSetIdProto opset_import = 9;
+ 
+-  // The domain which this function belongs to. Combined with FunctionProto.name, this forms the unique identity of
+-  // the FunctionProto.
++  // The domain which this function belongs to.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   optional string domain = 10;
++
++  // The overload identifier of the function.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
++  optional string overload = 13;
++
++  // Information for the values in the function. The ValueInfoProto.name's
++  // must be distinct and refer to names in the function (including inputs,
++  // outputs, and intermediate values). It is optional for a value to appear
++  // in value_info list.
++  repeated ValueInfoProto value_info = 12;
+ }
+ 
+ 
+diff --git a/onnx/onnx-ml.proto3 b/onnx/onnx-ml.proto3
+index 9ec9f776276ccf9b299651eb3bdeb3724a87f0dd..c0a7e6b996a30688299a73c0dd49f769745c6a65 100644
+--- a/onnx/onnx-ml.proto3
++++ b/onnx/onnx-ml.proto3
+@@ -210,6 +210,8 @@ message NodeProto {
+   string op_type = 4;  // namespace Operator
+   // The domain of the OperatorSet that specifies the operator named by op_type.
+   string domain = 7;   // namespace Domain
++  // Overload identifier, used only to map this to a model-local function.
++  string overload = 8;
+ 
+   // Additional named attributes.
+   repeated AttributeProto attribute = 5;
+@@ -400,7 +402,7 @@ message ModelProto {
+ 
+   // A list of function protos local to the model.
+   //
+-  // Name of the function "FunctionProto.name" should be unique within the domain "FunctionProto.domain".
++  // The (domain, name, overload) tuple must be unique across the function protos in this list.
+   // In case of any conflicts the behavior (whether the model local functions are given higher priority,
+   // or standard opserator sets are given higher priotity or this is treated as error) is defined by
+   // the runtimes.
+@@ -779,9 +781,8 @@ enum OperatorStatus {
+ }
+ 
+ message FunctionProto {
+-  // The name of the function, similar usage of op_type in OperatorProto.
+-  // Combined with FunctionProto.domain, this forms the unique identity of
+-  // the FunctionProto.
++  // The name of the function, similar to op_type in NodeProto.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   string name = 1;
+ 
+   // Deprecated since IR Version 8
+@@ -828,9 +829,19 @@ message FunctionProto {
+ 
+   repeated OperatorSetIdProto opset_import = 9;
+ 
+-  // The domain which this function belongs to. Combined with FunctionProto.name, this forms the unique identity of
+-  // the FunctionProto.
++  // The domain which this function belongs to.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   string domain = 10;
++
++  // The overload identifier of the function.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
++  string overload = 13;
++
++  // Information for the values in the function. The ValueInfoProto.name's
++  // must be distinct and refer to names in the function (including inputs,
++  // outputs, and intermediate values). It is optional for a value to appear
++  // in value_info list.
++  repeated ValueInfoProto value_info = 12;
+ }
+ 
+ 
+diff --git a/onnx/onnx.in.proto b/onnx/onnx.in.proto
+index 139084040569bff04407ea8254bf5932aa21c9b3..7ced658a519265216e3997ffbfedc1b1064d6e82 100644
+--- a/onnx/onnx.in.proto
++++ b/onnx/onnx.in.proto
+@@ -207,6 +207,8 @@ message NodeProto {
+   optional string op_type = 4;  // namespace Operator
+   // The domain of the OperatorSet that specifies the operator named by op_type.
+   optional string domain = 7;   // namespace Domain
++  // Overload identifier, used only to map this to a model-local function.
++  optional string overload = 8;
+ 
+   // Additional named attributes.
+   repeated AttributeProto attribute = 5;
+@@ -397,7 +399,7 @@ message ModelProto {
+ 
+   // A list of function protos local to the model.
+   //
+-  // Name of the function "FunctionProto.name" should be unique within the domain "FunctionProto.domain".
++  // The (domain, name, overload) tuple must be unique across the function protos in this list.
+   // In case of any conflicts the behavior (whether the model local functions are given higher priority,
+   // or standard opserator sets are given higher priotity or this is treated as error) is defined by
+   // the runtimes.
+@@ -780,9 +782,8 @@ enum OperatorStatus {
+ }
+ 
+ message FunctionProto {
+-  // The name of the function, similar usage of op_type in OperatorProto.
+-  // Combined with FunctionProto.domain, this forms the unique identity of
+-  // the FunctionProto.
++  // The name of the function, similar to op_type in NodeProto.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   optional string name = 1;
+ 
+   // Deprecated since IR Version 8
+@@ -829,8 +830,18 @@ message FunctionProto {
+ 
+   repeated OperatorSetIdProto opset_import = 9;
+ 
+-  // The domain which this function belongs to. Combined with FunctionProto.name, this forms the unique identity of
+-  // the FunctionProto.
++  // The domain which this function belongs to.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   optional string domain = 10;
++
++  // The overload identifier of the function.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
++  optional string overload = 13;
++
++  // Information for the values in the function. The ValueInfoProto.name's
++  // must be distinct and refer to names in the function (including inputs,
++  // outputs, and intermediate values). It is optional for a value to appear
++  // in value_info list.
++  repeated ValueInfoProto value_info = 12;
+ }
+ 
+diff --git a/onnx/onnx.proto b/onnx/onnx.proto
+index 9c287dd2c20cfbbb11a5d25e396d5f735b9a00d1..a9cea50a4448a0abd3afd30bbbc1cc8f6748b352 100644
+--- a/onnx/onnx.proto
++++ b/onnx/onnx.proto
+@@ -208,6 +208,8 @@ message NodeProto {
+   optional string op_type = 4;  // namespace Operator
+   // The domain of the OperatorSet that specifies the operator named by op_type.
+   optional string domain = 7;   // namespace Domain
++  // Overload identifier, used only to map this to a model-local function.
++  optional string overload = 8;
+ 
+   // Additional named attributes.
+   repeated AttributeProto attribute = 5;
+@@ -398,7 +400,7 @@ message ModelProto {
+ 
+   // A list of function protos local to the model.
+   //
+-  // Name of the function "FunctionProto.name" should be unique within the domain "FunctionProto.domain".
++  // The (domain, name, overload) tuple must be unique across the function protos in this list.
+   // In case of any conflicts the behavior (whether the model local functions are given higher priority,
+   // or standard opserator sets are given higher priotity or this is treated as error) is defined by
+   // the runtimes.
+@@ -763,9 +765,8 @@ enum OperatorStatus {
+ }
+ 
+ message FunctionProto {
+-  // The name of the function, similar usage of op_type in OperatorProto.
+-  // Combined with FunctionProto.domain, this forms the unique identity of
+-  // the FunctionProto.
++  // The name of the function, similar to op_type in NodeProto.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   optional string name = 1;
+ 
+   // Deprecated since IR Version 8
+@@ -812,9 +813,19 @@ message FunctionProto {
+ 
+   repeated OperatorSetIdProto opset_import = 9;
+ 
+-  // The domain which this function belongs to. Combined with FunctionProto.name, this forms the unique identity of
+-  // the FunctionProto.
++  // The domain which this function belongs to.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   optional string domain = 10;
++
++  // The overload identifier of the function.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
++  optional string overload = 13;
++
++  // Information for the values in the function. The ValueInfoProto.name's
++  // must be distinct and refer to names in the function (including inputs,
++  // outputs, and intermediate values). It is optional for a value to appear
++  // in value_info list.
++  repeated ValueInfoProto value_info = 12;
+ }
+ 
+ 
+diff --git a/onnx/onnx.proto3 b/onnx/onnx.proto3
+index 79e070b66b55db4cce1694de99b7a407701edb7f..ee676c8adadede217b23c04154a7cdb1e9094d8d 100644
+--- a/onnx/onnx.proto3
++++ b/onnx/onnx.proto3
+@@ -208,6 +208,8 @@ message NodeProto {
+   string op_type = 4;  // namespace Operator
+   // The domain of the OperatorSet that specifies the operator named by op_type.
+   string domain = 7;   // namespace Domain
++  // Overload identifier, used only to map this to a model-local function.
++  string overload = 8;
+ 
+   // Additional named attributes.
+   repeated AttributeProto attribute = 5;
+@@ -398,7 +400,7 @@ message ModelProto {
+ 
+   // A list of function protos local to the model.
+   //
+-  // Name of the function "FunctionProto.name" should be unique within the domain "FunctionProto.domain".
++  // The (domain, name, overload) tuple must be unique across the function protos in this list.
+   // In case of any conflicts the behavior (whether the model local functions are given higher priority,
+   // or standard opserator sets are given higher priotity or this is treated as error) is defined by
+   // the runtimes.
+@@ -763,9 +765,8 @@ enum OperatorStatus {
+ }
+ 
+ message FunctionProto {
+-  // The name of the function, similar usage of op_type in OperatorProto.
+-  // Combined with FunctionProto.domain, this forms the unique identity of
+-  // the FunctionProto.
++  // The name of the function, similar to op_type in NodeProto.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   string name = 1;
+ 
+   // Deprecated since IR Version 8
+@@ -812,9 +813,19 @@ message FunctionProto {
+ 
+   repeated OperatorSetIdProto opset_import = 9;
+ 
+-  // The domain which this function belongs to. Combined with FunctionProto.name, this forms the unique identity of
+-  // the FunctionProto.
++  // The domain which this function belongs to.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
+   string domain = 10;
++
++  // The overload identifier of the function.
++  // This is part of the unique-id (domain, name, overload) of FunctionProtos in a model.
++  string overload = 13;
++
++  // Information for the values in the function. The ValueInfoProto.name's
++  // must be distinct and refer to names in the function (including inputs,
++  // outputs, and intermediate values). It is optional for a value to appear
++  // in value_info list.
++  repeated ValueInfoProto value_info = 12;
+ }
+ 
+ 
+diff --git a/onnx/onnx_cpp2py_export/checker.pyi b/onnx/onnx_cpp2py_export/checker.pyi
+index e71c39e0c550be6e196885465005a9ff6bf9f865..d087d0c9a953a283e18d447f7342be01b9ffa13f 100644
+--- a/onnx/onnx_cpp2py_export/checker.pyi
++++ b/onnx/onnx_cpp2py_export/checker.pyi
+@@ -13,5 +13,8 @@ def check_attribute(bytes: bytes, checker_context: CheckerContext) -> None: ...
+ def check_node(bytes: bytes, checker_context: CheckerContext) -> None: ...
+ def check_function(bytes: bytes, checker_context: CheckerContext) -> None: ...
+ def check_graph(bytes: bytes, checker_context: CheckerContext) -> None: ...
+-def check_model(bytes: bytes, full_check: bool) -> None: ...
+-def check_model_path(path: str, full_check: bool) -> None: ...
++def check_model(bytes: bytes, full_check: bool, skip_opset_compatibility_check: bool) -> None: ...
++def check_model_path(path: str, full_check: bool, skip_opset_compatibility_check: bool) -> None: ...
++def _open_external_data(
++    base_dir: str, location: str, tensor_name: str, read_only: bool
++) -> int: ...
+diff --git a/onnx/onnx_cpp2py_export/inliner.pyi b/onnx/onnx_cpp2py_export/inliner.pyi
+new file mode 100644
+index 0000000000000000000000000000000000000000..52b3c899ae93fe0a20044fd75b8519178a2128a3
+--- /dev/null
++++ b/onnx/onnx_cpp2py_export/inliner.pyi
+@@ -0,0 +1,21 @@
++# Copyright (c) ONNX Project Contributors
++#
++# SPDX-License-Identifier: Apache-2.0
++
++from __future__ import annotations
++
++def inline_local_functions(model: bytes, convert_version: bool) -> bytes:
++    """
++    Inlines calls to model-local function in input model and returns it.
++    Both input and output are serialized ModelProtos.
++    """
++    ...
++
++def inline_selected_functions(model: bytes, function_ids: list[tuple[str,str]], exclude: bool) -> bytes:
++    """
++    Inlines calls to selected model-local functions in input model and returns it.
++    Inlines all functions specified in function_ids, unless exclude is true, in which
++    case it inlines all functions except those specified in function_ids.
++    Both input and output are serialized ModelProtos.
++    """
++    ...
+diff --git a/onnx/onnx_cpp2py_export/parser.pyi b/onnx/onnx_cpp2py_export/parser.pyi
+index 1cdb1c0a9cc17a85992058eb6fc49103730579e7..5cbed57c5c99211686b9ddb549ec0223b668480c 100644
+--- a/onnx/onnx_cpp2py_export/parser.pyi
++++ b/onnx/onnx_cpp2py_export/parser.pyi
+@@ -23,3 +23,11 @@ def parse_function(function: str) -> Tuple[bool, bytes, bytes]:
+     Otherwise, error-message contains a string describing the parse error.
+     """
+     ...
++
++def parse_node(node: str) -> Tuple[bool, bytes, bytes]:
++    """
++    Returns (success-flag, error-message, serialized-proto).
++    If success-flag is true, then serialized-proto contains the parsed NodeProto.
++    Otherwise, error-message contains a string describing the parse error.
++    """
++    ...
+diff --git a/onnx/onnx_cpp2py_export/printer.pyi b/onnx/onnx_cpp2py_export/printer.pyi
+index 593e659c8e0650c8822d10095458ec7e0aa7496f..5ca4df0906cca1cba9dde94b7e36ef746399a0a9 100644
+--- a/onnx/onnx_cpp2py_export/printer.pyi
++++ b/onnx/onnx_cpp2py_export/printer.pyi
+@@ -1,3 +1,4 @@
+ def function_to_text(serialized_function_proto: bytes) -> str: ...
+ def graph_to_text(serialized_graph_proto: bytes) -> str: ...
+ def model_to_text(serialized_model_proto: bytes) -> str: ...
++def node_to_text(serialized_node_proto: bytes) -> str: ...
+diff --git a/onnx/parser.py b/onnx/parser.py
+index 5fb61d8f2e101841969088ea72f24a9ebed387f7..28e74745a655e67b29e694704f2fad3658cd2d12 100644
+--- a/onnx/parser.py
++++ b/onnx/parser.py
+@@ -51,3 +51,19 @@ def parse_function(function_text: str) -> onnx.FunctionProto:
+         function_proto.ParseFromString(function_proto_str)
+         return function_proto
+     raise ParseError(msg)
++
++
++def parse_node(node_text: str) -> onnx.NodeProto:
++    """Parse a string to build a NodeProto.
++
++    Arguments:
++        node_text: formatted string
++    Returns:
++        NodeProto
++    """
++    (success, msg, node_proto_str) = C.parse_node(node_text)
++    if success:
++        node_proto = onnx.NodeProto()
++        node_proto.ParseFromString(node_proto_str)
++        return node_proto
++    raise ParseError(msg)
+diff --git a/onnx/printer.py b/onnx/printer.py
+index 5699ee7c10f1a26136ebc121d03cdea6b842f031..5e802abaa8e3f1e7b01c221c0ce7dfdbb209f086 100644
+--- a/onnx/printer.py
++++ b/onnx/printer.py
+@@ -6,11 +6,17 @@ import onnx
+ import onnx.onnx_cpp2py_export.printer as C  # noqa: N812
+ 
+ 
+-def to_text(proto: Union[onnx.ModelProto, onnx.FunctionProto, onnx.GraphProto]) -> str:
++def to_text(
++    proto: Union[
++        onnx.ModelProto, onnx.FunctionProto, onnx.GraphProto, onnx.NodeProto
++    ],
++) -> str:
+     if isinstance(proto, onnx.ModelProto):
+         return C.model_to_text(proto.SerializeToString())
+     if isinstance(proto, onnx.FunctionProto):
+         return C.function_to_text(proto.SerializeToString())
+     if isinstance(proto, onnx.GraphProto):
+         return C.graph_to_text(proto.SerializeToString())
++    if isinstance(proto, onnx.NodeProto):
++        return C.node_to_text(proto.SerializeToString())
+     raise TypeError("Unsupported argument type.")
+diff --git a/onnx/shape_inference/attribute_binder.h b/onnx/shape_inference/attribute_binder.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ece2b43821d2c0aed76d4862f2a57ff69d143e6
+--- /dev/null
++++ b/onnx/shape_inference/attribute_binder.h
+@@ -0,0 +1,67 @@
++// Copyright (c) ONNX Project Contributors
++
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#pragma once
++#include "onnx/common/visitor.h"
++
++namespace ONNX_NAMESPACE {
++namespace internal { // internal/private API
++
++using AttributeMap = std::unordered_map<std::string, const AttributeProto*>;
++
++// Class for binding formal attribute-parameters (in a node or graph) to their values.
++
++class AttributeBinder : public MutableVisitor {
++ public:
++  AttributeBinder(const AttributeMap& attr_map) : attr_map_(attr_map) {}
++
++  // Binding a formal attribute-parameter to a value may, as a special case, also
++  // remove the attribute from the list of attributes of a node (when the attribute
++  // has no specified value). Hence, we need to do the processing at a Node level
++  // rather than an attribute level.
++  void VisitNode(NodeProto* node) override {
++    auto& attributes = *node->mutable_attribute();
++    for (auto attr_iter = attributes.begin(); attr_iter != attributes.end();) {
++      auto& attr = *attr_iter;
++      if (!attr.ref_attr_name().empty()) {
++        // Attribute-references must be replaced by the corresponding attribute-value in the call-node
++        // if the call-node contains the attribute. Otherwise, this attribute must be removed.
++        auto it = attr_map_.find(attr.ref_attr_name());
++        if (it != attr_map_.end()) {
++          const AttributeProto* replacement = it->second;
++          // Copy value of attribute, but retain original name:
++          std::string name = attr.name();
++          attr = *replacement;
++          attr.set_name(name);
++          ++attr_iter;
++        } else {
++          attr_iter = attributes.erase(attr_iter);
++        }
++      } else {
++        // For regular attributes, we process subgraphs, if present, recursively.
++        VisitAttribute(&attr);
++        ++attr_iter;
++      }
++    }
++  }
++
++  // Updates a FunctionProto by replacing all attribute-references with the corresponding
++  // attribute-values in the call-node, if present. Otherwise, the attribute is removed.
++  static void BindAttributes(const NodeProto& callnode, FunctionProto& callee) {
++    AttributeMap map;
++    for (auto& attr : callnode.attribute()) {
++      map[attr.name()] = &attr;
++    }
++    AttributeBinder attr_binder(map);
++    attr_binder.VisitFunction(&callee);
++  }
++
++ private:
++  const AttributeMap& attr_map_;
++};
++
++} // namespace internal
++} // namespace ONNX_NAMESPACE
+diff --git a/onnx/shape_inference/implementation.cc b/onnx/shape_inference/implementation.cc
+index d3e06363b0b5424831701cbf085b4831be4bd658..7a728c40b5ec29b3c7b60565f045fec0ae9b94b2 100644
+--- a/onnx/shape_inference/implementation.cc
++++ b/onnx/shape_inference/implementation.cc
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include "onnx/shape_inference/implementation.h"
++#include <algorithm>
+ #include <fstream>
+ #include <list>
+ #include "onnx/checker.h"
+@@ -10,6 +11,7 @@
+ #include "onnx/common/file_utils.h"
+ #include "onnx/defs/data_type_utils.h"
+ #include "onnx/proto_utils.h"
++#include "onnx/shape_inference/attribute_binder.h"
+ #include "onnx/string_utils.h"
+ 
+ namespace ONNX_NAMESPACE {
+@@ -59,6 +61,9 @@ std::string GetElemTypeString(const TypeProto_SparseTensor& type) {
+   return ONNX_NAMESPACE::to_string(type.elem_type());
+ }
+ 
++inline bool IsOnnxDomainOp(const NodeProto& node, const std::string& op_type) {
++  return (IsOnnxDomain(node.domain()) && (node.op_type() == op_type));
++}
+ } // namespace
+ 
+ template <class T>
+@@ -234,8 +239,24 @@ void MaterializeSymbolicShape(TypeProto* inferred_type, SymbolTable& symbol_tabl
+   }
+ }
+ 
+-std::string GetModelLocalFunctionsMapIdentifier(const std::string& domain, const std::string& func_name) {
+-  return domain + ":" + func_name;
++std::string GetFunctionIdentifier(const FunctionProto& function) {
++  // Note: Models with IR version < 10 do not have the overload attribute.
++  // However, that will be mapped to an empty identifier.
++  std::string overload = function.overload();
++  if (overload.empty()) {
++    return function.domain() + ":" + function.name();
++  }
++  return function.domain() + ":" + function.name() + ":" + overload;
++}
++
++std::string GetFunctionIdentifier(const NodeProto& node) {
++  // Note: Models with IR version < 10 do not have the overload attribute.
++  // However, that will be mapped to an empty identifier.
++  std::string overload = node.overload();
++  if (overload.empty()) {
++    return node.domain() + ":" + node.op_type();
++  }
++  return node.domain() + ":" + node.op_type() + ":" + overload;
+ }
+ 
+ class ShapeInferenceImplBase {
+@@ -286,15 +307,18 @@ class ShapeInferenceImplBase {
+   }
+ 
+   template <typename T>
+-  void addTemporaryConstant(const std::string& name, const T& vector) {
++  void addTemporaryConstant(const std::string& name, const T& vector, bool scalar = false) {
+     input_data_by_name_holder[name] = ToTensor(vector);
++    if (!scalar) {
++      input_data_by_name_holder[name].add_dims(vector.size());
++    }
+     input_data_by_name[name] = &input_data_by_name_holder[name];
+   }
+ 
+   void preprocess(const NodeProto& n) {
+     if (checker::check_is_experimental_op(n)) {
+       has_experimental_op = true;
+-    } else if (n.op_type() == "Constant" && n.output().size() == 1) {
++    } else if (IsOnnxDomainOp(n, "Constant") && n.output().size() == 1) {
+       const std::string& output_name = n.output(0);
+       for (const auto& attr : n.attribute()) {
+         if (attr.name() == "value") {
+@@ -319,7 +343,7 @@ class ShapeInferenceImplBase {
+             }
+             case AttributeProto::INT: {
+               std::vector<int64_t> ints({attr.i()});
+-              addTemporaryConstant(output_name, ints);
++              addTemporaryConstant(output_name, ints, true);
+               break;
+             }
+             case AttributeProto::FLOATS: {
+@@ -329,7 +353,7 @@ class ShapeInferenceImplBase {
+             }
+             case AttributeProto::FLOAT: {
+               std::vector<float> floats({attr.f()});
+-              addTemporaryConstant(output_name, floats);
++              addTemporaryConstant(output_name, floats, true);
+               break;
+             }
+             default:
+@@ -340,13 +364,63 @@ class ShapeInferenceImplBase {
+     }
+   }
+ 
++  // Initialize a DataValueMap for a called function from the DataValueMap of the caller
++  void bindValuesOnCall(
++      const DataValueMap& caller_map,
++      const NodeProto& caller,
++      DataValueMap& callee_map,
++      const FunctionProto& callee) {
++    auto num_inputs = (std::min)(caller.input_size(), callee.input_size());
++    for (int i = 0; i < num_inputs; ++i) {
++      const std::string& actual = caller.input(i);
++      const std::string& formal = callee.input(i);
++      if (!actual.empty()) {
++        auto it = caller_map.find(actual);
++        if (it != caller_map.end()) {
++          callee_map[formal] = it->second;
++        }
++      }
++    }
++  }
++
++  // Update a DataValueMap for a calling function from the DataValueMap of the callee
++  void bindValuesOnReturn(
++      const DataValueMap& callee_map,
++      const FunctionProto& callee,
++      DataValueMap& caller_map,
++      const NodeProto& caller) {
++    auto num_outputs = (std::min)(caller.output_size(), callee.output_size());
++    for (int i = 0; i < num_outputs; ++i) {
++      const std::string& actual = caller.output(i);
++      const std::string& formal = callee.output(i);
++      if (!actual.empty()) {
++        auto it = callee_map.find(formal);
++        if (it != callee_map.end()) {
++          caller_map[actual] = it->second;
++        }
++      }
++    }
++  }
++
++  void processCall(const NodeProto& caller, const FunctionProto& callee, InferenceContext& ctx) {
++    DataValueMap callee_value_map;
++    if (generated_shape_data_by_name != nullptr) {
++      bindValuesOnCall(*generated_shape_data_by_name, caller, callee_value_map, callee);
++    }
++    InferShapeForFunctionNode(
++        callee, schema_registry, ctx, options, model_local_functions_map, symbol_table, &callee_value_map);
++    if (generated_shape_data_by_name != nullptr) {
++      bindValuesOnReturn(callee_value_map, callee, *generated_shape_data_by_name, caller);
++    }
++  }
++
+   void process(NodeProto& n) {
+     // Resolve domain for node
+     auto dit = opset_imports.find(n.domain());
+     if (dit == opset_imports.end()) {
+-      // Both "" and "ai.onnx" refer to the default ONNX domain
+-      if (n.domain() == "") {
+-        dit = opset_imports.find("ai.onnx");
++      // Both "" (ONNX_DOMAIN) and "ai.onnx" (AI_ONNX_DOMAIN) refer to the default ONNX domain
++      if (n.domain() == ONNX_DOMAIN) {
++        dit = opset_imports.find(AI_ONNX_DOMAIN);
+       }
+       if (dit == opset_imports.end()) {
+         fail_type_inference(
+@@ -365,37 +439,24 @@ class ShapeInferenceImplBase {
+         value_types_by_name,
+         input_data_by_name,
+         input_sparse_data_by_name,
+-        generated_shape_data_by_name,
+-        &graph_inference_context);
++        options,
++        &graph_inference_context,
++        generated_shape_data_by_name);
+ 
+     ONNX_TRY {
+       if (schema) {
+         if (schema->has_type_and_shape_inference_function()) {
+           schema->GetTypeAndShapeInferenceFunction()(ctx);
+         } else if (schema->HasFunction()) {
+-          InferShapeForFunctionNode(
+-              *(schema->GetFunction()),
+-              schema_registry,
+-              ctx,
+-              options,
+-              model_local_functions_map,
+-              symbol_table,
+-              generated_shape_data_by_name);
++          processCall(n, *(schema->GetFunction()), ctx);
+         } else {
+           // Continue with inference for remaining nodes
+           return;
+         }
+       } else if (model_local_functions_map.size() > 0) {
+-        auto iter = model_local_functions_map.find(GetModelLocalFunctionsMapIdentifier(n.domain(), n.op_type()));
++        auto iter = model_local_functions_map.find(GetFunctionIdentifier(n));
+         if (iter != model_local_functions_map.end()) {
+-          InferShapeForFunctionNode(
+-              *(iter->second),
+-              schema_registry,
+-              ctx,
+-              options,
+-              model_local_functions_map,
+-              symbol_table,
+-              generated_shape_data_by_name);
++          processCall(n, *(iter->second), ctx);
+         } else {
+           has_unsupported_op = true;
+           return;
+@@ -509,57 +570,11 @@ class ShapeInferenceImplBase {
+     for (auto& n : *graph.mutable_node()) {
+       process(n);
+     }
+-    // Throw shape inference error if any. Error mode right now only supports 0 and 1.
+-    // When set to 0, any node level shape inference errors are not thrown. This is to support backward compatiblity
+-    // with 1.7 and earlier releases. When set to 1 it will throw all exceptions.
+-    // TODO: Add a more granular way for exception handling.
+-    if (options.error_mode > 0 && !inference_errors.empty()) {
+-      std::string full_errors = "Shape inference error(s): ";
+-      for (const std::string& error : inference_errors) {
+-        full_errors += error + "\n";
+-      }
+-      fail_shape_inference(full_errors);
+-    }
+-  }
+-
+-  void replaceAttrRefs(NodeProto& n, std::unordered_map<std::string, const AttributeProto*> attr_map) {
+-    auto& attributes = *n.mutable_attribute();
+-    for (auto attr_iter = attributes.begin(); attr_iter != attributes.end();) {
+-      auto& attr = *attr_iter;
+-      if (!attr.ref_attr_name().empty()) {
+-        // Attribute-references must be replaced by the corresponding attribute-value in the call-node
+-        // if the call-node contains the attribute. Otherwise, this attribute must be removed.
+-        auto entry = attr_map.find(attr.ref_attr_name());
+-        if (entry != attr_map.cend()) {
+-          // Copy value of attribute, but retain original name:
+-          std::string name = attr.name();
+-          attr = *(entry->second);
+-          attr.set_name(name);
+-        } else {
+-          attr_iter = attributes.erase(attr_iter);
+-          continue;
+-        }
+-      }
+-      // Subgraphs must be recursively processed.
+-      if (attr.has_g()) {
+-        replaceAttrRefs(*attr.mutable_g(), attr_map);
+-      }
+-      for (auto& graph : *attr.mutable_graphs()) {
+-        replaceAttrRefs(graph, attr_map);
+-      }
+-      ++attr_iter;
+-    }
+   }
+ 
+-  void replaceAttrRefs(GraphProto& graph, std::unordered_map<std::string, const AttributeProto*> attr_map) {
+-    for (auto& n : *graph.mutable_node()) {
+-      replaceAttrRefs(n, attr_map);
+-    }
+-  }
+-
+-  void process(const NodeProto& n, std::unordered_map<std::string, const AttributeProto*> attr_map) {
++  void process(const NodeProto& n, internal::AttributeBinder& attribute_binder) {
+     NodeProto copy_n(n);
+-    replaceAttrRefs(copy_n, attr_map);
++    attribute_binder.VisitNode(&copy_n);
+     process(copy_n);
+   }
+ 
+@@ -569,23 +584,31 @@ class ShapeInferenceImplBase {
+     reuse_constant_tensors = false;
+ 
+     // Get a temporary tensor-shape map
++    const int num_actual_inputs = static_cast<int>(ctx.getNumInputs());
+     const auto num_func_inputs = func_proto.input_size();
+     std::vector<TypeProto> types_cache(num_func_inputs);
+     for (int i = 0; i < num_func_inputs; ++i) {
+-      if (ctx.getInputType(i) == nullptr) {
+-        fail_type_inference("Input ", i, " type is missing.");
+-      }
+-      types_cache[i] = *ctx.getInputType(i); // TODO: investigate whether we can remove cache
+-      value_types_by_name[func_proto.input().Get(i)] = &types_cache[i];
++      auto& parameter_name = func_proto.input().Get(i);
++      auto* type_ptr = (i < num_actual_inputs) ? ctx.getInputType(i) : nullptr;
++      // nullptr is valid, and indicates a missing optional input
++      if (type_ptr != nullptr) {
++        // Use a temporary copy of original type.
++        // TODO: investigate whether we can eliminate use of temporary copy
++        types_cache[i] = *type_ptr;
++        value_types_by_name[parameter_name] = &types_cache[i];
++      } else
++        value_types_by_name[parameter_name] = nullptr;
+     }
+ 
+     // Create a temporary initializer value map
+-    for (int i = 0; i < static_cast<int>(ctx.getNumInputs()) && i < num_func_inputs; ++i) {
++    for (int i = 0; i < num_actual_inputs && i < num_func_inputs; ++i) {
+       const TypeProto* type = ctx.getInputType(i);
+-      if (type->value_case() == TypeProto::kTensorType && ctx.getInputData(i) != nullptr) {
+-        input_data_by_name[func_proto.input().Get(i)] = ctx.getInputData(i);
+-      } else if (type->value_case() == TypeProto::kSparseTensorType && ctx.getInputSparseData(i) != nullptr) {
+-        input_sparse_data_by_name[func_proto.input().Get(i)] = ctx.getInputSparseData(i);
++      if (type != nullptr) {
++        if (type->value_case() == TypeProto::kTensorType && ctx.getInputData(i) != nullptr) {
++          input_data_by_name[func_proto.input().Get(i)] = ctx.getInputData(i);
++        } else if (type->value_case() == TypeProto::kSparseTensorType && ctx.getInputSparseData(i) != nullptr) {
++          input_sparse_data_by_name[func_proto.input().Get(i)] = ctx.getInputSparseData(i);
++        }
+       }
+     }
+ 
+@@ -596,8 +619,15 @@ class ShapeInferenceImplBase {
+       }
+     }
+ 
++    for (auto& default_value : func_proto.attribute_proto()) {
++      const std::string& name = default_value.name();
++      const AttributeProto* value = ctx.getAttribute(name);
++      attr_map[name] = (value != nullptr) ? value : &default_value;
++    }
++
++    internal::AttributeBinder attribute_binder(attr_map);
+     for (auto& n : func_proto.node()) {
+-      process(n, attr_map);
++      process(n, attribute_binder);
+     }
+ 
+     for (int i = 0; i < func_proto.output_size(); ++i) {
+@@ -624,7 +654,7 @@ class ShapeInferenceImplBase {
+       SymbolTable* symbol_table_in,
+       const ModelLocalFunctionsMap& model_local_functions_map_in,
+       const ISchemaRegistry* schema_registry_in = OpSchemaRegistry::Instance(),
+-      std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name_in = nullptr,
++      DataValueMap* generated_shape_data_by_name_in = nullptr,
+       const int ir_version_in = IR_VERSION // default the latest one
+       )
+       : g(*g_in),
+@@ -650,6 +680,21 @@ class ShapeInferenceImplBase {
+     }
+   }
+ 
++  void finalizeShapeInference() {
++    auto& errors = getErrors();
++    // Throw shape inference error if any. Error mode right now only supports 0 and 1.
++    // When set to 0, any node level shape inference errors are not thrown. This is to support backward compatiblity
++    // with 1.7 and earlier releases. When set to 1 it will throw all exceptions.
++    // TODO: Add a more granular way for exception handling.
++    if (!errors.empty() && options.error_mode > 0) {
++      std::string full_errors = "Inference error(s): ";
++      for (const std::string& error : inference_errors) {
++        full_errors += error + "\n";
++      }
++      fail_shape_inference(full_errors);
++    }
++  }
++
+   const std::vector<std::string>& getErrors() const {
+     return inference_errors;
+   }
+@@ -663,7 +708,7 @@ class ShapeInferenceImplBase {
+   SymbolTable* symbol_table;
+   const ModelLocalFunctionsMap& model_local_functions_map;
+   const ISchemaRegistry* schema_registry;
+-  std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name;
++  DataValueMap* generated_shape_data_by_name;
+   int ir_version;
+   GraphInferenceContext graph_inference_context;
+ 
+@@ -692,10 +737,10 @@ static void InferShapesImpl(
+     SymbolTable* symbol_table,
+     const ModelLocalFunctionsMap& model_local_functions_map,
+     const ISchemaRegistry* schema_registry = OpSchemaRegistry::Instance(),
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name = nullptr,
++    DataValueMap* generated_shape_data_by_name = nullptr,
+     const int ir_version = IR_VERSION // default the latest one
+ ) {
+-  std::unordered_map<std::string, TensorShapeProto> empty;
++  DataValueMap empty;
+   if (generated_shape_data_by_name == nullptr) {
+     generated_shape_data_by_name = &empty;
+   }
+@@ -710,6 +755,7 @@ static void InferShapesImpl(
+       generated_shape_data_by_name,
+       ir_version);
+   base.process(*g);
++  base.finalizeShapeInference();
+ }
+ 
+ // Either ModelProto or FunctionProto
+@@ -743,13 +789,12 @@ void InferShapes(
+     ModelProto& m,
+     const ISchemaRegistry* schema_registry,
+     const ShapeInferenceOptions& options,
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name) {
++    DataValueMap* generated_shape_data_by_name) {
+   auto opset_imports = GetOpsetImportsFromProto(m);
+   SymbolTableImpl symbol_table;
+   ModelLocalFunctionsMap model_local_functions_by_id;
+   for (const auto& function_proto : m.functions()) {
+-    model_local_functions_by_id.insert(
+-        {GetModelLocalFunctionsMapIdentifier(function_proto.domain(), function_proto.name()), &function_proto});
++    model_local_functions_by_id.insert({GetFunctionIdentifier(function_proto), &function_proto});
+   }
+   InferShapesImpl(
+       m.mutable_graph(),
+@@ -768,7 +813,7 @@ void InferShapes(
+     const std::string& save_path,
+     const ISchemaRegistry* schema_registry,
+     const ShapeInferenceOptions& options,
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name) {
++    DataValueMap* generated_shape_data_by_name) {
+   ModelProto model;
+   LoadProtoFromPath(model_path, model);
+   InferShapes(model, schema_registry, options, generated_shape_data_by_name);
+@@ -794,7 +839,7 @@ void InferShapeForFunctionNode(
+     const ShapeInferenceOptions& options,
+     const std::unordered_map<std::string, const FunctionProto*>& model_local_functions_map,
+     SymbolTable* symbol_table,
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name) {
++    DataValueMap* generated_shape_data_by_name) {
+   GraphProto g;
+   ShapeInferenceImplBase base(
+       &g,
+@@ -806,6 +851,7 @@ void InferShapeForFunctionNode(
+       schema_registry,
+       generated_shape_data_by_name);
+   base.process(func_proto, ctx);
++  base.finalizeShapeInference();
+ }
+ 
+ void InferShapeForFunctionNode(
+@@ -815,7 +861,7 @@ void InferShapeForFunctionNode(
+     const ShapeInferenceOptions& options,
+     const std::unordered_map<std::string, const FunctionProto*>& model_local_functions_map,
+     SymbolTable* symbol_table,
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name) {
++    DataValueMap* generated_shape_data_by_name) {
+   auto opset_imports = GetOpsetImportsFromProto(function_proto);
+   InferShapeForFunctionNode(
+       function_proto,
+@@ -832,8 +878,9 @@ struct FunctionInferenceContext : public InferenceContext {
+   FunctionInferenceContext(
+       const FunctionProto& func_proto,
+       const std::vector<TypeProto>& input_types,
+-      const std::vector<AttributeProto>& attributes)
+-      : input_types_(input_types) {
++      const std::vector<AttributeProto>& attributes,
++      const ShapeInferenceOptions& options)
++      : input_types_(input_types), options_(options) {
+     for (const auto& attr : attributes) {
+       attributesByName_[attr.name()] = &attr;
+     }
+@@ -860,7 +907,14 @@ struct FunctionInferenceContext : public InferenceContext {
+   }
+ 
+   const TypeProto* getInputType(size_t index) const override {
+-    return (index < input_types_.size()) ? &input_types_[index] : nullptr;
++    // We should return nullptr for missing optional parameters.
++    // An uninitialized TypeProto() is used for missing optional parameters, and
++    // is mapped to a nullptr here.
++    if (index >= input_types_.size())
++      return nullptr;
++    if (input_types_[index].value_case() == TypeProto::ValueCase::VALUE_NOT_SET)
++      return nullptr;
++    return &input_types_[index];
+   }
+ 
+   TypeProto* getOutputType(size_t index) override {
+@@ -895,16 +949,19 @@ struct FunctionInferenceContext : public InferenceContext {
+   const std::vector<TypeProto>& input_types_;
+   std::vector<TypeProto> output_types_;
+   std::unordered_map<std::string, const AttributeProto*> attributesByName_;
++  ShapeInferenceOptions options_;
+ };
+ 
+ std::vector<TypeProto> InferFunctionOutputTypes(
+     const FunctionProto& function_proto,
+     const std::vector<TypeProto>& input_types,
+     const std::vector<AttributeProto>& attributes) {
+-  FunctionInferenceContext ctx(function_proto, input_types, attributes);
++  // TODO: if it is desirable for infer_function_output_types to provide check_type, strict_mode, data_prop,
++  // we can add them to the Python API. For now we just assume the default options.
++  ShapeInferenceOptions options{true, 1, false};
++  FunctionInferenceContext ctx(function_proto, input_types, attributes, options);
+   auto opset_imports = GetOpsetImportsFromProto(function_proto);
+   GraphProto g;
+-  ShapeInferenceOptions options{true, 1, false};
+   ShapeInferenceImplBase base(
+       &g,
+       {}, // outer_scope_value_types_by_name
+@@ -915,14 +972,7 @@ std::vector<TypeProto> InferFunctionOutputTypes(
+       /*schema_registry*/ OpSchemaRegistry::Instance(),
+       /*generated_shape_data_by_name*/ nullptr);
+   base.process(function_proto, ctx);
+-  auto& errors = base.getErrors();
+-  if (!errors.empty()) {
+-    std::string all_errors = "Inference error(s): ";
+-    for (const std::string& error : errors) {
+-      all_errors += error + "\n";
+-    }
+-    fail_shape_inference(all_errors);
+-  }
++  base.finalizeShapeInference();
+   return ctx.popOutputTypes();
+ }
+ 
+@@ -987,12 +1037,11 @@ std::vector<const TypeProto*> GraphInferencerImpl::doInferencing(
+   // future: pass inputData into InferShapes either directly, or indirectly by
+   // updating initializers that match subgraph inputs.
+   (void)input_data;
+-  ShapeInferenceOptions options{};
+   InferShapesImpl(
+       g_,
+       *context_->outer_scope_value_types_by_name, // never null
+       context_->opset_imports,
+-      options,
++      options_,
+       symbol_table,
+       context_->model_local_functions,
+       context_->schema_registry,
+diff --git a/onnx/shape_inference/implementation.h b/onnx/shape_inference/implementation.h
+index 95c26431d4c21a24d6497059e5a11b2a430ca1de..d5d2751cde10ccf6fc9ca54edce48643bb87e6a9 100644
+--- a/onnx/shape_inference/implementation.h
++++ b/onnx/shape_inference/implementation.h
+@@ -14,6 +14,13 @@ namespace shape_inference {
+ 
+ using ModelLocalFunctionsMap = std::unordered_map<std::string, const FunctionProto*>;
+ 
++// We reuse TensorShapeProto to propagate statically known (partial) information about
++// the values of tensors. It is intended for tensors used to store shape information
++// (the return values of ops like Shape and input values of ops like Reshape/Expand).
++
++// A DataValueMap is used to store the statically known (partial) values of variables.
++using DataValueMap = std::unordered_map<std::string, TensorShapeProto>;
++
+ class SymbolTableImpl : public SymbolTable {
+  public:
+   SymbolTableImpl() : index_(0) {}
+@@ -87,7 +94,7 @@ struct GraphInferenceContext {
+       SymbolTable* symbol_table_in = nullptr,
+       const ModelLocalFunctionsMap& model_local_functions_in = {},
+       const ISchemaRegistry* schema_registry_in = OpSchemaRegistry::Instance(),
+-      std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name_in = nullptr,
++      DataValueMap* generated_shape_data_by_name_in = nullptr,
+       const int ir_version_in = IR_VERSION)
+       : outer_scope_value_types_by_name{&outer_scope_value_types_by_name_in},
+         opset_imports{opset_imports_in},
+@@ -102,13 +109,15 @@ struct GraphInferenceContext {
+   SymbolTable* symbol_table;
+   const ModelLocalFunctionsMap& model_local_functions;
+   const ISchemaRegistry* schema_registry;
+-  std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name;
++  DataValueMap* generated_shape_data_by_name;
+   const int ir_version;
+ };
+ 
+ class GraphInferencerImpl : public GraphInferencer {
+  public:
+-  GraphInferencerImpl(GraphProto& g, GraphInferenceContext& context) : g_{&g}, context_{&context} {}
++  GraphInferencerImpl(GraphProto& g, GraphInferenceContext& context) : g_{&g}, context_{&context}, options_() {}
++  GraphInferencerImpl(GraphProto& g, GraphInferenceContext& context, const ShapeInferenceOptions& options)
++      : g_{&g}, context_{&context}, options_(options) {}
+ 
+   std::vector<const TypeProto*> doInferencing(
+       const std::vector<const TypeProto*>& inputTypes,
+@@ -117,6 +126,7 @@ class GraphInferencerImpl : public GraphInferencer {
+  private:
+   GraphProto* g_;
+   GraphInferenceContext* context_;
++  ShapeInferenceOptions options_;
+ };
+ 
+ struct InferenceContextImpl : public InferenceContext {
+@@ -125,9 +135,10 @@ struct InferenceContextImpl : public InferenceContext {
+       const std::unordered_map<std::string, TypeProto*>& valueTypesByName,
+       const std::unordered_map<std::string, const TensorProto*>& inputDataByName,
+       const std::unordered_map<std::string, const SparseTensorProto*>& inputSparseDataByName,
+-      std::unordered_map<std::string, TensorShapeProto>* generatedShapeData = nullptr,
+-      GraphInferenceContext* graphInferenceContext = nullptr)
+-      : graphInferenceContext_{graphInferenceContext} {
++      const ShapeInferenceOptions& options,
++      GraphInferenceContext* graphInferenceContext = nullptr,
++      DataValueMap* generatedShapeData = nullptr)
++      : graphInferenceContext_{graphInferenceContext}, options_(options) {
+     for (auto& attr : *n.mutable_attribute()) {
+       attributesByName_[attr.name()] = &attr;
+       if (attr.has_g()) {
+@@ -247,7 +258,7 @@ struct InferenceContextImpl : public InferenceContext {
+       }
+ 
+       std::unique_ptr<GraphInferencer> new_inferencer{
+-          new GraphInferencerImpl(*attrNameToGraphProto->second, *graphInferenceContext_)};
++          new GraphInferencerImpl(*attrNameToGraphProto->second, *graphInferenceContext_, options_)};
+ 
+       inferencer = new_inferencer.get();
+       graphAttributeInferencers_.emplace(attr_name, std::move(new_inferencer));
+@@ -269,6 +280,7 @@ struct InferenceContextImpl : public InferenceContext {
+ 
+   // mutable as internal cache of GraphInferencer instances
+   mutable std::unordered_map<std::string, std::unique_ptr<GraphInferencer>> graphAttributeInferencers_;
++  ShapeInferenceOptions options_;
+ };
+ 
+ struct DataPropagationContextImpl : public DataPropagationContext {
+@@ -276,7 +288,7 @@ struct DataPropagationContextImpl : public DataPropagationContext {
+       NodeProto& n,
+       const std::unordered_map<std::string, TypeProto*>& valueTypesByName,
+       const std::unordered_map<std::string, const TensorProto*>& inputDataByName,
+-      std::unordered_map<std::string, TensorShapeProto>& generatedShapeData)
++      DataValueMap& generatedShapeData)
+       : generatedShapeData_(generatedShapeData) {
+     size_t input_idx = 0;
+ 
+@@ -400,7 +412,7 @@ struct DataPropagationContextImpl : public DataPropagationContext {
+   std::unordered_map<size_t, std::string> outputIndexToNameMap_;
+   std::vector<const TypeProto*> allInputTypes_;
+   std::vector<TypeProto> allOutputTypes_;
+-  std::unordered_map<std::string, TensorShapeProto>& generatedShapeData_;
++  DataValueMap& generatedShapeData_;
+   std::unordered_map<std::string, const AttributeProto*> attributesByName_;
+ };
+ 
+@@ -436,14 +448,14 @@ void InferShapes(
+     ModelProto& m,
+     const ISchemaRegistry* schema_registry = OpSchemaRegistry::Instance(),
+     const ShapeInferenceOptions& options = {},
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name = nullptr);
++    DataValueMap* generated_shape_data_by_name = nullptr);
+ 
+ void InferShapes(
+     const std::string& model_path,
+     const std::string& save_path = "",
+     const ISchemaRegistry* schema_registry = OpSchemaRegistry::Instance(),
+     const ShapeInferenceOptions& options = {},
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name = nullptr);
++    DataValueMap* generated_shape_data_by_name = nullptr);
+ 
+ ///
+ /// ModelLocalFunctionsMap is a map of function id -> model local function proto
+@@ -456,7 +468,7 @@ void InferShapeForFunctionNode(
+     const ShapeInferenceOptions& options = {},
+     const ModelLocalFunctionsMap& model_local_functions_map = {},
+     SymbolTable* symbolTable = nullptr,
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name = nullptr);
++    DataValueMap* generated_shape_data_by_name = nullptr);
+ 
+ ///
+ /// ModelLocalFunctionsMap is a map of function id -> model local function proto
+@@ -470,13 +482,15 @@ void InferShapeForFunctionNode(
+     const ShapeInferenceOptions& options = {},
+     const ModelLocalFunctionsMap& model_local_functions_map = {},
+     SymbolTable* symbolTable = nullptr,
+-    std::unordered_map<std::string, TensorShapeProto>* generated_shape_data_by_name = nullptr);
++    DataValueMap* generated_shape_data_by_name = nullptr);
+ 
+ ///
+ /// Apply type-and-shape-inference based checks to a Function body.
+ /// Returns the inferred types of the outputs of the function.
+ /// Inference depends on the types of the inputs of the function as well as
+ /// the attribute values supplied.
++/// A TypeProto with value_case() == TypeProto::ValueCase::VALUE_NOT_SET is used
++/// for missing optional parameters.
+ ///
+ std::vector<TypeProto> InferFunctionOutputTypes(
+     const FunctionProto& func_proto,
+diff --git a/onnx/version_converter/adapters/reshape_4_5.h b/onnx/version_converter/adapters/reshape_4_5.h
+index 4d35b9a1f926ecb6e33d98550929cc5dd6400ab6..71e6ac24e8cc4f312d05ce62837843de7e4d716a 100644
+--- a/onnx/version_converter/adapters/reshape_4_5.h
++++ b/onnx/version_converter/adapters/reshape_4_5.h
+@@ -25,6 +25,7 @@ class Reshape_4_5 final : public RemoveConsumedInputs {
+     for (int64_t shape : node->is(kshape)) {
+       data.emplace_back(shape);
+     }
++    t.sizes() = std::vector<int64_t>{static_cast<int64_t>(data.size())};
+     // Add value as input to node
+     Node* constant = graph->create(kConstant);
+     constant->insertBefore(node);
