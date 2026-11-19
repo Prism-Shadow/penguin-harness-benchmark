@@ -1,0 +1,5443 @@
+diff --git a/composer.json b/composer.json
+index 6edd8d4841012f1a2f82105d1c196025d630ece4..0d6d48adb9e733d33f896f6c0538afd9d7c24963 100644
+--- a/composer.json
++++ b/composer.json
+@@ -15,36 +15,57 @@
+         "security": "https://www.mongodb.com/security"
+     },
+     "authors": [
+-        { "name": "Andreas Braun", "email": "andreas.braun@mongodb.com", "role": "Leader" },
+-        { "name": "Pauline Vos", "email": "pauline.vos@mongodb.com", "role": "Maintainer" },
+-        { "name": "Jérôme Tamarelle", "email": "jerome.tamarelle@mongodb.com", "role": "Maintainer" },
+-        { "name": "Jeremy Mikola", "email": "jmikola@gmail.com", "role": "Maintainer" },
+-        { "name": "Jens Segers", "homepage": "https://jenssegers.com", "role": "Creator" }
++        {
++            "name": "Andreas Braun",
++            "email": "andreas.braun@mongodb.com",
++            "role": "Leader"
++        },
++        {
++            "name": "Pauline Vos",
++            "email": "pauline.vos@mongodb.com",
++            "role": "Maintainer"
++        },
++        {
++            "name": "Jérôme Tamarelle",
++            "email": "jerome.tamarelle@mongodb.com",
++            "role": "Maintainer"
++        },
++        {
++            "name": "Jeremy Mikola",
++            "email": "jmikola@gmail.com",
++            "role": "Maintainer"
++        },
++        {
++            "name": "Jens Segers",
++            "homepage": "https://jenssegers.com",
++            "role": "Creator"
++        }
+     ],
+     "license": "MIT",
+     "require": {
+-        "php": "^8.1",
++        "php": "^8.2",
+         "ext-mongodb": "^1.21|^2",
+         "composer-runtime-api": "^2.0.0",
+-        "illuminate/cache": "^10.36|^11|^12",
+-        "illuminate/container": "^10.0|^11|^12",
+-        "illuminate/database": "^10.30|^11|^12",
+-        "illuminate/events": "^10.0|^11|^12",
+-        "illuminate/support": "^10.0|^11|^12",
++        "illuminate/cache": "^12|^13.0",
++        "illuminate/container": "^12|^13.0",
++        "illuminate/database": "^12.50|^13.0",
++        "illuminate/events": "^12|^13.0",
++        "illuminate/support": "^12|^13.0",
+         "mongodb/mongodb": "^1.21|^2",
+-        "symfony/http-foundation": "^6.4|^7"
++        "symfony/polyfill-php86": "^1.38"
+     },
+     "require-dev": {
++        "doctrine/coding-standard": "^12.0",
++        "laravel/boost": "^2.4",
+         "laravel/scout": "^10.3",
+         "league/flysystem-gridfs": "^3.28",
+         "league/flysystem-read-only": "^3.0",
+-        "phpunit/phpunit": "^10.3|^11.5.3",
+-        "orchestra/testbench": "^8.0|^9.0|^10.0",
+         "mockery/mockery": "^1.4.4",
+-        "doctrine/coding-standard": "12.0.x-dev",
+-        "spatie/laravel-query-builder": "^5.6|^6",
+-        "phpstan/phpstan": "^1.10",
+-        "rector/rector": "^1.2"
++        "orchestra/testbench": "^10.0|^11.0",
++        "phpstan/phpstan": "^1.10|^2.1",
++        "phpunit/phpunit": "^11.5.3|^12.5.12",
++        "rector/rector": "^1.2|^2.3",
++        "spatie/laravel-query-builder": "^5.6|^6"
+     },
+     "conflict": {
+         "illuminate/bus": "< 10.37.2"
+@@ -85,6 +106,7 @@
+     "config": {
+         "allow-plugins": {
+             "dealerdirect/phpcodesniffer-composer-installer": true
+-        }
++        },
++        "sort-packages": true
+     }
+ }
+diff --git a/src/Bus/MongoBatchRepository.php b/src/Bus/MongoBatchRepository.php
+index 2656bbc30a1e9827d3f82c6717cf7ec2a73efab8..0a7693425915f5b8d3a43bf6b2908c9f2e94210a 100644
+--- a/src/Bus/MongoBatchRepository.php
++++ b/src/Bus/MongoBatchRepository.php
+@@ -107,9 +107,7 @@ class MongoBatchRepository extends DatabaseBatchRepository implements PrunableBa
+                     'total_jobs' => $amount,
+                     'pending_jobs' => $amount,
+                 ],
+-                '$set' => [
+-                    'finished_at' => null,
+-                ],
++                '$set' => ['finished_at' => null],
+             ],
+         );
+     }
+@@ -172,12 +170,14 @@ class MongoBatchRepository extends DatabaseBatchRepository implements PrunableBa
+     public function cancel(string $batchId): void
+     {
+         $batchId = new ObjectId($batchId);
++
++        $now = $this->getUTCDateTime();
+         $this->collection->updateOne(
+             ['_id' => $batchId],
+             [
+                 '$set' => [
+-                    'cancelled_at' => $this->getUTCDateTime(),
+-                    'finished_at' => $this->getUTCDateTime(),
++                    'cancelled_at' => $now,
++                    'finished_at' => $now,
+                 ],
+             ],
+         );
+@@ -201,6 +201,10 @@ class MongoBatchRepository extends DatabaseBatchRepository implements PrunableBa
+     #[Override]
+     public function rollBack(): void
+     {
++        if (! $this->connection->getSession()?->isInTransaction()) {
++            return;
++        }
++
+         $this->connection->rollBack();
+     }
+ 
+@@ -216,6 +220,7 @@ class MongoBatchRepository extends DatabaseBatchRepository implements PrunableBa
+     }
+ 
+     /** Prune all the unfinished entries older than the given date. */
++    #[Override]
+     public function pruneUnfinished(DateTimeInterface $before): int
+     {
+         $result = $this->collection->deleteMany(
+@@ -229,6 +234,7 @@ class MongoBatchRepository extends DatabaseBatchRepository implements PrunableBa
+     }
+ 
+     /** Prune all the cancelled entries older than the given date. */
++    #[Override]
+     public function pruneCancelled(DateTimeInterface $before): int
+     {
+         $result = $this->collection->deleteMany(
+diff --git a/src/Cache/MongoLock.php b/src/Cache/MongoLock.php
+index d273b4d99260a76bb84527eed2ad380938fbdfd4..dfcf6c11b0fb03dc9e45344f6c84d80672739402 100644
+--- a/src/Cache/MongoLock.php
++++ b/src/Cache/MongoLock.php
+@@ -41,6 +41,7 @@ final class MongoLock extends Lock
+     /**
+      * Attempt to acquire the lock.
+      */
++    #[Override]
+     public function acquire(): bool
+     {
+         // The lock can be acquired if: it doesn't exist, it has expired,
+@@ -80,7 +81,7 @@ final class MongoLock extends Lock
+             ],
+         );
+ 
+-        if ($this->lottery[0] <= 0 && random_int(1, $this->lottery[1]) <= $this->lottery[0]) {
++        if ($this->lottery[0] > 0 && random_int(1, $this->lottery[1]) <= $this->lottery[0]) {
+             $this->collection->deleteMany(['expires_at' => ['$lte' => $this->getUTCDateTime()]]);
+         }
+ 
+diff --git a/src/Cache/MongoStore.php b/src/Cache/MongoStore.php
+index e37884a93ca3aef03568f768a0f3bed3da22820b..c05e2b3f07b7dd56d42c767175321bbf356bb0f5 100644
+--- a/src/Cache/MongoStore.php
++++ b/src/Cache/MongoStore.php
+@@ -16,7 +16,6 @@ use function is_float;
+ use function is_int;
+ use function is_string;
+ use function serialize;
+-use function str_contains;
+ use function unserialize;
+ 
+ final class MongoStore implements LockProvider, Store
+@@ -97,10 +96,7 @@ final class MongoStore implements LockProvider, Store
+                     'expires_at' => $this->getUTCDateTime($seconds),
+                 ],
+             ],
+-            [
+-                'upsert' => true,
+-
+-            ],
++            ['upsert' => true],
+         );
+ 
+         return $result->getUpsertedCount() > 0 || $result->getModifiedCount() > 0;
+@@ -182,14 +178,18 @@ final class MongoStore implements LockProvider, Store
+     #[Override]
+     public function increment($key, $value = 1): int|float|false
+     {
++        $now = $this->getUTCDateTime();
++
+         $result = $this->collection->findOneAndUpdate(
+             [
+                 '_id' => $this->prefix . $key,
++                'expires_at' => ['$gt' => $now],
+             ],
+             [
+                 '$inc' => ['value' => $value],
+             ],
+             [
++                'projection' => ['value' => 1],
+                 'returnDocument' => FindOneAndUpdate::RETURN_DOCUMENT_AFTER,
+             ],
+         );
+@@ -198,12 +198,6 @@ final class MongoStore implements LockProvider, Store
+             return false;
+         }
+ 
+-        if ($result['expires_at'] <= $this->getUTCDateTime()) {
+-            $this->forgetIfExpired($key);
+-
+-            return false;
+-        }
+-
+         return $result['value'];
+     }
+ 
+@@ -261,6 +255,28 @@ final class MongoStore implements LockProvider, Store
+         return $result->getDeletedCount() > 0;
+     }
+ 
++    /**
++     * Extend the expiration time of an item in the cache.
++     *
++     * @param string $key
++     * @param int    $seconds
++     */
++    public function touch($key, $seconds): bool
++    {
++        $result = $this->collection->updateOne(
++            [
++                '_id' => $this->prefix . $key,
++                'expires_at' => ['$gt' => $this->getUTCDateTime()],
++            ],
++            [
++                '$set' => ['expires_at' => $this->getUTCDateTime($seconds)],
++            ],
++        );
++
++        return $result->getModifiedCount() > 0;
++    }
++
++    #[\Override]
+     public function flush(): bool
+     {
+         $this->collection->deleteMany([]);
+@@ -268,6 +284,7 @@ final class MongoStore implements LockProvider, Store
+         return true;
+     }
+ 
++    #[\Override]
+     public function getPrefix(): string
+     {
+         return $this->prefix;
+@@ -296,7 +313,7 @@ final class MongoStore implements LockProvider, Store
+ 
+     private function unserialize($value): mixed
+     {
+-        if (! is_string($value) || ! str_contains($value, ';')) {
++        if (! is_string($value)) {
+             return $value;
+         }
+ 
+diff --git a/src/CommandSubscriber.php b/src/CommandSubscriber.php
+index 5daa6e97aaeebb0dbf429a662ba37c4ef92993e0..1cad232808306c5bb66f0795a141d283338cf77d 100644
+--- a/src/CommandSubscriber.php
++++ b/src/CommandSubscriber.php
+@@ -7,6 +7,7 @@ use MongoDB\Driver\Monitoring\CommandFailedEvent;
+ use MongoDB\Driver\Monitoring\CommandStartedEvent;
+ use MongoDB\Driver\Monitoring\CommandSubscriber as CommandSubscriberInterface;
+ use MongoDB\Driver\Monitoring\CommandSucceededEvent;
++use Override;
+ 
+ use function get_object_vars;
+ use function in_array;
+@@ -21,16 +22,19 @@ final class CommandSubscriber implements CommandSubscriberInterface
+     {
+     }
+ 
++    #[Override]
+     public function commandStarted(CommandStartedEvent $event): void
+     {
+         $this->commands[$event->getOperationId()] = $event;
+     }
+ 
++    #[Override]
+     public function commandFailed(CommandFailedEvent $event): void
+     {
+         $this->logQuery($event);
+     }
+ 
++    #[Override]
+     public function commandSucceeded(CommandSucceededEvent $event): void
+     {
+         $this->logQuery($event);
+diff --git a/src/Concerns/ManagesTransactions.php b/src/Concerns/ManagesTransactions.php
+index 6403cc45ddbb16f988c4c973eecf2ff658517c06..d6ca20464f1000063faa535058b6c20eab1de28e 100644
+--- a/src/Concerns/ManagesTransactions.php
++++ b/src/Concerns/ManagesTransactions.php
+@@ -10,6 +10,7 @@ use MongoDB\Driver\Exception\RuntimeException;
+ use MongoDB\Driver\Session;
+ use Throwable;
+ 
++use function max;
+ use function MongoDB\with_transaction;
+ 
+ /**
+@@ -53,35 +54,97 @@ trait ManagesTransactions
+     /**
+      * Starts a transaction on the active session. An active session will be created if none exists.
+      */
++    #[\Override]
+     public function beginTransaction(array $options = []): void
+     {
++        $this->runCallbacksBeforeTransaction();
++
+         $this->getSessionOrCreate()->startTransaction($options);
++
++        $this->handleInitialTransactionState();
++    }
++
++    private function handleInitialTransactionState(): void
++    {
+         $this->transactions = 1;
++
++        $this->transactionsManager?->begin(
++            $this->getName(),
++            $this->transactions,
++        );
++
++        $this->fireConnectionEvent('beganTransaction');
+     }
+ 
+     /**
+      * Commit transaction in this session.
+      */
++    #[\Override]
+     public function commit(): void
+     {
++        $this->fireConnectionEvent('committing');
+         $this->getSessionOrThrow()->commitTransaction();
+-        $this->transactions = 0;
++
++        $this->handleCommitState();
++    }
++
++    private function handleCommitState(): void
++    {
++        [$levelBeingCommitted, $this->transactions] = [
++            $this->transactions,
++            max(0, $this->transactions - 1),
++        ];
++
++        $this->transactionsManager?->commit(
++            $this->getName(),
++            $levelBeingCommitted,
++            $this->transactions,
++        );
++
++        $this->fireConnectionEvent('committed');
+     }
+ 
+     /**
+      * Abort transaction in this session.
+      */
++    #[\Override]
+     public function rollBack($toLevel = null): void
+     {
+-        $this->getSessionOrThrow()->abortTransaction();
++        $session = $this->getSessionOrThrow();
++        if ($session->isInTransaction()) {
++            $session->abortTransaction();
++        }
++
++        $this->handleRollbackState();
++    }
++
++    private function handleRollbackState(): void
++    {
+         $this->transactions = 0;
++
++        $this->transactionsManager?->rollback(
++            $this->getName(),
++            $this->transactions,
++        );
++
++        $this->fireConnectionEvent('rollingBack');
++    }
++
++    private function runCallbacksBeforeTransaction(): void
++    {
++        foreach ($this->beforeStartingTransaction as $beforeTransactionCallback) {
++            $beforeTransactionCallback($this);
++        }
+     }
+ 
+     /**
+      * Static transaction function realize the with_transaction functionality provided by MongoDB.
+      *
+-     * @param  int $attempts
++     * @param int $attempts
++     *
++     * @throws Throwable
+      */
++    #[\Override]
+     public function transaction(Closure $callback, $attempts = 1, array $options = []): mixed
+     {
+         $attemptsLeft   = $attempts;
+@@ -93,15 +156,20 @@ trait ManagesTransactions
+ 
+             if ($attemptsLeft < 0) {
+                 $session->abortTransaction();
++                $this->handleRollbackState();
+ 
+                 return;
+             }
+ 
++            $this->runCallbacksBeforeTransaction();
++            $this->handleInitialTransactionState();
++
+             // Catch, store, and re-throw any exception thrown during execution
+             // of the callable. The last exception is re-thrown if the transaction
+             // was aborted because the number of callback attempts has been exceeded.
+             try {
+                 $callbackResult = $callback($this);
++                $this->fireConnectionEvent('committing');
+             } catch (Throwable $throwable) {
+                 throw $throwable;
+             }
+@@ -110,9 +178,12 @@ trait ManagesTransactions
+         with_transaction($this->getSessionOrCreate(), $callbackFunction, $options);
+ 
+         if ($attemptsLeft < 0 && $throwable) {
++            $this->handleRollbackState();
+             throw $throwable;
+         }
+ 
++        $this->handleCommitState();
++
+         return $callbackResult;
+     }
+ }
+diff --git a/src/Connection.php b/src/Connection.php
+index 3fa99e94bd86cca9ccb42f2318f3cc9d1fdad2d9..c16eb90991668d9883705efc4bc6cd48dd662409 100644
+--- a/src/Connection.php
++++ b/src/Connection.php
+@@ -16,6 +16,7 @@ use MongoDB\Driver\Exception\RuntimeException;
+ use MongoDB\Driver\ReadPreference;
+ use MongoDB\Laravel\Concerns\ManagesTransactions;
+ use OutOfBoundsException;
++use Override;
+ use Throwable;
+ 
+ use function filter_var;
+@@ -95,6 +96,7 @@ class Connection extends BaseConnection
+      *
+      * @return Query\Builder
+      */
++    #[Override]
+     public function table($table, $as = null)
+     {
+         $query = new Query\Builder($this, $this->getQueryGrammar(), $this->getPostProcessor());
+@@ -115,6 +117,7 @@ class Connection extends BaseConnection
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getSchemaBuilder()
+     {
+         return new Schema\Builder($this);
+@@ -172,6 +175,8 @@ class Connection extends BaseConnection
+         return $this->connection;
+     }
+ 
++    /** @inheritdoc  */
++    #[Override]
+     public function enableQueryLog()
+     {
+         parent::enableQueryLog();
+@@ -182,6 +187,7 @@ class Connection extends BaseConnection
+         }
+     }
+ 
++    #[Override]
+     public function disableQueryLog()
+     {
+         parent::disableQueryLog();
+@@ -192,6 +198,7 @@ class Connection extends BaseConnection
+         }
+     }
+ 
++    #[Override]
+     protected function withFreshQueryLog($callback)
+     {
+         try {
+@@ -270,6 +277,7 @@ class Connection extends BaseConnection
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function disconnect()
+     {
+         $this->disableQueryLog();
+@@ -340,34 +348,37 @@ class Connection extends BaseConnection
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getDriverName()
+     {
+         return 'mongodb';
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function getDriverTitle()
+     {
+         return 'MongoDB';
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function getDefaultPostProcessor()
+     {
+         return new Query\Processor();
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function getDefaultQueryGrammar()
+     {
+-        // Argument added in Laravel 12
+         return new Query\Grammar($this);
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function getDefaultSchemaGrammar()
+     {
+-        // Argument added in Laravel 12
+         return new Schema\Grammar($this);
+     }
+ 
+@@ -380,6 +391,7 @@ class Connection extends BaseConnection
+     }
+ 
+     /** @inheritdoc  */
++    #[\Override]
+     public function threadCount()
+     {
+         $status = $this->db->command(['serverStatus' => 1])->toArray();
+@@ -395,6 +407,7 @@ class Connection extends BaseConnection
+      *
+      * @return mixed
+      */
++    #[\Override]
+     public function __call($method, $parameters)
+     {
+         return $this->db->$method(...$parameters);
+@@ -418,6 +431,7 @@ class Connection extends BaseConnection
+      *
+      * @internal
+      */
++    #[\Override]
+     public function getServerVersion(): string
+     {
+         return $this->db->command(['buildInfo' => 1])->toArray()[0]['version'];
+diff --git a/src/Eloquent/Builder.php b/src/Eloquent/Builder.php
+index 7dba7b7ab5e4556e118cb611f35ff7a98d15fb68..5a272499296adbb68db69ef1ba29559e8445ea5d 100644
+--- a/src/Eloquent/Builder.php
++++ b/src/Eloquent/Builder.php
+@@ -15,18 +15,22 @@ use MongoDB\Builder\Type\SearchOperatorInterface;
+ use MongoDB\Driver\CursorInterface;
+ use MongoDB\Driver\Exception\BulkWriteException;
+ use MongoDB\Laravel\Connection;
++use MongoDB\Laravel\Helpers\QueriesRelationshipAggregates;
+ use MongoDB\Laravel\Helpers\QueriesRelationships;
+ use MongoDB\Laravel\Query\AggregationBuilder;
+ use MongoDB\Model\BSONDocument;
++use Override;
+ 
+ use function array_key_exists;
+ use function array_map;
++use function array_merge;
+ use function array_replace;
+ use function collect;
+ use function is_array;
+ use function is_object;
+ use function iterator_to_array;
+ use function property_exists;
++use function value;
+ 
+ /**
+  * @method \MongoDB\Laravel\Query\Builder toBase()
+@@ -34,8 +38,10 @@ use function property_exists;
+  */
+ class Builder extends EloquentBuilder
+ {
+-    private const DUPLICATE_KEY_ERROR = 11000;
+     use QueriesRelationships;
++    use QueriesRelationshipAggregates;
++
++    private const DUPLICATE_KEY_ERROR = 11000;
+ 
+     /**
+      * The methods that should be returned from query builder.
+@@ -69,7 +75,7 @@ class Builder extends EloquentBuilder
+     ];
+ 
+     /**
+-     * @return ($function is null ? AggregationBuilder : self)
++     * @return ($function is null ? AggregationBuilder : $this)
+      *
+      * @inheritdoc
+      */
+@@ -116,25 +122,43 @@ class Builder extends EloquentBuilder
+     public function vectorSearch(
+         string $index,
+         string $path,
+-        array $queryVector,
+-        int $limit,
++        array|null $queryVector = null,
++        int $limit = 10,
+         bool $exact = false,
+         QueryInterface|array $filter = [],
+         int|null $numCandidates = null,
++        string|null $query = null,
++        string|null $model = null,
+     ): Collection {
+-        $results = $this->toBase()->vectorSearch($index, $path, $queryVector, $limit, $exact, $filter, $numCandidates);
++        $results = $this->toBase()->vectorSearch(
++            index: $index,
++            path: $path,
++            limit: $limit,
++            queryVector: $queryVector,
++            exact: $exact,
++            filter: $filter,
++            numCandidates: $numCandidates,
++            query: $query,
++            model: $model,
++        );
+ 
+         return $this->model->hydrate($results->all());
+     }
+ 
+-    /** @inheritdoc */
++    /**
++     * @param array $options
++     *
++     * @inheritdoc
++     */
++    #[Override]
+     public function update(array $values, array $options = [])
+     {
+         // Intercept operations on embedded models and delegate logic
+         // to the parent relation instance.
+         $relation = $this->model->getParentRelation();
+         if ($relation) {
+-            $relation->performUpdate($this->model, $values);
++            $this->model->forceFill($this->addUpdatedAtColumn($values));
++            $relation->performUpdate($this->model);
+ 
+             return 1;
+         }
+@@ -173,6 +197,7 @@ class Builder extends EloquentBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function delete()
+     {
+         // Intercept operations on embedded models and delegate logic
+@@ -188,53 +213,37 @@ class Builder extends EloquentBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function increment($column, $amount = 1, array $extra = [])
+     {
+         // Intercept operations on embedded models and delegate logic
+         // to the parent relation instance.
+         $relation = $this->model->getParentRelation();
+         if ($relation) {
+-            $value = $this->model->{$column};
+-
+-            // When doing increment and decrements, Eloquent will automatically
+-            // sync the original attributes. We need to change the attribute
+-            // temporary in order to trigger an update query.
+-            $this->model->{$column} = null;
+-
+-            $this->model->syncOriginalAttribute($column);
+-
+-            return $this->model->update([$column => $value]);
++            return $this->update(array_merge([$column => $this->model->{$column}], $extra));
+         }
+ 
+         return parent::increment($column, $amount, $extra);
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function decrement($column, $amount = 1, array $extra = [])
+     {
+         // Intercept operations on embedded models and delegate logic
+         // to the parent relation instance.
+         $relation = $this->model->getParentRelation();
+         if ($relation) {
+-            $value = $this->model->{$column};
+-
+-            // When doing increment and decrements, Eloquent will automatically
+-            // sync the original attributes. We need to change the attribute
+-            // temporary in order to trigger an update query.
+-            $this->model->{$column} = null;
+-
+-            $this->model->syncOriginalAttribute($column);
+-
+-            return $this->model->update([$column => $value]);
++            return $this->update(array_merge([$column => $this->model->{$column}], $extra));
+         }
+ 
+         return parent::decrement($column, $amount, $extra);
+     }
+ 
+     /**
+-     * @param (Closure():T)|Expression|null $value
++     * @param (Closure(\MongoDB\Collection):T)|Expression|null $value
+      *
+-     * @return ($value is Closure ? T : ($value is null ? Collection : Expression))
++     * @return ($value is Closure ? (T is CursorInterface ? Collection<int, TModel> : T|TModel|Collection<int, TModel>) : ($value is null ? \MongoDB\Collection : \Illuminate\Contracts\Database\Query\Expression))
+      *
+      * @template T
+      */
+@@ -246,7 +255,7 @@ class Builder extends EloquentBuilder
+         // Convert MongoCursor results to a collection of models.
+         if ($results instanceof CursorInterface) {
+             $results->setTypeMap(['root' => 'array', 'document' => 'array', 'array' => 'array']);
+-            $results = array_map(fn ($document) => $this->query->aliasIdForResult($document), iterator_to_array($results));
++            $results = array_map(fn ($document) => $this->query->getGrammar()->prepareFieldsForResult($document), iterator_to_array($results));
+ 
+             return $this->model->hydrate($results);
+         }
+@@ -262,7 +271,7 @@ class Builder extends EloquentBuilder
+ 
+         // The result is a single object.
+         if (is_array($results) && (array_key_exists('_id', $results) || array_key_exists('id', $results))) {
+-            $results = $this->query->aliasIdForResult($results);
++            $results = $this->query->getGrammar()->prepareFieldsForResult($results);
+ 
+             return $this->model->newFromBuilder($results);
+         }
+@@ -270,7 +279,8 @@ class Builder extends EloquentBuilder
+         return $results;
+     }
+ 
+-    public function firstOrCreate(array $attributes = [], array $values = [])
++    #[Override]
++    public function firstOrCreate(array $attributes = [], Closure|array $values = [])
+     {
+         $instance = (clone $this)->where($attributes)->first();
+         if ($instance !== null) {
+@@ -279,13 +289,14 @@ class Builder extends EloquentBuilder
+ 
+         // createOrFirst is not supported in transaction.
+         if ($this->getConnection()->getSession()?->isInTransaction()) {
+-            return $this->create(array_replace($attributes, $values));
++            return $this->create(array_replace($attributes, value($values)));
+         }
+ 
+         return $this->createOrFirst($attributes, $values);
+     }
+ 
+-    public function createOrFirst(array $attributes = [], array $values = [])
++    #[Override]
++    public function createOrFirst(array $attributes = [], Closure|array $values = [])
+     {
+         // The duplicate key error would abort the transaction. Using the regular firstOrCreate in that case.
+         if ($this->getConnection()->getSession()?->isInTransaction()) {
+@@ -293,7 +304,7 @@ class Builder extends EloquentBuilder
+         }
+ 
+         try {
+-            return $this->create(array_replace($attributes, $values));
++            return $this->create(array_replace($attributes, value($values)));
+         } catch (BulkWriteException $e) {
+             if ($e->getCode() === self::DUPLICATE_KEY_ERROR) {
+                 return $this->where($attributes)->first() ?? throw $e;
+@@ -308,9 +319,8 @@ class Builder extends EloquentBuilder
+      * TODO Remove if https://github.com/laravel/framework/commit/6484744326531829341e1ff886cc9b628b20d73e
+      * will be reverted
+      * Issue in laravel/frawework https://github.com/laravel/framework/issues/27791.
+-     *
+-     * @return array
+      */
++    #[Override]
+     protected function addUpdatedAtColumn(array $values)
+     {
+         if (! $this->model->usesTimestamps() || $this->model->getUpdatedAtColumn() === null) {
+@@ -318,6 +328,10 @@ class Builder extends EloquentBuilder
+         }
+ 
+         $column = $this->model->getUpdatedAtColumn();
++        if (isset($values['$set'][$column])) {
++            return $values;
++        }
++
+         $values = array_replace(
+             [$column => $this->model->freshTimestampString()],
+             $values,
+@@ -332,6 +346,7 @@ class Builder extends EloquentBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function ensureOrderForCursorPagination($shouldReverse = false)
+     {
+         if (empty($this->query->orders)) {
+diff --git a/src/Eloquent/Casts/AsBsonArray.php b/src/Eloquent/Casts/AsBsonArray.php
+new file mode 100644
+index 0000000000000000000000000000000000000000..ecfb11e11e31a4e02e938f199193bbd598d280a3
+--- /dev/null
++++ b/src/Eloquent/Casts/AsBsonArray.php
+@@ -0,0 +1,76 @@
++<?php
++
++declare(strict_types=1);
++
++namespace MongoDB\Laravel\Eloquent\Casts;
++
++use Illuminate\Contracts\Database\Eloquent\Castable;
++use Illuminate\Contracts\Database\Eloquent\CastsAttributes;
++use MongoDB\BSON\Document;
++use MongoDB\BSON\PackedArray;
++use MongoDB\Model\BSONArray;
++
++use function is_array;
++
++class AsBsonArray implements Castable, CastsAttributes
++{
++    #[\Override]
++    public static function castUsing(array $arguments): static
++    {
++        return new static();
++    }
++
++    #[\Override]
++    public function get($model, string $key, $value, array $attributes)
++    {
++        if ($value instanceof PackedArray) {
++            $value = $value->toPHP(['root' => 'array', 'document' => 'object', 'array' => 'array']);
++        }
++
++        if ($value instanceof BSONArray) {
++            return clone $value;
++        }
++
++        return is_array($value) ? new BSONArray($value) : null;
++    }
++
++    #[\Override]
++    public function set($model, string $key, $value, array $attributes)
++    {
++        if ($value instanceof PackedArray) {
++            $value = $value->toPHP(['root' => 'array', 'document' => 'object', 'array' => 'array']);
++        }
++
++        if ($value === null) {
++            return [$key => null];
++        }
++
++        if ($value instanceof BSONArray) {
++            return [$key => clone $value];
++        }
++
++        return [$key => new BSONArray((array) $value)];
++    }
++
++    public function compare($model, string $key, $original, $value): bool
++    {
++        return self::normalize($original) === self::normalize($value);
++    }
++
++    private static function normalize($value): ?string
++    {
++        if ($value instanceof PackedArray) {
++            $value = $value->toPHP(['root' => 'array', 'document' => 'object', 'array' => 'array']);
++        }
++
++        if ($value === null) {
++            return null;
++        }
++
++        if ($value instanceof BSONArray) {
++            $value = $value->getArrayCopy();
++        }
++
++        return (string) Document::fromPHP(['v' => (array) $value]);
++    }
++}
+diff --git a/src/Eloquent/Casts/AsBsonDocument.php b/src/Eloquent/Casts/AsBsonDocument.php
+new file mode 100644
+index 0000000000000000000000000000000000000000..53d850107f46e459deb4c6504d5eebbe28def575
+--- /dev/null
++++ b/src/Eloquent/Casts/AsBsonDocument.php
+@@ -0,0 +1,82 @@
++<?php
++
++declare(strict_types=1);
++
++namespace MongoDB\Laravel\Eloquent\Casts;
++
++use Illuminate\Contracts\Database\Eloquent\Castable;
++use Illuminate\Contracts\Database\Eloquent\CastsAttributes;
++use MongoDB\BSON\Document;
++use MongoDB\Model\BSONDocument;
++use stdClass;
++
++use function is_array;
++
++class AsBsonDocument implements Castable, CastsAttributes
++{
++    #[\Override]
++    public static function castUsing(array $arguments): static
++    {
++        return new static();
++    }
++
++    #[\Override]
++    public function get($model, string $key, $value, array $attributes)
++    {
++        if ($value instanceof Document) {
++            $value = $value->toPHP(['root' => 'array', 'document' => 'object', 'array' => 'array']);
++        }
++
++        if ($value instanceof BSONDocument) {
++            return clone $value;
++        }
++
++        if ($value instanceof stdClass) {
++            $value = (array) $value;
++        }
++
++        return is_array($value) ? new BSONDocument($value) : null;
++    }
++
++    #[\Override]
++    public function set($model, string $key, $value, array $attributes)
++    {
++        if ($value instanceof Document) {
++            $value = $value->toPHP(['root' => 'array', 'document' => 'object', 'array' => 'array']);
++        }
++
++        if ($value === null) {
++            return [$key => null];
++        }
++
++        if ($value instanceof BSONDocument) {
++            return [$key => clone $value];
++        }
++
++        return [$key => new BSONDocument((array) $value)];
++    }
++
++    public function compare($model, string $key, $original, $value): bool
++    {
++        return self::normalize($original) === self::normalize($value);
++    }
++
++    private static function normalize($value): ?string
++    {
++        if ($value instanceof Document) {
++            $value = $value->toPHP(['root' => 'array', 'document' => 'object', 'array' => 'array']);
++        }
++
++        if ($value === null) {
++            return null;
++        }
++
++        if ($value instanceof BSONDocument) {
++            $value = $value->getArrayCopy();
++        } elseif ($value instanceof stdClass) {
++            $value = (array) $value;
++        }
++
++        return (string) Document::fromPHP(['v' => $value]);
++    }
++}
+diff --git a/src/Eloquent/Casts/BinaryUuid.php b/src/Eloquent/Casts/BinaryUuid.php
+index c7832f12539b305ea064089f55b408ef599e7c2e..9e416591048c7a7ca3ca65369d231887d8eb9aa0 100644
+--- a/src/Eloquent/Casts/BinaryUuid.php
++++ b/src/Eloquent/Casts/BinaryUuid.php
+@@ -26,6 +26,7 @@ class BinaryUuid implements CastsAttributes
+      *
+      * @return mixed
+      */
++    #[\Override]
+     public function get($model, string $key, $value, array $attributes)
+     {
+         if (! $value instanceof Binary || $value->getType() !== Binary::TYPE_UUID) {
+@@ -52,6 +53,7 @@ class BinaryUuid implements CastsAttributes
+      *
+      * @return Binary
+      */
++    #[\Override]
+     public function set($model, string $key, $value, array $attributes)
+     {
+         if ($value instanceof Binary) {
+diff --git a/src/Eloquent/Casts/ObjectId.php b/src/Eloquent/Casts/ObjectId.php
+index 1205392c7bc110d6947fdc2620224c524f58a283..6938824d868ea4f164fff5385b5704977cbd5b06 100644
+--- a/src/Eloquent/Casts/ObjectId.php
++++ b/src/Eloquent/Casts/ObjectId.php
+@@ -18,6 +18,7 @@ class ObjectId implements CastsAttributes
+      *
+      * @return mixed
+      */
++    #[\Override]
+     public function get($model, string $key, $value, array $attributes)
+     {
+         if (! $value instanceof BSONObjectId) {
+@@ -35,6 +36,7 @@ class ObjectId implements CastsAttributes
+      *
+      * @return mixed
+      */
++    #[\Override]
+     public function set($model, string $key, $value, array $attributes)
+     {
+         if ($value instanceof BSONObjectId) {
+diff --git a/src/Eloquent/DocumentModel.php b/src/Eloquent/DocumentModel.php
+index 965b1a444eadd6fb47e76314666df9a35881a451..30787af6d419a408e50c3ed4437b067905dd5d2b 100644
+--- a/src/Eloquent/DocumentModel.php
++++ b/src/Eloquent/DocumentModel.php
+@@ -4,13 +4,14 @@ declare(strict_types=1);
+ 
+ namespace MongoDB\Laravel\Eloquent;
+ 
+-use BackedEnum;
++use BadMethodCallException;
+ use Carbon\CarbonInterface;
+ use DateTimeInterface;
+ use DateTimeZone;
+ use Illuminate\Contracts\Queue\QueueableCollection;
+ use Illuminate\Contracts\Queue\QueueableEntity;
+ use Illuminate\Contracts\Support\Arrayable;
++use Illuminate\Database\Eloquent\Attributes\Table;
+ use Illuminate\Database\Eloquent\Concerns\HasAttributes;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\Relation;
+@@ -23,9 +24,10 @@ use MongoDB\BSON\Decimal128;
+ use MongoDB\BSON\ObjectID;
+ use MongoDB\BSON\Type;
+ use MongoDB\BSON\UTCDateTime;
++use MongoDB\Laravel\Eloquent\Model as MongoDBModel;
+ use MongoDB\Laravel\Query\Builder as QueryBuilder;
++use ReflectionProperty;
+ use Stringable;
+-use ValueError;
+ 
+ use function array_key_exists;
+ use function array_keys;
+@@ -40,6 +42,7 @@ use function func_get_args;
+ use function in_array;
+ use function is_array;
+ use function is_numeric;
++use function is_object;
+ use function is_string;
+ use function ltrim;
+ use function method_exists;
+@@ -48,12 +51,16 @@ use function str_contains;
+ use function str_starts_with;
+ use function strcmp;
+ use function strlen;
+-use function var_export;
++use function trigger_error;
+ 
++use const E_USER_DEPRECATED;
++
++/** @mixin Builder */
+ trait DocumentModel
+ {
+     use HybridRelations;
+     use EmbedsRelations;
++    use ModelAttributeInitialization;
+ 
+     /**
+      * The parent relation instance.
+@@ -93,6 +100,31 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    private function initializeMongoDBModelAttributes()
++    {
++        if (! method_exists(parent::class, 'initializeModelAttributes')) {
++            throw new BadMethodCallException(sprintf('Method %s::initializeModelAttributes() requires Laravel 13 or later. It is called by the model constructor and must not be called directly.', static::class));
++        }
++
++        parent::initializeModelAttributes();
++
++        $keyType = static::resolveClassAttribute(Table::class)?->keyType;
++
++        if ($keyType === null) {
++            return;
++        }
++
++        $declaringClass = (new ReflectionProperty($this, 'keyType'))->getDeclaringClass()->getName();
++
++        if ($declaringClass !== Model::class && $declaringClass !== MongoDBModel::class) {
++            return;
++        }
++
++        $this->keyType = $keyType;
++    }
++
++    /** @inheritdoc */
++    #[\Override]
+     public function getQualifiedKeyName()
+     {
+         return $this->getKeyName();
+@@ -105,6 +137,7 @@ trait DocumentModel
+      *
+      * @param  mixed $value
+      */
++    #[\Override]
+     public function fromDateTime($value): UTCDateTime
+     {
+         // If the value is already a UTCDateTime instance, we don't need to parse it.
+@@ -127,6 +160,7 @@ trait DocumentModel
+      *
+      * @param  mixed $value
+      */
++    #[\Override]
+     protected function asDateTime($value): DateTimeInterface
+     {
+         // Convert UTCDateTime instances to Carbon.
+@@ -139,18 +173,21 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function getDateFormat()
+     {
+         return $this->dateFormat ?: 'Y-m-d H:i:s';
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function freshTimestamp()
+     {
+         return new UTCDateTime(Date::now());
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function getAttribute($key)
+     {
+         if (! $key) {
+@@ -184,6 +221,7 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     protected function transformModelValue($key, $value)
+     {
+         $value = parent::transformModelValue($key, $value);
+@@ -191,10 +229,17 @@ trait DocumentModel
+         // to a Carbon or CarbonImmutable instance.
+         // @see Model::setAttribute()
+         if ($this->hasCast($key) && $value instanceof CarbonInterface) {
+-            $value->settings(array_replace($value->getSettings(), ['toStringFormat' => $this->getDateFormat()]));
++            $castType = $this->getCasts()[$key];
++
++            // Use the per-attribute format from the cast definition (e.g. "datetime:Y-m-d")
++            // instead of the model-wide dateFormat, so that each attribute keeps its own format.
++            $dateFormat = $this->isCustomDateTimeCast($castType) || $this->isImmutableCustomDateTimeCast($castType)
++                ? Str::after($castType, ':')
++                : $this->getDateFormat();
++
++            $value->settings(array_replace($value->getSettings(), ['toStringFormat' => $dateFormat]));
+ 
+             // "date" cast resets the time to 00:00:00.
+-            $castType = $this->getCasts()[$key];
+             if (str_starts_with($castType, 'date:') || str_starts_with($castType, 'immutable_date:')) {
+                 $value = $value->startOfDay();
+             }
+@@ -204,17 +249,7 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
+-    protected function getCastType($key)
+-    {
+-        $castType = $this->getCasts()[$key];
+-        if ($this->isCustomDateTimeCast($castType) || $this->isImmutableCustomDateTimeCast($castType)) {
+-            $this->setDateFormat(Str::after($castType, ':'));
+-        }
+-
+-        return parent::getCastType($key);
+-    }
+-
+-    /** @inheritdoc */
++    #[\Override]
+     protected function getAttributeFromArray($key)
+     {
+         $key = (string) $key;
+@@ -228,6 +263,7 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function setAttribute($key, $value)
+     {
+         $key = (string) $key;
+@@ -266,11 +302,30 @@ trait DocumentModel
+         return parent::setAttribute($key, $value);
+     }
+ 
++    /** @inheritdoc */
++    #[\Override]
++    protected function isJsonCastable($key)
++    {
++        if ($this->hasCast($key, ['array'])) {
++            trigger_error(
++                sprintf(
++                    'The "array" cast on attribute "%s" of model "%s" stores values as a JSON-encoded string in MongoDB, which is not the native format. Remove the cast to store native BSON arrays. If you must keep JSON string storage, use the "json" cast explicitly.',
++                    $key,
++                    static::class,
++                ),
++                E_USER_DEPRECATED,
++            );
++        }
++
++        return parent::isJsonCastable($key);
++    }
++
+     /**
+      * @param mixed $value
+      *
+      * @inheritdoc
+      */
++    #[\Override]
+     protected function asDecimal($value, $decimals)
+     {
+         // Convert BSON to string.
+@@ -287,6 +342,16 @@ trait DocumentModel
+         return parent::asDecimal($value, $decimals);
+     }
+ 
++    #[\Override]
++    public function fromJson($value, $asObject = false)
++    {
++        if (is_array($value)) {
++            return $asObject ? (object) $value : $value;
++        }
++
++        return parent::fromJson($value, $asObject);
++    }
++
+     /**
+      * Change to mongo native for decimal cast.
+      *
+@@ -301,6 +366,7 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function attributesToArray()
+     {
+         $attributes = parent::attributesToArray();
+@@ -321,12 +387,14 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function getCasts()
+     {
+         return $this->casts;
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function getDirty()
+     {
+         $dirty = parent::getDirty();
+@@ -340,6 +408,7 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function originalIsEquivalent($key)
+     {
+         if (! array_key_exists($key, $this->original)) {
+@@ -376,6 +445,14 @@ trait DocumentModel
+                 $this->castAttribute($key, $original);
+         }
+ 
++        if ($this->isClassComparable($key)) {
++            return $this->compareClassCastableAttribute($key, $original, $attribute);
++        }
++
++        if ($this->isClassCastable($key)) {
++            return ! is_object($attribute) ? $attribute === $original : $attribute == $original;
++        }
++
+         return is_numeric($attribute) && is_numeric($original)
+             && strcmp((string) $attribute, (string) $original) === 0;
+     }
+@@ -438,6 +515,7 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function push()
+     {
+         $parameters = func_get_args();
+@@ -532,6 +610,7 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function getForeignKey()
+     {
+         return Str::snake(class_basename($this)) . '_' . ltrim($this->primaryKey, '_');
+@@ -554,18 +633,21 @@ trait DocumentModel
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function newEloquentBuilder($query)
+     {
+         return new Builder($query);
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function qualifyColumn($column)
+     {
+         return $column;
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     protected function newBaseQueryBuilder()
+     {
+         $connection = $this->getConnection();
+@@ -584,6 +666,7 @@ trait DocumentModel
+      *
+      * @return array
+      */
++    #[\Override]
+     public function getQueueableRelations()
+     {
+         $relations = [];
+@@ -634,12 +717,14 @@ trait DocumentModel
+      *
+      * @return bool
+      */
++    #[\Override]
+     protected function isGuardableColumn($key)
+     {
+         return true;
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     protected function addCastAttributesToArray(array $attributes, array $mutatedAttributes)
+     {
+         foreach ($this->getCasts() as $key => $castType) {
+@@ -677,7 +762,7 @@ trait DocumentModel
+             }
+ 
+             if ($this->isEnumCastable($key) && (! $castValue instanceof Arrayable)) {
+-                $castValue = $castValue !== null ? $this->getStorableEnumValueFromLaravel11($this->getCasts()[$key], $castValue) : null;
++                $castValue = $castValue !== null ? $this->getStorableEnumValue($this->getCasts()[$key], $castValue) : null;
+             }
+ 
+             if ($castValue instanceof Arrayable) {
+@@ -690,23 +775,6 @@ trait DocumentModel
+         return $attributes;
+     }
+ 
+-    /**
+-     * Duplicate of {@see HasAttributes::getStorableEnumValue()} for Laravel 11 as the signature of the method has
+-     * changed in a non-backward compatible way.
+-     *
+-     * @todo Remove this method when support for Laravel 10 is dropped.
+-     */
+-    private function getStorableEnumValueFromLaravel11($expectedEnum, $value)
+-    {
+-        if (! $value instanceof $expectedEnum) {
+-            throw new ValueError(sprintf('Value [%s] is not of the expected enum type [%s].', var_export($value, true), $expectedEnum));
+-        }
+-
+-        return $value instanceof BackedEnum
+-            ? $value->value
+-            : $value->name;
+-    }
+-
+     /**
+      * Is a value a BSON type?
+      *
+@@ -722,6 +790,7 @@ trait DocumentModel
+     /**
+      * {@inheritDoc}
+      */
++    #[\Override]
+     public function save(array $options = [])
+     {
+         // SQL databases would autoincrement the id field if set to null.
+@@ -745,6 +814,7 @@ trait DocumentModel
+     /**
+      * {@inheritDoc}
+      */
++    #[\Override]
+     public function refresh()
+     {
+         parent::refresh();
+diff --git a/src/Eloquent/EmbedsRelations.php b/src/Eloquent/EmbedsRelations.php
+index d5984b08e2b021d456f300a831c4ec42be3988a9..da02cf7aef4e6d01205e44337ded64667155ec0e 100644
+--- a/src/Eloquent/EmbedsRelations.php
++++ b/src/Eloquent/EmbedsRelations.php
+@@ -28,7 +28,7 @@ trait EmbedsRelations
+      *
+      * @return EmbedsMany
+      */
+-    protected function embedsMany($related, $localKey = null, $foreignKey = null, $relation = null)
++    public function embedsMany($related, $localKey = null, $foreignKey = null, $relation = null)
+     {
+         // If no relation name was given, we will use this debug backtrace to extract
+         // the calling method's name and use that as the relationship name as most
+@@ -53,7 +53,7 @@ trait EmbedsRelations
+     }
+ 
+     /**
+-     * Define an embedded one-to-many relationship.
++     * Define an embedded one-to-one relationship.
+      *
+      * @param class-string $related
+      * @param string|null  $localKey
+@@ -62,7 +62,7 @@ trait EmbedsRelations
+      *
+      * @return EmbedsOne
+      */
+-    protected function embedsOne($related, $localKey = null, $foreignKey = null, $relation = null)
++    public function embedsOne($related, $localKey = null, $foreignKey = null, $relation = null)
+     {
+         // If no relation name was given, we will use this debug backtrace to extract
+         // the calling method's name and use that as the relationship name as most
+diff --git a/src/Eloquent/HybridRelations.php b/src/Eloquent/HybridRelations.php
+index 21344c8e9533d6b8b6f9208bf48096fdc44a9bb4..007f493eb06ca6c531c9c7c6192a0cc55ce41554 100644
+--- a/src/Eloquent/HybridRelations.php
++++ b/src/Eloquent/HybridRelations.php
+@@ -5,7 +5,7 @@ declare(strict_types=1);
+ namespace MongoDB\Laravel\Eloquent;
+ 
+ use Illuminate\Database\Eloquent\Concerns\HasRelationships;
+-use Illuminate\Database\Eloquent\Relations\MorphOne;
++use Illuminate\Database\Eloquent\Relations\Pivot;
+ use Illuminate\Support\Str;
+ use MongoDB\Laravel\Helpers\EloquentBuilder;
+ use MongoDB\Laravel\Relations\BelongsTo;
+@@ -13,6 +13,7 @@ use MongoDB\Laravel\Relations\BelongsToMany;
+ use MongoDB\Laravel\Relations\HasMany;
+ use MongoDB\Laravel\Relations\HasOne;
+ use MongoDB\Laravel\Relations\MorphMany;
++use MongoDB\Laravel\Relations\MorphOne;
+ use MongoDB\Laravel\Relations\MorphTo;
+ use MongoDB\Laravel\Relations\MorphToMany;
+ 
+@@ -35,12 +36,15 @@ trait HybridRelations
+      *
+      * @see HasRelationships::hasOne()
+      *
+-     * @param class-string $related
+-     * @param string|null  $foreignKey
+-     * @param string|null  $localKey
++     * @param  class-string<TRelatedModel> $related
++     * @param  string|null                 $foreignKey
++     * @param  string|null                 $localKey
+      *
+-     * @return \Illuminate\Database\Eloquent\Relations\HasOne
++     * @return \Illuminate\Database\Eloquent\Relations\HasOne<TRelatedModel, $this>
++     *
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function hasOne($related, $foreignKey = null, $localKey = null)
+     {
+         // Check if it is a relation with an original model.
+@@ -62,14 +66,17 @@ trait HybridRelations
+      *
+      * @see HasRelationships::morphOne()
+      *
+-     * @param class-string $related
+-     * @param string       $name
+-     * @param string|null  $type
+-     * @param string|null  $id
+-     * @param string|null  $localKey
++     * @param  class-string<TRelatedModel> $related
++     * @param  string                      $name
++     * @param  string|null                 $type
++     * @param  string|null                 $id
++     * @param  string|null                 $localKey
++     *
++     * @return MorphOne<TRelatedModel, $this>
+      *
+-     * @return MorphOne
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function morphOne($related, $name, $type = null, $id = null, $localKey = null)
+     {
+         // Check if it is a relation with an original model.
+@@ -91,12 +98,15 @@ trait HybridRelations
+      *
+      * @see HasRelationships::hasMany()
+      *
+-     * @param class-string $related
+-     * @param string|null  $foreignKey
+-     * @param string|null  $localKey
++     * @param  class-string<TRelatedModel> $related
++     * @param  string|null                 $foreignKey
++     * @param  string|null                 $localKey
+      *
+-     * @return \Illuminate\Database\Eloquent\Relations\HasMany
++     * @return \Illuminate\Database\Eloquent\Relations\HasMany<TRelatedModel, $this>
++     *
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function hasMany($related, $foreignKey = null, $localKey = null)
+     {
+         // Check if it is a relation with an original model.
+@@ -118,14 +128,17 @@ trait HybridRelations
+      *
+      * @see HasRelationships::morphMany()
+      *
+-     * @param class-string $related
+-     * @param string       $name
+-     * @param string|null  $type
+-     * @param string|null  $id
+-     * @param string|null  $localKey
++     * @param  class-string<TRelatedModel> $related
++     * @param  string                      $name
++     * @param  string|null                 $type
++     * @param  string|null                 $id
++     * @param  string|null                 $localKey
++     *
++     * @return \Illuminate\Database\Eloquent\Relations\MorphMany<TRelatedModel, $this>
+      *
+-     * @return \Illuminate\Database\Eloquent\Relations\MorphMany
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function morphMany($related, $name, $type = null, $id = null, $localKey = null)
+     {
+         // Check if it is a relation with an original model.
+@@ -140,8 +153,6 @@ trait HybridRelations
+         // get the table and create the relationship instances for the developers.
+         [$type, $id] = $this->getMorphs($name, $type, $id);
+ 
+-        $table = $instance->getTable();
+-
+         $localKey = $localKey ?: $this->getKeyName();
+ 
+         return new MorphMany($instance->newQuery(), $this, $type, $id, $localKey);
+@@ -152,13 +163,16 @@ trait HybridRelations
+      *
+      * @see HasRelationships::belongsTo()
+      *
+-     * @param class-string $related
+-     * @param string|null  $foreignKey
+-     * @param string|null  $ownerKey
+-     * @param string|null  $relation
++     * @param  class-string<TRelatedModel> $related
++     * @param  string|null                 $foreignKey
++     * @param  string|null                 $ownerKey
++     * @param  string|null                 $relation
++     *
++     * @return \Illuminate\Database\Eloquent\Relations\BelongsTo<TRelatedModel, $this>
+      *
+-     * @return \Illuminate\Database\Eloquent\Relations\BelongsTo
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function belongsTo($related, $foreignKey = null, $ownerKey = null, $relation = null)
+     {
+         // If no relation name was given, we will use this debug backtrace to extract
+@@ -197,13 +211,14 @@ trait HybridRelations
+      *
+      * @see HasRelationships::morphTo()
+      *
+-     * @param string      $name
+-     * @param string|null $type
+-     * @param string|null $id
+-     * @param string|null $ownerKey
++     * @param  string|null $name
++     * @param  string|null $type
++     * @param  string|null $id
++     * @param  string|null $ownerKey
+      *
+-     * @return \Illuminate\Database\Eloquent\Relations\MorphTo
++     * @return \Illuminate\Database\Eloquent\Relations\MorphTo<\Illuminate\Database\Eloquent\Model, $this>
+      */
++    #[\Override]
+     public function morphTo($name = null, $type = null, $id = null, $ownerKey = null)
+     {
+         // If no name is provided, we will use the backtrace to get the function name
+@@ -259,16 +274,19 @@ trait HybridRelations
+      *
+      * @see HasRelationships::belongsToMany()
+      *
+-     * @param class-string $related
+-     * @param string|null  $collection
+-     * @param string|null  $foreignPivotKey
+-     * @param string|null  $relatedPivotKey
+-     * @param string|null  $parentKey
+-     * @param string|null  $relatedKey
+-     * @param string|null  $relation
++     * @param  class-string<TRelatedModel>                                   $related
++     * @param  string|class-string<\Illuminate\Database\Eloquent\Model>|null $collection
++     * @param  string|null                                                   $foreignPivotKey
++     * @param  string|null                                                   $relatedPivotKey
++     * @param  string|null                                                   $parentKey
++     * @param  string|null                                                   $relatedKey
++     * @param  string|null                                                   $relation
++     *
++     * @return \Illuminate\Database\Eloquent\Relations\BelongsToMany<TRelatedModel, $this, Pivot>
+      *
+-     * @return \Illuminate\Database\Eloquent\Relations\BelongsToMany
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function belongsToMany(
+         $related,
+         $collection = null,
+@@ -334,18 +352,23 @@ trait HybridRelations
+     /**
+      * Define a morph-to-many relationship.
+      *
+-     * @param class-string $related
+-     * @param string       $name
+-     * @param string|null  $table
+-     * @param string|null  $foreignPivotKey
+-     * @param string|null  $relatedPivotKey
+-     * @param string|null  $parentKey
+-     * @param string|null  $relatedKey
+-     * @param string|null  $relation
+-     * @param bool         $inverse
+-     *
+-     * @return \Illuminate\Database\Eloquent\Relations\MorphToMany
++     * @see HasRelationships::morphToMany()
++     *
++     * @param  class-string<TRelatedModel> $related
++     * @param  string                      $name
++     * @param  string|null                 $table
++     * @param  string|null                 $foreignPivotKey
++     * @param  string|null                 $relatedPivotKey
++     * @param  string|null                 $parentKey
++     * @param  string|null                 $relatedKey
++     * @param  string|null                 $relation
++     * @param  bool                        $inverse
++     *
++     * @return \Illuminate\Database\Eloquent\Relations\MorphToMany<TRelatedModel, $this>
++     *
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function morphToMany(
+         $related,
+         $name,
+@@ -410,17 +433,22 @@ trait HybridRelations
+     /**
+      * Define a polymorphic, inverse many-to-many relationship.
+      *
+-     * @param class-string $related
+-     * @param string       $name
+-     * @param string|null  $table
+-     * @param string|null  $foreignPivotKey
+-     * @param string|null  $relatedPivotKey
+-     * @param string|null  $parentKey
+-     * @param string|null  $relatedKey
+-     * @param string|null  $relation
++     * @see HasRelationships::morphedByMany()
++     *
++     * @param  class-string<TRelatedModel> $related
++     * @param  string                      $name
++     * @param  string|null                 $table
++     * @param  string|null                 $foreignPivotKey
++     * @param  string|null                 $relatedPivotKey
++     * @param  string|null                 $parentKey
++     * @param  string|null                 $relatedKey
++     * @param  string|null                 $relation
+      *
+-     * @return \Illuminate\Database\Eloquent\Relations\MorphToMany
++     * @return \Illuminate\Database\Eloquent\Relations\MorphToMany<TRelatedModel, $this>
++     *
++     * @template TRelatedModel of \Illuminate\Database\Eloquent\Model
+      */
++    #[\Override]
+     public function morphedByMany(
+         $related,
+         $name,
+@@ -450,7 +478,7 @@ trait HybridRelations
+             $relatedPivotKey,
+             $parentKey,
+             $relatedKey,
+-            $relatedKey,
++            $relation,
+             true,
+         );
+     }
+diff --git a/src/Eloquent/MassPrunable.php b/src/Eloquent/MassPrunable.php
+index 98e947842c350dcac676678039339995fc1460c3..ecf033a3b98a2623cc54c56e19c010c69f0cd6db 100644
+--- a/src/Eloquent/MassPrunable.php
++++ b/src/Eloquent/MassPrunable.php
+@@ -5,6 +5,7 @@ declare(strict_types=1);
+ namespace MongoDB\Laravel\Eloquent;
+ 
+ use Illuminate\Database\Eloquent\MassPrunable as EloquentMassPrunable;
++use Illuminate\Database\Eloquent\SoftDeletes;
+ use Illuminate\Database\Events\ModelsPruned;
+ 
+ use function class_uses_recursive;
+diff --git a/src/Eloquent/Model.php b/src/Eloquent/Model.php
+index 54eef1dc548fcabbcfbe278620dc0bef0b66c872..01a44b2bcfab81ae22f206df9933d9a80a070c11 100644
+--- a/src/Eloquent/Model.php
++++ b/src/Eloquent/Model.php
+@@ -23,9 +23,7 @@ abstract class Model extends BaseModel
+      */
+     protected $keyType = 'string';
+ 
+-    private static $documentModelClasses = [
+-        User::class => true,
+-    ];
++    private static $documentModelClasses = [User::class => true];
+ 
+     /**
+      * Indicates if the given model class is a MongoDB document model.
+diff --git a/src/Eloquent/ModelAttributeInitialization.php b/src/Eloquent/ModelAttributeInitialization.php
+new file mode 100644
+index 0000000000000000000000000000000000000000..8768125655fc78d5c9b45fddbd1c4b7fa0f5034e
+--- /dev/null
++++ b/src/Eloquent/ModelAttributeInitialization.php
+@@ -0,0 +1,30 @@
++<?php
++
++declare(strict_types=1);
++
++namespace MongoDB\Laravel\Eloquent;
++
++use Illuminate\Database\Eloquent\Model;
++
++use function method_exists;
++
++// This hook was introduced in Laravel 13. Override is only valid when the
++// installed parent actually declares it; both versions share the same body.
++if (method_exists(Model::class, 'initializeModelAttributes')) {
++    trait ModelAttributeInitialization
++    {
++        #[\Override]
++        public function initializeModelAttributes()
++        {
++            $this->initializeMongoDBModelAttributes();
++        }
++    }
++} else {
++    trait ModelAttributeInitialization
++    {
++        public function initializeModelAttributes()
++        {
++            $this->initializeMongoDBModelAttributes();
++        }
++    }
++}
+diff --git a/src/Eloquent/SoftDeletes.php b/src/Eloquent/SoftDeletes.php
+index 135c55dcfebccb1f3aef36c69e31ff5073f306ca..438219f3c877178c206e539bacde88077f8dfbfb 100644
+--- a/src/Eloquent/SoftDeletes.php
++++ b/src/Eloquent/SoftDeletes.php
+@@ -4,6 +4,14 @@ declare(strict_types=1);
+ 
+ namespace MongoDB\Laravel\Eloquent;
+ 
++use function sprintf;
++use function trigger_error;
++
++use const E_USER_DEPRECATED;
++
++trigger_error(sprintf('Since mongodb/laravel-mongodb:5.5, trait "%s" is deprecated, use "%s" instead.', SoftDeletes::class, \Illuminate\Database\Eloquent\SoftDeletes::class), E_USER_DEPRECATED);
++
++/** @deprecated since mongodb/laravel-mongodb:5.5, use \Illuminate\Database\Eloquent\SoftDeletes instead */
+ trait SoftDeletes
+ {
+     use \Illuminate\Database\Eloquent\SoftDeletes;
+diff --git a/src/Helpers/QueriesRelationshipAggregates.php b/src/Helpers/QueriesRelationshipAggregates.php
+new file mode 100644
+index 0000000000000000000000000000000000000000..78df0cd87bc68b1611f088e80edfc47675c828fc
+--- /dev/null
++++ b/src/Helpers/QueriesRelationshipAggregates.php
+@@ -0,0 +1,338 @@
++<?php
++
++declare(strict_types=1);
++
++namespace MongoDB\Laravel\Helpers;
++
++use Closure;
++use Illuminate\Database\Eloquent\Model as EloquentModel;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\BelongsToMany;
++use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
++use Illuminate\Database\Eloquent\Relations\MorphTo;
++use Illuminate\Database\Eloquent\Relations\Relation;
++use Illuminate\Support\Collection;
++use Illuminate\Support\Str;
++use InvalidArgumentException;
++use LogicException;
++use MongoDB\BSON\Binary;
++use MongoDB\Laravel\Eloquent\Model as DocumentModel;
++use MongoDB\Laravel\Relations\EmbedsOneOrMany;
++use Stringable;
++
++use function bin2hex;
++use function class_basename;
++use function count;
++use function explode;
++use function get_debug_type;
++use function implode;
++use function in_array;
++use function is_array;
++use function is_scalar;
++use function is_string;
++use function preg_replace;
++use function sprintf;
++use function str_starts_with;
++use function strtolower;
++
++/**
++ * Support for withCount, withExists, withSum, withAvg, withMin and withMax on document models.
++ *
++ * MongoDB has no correlated subquery, so the values cannot be selected with the parent documents
++ * as Eloquent does. They are computed with one additional query per aggregate, after the parent
++ * documents are read.
++ *
++ * @internal
++ */
++trait QueriesRelationshipAggregates
++{
++    private const AGGREGATE_FUNCTIONS = ['count', 'exists', 'sum', 'avg', 'min', 'max'];
++
++    /** @var array<string, array{name: string, function: string, column: string, parentKey: ?string, constraints: Closure}> */
++    private array $withAggregates = [];
++
++    /** @inheritdoc */
++    #[\Override]
++    public function withAggregate($relations, $column, $function = null)
++    {
++        if (empty($relations)) {
++            return $this;
++        }
++
++        if (! in_array($function, self::AGGREGATE_FUNCTIONS, true)) {
++            throw new InvalidArgumentException(sprintf(
++                'Aggregate function "%s" is not supported by MongoDB. Supported functions are: %s.',
++                $function ?? 'null',
++                implode(', ', self::AGGREGATE_FUNCTIONS),
++            ));
++        }
++
++        if (! is_string($column)) {
++            throw new InvalidArgumentException('The aggregate column name must be a string.');
++        }
++
++        if (str_starts_with($column, '$')) {
++            throw new InvalidArgumentException(sprintf(
++                'The aggregate column name "%s" must not start with "$".',
++                $column,
++            ));
++        }
++
++        foreach ($this->parseWithRelations(is_array($relations) ? $relations : [$relations]) as $name => $constraints) {
++            [$name, $alias] = $this->resolveAggregateAlias($name, $function, $column);
++
++            $relation = $this->getRelationWithoutConstraints($name);
++            $this->assertAggregateRelationSupported($relation, $name);
++            $this->assertEmbeddedConstraintsSupported($relation, $name, $constraints);
++
++            // The key used to match the aggregated values with the parent documents must be read.
++            $parentKey = $this->getAggregateParentKey($relation);
++            if ($parentKey !== null && $this->getQuery()->columns !== null) {
++                $this->addSelect($parentKey);
++            }
++
++            $this->withAggregates[$alias] = [
++                'name' => $name,
++                'function' => $function,
++                'column' => $column,
++                'parentKey' => $parentKey,
++                'constraints' => $constraints,
++            ];
++        }
++
++        return $this;
++    }
++
++    /**
++     * Resolve the relation name and the attribute alias, using the same alias as
++     * Illuminate\Database\Eloquent\Concerns\QueriesRelationships::withAggregate.
++     *
++     * @return array{0: string, 1: string} the relation name and the alias
++     */
++    private function resolveAggregateAlias(string $name, string $function, string $column): array
++    {
++        $segments = explode(' ', $name);
++
++        if (count($segments) === 3 && strtolower($segments[1]) === 'as') {
++            return [$segments[0], $segments[2]];
++        }
++
++        $alias = Str::snake(preg_replace(
++            '/[^[:alnum:][:space:]_]/u',
++            '',
++            sprintf('%s %s %s', $name, $function, strtolower($column)),
++        ));
++
++        return [$name, $alias];
++    }
++
++    private function assertEmbeddedConstraintsSupported(Relation $relation, string $name, Closure $constraints): void
++    {
++        if (! $relation instanceof EmbedsOneOrMany) {
++            return;
++        }
++
++        $subQuery = $relation->getRelated()->newQuery();
++        $constraints($subQuery);
++        $query = $subQuery->getQuery();
++
++        if ($query->wheres || $query->limit !== null || $query->offset !== null || $query->distinct) {
++            throw new LogicException(sprintf(
++                'Constraints on the embedded relation "%s" are not supported.',
++                $name,
++            ));
++        }
++    }
++
++    /** @inheritdoc */
++    #[\Override]
++    public function eagerLoadRelations(array $models)
++    {
++        foreach ($this->withAggregates as $alias => $aggregate) {
++            $this->assertAggregateNotUsedInQuery($alias);
++            $this->hydrateAggregate($models, $alias, $aggregate);
++        }
++
++        return parent::eagerLoadRelations($models);
++    }
++
++    /**
++     * @param EloquentModel[]                                                                                 $models
++     * @param array{name: string, function: string, column: string, parentKey: ?string, constraints: Closure} $aggregate
++     */
++    private function hydrateAggregate(array $models, string $alias, array $aggregate): void
++    {
++        // The relation is resolved for each execution to start from a query without constraints.
++        $relation = $this->getRelationWithoutConstraints($aggregate['name']);
++
++        // Embedded documents are already part of the parent document, no query is needed.
++        if ($relation instanceof EmbedsOneOrMany) {
++            foreach ($models as $model) {
++                $model->setAttribute($alias, self::aggregateValues(
++                    $model->{$aggregate['name']}()->getResults(),
++                    $aggregate['function'],
++                    $aggregate['column'],
++                ));
++            }
++
++            return;
++        }
++
++        $relation->addEagerConstraints($models);
++        // Same as Illuminate\Database\Eloquent\Concerns\QueriesRelationships::withAggregate,
++        // the constraints are applied to the query of the related model.
++        $aggregate['constraints']($relation->getQuery());
++
++        // HasOneOrMany relations are aggregated by the server, grouped by foreign key.
++        if ($relation instanceof HasOneOrMany) {
++            $this->hydrateGroupedAggregate($models, $alias, $aggregate, $relation);
++
++            return;
++        }
++
++        // The related documents cannot be grouped by the server: a BelongsTo relation has a single
++        // related document per parent, and the keys of many-to-many relations are stored in an array
++        // field. The eager loading logic is reused to match the related documents to their parent.
++        $this->hydrateMatchedAggregate($models, $alias, $aggregate, $relation);
++    }
++
++    /**
++     * @param EloquentModel[]                                                                                 $models
++     * @param array{name: string, function: string, column: string, parentKey: ?string, constraints: Closure} $aggregate
++     */
++    private function hydrateGroupedAggregate(array $models, string $alias, array $aggregate, HasOneOrMany $relation): void
++    {
++        $function = $aggregate['function'];
++        $foreignKey = $this->getHasCompareKey($relation);
++        $results = $relation->getQuery()->toBase()
++            ->groupBy($foreignKey)
++            ->aggregate($function === 'exists' ? 'count' : $function, [$aggregate['column']]);
++
++        $values = [];
++        foreach ($results as $result) {
++            $values[self::aggregateKey($result->{$foreignKey})] = $function === 'exists'
++                ? $result->aggregate > 0
++                : $result->aggregate;
++        }
++
++        $default = self::aggregateDefault($function);
++        foreach ($models as $model) {
++            $key = self::aggregateKey($model->getAttribute($aggregate['parentKey']));
++
++            $model->setAttribute($alias, $values[$key] ?? $default);
++        }
++    }
++
++    /**
++     * @param EloquentModel[]                                                                                 $models
++     * @param array{name: string, function: string, column: string, parentKey: ?string, constraints: Closure} $aggregate
++     */
++    private function hydrateMatchedAggregate(array $models, string $alias, array $aggregate, Relation $relation): void
++    {
++        $relation->match($models, $relation->getEager(), $alias);
++
++        foreach ($models as $model) {
++            // match() leaves the relation unset on models without related documents.
++            $related = $model->relationLoaded($alias) ? $model->getRelation($alias) : null;
++            $model->unsetRelation($alias);
++
++            $model->setAttribute($alias, self::aggregateValues($related, $aggregate['function'], $aggregate['column']));
++        }
++    }
++
++    private static function aggregateDefault(string $function): mixed
++    {
++        return match ($function) {
++            'count' => 0,
++            'exists' => false,
++            default => null,
++        };
++    }
++
++    private static function aggregateValues(mixed $related, string $function, string $column): mixed
++    {
++        $values = match (true) {
++            $related instanceof Collection => $related,
++            $related === null => new Collection(),
++            default => new Collection([$related]),
++        };
++
++        if ($values->isEmpty()) {
++            return self::aggregateDefault($function);
++        }
++
++        return match ($function) {
++            'count' => $values->count(),
++            'exists' => true,
++            'sum' => $values->sum($column),
++            'avg' => $values->avg($column),
++            'min' => $values->min($column),
++            'max' => $values->max($column),
++        };
++    }
++
++    /** Document keys are compared as strings, as ObjectId instances are not identical. */
++    private static function aggregateKey(mixed $value): string
++    {
++        if ($value instanceof Binary) {
++            return bin2hex($value->getData());
++        }
++
++        if (is_scalar($value) || $value instanceof Stringable) {
++            return (string) $value;
++        }
++
++        throw new InvalidArgumentException(sprintf(
++            'The relation key of type "%s" cannot be used to match aggregated values.',
++            get_debug_type($value),
++        ));
++    }
++
++    private function assertAggregateRelationSupported(Relation $relation, string $name): void
++    {
++        if ($relation instanceof EmbedsOneOrMany) {
++            return;
++        }
++
++        if (! DocumentModel::isDocumentModel($relation->getRelated()) || $this->isAcrossConnections($relation)) {
++            throw new LogicException(sprintf(
++                'Aggregating the hybrid relation "%s" is not supported. The related model must be stored in MongoDB.',
++                $name,
++            ));
++        }
++
++        if (
++            $relation instanceof HasOneOrMany
++            || $relation instanceof BelongsToMany
++            || ($relation instanceof BelongsTo && ! $relation instanceof MorphTo)
++        ) {
++            return;
++        }
++
++        throw new LogicException(sprintf(
++            '%s is not supported for relation aggregates.',
++            class_basename($relation),
++        ));
++    }
++
++    private function getAggregateParentKey(Relation $relation): ?string
++    {
++        return match (true) {
++            $relation instanceof HasOneOrMany => $relation->getLocalKeyName(),
++            $relation instanceof BelongsTo => $relation->getForeignKeyName(),
++            $relation instanceof BelongsToMany => $relation->getParentKeyName(),
++            default => null,
++        };
++    }
++
++    /** The aggregated value does not exist in the documents, the server cannot use it. */
++    private function assertAggregateNotUsedInQuery(string $alias): void
++    {
++        if (isset($this->getQuery()->orders[$alias])) {
++            throw new LogicException(sprintf(
++                'Ordering by the aggregated field "%s" is not supported, as it is computed after the documents are read. Sort the results with the collection method "sortBy" instead.',
++                $alias,
++            ));
++        }
++    }
++}
+diff --git a/src/Helpers/QueriesRelationships.php b/src/Helpers/QueriesRelationships.php
+index 1f1ffa34be20834b745008b3873b9f797892cc06..73f84fec12cafb42302ccb6a7a1d24566fe93797 100644
+--- a/src/Helpers/QueriesRelationships.php
++++ b/src/Helpers/QueriesRelationships.php
+@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+ use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
+ use Illuminate\Database\Eloquent\Relations\Relation;
+ use Illuminate\Support\Collection;
++use LogicException;
+ use MongoDB\Laravel\Eloquent\Model;
+ use MongoDB\Laravel\Relations\MorphToMany;
+ 
+@@ -41,6 +42,7 @@ trait QueriesRelationships
+      *
+      * @throws Exception
+      */
++    #[\Override]
+     public function has($relation, $operator = '>=', $count = 1, $boolean = 'and', ?Closure $callback = null)
+     {
+         if (is_string($relation)) {
+@@ -104,6 +106,8 @@ trait QueriesRelationships
+      */
+     public function addHybridHas(Relation $relation, $operator = '>=', $count = 1, $boolean = 'and', ?Closure $callback = null)
+     {
++        $this->assertHybridRelationSupported($relation);
++
+         $hasQuery = $relation->getQuery();
+         if ($callback) {
+             $hasQuery->callScope($callback);
+@@ -128,6 +132,26 @@ trait QueriesRelationships
+         return $this->whereIn($this->getRelatedConstraintKey($relation), $relatedIds, $boolean, $not);
+     }
+ 
++    /**
++     * @param Relation $relation
++     *
++     * @return void
++     *
++     * @throws Exception
++     */
++    private function assertHybridRelationSupported(Relation $relation): void
++    {
++        if (
++            $relation instanceof HasOneOrMany
++            || $relation instanceof BelongsTo
++            || ($relation instanceof BelongsToMany && ! $this->isAcrossConnections($relation))
++        ) {
++            return;
++        }
++
++        throw new LogicException(class_basename($relation) . ' is not supported for hybrid query constraints.');
++    }
++
+     /**
+      * @param Builder  $hasQuery
+      * @param Relation $relation
+@@ -213,6 +237,8 @@ trait QueriesRelationships
+      */
+     protected function getRelatedConstraintKey(Relation $relation)
+     {
++        $this->assertHybridRelationSupported($relation);
++
+         if ($relation instanceof HasOneOrMany) {
+             return $relation->getLocalKeyName();
+         }
+@@ -221,7 +247,7 @@ trait QueriesRelationships
+             return $relation->getForeignKeyName();
+         }
+ 
+-        if ($relation instanceof BelongsToMany && ! $this->isAcrossConnections($relation)) {
++        if ($relation instanceof BelongsToMany) {
+             return $this->model->getKeyName();
+         }
+ 
+diff --git a/src/MongoDBBusServiceProvider.php b/src/MongoDBBusServiceProvider.php
+index d3d6f25fc0a74682180a0510f00d0745c82bf1b3..ab0afb588d73fbb5c52a13c7d188caf24d5cfe41 100644
+--- a/src/MongoDBBusServiceProvider.php
++++ b/src/MongoDBBusServiceProvider.php
+@@ -10,6 +10,7 @@ use Illuminate\Contracts\Support\DeferrableProvider;
+ use Illuminate\Support\ServiceProvider;
+ use InvalidArgumentException;
+ use MongoDB\Laravel\Bus\MongoBatchRepository;
++use Override;
+ 
+ use function sprintf;
+ 
+@@ -18,6 +19,7 @@ class MongoDBBusServiceProvider extends ServiceProvider implements DeferrablePro
+     /**
+      * Register the service provider.
+      */
++    #[Override]
+     public function register()
+     {
+         $this->app->singleton(MongoBatchRepository::class, function (Container $app) {
+@@ -46,6 +48,8 @@ class MongoDBBusServiceProvider extends ServiceProvider implements DeferrablePro
+         });
+     }
+ 
++    /** @inheritdoc */
++    #[Override]
+     public function provides()
+     {
+         return [
+diff --git a/src/MongoDBServiceProvider.php b/src/MongoDBServiceProvider.php
+index a51a639197ba0858b695d2c5690107db9ea3cef4..dfe473359830c7b21deaa30afdb2c9802cc7ba1e 100644
+--- a/src/MongoDBServiceProvider.php
++++ b/src/MongoDBServiceProvider.php
+@@ -14,6 +14,7 @@ use Illuminate\Foundation\Application;
+ use Illuminate\Session\SessionManager;
+ use Illuminate\Support\ServiceProvider;
+ use InvalidArgumentException;
++use Laravel\Boost\BoostServiceProvider;
+ use Laravel\Scout\EngineManager;
+ use League\Flysystem\Filesystem;
+ use League\Flysystem\GridFS\GridFSAdapter;
+@@ -24,10 +25,15 @@ use MongoDB\Laravel\Eloquent\Model;
+ use MongoDB\Laravel\Queue\MongoConnector;
+ use MongoDB\Laravel\Scout\ScoutEngine;
+ use MongoDB\Laravel\Session\MongoDbSessionHandler;
++use MongoDB\Laravel\Tools\DatabaseInfo;
++use MongoDB\Laravel\Tools\DatabaseQuery;
++use Override;
+ use RuntimeException;
+ 
++use function array_merge;
+ use function assert;
+ use function class_exists;
++use function config;
+ use function get_debug_type;
+ use function is_string;
+ use function sprintf;
+@@ -47,6 +53,7 @@ class MongoDBServiceProvider extends ServiceProvider
+     /**
+      * Register the service provider.
+      */
++    #[Override]
+     public function register()
+     {
+         // Add database driver.
+@@ -77,10 +84,7 @@ class MongoDBServiceProvider extends ServiceProvider
+ 
+         // Add cache and lock drivers.
+         $this->app->resolving('cache', function (CacheManager $cache) {
+-            $cache->extend('mongodb', function (Application $app, array $config): Repository {
+-                // The closure is bound to the CacheManager
+-                assert($this instanceof CacheManager);
+-
++            $cache->extend('mongodb', function (Application $app, array $config) use ($cache): Repository {
+                 $store = new MongoStore(
+                     $app['db']->connection($config['connection'] ?? null),
+                     $config['collection'] ?? 'cache',
+@@ -91,7 +95,7 @@ class MongoDBServiceProvider extends ServiceProvider
+                     $config['lock_timeout'] ?? 86400,
+                 );
+ 
+-                return $this->repository($store, $config);
++                return $cache->repository($store, $config);
+             });
+         });
+ 
+@@ -104,13 +108,14 @@ class MongoDBServiceProvider extends ServiceProvider
+ 
+         $this->registerFlysystemAdapter();
+         $this->registerScoutEngine();
++        $this->registerBoostTools();
+     }
+ 
+     private function registerFlysystemAdapter(): void
+     {
+         // GridFS adapter for filesystem
+         $this->app->resolving('filesystem', static function (FilesystemManager $filesystemManager) {
+-            $filesystemManager->extend('gridfs', static function (Application $app, array $config) {
++            $filesystemManager->extend('gridfs', function (Application $app, array $config) {
+                 if (! class_exists(GridFSAdapter::class)) {
+                     throw new RuntimeException('GridFS adapter for Flysystem is missing. Try running "composer require league/flysystem-gridfs"');
+                 }
+@@ -158,6 +163,18 @@ class MongoDBServiceProvider extends ServiceProvider
+         });
+     }
+ 
++    private function registerBoostTools(): void
++    {
++        if (! class_exists(BoostServiceProvider::class)) {
++            return;
++        }
++
++        config()->set('boost.mcp.tools.include', array_merge(
++            config('boost.mcp.tools.include', []),
++            [DatabaseInfo::class, DatabaseQuery::class],
++        ));
++    }
++
+     private function registerScoutEngine(): void
+     {
+         $this->app->resolving(EngineManager::class, function (EngineManager $engineManager) {
+diff --git a/src/Query/Builder.php b/src/Query/Builder.php
+index 9a6701b87760991eb77b9f39361f8c80133ba934..00f01b977c38793ba34b20e10e5d8c792a79386c 100644
+--- a/src/Query/Builder.php
++++ b/src/Query/Builder.php
+@@ -8,14 +8,11 @@ use ArgumentCountError;
+ use BadMethodCallException;
+ use Carbon\CarbonPeriod;
+ use Closure;
+-use DateTimeInterface;
+-use DateTimeZone;
+ use Illuminate\Database\Query\Builder as BaseBuilder;
+ use Illuminate\Database\Query\Expression;
+ use Illuminate\Support\Arr;
+ use Illuminate\Support\Carbon;
+ use Illuminate\Support\Collection;
+-use Illuminate\Support\Facades\Date;
+ use Illuminate\Support\LazyCollection;
+ use InvalidArgumentException;
+ use LogicException;
+@@ -27,18 +24,21 @@ use MongoDB\Builder\Search;
+ use MongoDB\Builder\Stage\FluentFactoryTrait;
+ use MongoDB\Builder\Type\QueryInterface;
+ use MongoDB\Builder\Type\SearchOperatorInterface;
+-use MongoDB\Driver\Cursor;
++use MongoDB\Driver\CursorInterface;
+ use MongoDB\Driver\ReadPreference;
+ use MongoDB\Laravel\Connection;
+ use Override;
++use ReflectionMethod;
+ use RuntimeException;
+-use stdClass;
++use SortDirection;
+ use TypeError;
+ 
+ use function array_fill_keys;
+ use function array_filter;
+ use function array_is_list;
+ use function array_key_exists;
++use function array_key_first;
++use function array_keys;
+ use function array_map;
+ use function array_merge;
+ use function array_replace;
+@@ -49,7 +49,6 @@ use function call_user_func;
+ use function call_user_func_array;
+ use function count;
+ use function ctype_xdigit;
+-use function date_default_timezone_get;
+ use function dd;
+ use function dump;
+ use function end;
+@@ -57,7 +56,6 @@ use function explode;
+ use function func_get_args;
+ use function func_num_args;
+ use function get_debug_type;
+-use function get_object_vars;
+ use function implode;
+ use function in_array;
+ use function is_array;
+@@ -71,10 +69,8 @@ use function md5;
+ use function preg_match;
+ use function preg_quote;
+ use function preg_replace;
+-use function property_exists;
+ use function serialize;
+ use function sprintf;
+-use function str_contains;
+ use function str_ends_with;
+ use function str_replace;
+ use function str_starts_with;
+@@ -84,7 +80,10 @@ use function substr;
+ use function trait_exists;
+ use function var_export;
+ 
+-/** @property Connection $connection */
++/**
++ * @property Connection $connection
++ * @property Grammar    $grammar
++ */
+ class Builder extends BaseBuilder
+ {
+     private const REGEX_DELIMITERS = ['/', '#', '~'];
+@@ -101,14 +100,7 @@ class Builder extends BaseBuilder
+      *
+      * @var array
+      */
+-    public $projections = [];
+-
+-    /**
+-     * The maximum amount of seconds to allow the query to run.
+-     *
+-     * @var int|float
+-     */
+-    public $timeout;
++    public array $projections = [];
+ 
+     /**
+      * The cursor hint value.
+@@ -124,7 +116,7 @@ class Builder extends BaseBuilder
+      *
+      * @var array
+      */
+-    public $options = [];
++    public array $options = [];
+ 
+     /**
+      * All of the available clause operators.
+@@ -180,7 +172,7 @@ class Builder extends BaseBuilder
+      *
+      * @var array
+      */
+-    protected $conversion = [
++    protected array $conversion = [
+         '=' => 'eq',
+         '!=' => 'ne',
+         '<>' => 'ne',
+@@ -214,20 +206,6 @@ class Builder extends BaseBuilder
+         return $this;
+     }
+ 
+-    /**
+-     * The maximum amount of seconds to allow the query to run.
+-     *
+-     * @param  int|float $seconds
+-     *
+-     * @return $this
+-     */
+-    public function timeout($seconds)
+-    {
+-        $this->timeout = $seconds;
+-
+-        return $this;
+-    }
+-
+     /**
+      * Set the cursor hint.
+      *
+@@ -243,12 +221,14 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function find($id, $columns = [])
+     {
+         return $this->where('_id', '=', $this->convertKey($id))->first($columns);
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function value($column)
+     {
+         $result = (array) $this->first([$column]);
+@@ -257,12 +237,14 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function get($columns = [])
+     {
+         return $this->getFresh($columns);
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function cursor($columns = [])
+     {
+         $result = $this->getFresh($columns, true);
+@@ -316,11 +298,11 @@ class Builder extends BaseBuilder
+         }
+ 
+         $wheres = $this->compileWheres();
+-        $wheres = $this->aliasIdForQuery($wheres);
++        $wheres = $this->grammar->prepareFieldsForQuery($wheres);
+ 
+         // Use MongoDB's aggregation framework when using grouping or aggregation functions.
+         if ($this->groups || $this->aggregate) {
+-            $group   = [];
++            $group = [];
+             $unwinds = [];
+             $set = [];
+ 
+@@ -338,6 +320,12 @@ class Builder extends BaseBuilder
+             // Add the last value of each column when there is no aggregate function.
+             if ($this->groups && ! $this->aggregate) {
+                 foreach ($columns as $column) {
++                    // The _id field holds the grouping keys and must not be
++                    // overwritten by an accumulator when it is selected.
++                    if ($column === '_id') {
++                        continue;
++                    }
++
+                     $key = str_replace('.', '_', $column);
+ 
+                     $group[$key] = ['$last' => '$' . $column];
+@@ -355,7 +343,7 @@ class Builder extends BaseBuilder
+                     $splitColumns = explode('.*.', $column);
+                     if (count($splitColumns) === 2) {
+                         $unwinds[] = $splitColumns[0];
+-                        $column    = implode('.', $splitColumns);
++                        $column = implode('.', $splitColumns);
+                     }
+ 
+                     $aggregations = blank($this->aggregate['columns']) ? [] : $this->aggregate['columns'];
+@@ -408,7 +396,7 @@ class Builder extends BaseBuilder
+ 
+             // Apply order and limit
+             if ($this->orders) {
+-                $pipeline[] = ['$sort' => $this->aliasIdForQuery($this->orders)];
++                $pipeline[] = ['$sort' => $this->grammar->prepareFieldsForQuery($this->orders)];
+             }
+ 
+             if ($this->offset) {
+@@ -449,7 +437,7 @@ class Builder extends BaseBuilder
+ 
+         // Normal query
+         // Convert select columns to simple projections.
+-        $projection = $this->aliasIdForQuery(array_fill_keys($columns, true));
++        $projection = $this->grammar->prepareFieldsForQuery(array_fill_keys($columns, true));
+ 
+         // Add custom projections.
+         if ($this->projections) {
+@@ -459,12 +447,12 @@ class Builder extends BaseBuilder
+         $options = [];
+ 
+         // Apply order, offset, limit and projection
+-        if ($this->timeout) {
++        if (! empty($this->timeout)) {
+             $options['maxTimeMS'] = (int) ($this->timeout * 1000);
+         }
+ 
+         if ($this->orders) {
+-            $options['sort'] = $this->aliasIdForQuery($this->orders);
++            $options['sort'] = $this->grammar->prepareFieldsForQuery($this->orders);
+         }
+ 
+         if ($this->offset) {
+@@ -538,18 +526,18 @@ class Builder extends BaseBuilder
+         if ($returnLazy) {
+             return LazyCollection::make(function () use ($result) {
+                 foreach ($result as $item) {
+-                    yield $this->aliasIdForResult($item);
++                    yield $this->grammar->prepareFieldsForResult($item);
+                 }
+             });
+         }
+ 
+-        if ($result instanceof Cursor) {
++        if ($result instanceof CursorInterface) {
+             $result = $result->toArray();
+         }
+ 
+         foreach ($result as &$document) {
+             if (is_array($document) || is_object($document)) {
+-                $document = $this->aliasIdForResult($document);
++                $document = $this->grammar->prepareFieldsForResult($document);
+             }
+         }
+ 
+@@ -579,6 +567,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @return ($function is null ? AggregationBuilder : mixed) */
++    #[Override]
+     public function aggregate($function = null, $columns = ['*'])
+     {
+         assert(is_array($columns), new TypeError(sprintf('Argument #2 ($columns) must be of type array, %s given', get_debug_type($columns))));
+@@ -619,8 +608,8 @@ class Builder extends BaseBuilder
+         // Once we have executed the query, we will reset the aggregate property so
+         // that more select queries can be executed against the database without
+         // the aggregate value getting in the way when the grammar builds it.
+-        $this->aggregate          = null;
+-        $this->columns            = $previousColumns;
++        $this->aggregate = null;
++        $this->columns = $previousColumns;
+         $this->bindings['select'] = $previousSelectBindings;
+ 
+         // When the aggregation is per group, we return the results as is.
+@@ -640,9 +629,10 @@ class Builder extends BaseBuilder
+     }
+ 
+     /**
+-     * {@inheritDoc}
++     * @param string $function
++     * @param array  $columns
+      *
+-     * @see \Illuminate\Database\Query\Builder::aggregateByGroup()
++     * @return mixed
+      */
+     public function aggregateByGroup(string $function, array $columns = ['*'])
+     {
+@@ -654,12 +644,14 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function exists()
+     {
+         return $this->first(['id']) !== null;
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function distinct($column = false)
+     {
+         $this->distinct = true;
+@@ -672,17 +664,24 @@ class Builder extends BaseBuilder
+     }
+ 
+     /**
+-     * @param int|string|array $direction
++     * @param SortDirection|int|string|array $direction
+      *
+      * @inheritdoc
+      */
++    #[Override]
+     public function orderBy($column, $direction = 'asc')
+     {
+-        if (is_string($direction)) {
++        if ($direction instanceof SortDirection) {
++            $direction = match ($direction) {
++                SortDirection::Ascending => 1,
++                SortDirection::Descending => -1,
++                default => throw new InvalidArgumentException('Unexpected SortDirection enum case.'),
++            };
++        } elseif (is_string($direction)) {
+             $direction = match ($direction) {
+                 'asc', 'ASC' => 1,
+                 'desc', 'DESC' => -1,
+-                default => throw new InvalidArgumentException('Order direction must be "asc" or "desc".'),
++                default => throw new InvalidArgumentException('Order direction must be "asc", "desc" or a case from the SortDirection enum.'),
+             };
+         }
+ 
+@@ -696,7 +695,34 @@ class Builder extends BaseBuilder
+         return $this;
+     }
+ 
++    /**
++     * Override Illuminate's removeExistingOrdersFor to support associative order storage used by MongoDB.
++     *
++     * @inheritdoc
++     */
++    #[Override]
++    protected function removeExistingOrdersFor($column): array
++    {
++        $orders = $this->orders ?? [];
++
++        $toUnset = array_filter(
++            array_keys($orders),
++            function ($orderColumn) use ($column) {
++                return $orderColumn === $column
++                    || ($orderColumn === 'id' && $column === '_id')
++                    || ($orderColumn === '_id' && $column === 'id');
++            },
++        );
++
++        foreach ($toUnset as $column) {
++            unset($orders[$column]);
++        }
++
++        return $orders;
++    }
++
+     /** @inheritdoc */
++    #[Override]
+     public function whereBetween($column, iterable $values, $boolean = 'and', $not = false)
+     {
+         $type = 'between';
+@@ -721,6 +747,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function insert(array $values)
+     {
+         // Allow empty insert batch for consistency with Eloquent SQL
+@@ -745,7 +772,10 @@ class Builder extends BaseBuilder
+             $values = [$values];
+         }
+ 
+-        $values = $this->aliasIdForQuery($values);
++        $values = array_map(
++            $this->grammar->prepareFieldsForQuery(...),
++            $values,
++        );
+ 
+         $options = $this->inheritConnectionOptions();
+ 
+@@ -755,11 +785,12 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function insertGetId(array $values, $sequence = null)
+     {
+         $options = $this->inheritConnectionOptions();
+ 
+-        $values = $this->aliasIdForQuery($values);
++        $values = $this->grammar->prepareFieldsForQuery($values);
+ 
+         $result = $this->collection->insertOne($values, $options);
+ 
+@@ -774,6 +805,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function update(array $values, array $options = [])
+     {
+         // Use $set as default operator for field names that are not in an operator
+@@ -790,6 +822,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function upsert(array $values, $uniqueBy, $update = null): int
+     {
+         if ($values === []) {
+@@ -836,6 +869,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function increment($column, $amount = 1, array $extra = [], array $options = [])
+     {
+         $query = ['$inc' => [(string) $column => $amount]];
+@@ -856,6 +890,12 @@ class Builder extends BaseBuilder
+         return $this->performUpdate($query, $options);
+     }
+ 
++    /**
++     * @param array $options
++     *
++     * @inheritdoc
++     */
++    #[Override]
+     public function incrementEach(array $columns, array $extra = [], array $options = [])
+     {
+         $stage['$addFields'] = $extra;
+@@ -873,12 +913,14 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function decrement($column, $amount = 1, array $extra = [], array $options = [])
+     {
+         return $this->increment($column, -1 * $amount, $extra, $options);
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function decrementEach(array $columns, array $extra = [], array $options = [])
+     {
+         $decrement = [];
+@@ -890,7 +932,49 @@ class Builder extends BaseBuilder
+         return $this->incrementEach($decrement, $extra, $options);
+     }
+ 
++    /**
++     * Multiply a column's value by a given amount.
++     *
++     * @param  string    $column
++     * @param  float|int $amount
++     *
++     * @return int
++     */
++    public function multiply($column, $amount, array $extra = [], array $options = [])
++    {
++        $query = ['$mul' => [(string) $column => $amount]];
++
++        if (! empty($extra)) {
++            $query['$set'] = $extra;
++        }
++
++        // Protect
++        $this->where(function ($query) use ($column) {
++            $query->where($column, 'exists', true);
++
++            $query->whereNotNull($column);
++        });
++
++        $options = $this->inheritConnectionOptions($options);
++
++        return $this->performUpdate($query, $options);
++    }
++
++    /**
++     * Divide a column's value by a given amount.
++     *
++     * @param  string    $column
++     * @param  float|int $amount
++     *
++     * @return int
++     */
++    public function divide($column, $amount, array $extra = [], array $options = [])
++    {
++        return $this->multiply($column, 1 / $amount, $extra, $options);
++    }
++
+     /** @inheritdoc */
++    #[Override]
+     public function pluck($column, $key = null)
+     {
+         $results = $this->get($key === null ? [$column] : [$column, $key]);
+@@ -901,6 +985,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function delete($id = null)
+     {
+         // If an ID is passed to the method, we will set the where clause to check
+@@ -910,8 +995,8 @@ class Builder extends BaseBuilder
+             $this->where('_id', '=', $id);
+         }
+ 
+-        $wheres  = $this->compileWheres();
+-        $wheres  = $this->aliasIdForQuery($wheres);
++        $wheres = $this->compileWheres();
++        $wheres = $this->grammar->prepareFieldsForQuery($wheres);
+         $options = $this->inheritConnectionOptions();
+ 
+         /**
+@@ -932,6 +1017,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function from($collection, $as = null)
+     {
+         if ($collection) {
+@@ -941,10 +1027,11 @@ class Builder extends BaseBuilder
+         return parent::from($collection);
+     }
+ 
++    #[\Override]
+     public function truncate(): bool
+     {
+         $options = $this->inheritConnectionOptions();
+-        $result  = $this->collection->deleteMany([], $options);
++        $result = $this->collection->deleteMany([], $options);
+ 
+         return $result->isAcknowledged();
+     }
+@@ -965,12 +1052,13 @@ class Builder extends BaseBuilder
+     }
+ 
+     /**
+-     * @param (Closure():T)|Expression|null $value
++     * @param (Closure(\MongoDB\Collection):T)|Expression|null $value
+      *
+-     * @return ($value is Closure ? T : ($value is null ? Collection : Expression))
++     * @return ($value is Closure ? T : ($value is null ? \MongoDB\Collection : Expression))
+      *
+      * @template T
+      */
++    #[Override]
+     public function raw($value = null)
+     {
+         // Execute the closure on the mongodb collection
+@@ -1073,11 +1161,13 @@ class Builder extends BaseBuilder
+      *
+      * @inheritdoc
+      */
++    #[Override]
+     public function newQuery()
+     {
+         return new static($this->connection, $this->grammar, $this->processor);
+     }
+ 
++    #[Override]
+     public function runPaginationCountQuery($columns = ['*'])
+     {
+         if ($this->distinct) {
+@@ -1112,12 +1202,12 @@ class Builder extends BaseBuilder
+             $options['multiple'] = true;
+         }
+ 
+-        $update = $this->aliasIdForQuery($update);
++        $update = $this->grammar->prepareFieldsForQuery($update);
+ 
+         $options = $this->inheritConnectionOptions($options);
+ 
+         $wheres = $this->compileWheres();
+-        $wheres = $this->aliasIdForQuery($wheres);
++        $wheres = $this->grammar->prepareFieldsForQuery($wheres);
+         $result = $this->collection->updateMany($wheres, $update, $options);
+         if ($result->isAcknowledged()) {
+             return $result->getModifiedCount() ?: $result->getUpsertedCount();
+@@ -1160,6 +1250,7 @@ class Builder extends BaseBuilder
+      *
+      * @return $this
+      */
++    #[Override]
+     public function where($column, $operator = null, $value = null, $boolean = 'and')
+     {
+         $params = func_get_args();
+@@ -1212,10 +1303,11 @@ class Builder extends BaseBuilder
+             if (isset($where['column'])) {
+                 $where['column'] = (string) $where['column'];
+ 
+-                // Compatibility with Eloquent queries that uses "id" instead of MongoDB's _id
+-                if ($where['column'] === 'id') {
+-                    $where['column'] = '_id';
+-                }
++                // Compatibility with Eloquent queries that use "id" instead of MongoDB's _id.
++                // Delegates to Grammar::prepareFieldsForQuery so the aliasing is overridable.
++                $where['column'] = (string) array_key_first(
++                    $this->grammar->prepareFieldsForQuery([$where['column'] => null]),
++                );
+ 
+                 // Convert id's.
+                 if ($where['column'] === '_id' || str_ends_with($where['column'], '._id')) {
+@@ -1285,9 +1377,9 @@ class Builder extends BaseBuilder
+ 
+     protected function compileWhereBasic(array $where): array
+     {
+-        $column   = $where['column'];
++        $column = $where['column'];
+         $operator = $where['operator'];
+-        $value    = $where['value'];
++        $value = $where['value'];
+ 
+         // Replace like or not like with a Regex instance.
+         if (in_array($operator, ['like', 'not like'])) {
+@@ -1335,7 +1427,7 @@ class Builder extends BaseBuilder
+                 $flags = end($e);
+                 // Extract the regex string between the delimiters
+                 $regstr = substr($value, 1, -1 - strlen($flags));
+-                $value  = new Regex($regstr, $flags);
++                $value = new Regex($regstr, $flags);
+             }
+ 
+             // For inverse regex operations, we can just use the $not operator with the Regex
+@@ -1376,7 +1468,7 @@ class Builder extends BaseBuilder
+     protected function compileWhereNull(array $where): array
+     {
+         $where['operator'] = '=';
+-        $where['value']    = null;
++        $where['value'] = null;
+ 
+         return $this->compileWhereBasic($where);
+     }
+@@ -1384,7 +1476,7 @@ class Builder extends BaseBuilder
+     protected function compileWhereNotNull(array $where): array
+     {
+         $where['operator'] = 'ne';
+-        $where['value']    = null;
++        $where['value'] = null;
+ 
+         return $this->compileWhereBasic($where);
+     }
+@@ -1392,7 +1484,7 @@ class Builder extends BaseBuilder
+     protected function compileWhereBetween(array $where): array
+     {
+         $column = $where['column'];
+-        $not    = $where['not'];
++        $not = $where['not'];
+         $values = $where['values'];
+ 
+         if ($not) {
+@@ -1423,7 +1515,7 @@ class Builder extends BaseBuilder
+     protected function compileWhereDate(array $where): array
+     {
+         $startOfDay = new UTCDateTime(Carbon::parse($where['value'])->startOfDay());
+-        $endOfDay   = new UTCDateTime(Carbon::parse($where['value'])->endOfDay());
++        $endOfDay = new UTCDateTime(Carbon::parse($where['value'])->endOfDay());
+ 
+         return match ($where['operator']) {
+             'eq', '=' => [
+@@ -1607,21 +1699,29 @@ class Builder extends BaseBuilder
+     public function vectorSearch(
+         string $index,
+         string $path,
+-        array $queryVector,
+-        int $limit,
++        array|null $queryVector = null,
++        int $limit = 10,
+         bool $exact = false,
+         QueryInterface|array|null $filter = null,
+         int|null $numCandidates = null,
++        string|null $query = null,
++        string|null $model = null,
+     ): Collection {
++        if (($query !== null || $model !== null) && ! self::vectorSearchSupportsAutoEmbedding()) {
++            throw new BadMethodCallException('The "query" and "model" parameters of vectorSearch() require mongodb/mongodb 2.4+.');
++        }
++
+         // Forward named arguments to the vectorSearch stage, skip null values
+         $args = array_filter([
+             'index' => $index,
+             'limit' => $limit,
+             'path' => $path,
+-            'queryVector' => $queryVector,
++            'model' => $model,
+             'exact' => $exact,
+             'filter' => $filter,
+             'numCandidates' => $numCandidates,
++            'queryVector' => $queryVector,
++            'query' => $query,
+         ], fn ($arg) => $arg !== null);
+ 
+         return $this->aggregate()
+@@ -1653,6 +1753,28 @@ class Builder extends BaseBuilder
+         )->get()->pluck($path);
+     }
+ 
++    /**
++     * Check whether the installed mongodb/mongodb library supports the
++     * "query" and "model" auto-embedding parameters of vectorSearch(),
++     * added in mongodb/mongodb 2.4.
++     */
++    private static function vectorSearchSupportsAutoEmbedding(): bool
++    {
++        static $supported;
++
++        if ($supported === null) {
++            $supported = false;
++            foreach ((new ReflectionMethod(FluentFactoryTrait::class, 'vectorSearch'))->getParameters() as $param) {
++                if ($param->getName() === 'query') {
++                    $supported = true;
++                    break;
++                }
++            }
++        }
++
++        return $supported;
++    }
++
+     /**
+      * Apply the connection's session to options if it's not already specified.
+      */
+@@ -1673,6 +1795,7 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function __call($method, $parameters)
+     {
+         if ($method === 'unset') {
+@@ -1683,195 +1806,167 @@ class Builder extends BaseBuilder
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function toSql()
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB. Try "toMql()" instead.');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function toRawSql()
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB. Try "toMql()" instead.');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function whereColumn($first, $operator = null, $second = null, $boolean = 'and')
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function whereFullText($columns, $value, array $options = [], $boolean = 'and')
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function groupByRaw($sql, array $bindings = [])
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function orderByRaw($sql, $bindings = [])
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function unionAll($query)
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function union($query, $all = false)
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function having($column, $operator = null, $value = null, $boolean = 'and')
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function havingRaw($sql, array $bindings = [], $boolean = 'and')
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function havingBetween($column, iterable $values, $boolean = 'and', $not = false)
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function whereIntegerInRaw($column, $values, $boolean = 'and', $not = false)
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function orWhereIntegerInRaw($column, $values)
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function whereIntegerNotInRaw($column, $values, $boolean = 'and')
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+     /** @internal This method is not supported by MongoDB. */
++    #[Override]
+     public function orWhereIntegerNotInRaw($column, $values, $boolean = 'and')
+     {
+         throw new BadMethodCallException('This method is not supported by MongoDB');
+     }
+ 
+-    private function aliasIdForQuery(array $values, bool $root = true): array
++    /**
++     * Base method from Laravel >= 13.0
++     * ToDo: mark as `#[Override]` when we drop support for Laravel < 13.0
++     *
++     * @internal This method is not supported by MongoDB. Use vectorSearch() instead.
++     */
++    #[\Override]
++    public function whereVectorSimilarTo($column, $vector, $minSimilarity = 0.6, $order = true)
+     {
+-        if (array_key_exists('id', $values) && ($root || $this->connection->getRenameEmbeddedIdField())) {
+-            if (array_key_exists('_id', $values) && $values['id'] !== $values['_id']) {
+-                throw new InvalidArgumentException('Cannot have both "id" and "_id" fields.');
+-            }
+-
+-            $values['_id'] = $values['id'];
+-            unset($values['id']);
+-        }
+-
+-        foreach ($values as $key => $value) {
+-            if (! is_string($key)) {
+-                continue;
+-            }
+-
+-            // "->" arrow notation for subfields is an alias for "." dot notation
+-            if (str_contains($key, '->')) {
+-                $newkey = str_replace('->', '.', $key);
+-                if (array_key_exists($newkey, $values) && $value !== $values[$newkey]) {
+-                    throw new InvalidArgumentException(sprintf('Cannot have both "%s" and "%s" fields.', $key, $newkey));
+-                }
+-
+-                $values[$newkey] = $value;
+-                unset($values[$key]);
+-                $key = $newkey;
+-            }
+-
+-            // ".id" subfield are alias for "._id"
+-            if (str_ends_with($key, '.id') && $this->connection->getRenameEmbeddedIdField()) {
+-                $newkey = substr($key, 0, -3) . '._id';
+-                if (array_key_exists($newkey, $values) && $value !== $values[$newkey]) {
+-                    throw new InvalidArgumentException(sprintf('Cannot have both "%s" and "%s" fields.', $key, $newkey));
+-                }
+-
+-                $values[substr($key, 0, -3) . '._id'] = $value;
+-                unset($values[$key]);
+-            }
+-        }
+-
+-        foreach ($values as &$value) {
+-            if (is_array($value)) {
+-                $value = $this->aliasIdForQuery($value, false);
+-            } elseif ($value instanceof DateTimeInterface) {
+-                $value = new UTCDateTime($value);
+-            }
+-        }
+-
+-        return $values;
++        throw new BadMethodCallException('This method is not supported by MongoDB. Use vectorSearch() instead.');
+     }
+ 
+     /**
+-     * @internal
+-     *
+-     * @psalm-param T $values
++     * Base method from Laravel >= 13.0
++     * ToDo: mark as `#[Override]` when we drop support for Laravel < 13.0
+      *
+-     * @psalm-return T
+-     *
+-     * @template T of array|object
++     * @internal This method is not supported by MongoDB. Use vectorSearch() with the $filter parameter instead.
+      */
+-    public function aliasIdForResult(array|object $values, bool $root = true): array|object
++    #[\Override]
++    public function whereVectorDistanceLessThan($column, $vector, $maxDistance, $boolean = 'and')
+     {
+-        if (is_array($values)) {
+-            if (
+-                array_key_exists('_id', $values) && ! array_key_exists('id', $values)
+-                && ($root || $this->connection->getRenameEmbeddedIdField())
+-            ) {
+-                $values['id'] = $values['_id'];
+-                unset($values['_id']);
+-            }
+-
+-            foreach ($values as $key => $value) {
+-                if ($value instanceof UTCDateTime) {
+-                    $values[$key] = Date::instance($value->toDateTime())
+-                        ->setTimezone(new DateTimeZone(date_default_timezone_get()));
+-                } elseif (is_array($value) || is_object($value)) {
+-                    $values[$key] = $this->aliasIdForResult($value, false);
+-                }
+-            }
+-        }
++        throw new BadMethodCallException('This method is not supported by MongoDB. Use vectorSearch() with the $filter parameter instead.');
++    }
+ 
+-        if ($values instanceof stdClass) {
+-            if (
+-                property_exists($values, '_id') && ! property_exists($values, 'id')
+-                && ($root || $this->connection->getRenameEmbeddedIdField())
+-            ) {
+-                $values->id = $values->_id;
+-                unset($values->_id);
+-            }
++    /**
++     * Base method from Laravel >= 13.0
++     * ToDo: mark as `#[Override]` when we drop support for Laravel < 13.0
++     *
++     * @internal This method is not supported by MongoDB. Use vectorSearch() with the $filter parameter instead.
++     */
++    #[\Override]
++    public function orWhereVectorDistanceLessThan($column, $vector, $maxDistance)
++    {
++        throw new BadMethodCallException('This method is not supported by MongoDB. Use vectorSearch() with the $filter parameter instead.');
++    }
+ 
+-            foreach (get_object_vars($values) as $key => $value) {
+-                if ($value instanceof UTCDateTime) {
+-                    $values->{$key} = Date::instance($value->toDateTime())
+-                        ->setTimezone(new DateTimeZone(date_default_timezone_get()));
+-                } elseif (is_array($value) || is_object($value)) {
+-                    $values->{$key} = $this->aliasIdForResult($value, false);
+-                }
+-            }
+-        }
++    /**
++     * Base method from Laravel >= 13.0
++     * ToDo: mark as `#[Override]` when we drop support for Laravel < 13.0
++     *
++     * @internal This method is not supported by MongoDB. Use vectorSearch() instead, which returns vectorSearchScore in the result.
++     */
++    #[\Override]
++    public function selectVectorDistance($column, $vector, $as = null)
++    {
++        throw new BadMethodCallException('This method is not supported by MongoDB. Use vectorSearch() instead, which returns vectorSearchScore in the result.');
++    }
+ 
+-        return $values;
++    /**
++     * Base method from Laravel >= 13.0
++     * ToDo: mark as `#[Override]` when we drop support for Laravel < 13.0
++     *
++     * @internal This method is not supported by MongoDB. Use vectorSearch() instead, which returns results ordered by vector score.
++     */
++    #[\Override]
++    public function orderByVectorDistance($column, $vector = [])
++    {
++        throw new BadMethodCallException('This method is not supported by MongoDB. Use vectorSearch() instead, which returns results ordered by vector score.');
+     }
+ }
+diff --git a/src/Query/BuilderTimeout.php b/src/Query/BuilderTimeout.php
+deleted file mode 100644
+index d40eefff4d5365f3efff5710d966ead467ecc7a4..0000000000000000000000000000000000000000
+--- a/src/Query/BuilderTimeout.php
++++ /dev/null
+@@ -1,37 +0,0 @@
+-<?php
+-
+-declare(strict_types=1);
+-
+-namespace MongoDB\Laravel\Query;
+-
+-use Illuminate\Database\Query\Builder;
+-use MongoDB\Laravel\Schema\BlueprintLaravelCompatibility;
+-
+-use function dirname;
+-use function is_file;
+-use function method_exists;
+-
+-// The cumulative source keeps this legacy surface only while its matching
+-// pre-Laravel-12 Blueprint compatibility layer is present.
+-$blueprintCompatibilityFile = dirname(__DIR__) . '/Schema/BlueprintLaravelCompatibility.php';
+-
+-if (is_file($blueprintCompatibilityFile) && trait_exists(BlueprintLaravelCompatibility::class)) {
+-    if (method_exists(Builder::class, 'timeout')) {
+-        trait BuilderTimeout
+-        {
+-        }
+-    } else {
+-        trait BuilderTimeout
+-        {
+-            /** @var int|float */
+-            public $timeout;
+-
+-            public function timeout($seconds)
+-            {
+-                $this->timeout = $seconds;
+-
+-                return $this;
+-            }
+-        }
+-    }
+-}
+diff --git a/src/Query/Grammar.php b/src/Query/Grammar.php
+index 381a98eaab8c780ca0ddc5a8f203839500fe66db..47326d4f8798d0837392afe6582155df2fb4182e 100644
+--- a/src/Query/Grammar.php
++++ b/src/Query/Grammar.php
+@@ -4,8 +4,158 @@ declare(strict_types=1);
+ 
+ namespace MongoDB\Laravel\Query;
+ 
++use DateInvalidTimeZoneException;
++use DateTimeInterface;
++use DateTimeZone;
+ use Illuminate\Database\Query\Grammars\Grammar as BaseGrammar;
++use Illuminate\Support\Facades\Date;
++use InvalidArgumentException;
++use MongoDB\BSON\UTCDateTime;
++use MongoDB\Laravel\Connection;
++use stdClass;
+ 
++use function array_key_exists;
++use function date_default_timezone_get;
++use function get_object_vars;
++use function is_array;
++use function is_object;
++use function is_string;
++use function property_exists;
++use function sprintf;
++use function str_contains;
++use function str_ends_with;
++use function str_replace;
++use function substr;
++
++/** @property Connection $connection */
+ class Grammar extends BaseGrammar
+ {
++    /**
++     * Prepare fields for the MongoDB query by aliasing "id" to "_id" and handling arrow notation.
++     * Users can override this method to customize field aliasing behavior.
++     *
++     * @param array<string, mixed> $values The values to prepare
++     * @param bool                 $root   Whether this is the root level (affects embedded id field handling)
++     * @psalm-param T $values
++     *
++     * @return array<string, mixed> The prepared values
++     * @psalm-return T
++     *
++     * @template T of array
++     */
++    public function prepareFieldsForQuery(array $values, bool $root = true): array
++    {
++        if (array_key_exists('id', $values) && ($root || $this->connection->getRenameEmbeddedIdField())) {
++            if (array_key_exists('_id', $values) && $values['id'] !== $values['_id']) {
++                throw new InvalidArgumentException('Cannot have both "id" and "_id" fields.');
++            }
++
++            $values['_id'] = $values['id'];
++            unset($values['id']);
++        }
++
++        foreach ($values as $key => $value) {
++            if (! is_string($key)) {
++                continue;
++            }
++
++            // "->" arrow notation for subfields is an alias for "." dot notation
++            if (str_contains($key, '->')) {
++                $newKey = str_replace('->', '.', $key);
++                if (array_key_exists($newKey, $values) && $value !== $values[$newKey]) {
++                    throw new InvalidArgumentException(sprintf('Cannot have both "%s" and "%s" fields.', $key, $newKey));
++                }
++
++                $values[$newKey] = $value;
++                unset($values[$key]);
++                $key = $newKey;
++            }
++
++            // ".id" subfield are alias for "._id"
++            if (str_ends_with($key, '.id') && $this->connection->getRenameEmbeddedIdField()) {
++                $newKey = substr($key, 0, -3) . '._id';
++                if (array_key_exists($newKey, $values) && $value !== $values[$newKey]) {
++                    throw new InvalidArgumentException(sprintf('Cannot have both "%s" and "%s" fields.', $key, $newKey));
++                }
++
++                $values[$newKey] = $value;
++                unset($values[$key]);
++            }
++        }
++
++        foreach ($values as &$value) {
++            if (is_array($value)) {
++                $value = $this->prepareFieldsForQuery($value, false);
++            } elseif ($value instanceof DateTimeInterface) {
++                $value = new UTCDateTime($value);
++            } elseif ($value instanceof stdClass) {
++                $value = $this->prepareFieldsForQuery(
++                    get_object_vars($value),
++                    false,
++                );
++
++                $value = (object) $value;
++            }
++        }
++
++        return $values;
++    }
++
++    /**
++     * Prepare fields from the MongoDB result by aliasing "_id" to "id".
++     * Users can override this method to customize field aliasing behavior.
++     *
++     * @param array<string, mixed>|object $values The values to prepare
++     * @param bool                        $root   Whether this is the root level (affects embedded id field handling)
++     * @psalm-param T                     $values
++     *
++     * @return array<string, mixed>|object The prepared values
++     * @psalm-return T
++     *
++     * @throws DateInvalidTimeZoneException
++     *
++     * @template T of array|object
++     */
++    public function prepareFieldsForResult(array|object $values, bool $root = true): array|object
++    {
++        if (is_array($values)) {
++            if (
++                array_key_exists('_id', $values) && ! array_key_exists('id', $values)
++                && ($root || $this->connection->getRenameEmbeddedIdField())
++            ) {
++                $values['id'] = $values['_id'];
++                unset($values['_id']);
++            }
++
++            foreach ($values as $key => $value) {
++                if ($value instanceof UTCDateTime) {
++                    $values[$key] = Date::instance($value->toDateTime())
++                        ->setTimezone(new DateTimeZone(date_default_timezone_get()));
++                } elseif (is_array($value) || is_object($value)) {
++                    $values[$key] = $this->prepareFieldsForResult($value, false);
++                }
++            }
++        }
++
++        if ($values instanceof stdClass) {
++            if (
++                property_exists($values, '_id') && ! property_exists($values, 'id')
++                && ($root || $this->connection->getRenameEmbeddedIdField())
++            ) {
++                $values->id = $values->_id;
++                unset($values->_id);
++            }
++
++            foreach (get_object_vars($values) as $key => $value) {
++                if ($value instanceof UTCDateTime) {
++                    $values->{$key} = Date::instance($value->toDateTime())
++                        ->setTimezone(new DateTimeZone(date_default_timezone_get()));
++                } elseif (is_array($value) || is_object($value)) {
++                    $values->{$key} = $this->prepareFieldsForResult($value, false);
++                }
++            }
++        }
++
++        return $values;
++    }
+ }
+diff --git a/src/Queue/MongoConnector.php b/src/Queue/MongoConnector.php
+index be51d4fe15c594e15a5d53be4363f8ad5b958bc0..50d2f38e7cf5d33fe144244fe454c130e86e078a 100644
+--- a/src/Queue/MongoConnector.php
++++ b/src/Queue/MongoConnector.php
+@@ -34,6 +34,7 @@ class MongoConnector implements ConnectorInterface
+      *
+      * @return Queue
+      */
++    #[\Override]
+     public function connect(array $config)
+     {
+         if (! isset($config['collection']) && isset($config['table'])) {
+diff --git a/src/Queue/MongoQueue.php b/src/Queue/MongoQueue.php
+index 7810aab9276b21c48224926e05c486816e5356cf..6f12990adec35d312769cfd1c1af43f464839158 100644
+--- a/src/Queue/MongoQueue.php
++++ b/src/Queue/MongoQueue.php
+@@ -8,6 +8,7 @@ use Carbon\Carbon;
+ use Illuminate\Queue\DatabaseQueue;
+ use MongoDB\Laravel\Connection;
+ use MongoDB\Operation\FindOneAndUpdate;
++use Override;
+ use stdClass;
+ 
+ class MongoQueue extends DatabaseQueue
+@@ -34,7 +35,12 @@ class MongoQueue extends DatabaseQueue
+         $this->retryAfter = $retryAfter;
+     }
+ 
+-    /** @inheritdoc */
++    /**
++     * @return MongoJob|null
++     *
++     * @inheritdoc
++     */
++    #[Override]
+     public function pop($queue = null)
+     {
+         $queue = $this->getQueue($queue);
+@@ -72,16 +78,18 @@ class MongoQueue extends DatabaseQueue
+      */
+     protected function getNextAvailableJobAndReserve($queue)
+     {
++        $now = Carbon::now()->getTimestamp();
++
+         $job = $this->database->getCollection($this->table)->findOneAndUpdate(
+             [
+                 'queue' => $this->getQueue($queue),
+                 'reserved' => ['$ne' => 1],
+-                'available_at' => ['$lte' => Carbon::now()->getTimestamp()],
++                'available_at' => ['$lte' => $now],
+             ],
+             [
+                 '$set' => [
+                     'reserved' => 1,
+-                    'reserved_at' => Carbon::now()->getTimestamp(),
++                    'reserved_at' => $now,
+                 ],
+                 '$inc' => ['attempts' => 1],
+             ],
+@@ -138,12 +146,14 @@ class MongoQueue extends DatabaseQueue
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function deleteReserved($queue, $id)
+     {
+         $this->database->table($this->table)->where('_id', $id)->delete();
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function deleteAndRelease($queue, $job, $delay)
+     {
+         $this->deleteReserved($queue, $job->getJobId());
+diff --git a/src/Relations/BelongsTo.php b/src/Relations/BelongsTo.php
+index 93eb11f8e52c27e2754388cbee6392facdc3c1f1..15447c2196c7d46c88f94be71f8cd5f1c895f716 100644
+--- a/src/Relations/BelongsTo.php
++++ b/src/Relations/BelongsTo.php
+@@ -7,6 +7,7 @@ namespace MongoDB\Laravel\Relations;
+ use Illuminate\Database\Eloquent\Builder;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsTo as EloquentBelongsTo;
++use Override;
+ 
+ /**
+  * @template TRelatedModel of Model
+@@ -26,6 +27,7 @@ class BelongsTo extends EloquentBelongsTo
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function addConstraints()
+     {
+         if (static::$constraints) {
+@@ -37,6 +39,7 @@ class BelongsTo extends EloquentBelongsTo
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function addEagerConstraints(array $models)
+     {
+         // We'll grab the primary key name of the related models since it could be set to
+@@ -46,6 +49,7 @@ class BelongsTo extends EloquentBelongsTo
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getRelationExistenceQuery(Builder $query, Builder $parentQuery, $columns = ['*'])
+     {
+         return $query;
+@@ -58,11 +62,13 @@ class BelongsTo extends EloquentBelongsTo
+      *
+      * @return string
+      */
++    #[Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+     }
+ 
++    #[Override]
+     public function getQualifiedForeignKeyName(): string
+     {
+         return $this->foreignKey;
+diff --git a/src/Relations/BelongsToMany.php b/src/Relations/BelongsToMany.php
+index 042ec22cec6ba286f30297d3fd42beed3524f5a1..8978483ec188c5746d070a1c0b52da6106c11500 100644
+--- a/src/Relations/BelongsToMany.php
++++ b/src/Relations/BelongsToMany.php
+@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsToMany as EloquentBelongsToMany;
+ use Illuminate\Support\Arr;
+ use MongoDB\Laravel\Eloquent\Model as DocumentModel;
++use Override;
+ 
+ use function array_diff;
+ use function array_keys;
+@@ -39,12 +40,14 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getRelationExistenceQuery(Builder $query, Builder $parentQuery, $columns = ['*'])
+     {
+         return $query;
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function hydratePivotRelation(array $models)
+     {
+         // Do nothing.
+@@ -61,12 +64,14 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function shouldSelect(array $columns = ['*'])
+     {
+         return $columns;
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function addConstraints()
+     {
+         if (static::$constraints) {
+@@ -89,6 +94,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function save(Model $model, array $pivotAttributes = [], $touch = true)
+     {
+         $model->save(['touch' => false]);
+@@ -99,6 +105,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function create(array $attributes = [], array $joining = [], $touch = true)
+     {
+         $instance = $this->related->newInstance($attributes);
+@@ -114,6 +121,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function sync($ids, $detaching = true)
+     {
+         $changes = [
+@@ -177,6 +185,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function updateExistingPivot($id, array $attributes, $touch = true)
+     {
+         // Do nothing, we have no pivot table.
+@@ -184,6 +193,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function attach($id, array $attributes = [], $touch = true)
+     {
+         if ($id instanceof Model) {
+@@ -224,6 +234,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function detach($ids = [], $touch = true)
+     {
+         if ($ids instanceof Model) {
+@@ -264,6 +275,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function buildDictionary(Collection $results)
+     {
+         $foreign = $this->foreignPivotKey;
+@@ -283,6 +295,7 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function newPivotQuery()
+     {
+         return $this->newRelatedQuery();
+@@ -309,12 +322,14 @@ class BelongsToMany extends EloquentBelongsToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getQualifiedForeignPivotKeyName()
+     {
+         return $this->foreignPivotKey;
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getQualifiedRelatedPivotKeyName()
+     {
+         return $this->relatedPivotKey;
+@@ -323,10 +338,9 @@ class BelongsToMany extends EloquentBelongsToMany
+     /**
+      * Get the name of the "where in" method for eager loading.
+      *
+-     * @param string $key
+-     *
+-     * @return string
++     * @inheritdoc
+      */
++    #[Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/EmbedsMany.php b/src/Relations/EmbedsMany.php
+index 49e1afa2d9b9ebc1543889c2925767b7880f2a8a..65bffdad738cc05c0e490d9b8112f3b94b1f284d 100644
+--- a/src/Relations/EmbedsMany.php
++++ b/src/Relations/EmbedsMany.php
+@@ -30,6 +30,7 @@ use function value;
+ class EmbedsMany extends EmbedsOneOrMany
+ {
+     /** @inheritdoc */
++    #[\Override]
+     public function initRelation(array $models, $relation)
+     {
+         foreach ($models as $model) {
+@@ -40,6 +41,7 @@ class EmbedsMany extends EmbedsOneOrMany
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function getResults()
+     {
+         return $this->toCollection($this->getEmbedded());
+@@ -347,6 +349,7 @@ class EmbedsMany extends EmbedsOneOrMany
+     }
+ 
+     /** @inheritdoc */
++    #[\Override]
+     public function __call($method, $parameters)
+     {
+         if (method_exists(Collection::class, $method)) {
+@@ -363,6 +366,7 @@ class EmbedsMany extends EmbedsOneOrMany
+      *
+      * @return string
+      */
++    #[\Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/EmbedsOne.php b/src/Relations/EmbedsOne.php
+index be7fb192f015e3267807295ab84c45cf7bc79446..4ff713c155151a1de7f680231a48906c27705e43 100644
+--- a/src/Relations/EmbedsOne.php
++++ b/src/Relations/EmbedsOne.php
+@@ -19,6 +19,7 @@ use function throw_if;
+  */
+ class EmbedsOne extends EmbedsOneOrMany
+ {
++    #[\Override]
+     public function initRelation(array $models, $relation)
+     {
+         foreach ($models as $model) {
+@@ -28,11 +29,13 @@ class EmbedsOne extends EmbedsOneOrMany
+         return $models;
+     }
+ 
++    #[\Override]
+     public function getResults()
+     {
+         return $this->toModel($this->getEmbedded());
+     }
+ 
++    #[\Override]
+     public function getEager()
+     {
+         $eager = $this->get();
+@@ -163,6 +166,7 @@ class EmbedsOne extends EmbedsOneOrMany
+      *
+      * @return string
+      */
++    #[\Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/EmbedsOneOrMany.php b/src/Relations/EmbedsOneOrMany.php
+index a46593cf47ebbfe4de4452852d06b3e3db374494..cc9376dcc3fdb2fdf59b4314a9fdf097e183e727 100644
+--- a/src/Relations/EmbedsOneOrMany.php
++++ b/src/Relations/EmbedsOneOrMany.php
+@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Relations\Relation;
+ use Illuminate\Database\Query\Expression;
+ use MongoDB\Driver\Exception\LogicException;
+ use MongoDB\Laravel\Eloquent\Model as DocumentModel;
++use Override;
+ use Throwable;
+ 
+ use function array_merge;
+@@ -78,6 +79,7 @@ abstract class EmbedsOneOrMany extends Relation
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function addConstraints()
+     {
+         if (static::$constraints) {
+@@ -86,12 +88,14 @@ abstract class EmbedsOneOrMany extends Relation
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function addEagerConstraints(array $models)
+     {
+         // There are no eager loading constraints.
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function match(array $models, Collection $results, $relation)
+     {
+         foreach ($models as $model) {
+@@ -105,13 +109,7 @@ abstract class EmbedsOneOrMany extends Relation
+         return $models;
+     }
+ 
+-    /**
+-     * Shorthand to get the results of the relationship.
+-     *
+-     * @param  array $columns
+-     *
+-     * @return Collection
+-     */
++    #[Override]
+     public function get($columns = ['*'])
+     {
+         return $this->getResults();
+@@ -324,6 +322,7 @@ abstract class EmbedsOneOrMany extends Relation
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getQuery()
+     {
+         // Because we are sharing this relation instance to models, we need
+@@ -332,6 +331,7 @@ abstract class EmbedsOneOrMany extends Relation
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function toBase()
+     {
+         // Because we are sharing this relation instance to models, we need
+@@ -367,6 +367,7 @@ abstract class EmbedsOneOrMany extends Relation
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getQualifiedParentKeyName()
+     {
+         $parentRelation = $this->getParentRelation();
+@@ -425,10 +426,10 @@ abstract class EmbedsOneOrMany extends Relation
+      * Get the name of the "where in" method for eager loading.
+      *
+      * @param EloquentModel $model
+-     * @param  string        $key
+      *
+-     * @return string
++     * @inheritdoc
+      */
++    #[Override]
+     protected function whereInMethod(EloquentModel $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/HasMany.php b/src/Relations/HasMany.php
+index c8e7e059089f615f3d9268bae1a5283da2009501..0522304950dca37439143641688c83f00c341934 100644
+--- a/src/Relations/HasMany.php
++++ b/src/Relations/HasMany.php
+@@ -7,6 +7,7 @@ namespace MongoDB\Laravel\Relations;
+ use Illuminate\Database\Eloquent\Builder;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\HasMany as EloquentHasMany;
++use Override;
+ 
+ /**
+  * @template TRelatedModel of Model
+@@ -20,6 +21,7 @@ class HasMany extends EloquentHasMany
+      *
+      * @return string
+      */
++    #[Override]
+     public function getForeignKeyName()
+     {
+         return $this->foreignKey;
+@@ -36,6 +38,7 @@ class HasMany extends EloquentHasMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getRelationExistenceQuery(Builder $query, Builder $parentQuery, $columns = ['*'])
+     {
+         $foreignKey = $this->getHasCompareKey();
+@@ -46,10 +49,9 @@ class HasMany extends EloquentHasMany
+     /**
+      * Get the name of the "where in" method for eager loading.
+      *
+-     * @param string $key
+-     *
+-     * @return string
++     * @inheritdoc
+      */
++    #[Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/HasOne.php b/src/Relations/HasOne.php
+index ea26761d3867eb83419f91afb626ae803196f32c..bfa297c4e0523cd526a7cc6b3be927e6732635da 100644
+--- a/src/Relations/HasOne.php
++++ b/src/Relations/HasOne.php
+@@ -7,6 +7,7 @@ namespace MongoDB\Laravel\Relations;
+ use Illuminate\Database\Eloquent\Builder;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\HasOne as EloquentHasOne;
++use Override;
+ 
+ /**
+  * @template TRelatedModel of Model
+@@ -20,6 +21,7 @@ class HasOne extends EloquentHasOne
+      *
+      * @return string
+      */
++    #[Override]
+     public function getForeignKeyName()
+     {
+         return $this->foreignKey;
+@@ -36,6 +38,7 @@ class HasOne extends EloquentHasOne
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function getRelationExistenceQuery(Builder $query, Builder $parentQuery, $columns = ['*'])
+     {
+         $foreignKey = $this->getForeignKeyName();
+@@ -43,13 +46,8 @@ class HasOne extends EloquentHasOne
+         return $query->select($foreignKey)->where($foreignKey, 'exists', true);
+     }
+ 
+-    /**
+-     * Get the name of the "where in" method for eager loading.
+-     *
+-     * @param string $key
+-     *
+-     * @return string
+-     */
++    /** Get the name of the "where in" method for eager loading. */
++    #[Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/MorphMany.php b/src/Relations/MorphMany.php
+index 5f395950f632dcafd52fb2a77c00ca0282a9e99c..925ebcfa94260a9a255faa599d09601aa814a324 100644
+--- a/src/Relations/MorphMany.php
++++ b/src/Relations/MorphMany.php
+@@ -6,6 +6,7 @@ namespace MongoDB\Laravel\Relations;
+ 
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\MorphMany as EloquentMorphMany;
++use Override;
+ 
+ /**
+  * @template TRelatedModel of Model
+@@ -14,13 +15,7 @@ use Illuminate\Database\Eloquent\Relations\MorphMany as EloquentMorphMany;
+  */
+ class MorphMany extends EloquentMorphMany
+ {
+-    /**
+-     * Get the name of the "where in" method for eager loading.
+-     *
+-     * @param string $key
+-     *
+-     * @return string
+-     */
++    #[Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/MorphOne.php b/src/Relations/MorphOne.php
+new file mode 100644
+index 0000000000000000000000000000000000000000..699401d2499dd2ea624e753efb55c87934829898
+--- /dev/null
++++ b/src/Relations/MorphOne.php
+@@ -0,0 +1,23 @@
++<?php
++
++declare(strict_types=1);
++
++namespace MongoDB\Laravel\Relations;
++
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\MorphOne as EloquentMorphOne;
++use Override;
++
++/**
++ * @template TRelatedModel of Model
++ * @template TDeclaringModel of Model
++ * @extends EloquentMorphOne<TRelatedModel, TDeclaringModel>
++ */
++class MorphOne extends EloquentMorphOne
++{
++    #[Override]
++    protected function whereInMethod(Model $model, $key)
++    {
++        return 'whereIn';
++    }
++}
+diff --git a/src/Relations/MorphTo.php b/src/Relations/MorphTo.php
+index 4888b2d979dcb0766938cd7de7f256e3bb451082..9f1bf1441c9a74b982b8cfd2c758b7afbaa5f598 100644
+--- a/src/Relations/MorphTo.php
++++ b/src/Relations/MorphTo.php
+@@ -6,6 +6,7 @@ namespace MongoDB\Laravel\Relations;
+ 
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\MorphTo as EloquentMorphTo;
++use Override;
+ 
+ /**
+  * @template TRelatedModel of Model
+@@ -15,6 +16,7 @@ use Illuminate\Database\Eloquent\Relations\MorphTo as EloquentMorphTo;
+ class MorphTo extends EloquentMorphTo
+ {
+     /** @inheritdoc */
++    #[Override]
+     public function addConstraints()
+     {
+         if (static::$constraints) {
+@@ -30,6 +32,7 @@ class MorphTo extends EloquentMorphTo
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function getResultsByType($type)
+     {
+         $instance = $this->createModelByType($type);
+@@ -41,13 +44,8 @@ class MorphTo extends EloquentMorphTo
+         return $query->whereIn($key, $this->gatherKeysByType($type, $instance->getKeyType()))->get();
+     }
+ 
+-    /**
+-     * Get the name of the "where in" method for eager loading.
+-     *
+-     * @param string $key
+-     *
+-     * @return string
+-     */
++    /** Get the name of the "where in" method for eager loading. */
++    #[Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Relations/MorphToMany.php b/src/Relations/MorphToMany.php
+index a1514d23529681124a2d98998e42a16412cb5f34..724dad9125a72340631028bdee32466ac825d345 100644
+--- a/src/Relations/MorphToMany.php
++++ b/src/Relations/MorphToMany.php
+@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\MorphToMany as EloquentMorphToMany;
+ use Illuminate\Support\Arr;
+ use MongoDB\BSON\ObjectId;
++use Override;
+ 
+ use function array_diff;
+ use function array_key_exists;
+@@ -31,25 +32,25 @@ use function is_numeric;
+  */
+ class MorphToMany extends EloquentMorphToMany
+ {
+-    /** @inheritdoc */
++    #[Override]
+     public function getRelationExistenceQuery(Builder $query, Builder $parentQuery, $columns = ['*'])
+     {
+         return $query;
+     }
+ 
+-    /** @inheritdoc */
++    #[Override]
+     protected function hydratePivotRelation(array $models)
+     {
+         // Do nothing.
+     }
+ 
+-    /** @inheritdoc */
++    #[Override]
+     protected function shouldSelect(array $columns = ['*'])
+     {
+         return $columns;
+     }
+ 
+-    /** @inheritdoc */
++    #[Override]
+     public function addConstraints()
+     {
+         if (static::$constraints) {
+@@ -57,7 +58,7 @@ class MorphToMany extends EloquentMorphToMany
+         }
+     }
+ 
+-    /** @inheritdoc */
++    #[Override]
+     public function addEagerConstraints(array $models)
+     {
+         // To load relation's data, we act normally on MorphToMany relation,
+@@ -102,6 +103,7 @@ class MorphToMany extends EloquentMorphToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function save(Model $model, array $pivotAttributes = [], $touch = true)
+     {
+         $model->save(['touch' => false]);
+@@ -112,6 +114,7 @@ class MorphToMany extends EloquentMorphToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function create(array $attributes = [], array $joining = [], $touch = true)
+     {
+         $instance = $this->related->newInstance($attributes);
+@@ -127,6 +130,7 @@ class MorphToMany extends EloquentMorphToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function sync($ids, $detaching = true)
+     {
+         $changes = [
+@@ -203,12 +207,14 @@ class MorphToMany extends EloquentMorphToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function updateExistingPivot($id, array $attributes, $touch = true): void
+     {
+         // Do nothing, we have no pivot table.
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function attach($id, array $attributes = [], $touch = true)
+     {
+         if ($id instanceof Model) {
+@@ -302,6 +308,7 @@ class MorphToMany extends EloquentMorphToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function detach($ids = [], $touch = true)
+     {
+         if ($ids instanceof Model) {
+@@ -376,6 +383,7 @@ class MorphToMany extends EloquentMorphToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     protected function buildDictionary(Collection $results)
+     {
+         $foreign = $this->foreignPivotKey;
+@@ -403,6 +411,7 @@ class MorphToMany extends EloquentMorphToMany
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function newPivotQuery()
+     {
+         return $this->newRelatedQuery();
+@@ -418,19 +427,13 @@ class MorphToMany extends EloquentMorphToMany
+         return $this->related->newQuery();
+     }
+ 
+-    /** @inheritdoc */
++    #[Override]
+     public function getQualifiedRelatedPivotKeyName()
+     {
+         return $this->relatedPivotKey;
+     }
+ 
+-    /**
+-     * Get the name of the "where in" method for eager loading.
+-     *
+-     * @param string $key
+-     *
+-     * @return string
+-     */
++    #[Override]
+     protected function whereInMethod(Model $model, $key)
+     {
+         return 'whereIn';
+diff --git a/src/Schema/Blueprint.php b/src/Schema/Blueprint.php
+index 1197bfde110990c570e8858c8d75483ef73697dc..3b019f98be9e7a1b088019ba34e4aa8a3a26acd2 100644
+--- a/src/Schema/Blueprint.php
++++ b/src/Schema/Blueprint.php
+@@ -4,11 +4,14 @@ declare(strict_types=1);
+ 
+ namespace MongoDB\Laravel\Schema;
+ 
++use Closure;
+ use Illuminate\Database\Schema\Blueprint as BaseBlueprint;
+ use MongoDB\Collection;
+ use MongoDB\Laravel\Connection;
++use Override;
+ 
+ use function array_flip;
++use function array_merge;
+ use function implode;
+ use function in_array;
+ use function is_array;
+@@ -16,12 +19,116 @@ use function is_int;
+ use function is_string;
+ use function key;
+ 
+-/** @property Connection $connection */
++/**
++ * @property Connection $connection
++ * @link https://www.mongodb.com/docs/atlas/atlas-search/define-field-mappings/#std-label-fts-field-mappings
++ * @phpstan-type TypeSearchIndexField array{
++ *     type: 'boolean'|'date'|'dateFacet'|'objectId'|'stringFacet'|'uuid',
++ * } | array{
++ *     type: 'autocomplete',
++ *     analyzer?: string,
++ *     maxGrams?: int,
++ *     minGrams?: int,
++ *     tokenization?: 'edgeGram'|'rightEdgeGram'|'nGram',
++ *     foldDiacritics?: bool,
++ *     similarity?: array{type: 'bm25'|'boolean'|'stableTfl'},
++ * } | array{
++ *     type: 'document'|'embeddedDocuments',
++ *     dynamic?: bool,
++ *     fields: array<string, array<mixed>>,
++ * } | array{
++ *     type: 'geo',
++ *     indexShapes?: bool,
++ * } | array{
++ *     type: 'number'|'numberFacet',
++ *     representation?: 'int64'|'double',
++ *     indexIntegers?: bool,
++ *     indexDoubles?: bool,
++ * } | array{
++ *     type: 'token',
++ *     normalizer?: 'lowercase'|'none',
++ * } | array{
++ *     type: 'string',
++ *     analyzer?: string,
++ *     searchAnalyzer?: string,
++ *     indexOptions?: 'docs'|'freqs'|'positions'|'offsets',
++ *     store?: bool,
++ *     ignoreAbove?: int,
++ *     multi?: array<string, array<string, mixed>>,
++ *     norms?: 'include'|'omit',
++ *     similarity?: array{type: 'bm25'|'boolean'|'stableTfl'},
++ * }
++ * @link https://www.mongodb.com/docs/atlas/atlas-search/analyzers/character-filters/
++ * @phpstan-type TypeSearchIndexCharFilter array{
++ *      type: 'icuNormalize'|'persian',
++ *  } | array{
++ *     type: 'htmlStrip',
++ *     ignoredTags?: string[],
++ * } | array{
++ *     type: 'mapping',
++ *     mappings?: array<string, string>,
++ * }
++ * @link https://www.mongodb.com/docs/atlas/atlas-search/analyzers/token-filters/
++ * @phpstan-type TypeSearchIndexTokenFilter array{type: string, ...}
++ * @link https://www.mongodb.com/docs/atlas/atlas-search/analyzers/custom/
++ * @phpstan-type TypeSearchIndexAnalyzer array{
++ *     name: string,
++ *     charFilters?: TypeSearchIndexCharFilter[],
++ *     tokenizer: array{type: string},
++ *     tokenFilters?: TypeSearchIndexTokenFilter[],
++ * }
++ * @link https://www.mongodb.com/docs/atlas/atlas-search/stored-source-definition/#std-label-fts-stored-source-definition
++ * @phpstan-type TypeSearchIndexStoredSource bool | array{
++ *     include: array<string>,
++ * } | array{
++ *     exclude: array<string>,
++ * }
++ * @link https://www.mongodb.com/docs/atlas/atlas-search/synonyms/#std-label-synonyms-ref
++ * @phpstan-type TypeSearchIndexSynonyms array{
++ *     analyzer: string,
++ *     name: string,
++ *     source?: array{collection: string},
++ * }
++ * @link https://www.mongodb.com/docs/manual/reference/command/createSearchIndexes/#std-label-search-index-definition-create
++ * @phpstan-type TypeSearchIndexDefinition array{
++ *     analyzer?: string,
++ *     analyzers?: TypeSearchIndexAnalyzer[],
++ *     searchAnalyzer?: string,
++ *     mappings: array{dynamic: true} | array{dynamic?: bool|array{typeSet: string}, fields: array<string, TypeSearchIndexField|TypeSearchIndexField[]>},
++ *     storedSource?: TypeSearchIndexStoredSource,
++ *     synonyms?: TypeSearchIndexSynonyms[],
++ *     typeSets?: array<array{name: string, types: array<array{type: string, ...}>}>,
++ * }
++ * @link https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-type/#atlas-vector-search-index-fields
++ * @phpstan-type TypeVectorSearchIndexField array{
++ *     type: 'vector',
++ *     path: string,
++ *     numDimensions: int,
++ *     similarity: 'euclidean'|'cosine'|'dotProduct',
++ *     quantization?: 'none'|'scalar'|'binary',
++ *     indexingMethod?: 'flat'|'hnsw',
++ *     hnswOptions?: array{maxEdges?: int, numEdgeCandidates?: int},
++ * } | array{
++ *     type: 'autoEmbed',
++ *     modality: 'text',
++ *     path: string,
++ *     model: string,
++ *     numDimensions?: int,
++ *     quantization?: 'float'|'scalar'|'binary'|'binaryNoRescore',
++ *     similarity?: 'euclidean'|'cosine'|'dotProduct',
++ *     indexingMethod?: 'flat'|'hnsw',
++ *     hnswOptions?: array{maxEdges?: int, numEdgeCandidates?: int},
++ * } | array{
++ *     type: 'filter',
++ *     path: string,
++ * }
++ * @link https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-type/#atlas-vector-search-index-fields
++ * @phpstan-type TypeVectorSearchIndexDefinition array{
++ *     fields: TypeVectorSearchIndexField[],
++ * }
++ */
+ class Blueprint extends BaseBlueprint
+ {
+-    // Import $connection property and constructor for Laravel 12 compatibility
+-    use BlueprintLaravelCompatibility;
+-
+     /**
+      * The MongoDB collection object for this blueprint.
+      *
+@@ -29,6 +136,13 @@ class Blueprint extends BaseBlueprint
+      */
+     protected $collection;
+ 
++    public function __construct(Connection $connection, string $collection, ?Closure $callback = null)
++    {
++        parent::__construct($connection, $collection, $callback);
++
++        $this->collection = $connection->getCollection($collection);
++    }
++
+     /**
+      * Fluent columns.
+      *
+@@ -37,6 +151,7 @@ class Blueprint extends BaseBlueprint
+     protected $columns = [];
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function index($columns = null, $name = null, $algorithm = null, $options = [])
+     {
+         $columns = $this->fluent($columns);
+@@ -63,12 +178,14 @@ class Blueprint extends BaseBlueprint
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function primary($columns = null, $name = null, $algorithm = null, $options = [])
+     {
+         return $this->unique($columns, $name, $algorithm, $options);
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function dropIndex($index = null)
+     {
+         $index = $this->transformColumns($index);
+@@ -117,6 +234,22 @@ class Blueprint extends BaseBlueprint
+         return false;
+     }
+ 
++    public function jsonSchema(
++        array $schema = [],
++        ?string $validationLevel = null,
++        ?string $validationAction = null,
++    ): void {
++        $options = array_merge(
++            [
++                'validator' => ['$jsonSchema' => $schema],
++            ],
++            $validationLevel !== null ? ['validationLevel' => $validationLevel] : [],
++            $validationAction !== null ? ['validationAction' => $validationAction] : [],
++        );
++
++        $this->connection->getDatabase()->modifyCollection($this->collection->getCollectionName(), $options);
++    }
++
+     /**
+      * @param  string|array $indexOrColumns
+      *
+@@ -151,6 +284,7 @@ class Blueprint extends BaseBlueprint
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function unique($columns = null, $name = null, $algorithm = null, $options = [])
+     {
+         $columns = $this->fluent($columns);
+@@ -232,6 +366,7 @@ class Blueprint extends BaseBlueprint
+      *
+      * @return void
+      */
++    #[Override]
+     public function create($options = [])
+     {
+         $collection = $this->collection->getCollectionName();
+@@ -243,6 +378,7 @@ class Blueprint extends BaseBlueprint
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function drop()
+     {
+         $this->collection->drop();
+@@ -251,6 +387,7 @@ class Blueprint extends BaseBlueprint
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function renameColumn($from, $to)
+     {
+         $this->collection->updateMany([$from => ['$exists' => true]], ['$rename' => [$from => $to]]);
+@@ -259,6 +396,7 @@ class Blueprint extends BaseBlueprint
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function addColumn($type, $name, array $parameters = [])
+     {
+         $this->fluent($name);
+@@ -266,6 +404,18 @@ class Blueprint extends BaseBlueprint
+         return $this;
+     }
+ 
++    /** @inheritdoc */
++    #[Override]
++    public function after($column, $callback = null)
++    {
++        // Laravel column builders chain after() onto addColumn. MongoDB has no column order.
++        if ($callback instanceof Closure) {
++            $callback($this);
++        }
++
++        return $this;
++    }
++
+     /**
+      * Specify a sparse and unique index for the collection.
+      *
+@@ -293,15 +443,7 @@ class Blueprint extends BaseBlueprint
+      *
+      * @see https://www.mongodb.com/docs/manual/reference/command/createSearchIndexes/#std-label-search-index-definition-create
+      *
+-     * @phpstan-param array{
+-     *      analyzer?: string,
+-     *      analyzers?: list<array>,
+-     *      searchAnalyzer?: string,
+-     *      mappings: array{dynamic: true} | array{dynamic?: bool, fields: array<string, array>},
+-     *      storedSource?: bool|array,
+-     *      synonyms?: list<array>,
+-     *      ...
+-     *  } $definition
++     * @phpstan-param TypeSearchIndexDefinition $definition
+      */
+     public function searchIndex(array $definition, string $name = 'default'): static
+     {
+@@ -315,7 +457,7 @@ class Blueprint extends BaseBlueprint
+      *
+      * @see https://www.mongodb.com/docs/manual/reference/command/createSearchIndexes/#std-label-vector-search-index-definition-create
+      *
+-     * @phpstan-param array{fields: array<string, array{type: string, ...}>} $definition
++     * @phpstan-param TypeVectorSearchIndexDefinition $definition
+      */
+     public function vectorSearchIndex(array $definition, string $name = 'default'): static
+     {
+@@ -362,6 +504,7 @@ class Blueprint extends BaseBlueprint
+      *
+      * @return Blueprint
+      */
++    #[\Override]
+     public function __call($method, $parameters)
+     {
+         // Dummy.
+diff --git a/src/Schema/BlueprintLaravelCompatibility.php b/src/Schema/BlueprintLaravelCompatibility.php
+deleted file mode 100644
+index bf288eae87a8b9e1fd04724419ec483f65a77a4c..0000000000000000000000000000000000000000
+--- a/src/Schema/BlueprintLaravelCompatibility.php
++++ /dev/null
+@@ -1,50 +0,0 @@
+-<?php
+-
+-namespace MongoDB\Laravel\Schema;
+-
+-use Closure;
+-use Illuminate\Database\Connection;
+-use Illuminate\Database\Schema\Blueprint as BaseBlueprint;
+-
+-use function property_exists;
+-
+-/**
+- * The $connection property and constructor param were added in Laravel 12
+- * We keep the untyped $connection property for older version of Laravel to maintain compatibility
+- * and not break projects that would extend the MongoDB Blueprint class.
+- *
+- * @see https://github.com/laravel/framework/commit/f29df4740d724f1c36385c9989569e3feb9422df#diff-68f714a9f1b751481b993414d3f1300ad55bcef12084ec0eb8f47f350033c24bR107
+- *
+- * phpcs:disable PSR1.Classes.ClassDeclaration.MultipleClasses
+- */
+-if (! property_exists(BaseBlueprint::class, 'connection')) {
+-    /** @internal For compatibility with Laravel 10 and 11 */
+-    trait BlueprintLaravelCompatibility
+-    {
+-        /**
+-         * The MongoDB connection object for this blueprint.
+-         *
+-         * @var Connection
+-         */
+-        protected $connection;
+-
+-        public function __construct(Connection $connection, string $collection, ?Closure $callback = null)
+-        {
+-            parent::__construct($collection, $callback);
+-
+-            $this->connection = $connection;
+-            $this->collection = $connection->getCollection($collection);
+-        }
+-    }
+-} else {
+-    /** @internal For compatibility with Laravel 12+ */
+-    trait BlueprintLaravelCompatibility
+-    {
+-        public function __construct(Connection $connection, string $collection, ?Closure $callback = null)
+-        {
+-            parent::__construct($connection, $collection, $callback);
+-
+-            $this->collection = $connection->getCollection($collection);
+-        }
+-    }
+-}
+diff --git a/src/Schema/Builder.php b/src/Schema/Builder.php
+index 78cb3a4c182338ba7ab87fe03a3263e386712ade..2674e7452a920078fca03a19f1510e7153eebcec 100644
+--- a/src/Schema/Builder.php
++++ b/src/Schema/Builder.php
+@@ -6,11 +6,11 @@ namespace MongoDB\Laravel\Schema;
+ 
+ use Closure;
+ use MongoDB\Collection;
+-use MongoDB\Database;
+ use MongoDB\Driver\Exception\ServerException;
+ use MongoDB\Laravel\Connection;
+ use MongoDB\Model\CollectionInfo;
+ use MongoDB\Model\IndexInfo;
++use Override;
+ 
+ use function array_column;
+ use function array_fill_keys;
+@@ -49,6 +49,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+      * @param string $table
+      * @param string $column
+      */
++    #[\Override]
+     public function hasColumn($table, $column): bool
+     {
+         return $this->hasColumns($table, [$column]);
+@@ -60,6 +61,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+      * @param string   $table
+      * @param string[] $columns
+      */
++    #[\Override]
+     public function hasColumns($table, array $columns): bool
+     {
+         // The field "id" (alias of "_id") always exists in MongoDB documents
+@@ -99,12 +101,14 @@ class Builder extends \Illuminate\Database\Schema\Builder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function hasTable($table)
+     {
+         return $this->hasCollection($table);
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function table($table, Closure $callback)
+     {
+         $blueprint = $this->createBlueprint($table);
+@@ -115,6 +119,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function create($table, ?Closure $callback = null, array $options = [])
+     {
+         $blueprint = $this->createBlueprint($table);
+@@ -127,6 +132,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function dropIfExists($table)
+     {
+         if ($this->hasCollection($table)) {
+@@ -135,6 +141,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+     }
+ 
+     /** @inheritdoc */
++    #[Override]
+     public function drop($table)
+     {
+         $blueprint = $this->createBlueprint($table);
+@@ -151,18 +158,29 @@ class Builder extends \Illuminate\Database\Schema\Builder
+      * one by one. The database will be automatically recreated when a new connection
+      * writes to it.
+      */
++    #[Override]
+     public function dropAllTables()
+     {
+         $this->connection->getDatabase()->drop();
+     }
+ 
+-    /** @param string|null $schema Database name */
++    /**
++     * @param string|null $schema Database name
++     *
++     * @inheritdoc
++     */
++    #[Override]
+     public function getTables($schema = null)
+     {
+         return $this->getCollectionRows('collection', $schema);
+     }
+ 
+-    /** @param  string|null $schema Database name */
++    /**
++     * @param  string|null $schema Database name
++     *
++     * @inheritdoc
++     */
++    #[Override]
+     public function getViews($schema = null)
+     {
+         return $this->getCollectionRows('view', $schema);
+@@ -174,6 +192,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+      *
+      * @return array
+      */
++    #[Override]
+     public function getTableListing($schema = null, $schemaQualified = false)
+     {
+         $collections = [];
+@@ -197,6 +216,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+         return $collections;
+     }
+ 
++    #[Override]
+     public function getColumns($table)
+     {
+         $db = null;
+@@ -255,6 +275,7 @@ class Builder extends \Illuminate\Database\Schema\Builder
+         return $columns;
+     }
+ 
++    #[Override]
+     public function getIndexes($table)
+     {
+         $collection = $this->connection->getDatabase()->selectCollection($table);
+@@ -309,12 +330,18 @@ class Builder extends \Illuminate\Database\Schema\Builder
+         return $indexList;
+     }
+ 
++    #[Override]
+     public function getForeignKeys($table)
+     {
+         return [];
+     }
+ 
+-    /** @inheritdoc */
++    /**
++     * @return Blueprint
++     *
++     * @inheritdoc
++     */
++    #[Override]
+     protected function createBlueprint($table, ?Closure $callback = null)
+     {
+         return new Blueprint($this->connection, $table);
+diff --git a/src/Scout/ScoutEngine.php b/src/Scout/ScoutEngine.php
+index 9455608bba6d67d5e95565ab52251e7989bad8ee..e9be45d250bb802aec773c6c1dbecbb95e6fc57e 100644
+--- a/src/Scout/ScoutEngine.php
++++ b/src/Scout/ScoutEngine.php
+@@ -60,9 +60,7 @@ final class ScoutEngine extends Engine
+     private const WAIT_TIMEOUT_SEC = 300;
+ 
+     private const DEFAULT_DEFINITION = [
+-        'mappings' => [
+-            'dynamic' => true,
+-        ],
++        'mappings' => ['dynamic' => true],
+     ];
+ 
+     private const TYPEMAP = ['root' => 'object', 'document' => 'bson', 'array' => 'bson'];
+@@ -128,11 +126,9 @@ final class ScoutEngine extends Engine
+             $bulk[] = [
+                 'updateOne' => [
+                     ['_id' => $model->getScoutKey()],
+-                    [
+-                        // The _id field is added automatically when the document is inserted
+-                        // Update all other fields
+-                        '$set' => $searchableData,
+-                    ],
++                    // The _id field is added automatically when the document is inserted
++                    // Update all other fields
++                    ['$set' => $searchableData],
+                     ['upsert' => true],
+                 ],
+             ];
+@@ -151,7 +147,7 @@ final class ScoutEngine extends Engine
+     #[Override]
+     public function delete($models): void
+     {
+-        assert($models instanceof EloquentCollection, new TypeError(sprintf('Argument #1 ($models) must be of type %s, %s given', Collection::class, get_debug_type($models))));
++        assert($models instanceof EloquentCollection, new TypeError(sprintf('Argument #1 ($models) must be of type %s, %s given', EloquentCollection::class, get_debug_type($models))));
+ 
+         if ($models->isEmpty()) {
+             return;
+@@ -202,6 +198,18 @@ final class ScoutEngine extends Engine
+      */
+     private function performSearch(Builder $builder, ?int $offset = null): array
+     {
++        // Validate sort before any I/O so unit tests can assert on these exceptions without a real collection.
++        $columns = array_column($builder->orders, 'column');
++        if (in_array('_score', $columns, true) && in_array('score', $columns, true)) {
++            throw new InvalidArgumentException("Cannot sort by a field named 'score' together with Atlas Search's '_score' relevance sort.");
++        }
++
++        foreach ($builder->orders as $order) {
++            if ($order['column'] === '_score' && $order['direction'] === 'asc') {
++                throw new InvalidArgumentException("Cannot sort by '_score' in ascending order; Atlas Search relevance score always sorts descending.");
++            }
++        }
++
+         $collection = $this->getSearchableCollection($builder->model);
+ 
+         if ($builder->callback) {
+@@ -264,10 +272,15 @@ final class ScoutEngine extends Engine
+             $compound['mustNot'][] = ['in' => ['path' => $field, 'value' => $value]];
+         }
+ 
+-        // Sort by field value only if specified
++        // Sort by field value only if specified.
++        // '_score' maps to Atlas Search's relevance score via $meta: searchScore (always descending).
+         $sort = [];
+         foreach ($builder->orders as $order) {
+-            $sort[$order['column']] = $order['direction'] === 'asc' ? 1 : -1;
++            if ($order['column'] === '_score') {
++                $sort['score'] = ['$meta' => 'searchScore'];
++            } else {
++                $sort[$order['column']] = $order['direction'] === 'asc' ? 1 : -1;
++            }
+         }
+ 
+         $pipeline = [
+@@ -280,10 +293,8 @@ final class ScoutEngine extends Engine
+                 ],
+             ],
+             [
+-                '$addFields' => [
+-                    // Metadata field with the total count of documents
+-                    '__count' => '$$SEARCH_META.count.lowerBound',
+-                ],
++                // Metadata field with the total count of documents
++                '$addFields' => ['__count' => '$$SEARCH_META.count.lowerBound'],
+             ],
+         ];
+ 
+@@ -350,7 +361,7 @@ final class ScoutEngine extends Engine
+         return $this->performMap($builder, $results, $model, true);
+     }
+ 
+-    /** @return ($lazy is true ? LazyCollection : Collection)<mixed> */
++    /** @return ($lazy is true ? LazyCollection : Collection<mixed>) */
+     private function performMap(Builder $builder, array $results, Model $model, bool $lazy): Collection|LazyCollection
+     {
+         if (! $results) {
+diff --git a/src/Session/MongoDbSessionHandler.php b/src/Session/MongoDbSessionHandler.php
+index dd57f2a3cd21d179a348d6d9a899d80b3327e189..b6082b6b9b5625a3577862f09092b1032081688e 100644
+--- a/src/Session/MongoDbSessionHandler.php
++++ b/src/Session/MongoDbSessionHandler.php
+@@ -1,14 +1,5 @@
+ <?php
+ 
+-/*
+- * This file is part of the Symfony package.
+- *
+- * (c) Fabien Potencier <fabien@symfony.com>
+- *
+- * For the full copyright and license information, please view the LICENSE
+- * file that was distributed with this source code.
+- */
+-
+ namespace MongoDB\Laravel\Session;
+ 
+ use Illuminate\Session\DatabaseSessionHandler;
+@@ -16,6 +7,7 @@ use MongoDB\BSON\Binary;
+ use MongoDB\BSON\Document;
+ use MongoDB\BSON\UTCDateTime;
+ use MongoDB\Collection;
++use Override;
+ 
+ use function tap;
+ use function time;
+@@ -32,6 +24,7 @@ final class MongoDbSessionHandler extends DatabaseSessionHandler
+         return true;
+     }
+ 
++    #[Override]
+     public function gc($lifetime): int
+     {
+         $result = $this->getCollection()->deleteMany(['last_activity' => ['$lt' => $this->getUTCDateTime(-$lifetime)]]);
+@@ -39,6 +32,7 @@ final class MongoDbSessionHandler extends DatabaseSessionHandler
+         return $result->getDeletedCount() ?? 0;
+     }
+ 
++    #[Override]
+     public function destroy($sessionId): bool
+     {
+         $this->getCollection()->deleteOne(['_id' => (string) $sessionId]);
+@@ -46,6 +40,7 @@ final class MongoDbSessionHandler extends DatabaseSessionHandler
+         return true;
+     }
+ 
++    #[Override]
+     public function read($sessionId): string|false
+     {
+         $result = $this->getCollection()->findOne(
+@@ -63,6 +58,7 @@ final class MongoDbSessionHandler extends DatabaseSessionHandler
+         return false;
+     }
+ 
++    #[Override]
+     public function write($sessionId, $data): bool
+     {
+         $payload = $this->getDefaultPayload($data);
+@@ -87,6 +83,7 @@ final class MongoDbSessionHandler extends DatabaseSessionHandler
+         );
+     }
+ 
++    #[Override]
+     protected function getDefaultPayload($data): array
+     {
+         $payload = [
+diff --git a/src/Tools/DatabaseInfo.php b/src/Tools/DatabaseInfo.php
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfd7bb9e53155bd69386bac895ad701b4c23f62e
+--- /dev/null
++++ b/src/Tools/DatabaseInfo.php
+@@ -0,0 +1,186 @@
++<?php
++
++declare(strict_types=1);
++
++namespace MongoDB\Laravel\Tools;
++
++use Illuminate\Contracts\JsonSchema\JsonSchema;
++use Illuminate\JsonSchema\Types\Type;
++use Illuminate\Support\Facades\Cache;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Log;
++use Laravel\Mcp\Request;
++use Laravel\Mcp\Response;
++use Laravel\Mcp\Server\Tool;
++use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
++use MongoDB\Database;
++use MongoDB\Laravel\Connection;
++use MongoDB\Model\CollectionInfo;
++use Throwable;
++
++use function assert;
++use function is_bool;
++use function is_string;
++use function sprintf;
++use function str_contains;
++use function strtolower;
++
++/**
++ * MongoDB equivalent of Boost's DatabaseSchema tool.
++ */
++#[IsReadOnly]
++class DatabaseInfo extends Tool
++{
++    /**
++     * The tool's description.
++     */
++    protected string $description = 'Read information about a MongoDB database. MongoDB does not use tables and columns, so this returns collection metadata. Full details (including indexes and options) are returned when "summary" is omitted or false. Set "summary" to true for an overview of collection names, types, and estimated document counts only. Only use this tool with a connection you already know uses the "mongodb" driver. Params: "connection" (required) - the name of a MongoDB database connection to inspect; "summary" (default false) - return only the overview when true; "filter" - substring match on collection names.';
++
++    /**
++     * Get the tool's input schema.
++     *
++     * @return array<string, Type>
++     */
++    #[\Override]
++    public function schema(JsonSchema $schema): array
++    {
++        return [
++            'summary' => $schema->boolean()
++                ->description('Return only collection names, types, and estimated document counts. Use this first to understand the database, then request full details for specific collections using "filter". Defaults to false.'),
++            'connection' => $schema->string()
++                ->description('Name of the MongoDB database connection to inspect. Must be a connection that uses the "mongodb" driver.')
++                ->required(),
++            'filter' => $schema->string()
++                ->description('Filter collections by name (substring match).'),
++        ];
++    }
++
++    /**
++     * Handle the tool request.
++     */
++    public function handle(Request $request): Response
++    {
++        $summary = $request->get('summary', false);
++        $connectionName = $request->get('connection');
++        $filter = $request->get('filter', '');
++
++        if (! is_string($connectionName) || $connectionName === '') {
++            return Response::error('The connection must be a non-empty string.');
++        }
++
++        if (! is_bool($summary) || ! is_string($filter)) {
++            return Response::error('Summary must be boolean and filter must be a string.');
++        }
++
++        try {
++            $connection = DB::connection($connectionName);
++
++            if (! $connection instanceof Connection) {
++                return Response::error(sprintf('The [%s] connection is not a MongoDB connection.', $connectionName));
++            }
++
++            $cacheKey = sprintf(
++                'mongodb:mcp:database-info:%s:%s:%d',
++                $connectionName,
++                $filter,
++                (int) $summary,
++            );
++
++            try {
++                $info = Cache::remember($cacheKey, 20, fn (): array => $this->getDatabaseInfo($connection, $connectionName, $filter, $summary));
++            } catch (Throwable) {
++                $info = $this->getDatabaseInfo($connection, $connectionName, $filter, $summary);
++            }
++
++            return Response::json($info);
++        } catch (Throwable $exception) {
++            Log::error('Failed to read information for MongoDB connection: ' . $connectionName, [
++                'error' => $exception->getMessage(),
++            ]);
++
++            return Response::error(sprintf('Failed to read information for the [%s] connection.', $connectionName));
++        }
++
++    }
++
++    /** @return array{database: string, connection: string, collections: array<string, mixed>} */
++    protected function getDatabaseInfo(Connection $connection, string $connectionName, string $filter, bool $summary): array
++    {
++        $database = $connection->getDatabase();
++
++        $collections = [];
++
++        foreach ($database->listCollections() as $collectionInfo) {
++            assert($collectionInfo instanceof CollectionInfo);
++            $name = $collectionInfo->getName();
++
++            if ($filter !== '' && ! str_contains(strtolower($name), strtolower($filter))) {
++                continue;
++            }
++
++            $collections[$name] = $summary
++                ? $this->getCollectionSummary($database, $collectionInfo)
++                : $this->getCollectionDetails($database, $collectionInfo);
++        }
++
++        return [
++            'database' => $database->getDatabaseName(),
++            'connection' => $connectionName,
++            'collections' => $collections,
++        ];
++    }
++
++    /** @return array{type: string, estimated_document_count: int} */
++    protected function getCollectionSummary(Database $database, CollectionInfo $collectionInfo): array
++    {
++        return [
++            'type' => $collectionInfo->getType(),
++            'estimated_document_count' => $this->estimatedDocumentCount($database, $collectionInfo->getName()),
++        ];
++    }
++
++    /** @return array<string, mixed> */
++    protected function getCollectionDetails(Database $database, CollectionInfo $collectionInfo): array
++    {
++        $name = $collectionInfo->getName();
++
++        try {
++            return [
++                'type' => $collectionInfo->getType(),
++                'estimated_document_count' => $this->estimatedDocumentCount($database, $name),
++                'options' => $collectionInfo->getOptions(),
++                'indexes' => $this->getIndexes($database, $name),
++            ];
++        } catch (Throwable $exception) {
++            Log::error('Failed to get details for MongoDB collection: ' . $name, [
++                'error' => $exception->getMessage(),
++            ]);
++
++            return ['error' => sprintf('Failed to get details for collection [%s].', $name)];
++        }
++    }
++
++    protected function estimatedDocumentCount(Database $database, string $collection): int
++    {
++        try {
++            return $database->getCollection($collection)->estimatedDocumentCount();
++        } catch (Throwable) {
++            return 0;
++        }
++    }
++
++    /** @return array<string, array{keys: array<string, mixed>, unique: bool}> */
++    protected function getIndexes(Database $database, string $collection): array
++    {
++        $indexes = [];
++
++        foreach ($database->getCollection($collection)->listIndexes() as $index) {
++            $indexes[$index->getName()] = [
++                'keys' => $index->getKey(),
++                'unique' => $index->isUnique(),
++            ];
++        }
++
++        return $indexes;
++    }
++}
+diff --git a/src/Tools/DatabaseQuery.php b/src/Tools/DatabaseQuery.php
+new file mode 100644
+index 0000000000000000000000000000000000000000..7becdbdd322df9719c45ed090962a7811427d311
+--- /dev/null
++++ b/src/Tools/DatabaseQuery.php
+@@ -0,0 +1,238 @@
++<?php
++
++declare(strict_types=1);
++
++namespace MongoDB\Laravel\Tools;
++
++use Illuminate\Contracts\JsonSchema\JsonSchema;
++use Illuminate\JsonSchema\Types\Type;
++use Illuminate\Support\Facades\DB;
++use InvalidArgumentException;
++use Laravel\Mcp\Request;
++use Laravel\Mcp\Response;
++use Laravel\Mcp\Server\Tool;
++use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
++use MongoDB\Laravel\Connection;
++use Throwable;
++
++use function array_key_first;
++use function array_is_list;
++use function array_merge;
++use function array_walk;
++use function count;
++use function implode;
++use function in_array;
++use function is_array;
++use function is_string;
++use function sprintf;
++use function str_starts_with;
++use function substr;
++
++/**
++ * MongoDB equivalent of Boost's DatabaseQuery tool.
++ *
++ * Runs read-only MQL commands against a MongoDB connection. Boost's own
++ * DatabaseQuery tool only understands SQL and will not run against a
++ * "mongodb" driver connection.
++ */
++#[IsReadOnly]
++class DatabaseQuery extends Tool
++{
++    // BSON objects are capped at 100 nesting levels:
++    // https://www.mongodb.com/docs/manual/reference/limits/#mongodb-limit-Nested-Depth-for-BSON-Documents
++    private const MAX_NESTING_LEVEL = 100;
++
++    // Aggregation pipelines are capped at 1000 stages
++    // https://www.mongodb.com/docs/manual/core/aggregation-pipeline-limits/#number-of-stages-restrictions
++    private const MAX_STAGES_PER_PIPELINE = 1000;
++
++    /**
++     * The tool's name.
++     *
++     * Set explicitly so it does not collide with Boost's own `database-query` tool.
++     */
++    protected string $name = 'database-query-mongodb';
++
++    /**
++     * The tool's description.
++     */
++    protected string $description = 'Execute a read-only MQL command against a MongoDB connection. Pass a "command" argument (an MQL command document, e.g. {"find": "users", "filter": {"active": true}}) — never SQL. Only read commands are allowed (aggregate, count, distinct, find). Only use this tool with a connection you already know uses the "mongodb" driver.';
++
++    /**
++     * Get the tool's input schema.
++     *
++     * @return array<string, Type>
++     */
++    #[\Override]
++    public function schema(JsonSchema $schema): array
++    {
++        return [
++            'command' => $schema->object()
++                ->description('The MQL command to execute. Only read commands are allowed (i.e. aggregate, count, distinct, find).')
++                ->required(),
++            'connection' => $schema->string()
++                ->description('Name of the MongoDB database connection to query. Must be a connection that uses the "mongodb" driver.')
++                ->required(),
++        ];
++    }
++
++    /**
++     * Handle the tool request.
++     */
++    public function handle(Request $request): Response
++    {
++        $connectionName = $request->get('connection');
++        if (! is_string($connectionName) || $connectionName === '') {
++            return Response::error('The connection must be a non-empty string.');
++        }
++        try {
++            $connection = DB::connection($connectionName);
++
++            if (! $connection instanceof Connection) {
++                return Response::error(sprintf('The [%s] connection is not a MongoDB connection.', $connectionName));
++            }
++
++            return Response::json($this->handleMql($request->array('command'), $connection));
++        } catch (InvalidArgumentException $exception) {
++            return Response::error($exception->getMessage());
++        } catch (Throwable $exception) {
++            return Response::error('Query failed: ' . $exception->getMessage());
++        }
++    }
++
++    /**
++     * @param array<string, mixed> $command
++     *
++     * @return array<int, mixed>
++     *
++     * @throws InvalidArgumentException
++     */
++    private function handleMql(array $command, Connection $connection): array
++    {
++        if ($command === []) {
++            throw new InvalidArgumentException('Please pass a valid MongoDB command');
++        }
++
++        // Allowed CRUD commands (https://www.mongodb.com/docs/manual/reference/mql/crud-commands/)
++        $allowList = ['aggregate', 'count', 'distinct', 'find'];
++        $operation = array_key_first($command);
++
++        if (! in_array($operation, $allowList, true)) {
++            throw new InvalidArgumentException(sprintf('Only read commands are allowed (%s).', implode(', ', $allowList)));
++        }
++
++        if ($operation === 'aggregate') {
++            // Check nested write ops recursively with conservative allow list
++            $this->ensureNoNestedWriteInAggregation($command['pipeline'] ?? []);
++        }
++
++        return $connection->getDatabase()->command($command)->toArray();
++    }
++
++    /**
++     * @param array<int, array<string, mixed>> $pipeline
++     *
++     * @throws InvalidArgumentException
++     */
++    private function ensureNoNestedWriteInAggregation(array $pipeline, int $level = 1): void
++    {
++        if (! array_is_list($pipeline)) {
++            throw new InvalidArgumentException('Only read aggregation stages are allowed in a pipeline list.');
++        }
++
++        if ($level > self::MAX_NESTING_LEVEL) {
++            throw new InvalidArgumentException(sprintf('Aggregation nesting exceeds the maximum of %d levels.', self::MAX_NESTING_LEVEL));
++        }
++
++        if (count($pipeline) > self::MAX_STAGES_PER_PIPELINE) {
++            throw new InvalidArgumentException(sprintf('A pipeline exceeds the maximum of %d stages.', self::MAX_STAGES_PER_PIPELINE));
++        }
++
++        // These aggregation stages may contain nested aggregation pipelines
++        // and must be checked for write ops recursively.
++        $supportsNestedWrites = ['facet', 'lookup', 'unionWith'];
++
++        // Every known read-only aggregation stage. Kept as an allow list (rather than
++        // denying $merge/$out) so that write stages added in the future are rejected by
++        // default. See https://www.mongodb.com/docs/manual/reference/mql/aggregation-stages
++        $allowList = array_merge($supportsNestedWrites, [
++            'addFields',
++            'bucket',
++            'bucketAuto',
++            'changeStream',
++            'changeStreamSplitLargeEvent',
++            'collStats',
++            'count',
++            'currentOp',
++            'densify',
++            'documents',
++            'fill',
++            'geoNear',
++            'graphLookup',
++            'group',
++            'indexStats',
++            'limit',
++            'listLocalSessions',
++            'listSampledQueries',
++            'listSearchIndexes',
++            'listSessions',
++            'match',
++            'planCacheStats',
++            'project',
++            'redact',
++            'replaceRoot',
++            'replaceWith',
++            'sample',
++            'search',
++            'searchMeta',
++            'set',
++            'setWindowFields',
++            'shardedDataDistribution',
++            'skip',
++            'sort',
++            'sortByCount',
++            'unwind',
++            'unset',
++            'vectorSearch',
++        ]);
++
++        // A pipeline is a list of single-key stage documents, e.g. [['$match' => [...]], ...].
++        foreach ($pipeline as $stage) {
++            if (! is_array($stage) || count($stage) !== 1) {
++                throw new InvalidArgumentException('Only read aggregation stages are allowed; each stage must have one operator.');
++            }
++
++            $operator = array_key_first($stage);
++            if (! str_starts_with((string) $operator, '$')) {
++                throw new InvalidArgumentException('Only read aggregation stages are allowed; stage operators must start with $.');
++            }
++
++            $stageName = substr($operator, 1);
++            $stageBody = $stage[$operator];
++
++            if (! in_array($stageName, $allowList, true)) {
++                throw new InvalidArgumentException(sprintf('Only read aggregation stages are allowed. Found: %s', $stageName));
++            }
++
++            if (! in_array($stageName, $supportsNestedWrites, true)) {
++                continue;
++            }
++
++            switch ($stageName) {
++                case 'facet':
++                    array_walk($stageBody, fn ($pipeline) => $this->ensureNoNestedWriteInAggregation($pipeline, $level + 1));
++
++                    break;
++
++                case 'lookup':
++                case 'unionWith':
++                    // Both stages take an optional single sub-pipeline; unionWith may also be a plain collection name.
++                    if (is_array($stageBody) && isset($stageBody['pipeline'])) {
++                        $this->ensureNoNestedWriteInAggregation($stageBody['pipeline'], $level + 1);
++                    }
++
++                    break;
++            }
++        }
++    }
++}
+diff --git a/src/Validation/DatabasePresenceVerifier.php b/src/Validation/DatabasePresenceVerifier.php
+index c5c37853978ac0da5a6c5629310f963713c16305..fdd783ab5a90e4ea0e6d26c75e8df21e64bfadc2 100644
+--- a/src/Validation/DatabasePresenceVerifier.php
++++ b/src/Validation/DatabasePresenceVerifier.php
+@@ -5,6 +5,7 @@ declare(strict_types=1);
+ namespace MongoDB\Laravel\Validation;
+ 
+ use MongoDB\BSON\Regex;
++use Override;
+ 
+ use function array_map;
+ use function implode;
+@@ -12,17 +13,8 @@ use function preg_quote;
+ 
+ class DatabasePresenceVerifier extends \Illuminate\Validation\DatabasePresenceVerifier
+ {
+-    /**
+-     * Count the number of objects in a collection having the given value.
+-     *
+-     * @param string $collection
+-     * @param string $column
+-     * @param string $value
+-     * @param int    $excludeId
+-     * @param string $idColumn
+-     *
+-     * @return int
+-     */
++    /** Count the number of objects in a collection having the given value. */
++    #[Override]
+     public function getCount($collection, $column, $value, $excludeId = null, $idColumn = null, array $extra = [])
+     {
+         $query = $this->table($collection)->where($column, new Regex('^' . preg_quote($value) . '$', '/i'));
+@@ -38,16 +30,8 @@ class DatabasePresenceVerifier extends \Illuminate\Validation\DatabasePresenceVe
+         return $query->count();
+     }
+ 
+-    /**
+-     * Count the number of objects in a collection with the given values.
+-     *
+-     * @param string $collection
+-     * @param string $column
+-     * @param array  $values
+-     * @param array  $extra
+-     *
+-     * @return int
+-     */
++    /** Count the number of objects in a collection with the given values. */
++    #[Override]
+     public function getMultiCount($collection, $column, array $values, array $extra = [])
+     {
+         // Nothing can match an empty array. Return early to avoid matching an empty string.
+diff --git a/src/Validation/ValidationServiceProvider.php b/src/Validation/ValidationServiceProvider.php
+index 1095e93a341ea03efd47b2515a2b85a291d0bbb0..6f7ebd9805465778e0438de488637286f780e6be 100644
+--- a/src/Validation/ValidationServiceProvider.php
++++ b/src/Validation/ValidationServiceProvider.php
+@@ -5,9 +5,11 @@ declare(strict_types=1);
+ namespace MongoDB\Laravel\Validation;
+ 
+ use Illuminate\Validation\ValidationServiceProvider as BaseProvider;
++use Override;
+ 
+ class ValidationServiceProvider extends BaseProvider
+ {
++    #[Override]
+     protected function registerPresenceVerifier()
+     {
+         $this->app->singleton('validation.presence', function ($app) {
