@@ -1,0 +1,169 @@
+﻿// Licensed under MIT No Attribution, see LICENSE file at the root.
+// Copyright 2013 Andreas Gullberg Larsen (andreas.larsen84@gmail.com). Maintained at https://github.com/angularsen/UnitsNet.
+
+using System.Globalization;
+
+namespace UnitsNet.Tests
+{
+    public partial class QuantityTests
+    {
+        private static readonly CultureInfo Russian = CultureInfo.GetCultureInfo("ru-RU");
+
+        [Fact]
+        public void GetHashCodeForDifferentQuantitiesWithSameValuesAreNotEqual()
+        {
+            var length = new Length(1.0, (LengthUnit)2);
+            var area = new Area(1.0, (AreaUnit)2);
+
+            Assert.NotEqual(length.GetHashCode(), area.GetHashCode());
+        }
+
+        [Fact]
+        public void TryFrom_ValidQuantityNameAndUnitName_ReturnsTrueAndQuantity()
+        {
+            void AssertFrom(string quantityName, string unitName, Enum expectedUnit)
+            {
+                Assert.True(Quantity.TryFrom(5, quantityName, unitName, out IQuantity? quantity));
+                Assert.NotNull(quantity);
+                Assert.Equal(5, quantity!.Value);
+                Assert.Equal(expectedUnit, quantity.Unit);
+            }
+
+            AssertFrom("Length", "Centimeter", LengthUnit.Centimeter);
+            AssertFrom("Mass", "Kilogram", MassUnit.Kilogram);
+        }
+
+        [Fact]
+        public void TryFrom_InvalidQuantityNameAndUnitName_ReturnsFalseAndNull()
+        {
+            void AssertInvalid(string quantityName, string unitName)
+            {
+                Assert.False(Quantity.TryFrom(5, quantityName, unitName, out IQuantity? quantity));
+                Assert.Null(quantity);
+            }
+
+            AssertInvalid("Length", "InvalidUnit");
+            AssertInvalid("InvalidQuantity", "Kilogram");
+        }
+
+        [Fact]
+        public void From_ValidQuantityNameAndUnitName_ReturnsQuantity()
+        {
+            void AssertFrom(string quantityName, string unitName, Enum expectedUnit)
+            {
+                IQuantity quantity = Quantity.From(5, quantityName, unitName);
+                Assert.NotNull(quantity);
+                Assert.Equal(5, quantity.Value);
+                Assert.Equal(expectedUnit, quantity.Unit);
+            }
+
+            AssertFrom("Length", "Centimeter", LengthUnit.Centimeter);
+            AssertFrom("Mass", "Kilogram", MassUnit.Kilogram);
+        }
+
+        [Fact]
+        public void From_InvalidQuantityName_ThrowsQuantityNotFoundException()
+        {
+            Assert.Throws<QuantityNotFoundException>(() => Quantity.From(5, "InvalidQuantity", "Kilogram"));
+        }
+        
+        [Fact]
+        public void From_InvalidUnitName_ThrowsUnitNotFoundException()
+        {
+            Assert.Throws<UnitNotFoundException>(() => Quantity.From(5, "Length", "InvalidUnit"));
+        }
+
+        [Fact]
+        public void FromUnitAbbreviation_ReturnsQuantity()
+        {
+            IQuantity q = Quantity.FromUnitAbbreviation(CultureInfo.InvariantCulture, 5, "cm");
+            Assert.Equal(5, q.Value);
+            Assert.Equal(LengthUnit.Centimeter, q.Unit);
+        }
+
+        [Fact]
+        public void TryFromUnitAbbreviation_ReturnsQuantity()
+        {
+            Assert.True(Quantity.TryFromUnitAbbreviation(5, "cm", out IQuantity? quantity));
+            Assert.Equal(LengthUnit.Centimeter, quantity!.Unit);
+        }
+
+        [Fact]
+        public void FromUnitAbbreviation_MatchingCulture_ReturnsQuantity()
+        {
+            IQuantity quantity = Quantity.FromUnitAbbreviation(Russian, 5, "см");
+            Assert.Equal(5, quantity.Value);
+            Assert.Equal(LengthUnit.Centimeter, quantity.Unit);
+        }
+
+        [Fact]
+        public void FromUnitAbbreviation_MatchingFallbackCulture_ReturnsQuantity()
+        {
+            // The localized abbreviation is "см"
+            IQuantity quantity = Quantity.FromUnitAbbreviation(Russian, 5, "cm");  
+            Assert.Equal(5, quantity.Value);
+            Assert.Equal(LengthUnit.Centimeter, quantity.Unit);
+        }
+
+        [Fact]
+        public void TryFromUnitAbbreviation_MatchingFallbackCulture_ReturnsQuantity()
+        {
+            // The localized abbreviation is "см"
+            var success = Quantity.TryFromUnitAbbreviation(Russian, 5, "cm", out IQuantity? quantity);
+            Assert.True(success); 
+            Assert.NotNull(quantity);  
+            Assert.Equal(5, quantity.Value);
+            Assert.Equal(LengthUnit.Centimeter, quantity.Unit);
+        }
+
+        [Fact]
+        public void FromUnitAbbreviation_InvalidAbbreviation_ThrowsUnitNotFoundException()
+        {
+            Assert.Throws<UnitNotFoundException>(() => Quantity.FromUnitAbbreviation(5, "nonexisting-unit"));
+        }
+
+        [Fact]
+        public void TryFromUnitAbbreviation_InvalidAbbreviation_ThrowsUnitNotFoundException()
+        {
+            Assert.False(Quantity.TryFromUnitAbbreviation(5, "nonexisting-unit", out IQuantity? q));
+            Assert.Null(q);
+        }
+
+        [Fact]
+        public void FromUnitAbbreviation_AmbiguousAbbreviation_ThrowsAmbiguousUnitParseException()
+        {
+            // MassFraction.Percent
+            // Ratio.Percent
+            // VolumeConcentration.Percent
+            Assert.Throws<AmbiguousUnitParseException>(() => Quantity.FromUnitAbbreviation(5, "%"));
+        }
+
+        [Fact]
+        public void TryFromUnitAbbreviation_AmbiguousAbbreviation_ReturnsFalse()
+        {
+            // MassFraction.Percent
+            // Ratio.Percent
+            // VolumeConcentration.Percent
+            Assert.False(Quantity.TryFromUnitAbbreviation(5, "%", out IQuantity? q));
+            Assert.Null(q);
+        }
+
+        [Fact]
+        public void AllowSpecialValue()
+        {
+            try
+            {
+                var r = Ratio.FromDecimalFractions(double.NaN);
+            }
+            catch (ArgumentException)
+            {
+                Assert.Fail("Special double values (NaN, -Inf, +Inf) must be allowed.");
+            }
+        }
+
+        private static Length ParseLength(string str)
+        {
+            return Length.Parse(str, CultureInfo.InvariantCulture);
+        }
+    }
+}

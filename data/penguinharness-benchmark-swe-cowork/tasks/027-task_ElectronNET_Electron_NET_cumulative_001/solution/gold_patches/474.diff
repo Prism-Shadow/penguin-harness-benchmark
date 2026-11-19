@@ -1,0 +1,619 @@
+diff --git a/Changelog.md b/Changelog.md
+index c045b901a5e6379f18c947d895981ddcbf6865ea..260da01ab04c9b3a160b6dd08655f82f4cf8dd73 100644
+--- a/Changelog.md
++++ b/Changelog.md
+@@ -1,5 +1,20 @@
+ # Not released
+ 
++# 9.31.3
++
++ElectronNET.CLI:
++
++* New Feature: Set a description of the app in `electron.manifest.json` (thanks [BurtsevC](https://github.com/BurtsevC)) [\#433](https://github.com/ElectronNET/Electron.NET/pull/433)
++* New Feature: Set a target for the start command (thanks [gabecook](https://github.com/gabecook)) [\#463](https://github.com/ElectronNET/Electron.NET/pull/463)
++* New Feature: `electronize init` support for F# projects (thanks [kojo12228](https://github.com/kojo12228)) [\#457](https://github.com/ElectronNET/Electron.NET/pull/457)
++* New Feature: Linux support for the buildAll.sh (thanks [duncanawoods](https://github.com/duncanawoods)) [\#465](https://github.com/ElectronNET/Electron.NET/pull/465)
++* Fixed bug: ERR_UNKNOWN_URL_SCHEME by intercepting file:// protocol (thanks [duncanawoods](https://github.com/duncanawoods)) [\#467](https://github.com/ElectronNET/Electron.NET/pull/467)
++
++ElectronNET.API:
++
++* New Feature: Native Electron 9.2.0 support, but not all new features (we search contributors)
++* Fixed bug: Set default WebPreferences.DefaultFontSize (thanks [duncanawoods](https://github.com/duncanawoods)) [\#468](https://github.com/ElectronNET/Electron.NET/pull/468)
++
+ # Released
+ 
+ # 9.31.2
+diff --git a/ElectronNET.API/App.cs b/ElectronNET.API/App.cs
+index 194dd4b6c3f3338e38b5ce9476b008629af19be6..c3888190154bbe73622152a8e0063ca98095f91b 100644
+--- a/ElectronNET.API/App.cs
++++ b/ElectronNET.API/App.cs
+@@ -407,6 +407,27 @@ namespace ElectronNET.API
+         /// which will be preferred over name by Electron.
+         /// </summary>
+         public string Name
++        {
++            [Obsolete("Use the asynchronous version NameAsync instead")]
++            get
++            {
++                return NameAsync.Result;
++            }
++            set
++            {
++                BridgeConnector.Socket.Emit("appSetName", value);
++            }
++        }
++
++        /// <summary>
++        /// A <see cref="string"/> property that indicates the current application's name, which is the name in the
++        /// application's package.json file.
++        ///
++        /// Usually the name field of package.json is a short lowercase name, according to the npm modules spec. You
++        /// should usually also specify a productName field, which is your application's full capitalized name, and
++        /// which will be preferred over name by Electron.
++        /// </summary>
++        public Task<string> NameAsync
+         {
+             get
+             {
+@@ -423,14 +444,11 @@ namespace ElectronNET.API
+                     BridgeConnector.Socket.Emit("appGetName");
+ 
+                     return taskCompletionSource.Task;
+-                }).Result;
+-            }
+-            set
+-            {
+-                BridgeConnector.Socket.Emit("appSetName", value);
++                });
+             }
+         }
+ 
++
+         internal App() 
+         {
+             CommandLine = new CommandLine();
+@@ -1479,6 +1497,27 @@ namespace ElectronNET.API
+         /// is used.
+         /// </summary>
+         public string UserAgentFallback
++        {
++            [Obsolete("Use the asynchronous version UserAgentFallbackAsync instead")]
++            get
++            {
++                return UserAgentFallbackAsync.Result;
++            }
++            set
++            {
++                BridgeConnector.Socket.Emit("appSetUserAgentFallback", value);
++            }
++        }
++
++        /// <summary>
++        /// A <see cref="string"/> which is the user agent string Electron will use as a global fallback.
++        /// <para/>
++        /// This is the user agent that will be used when no user agent is set at the webContents or
++        /// session level. It is useful for ensuring that your entire app has the same user agent. Set to a
++        /// custom value as early as possible in your app's initialization to ensure that your overridden value
++        /// is used.
++        /// </summary>
++        public Task<string> UserAgentFallbackAsync
+         {
+             get
+             {
+@@ -1495,11 +1534,7 @@ namespace ElectronNET.API
+                     BridgeConnector.Socket.Emit("appGetUserAgentFallback");
+ 
+                     return taskCompletionSource.Task;
+-                }).Result;
+-            }
+-            set
+-            {
+-                BridgeConnector.Socket.Emit("appSetUserAgentFallback", value);
++                });
+             }
+         }
+ 
+diff --git a/ElectronNET.API/AutoUpdater.cs b/ElectronNET.API/AutoUpdater.cs
+index ccf2590a92253adb3349920eb9e6ab4a6c6645b4..da1001fa5881c9231ec8e1f83f8e6b7c4829d466 100644
+--- a/ElectronNET.API/AutoUpdater.cs
++++ b/ElectronNET.API/AutoUpdater.cs
+@@ -1,6 +1,9 @@
+ ﻿using ElectronNET.API.Entities;
++using Newtonsoft.Json;
+ using Newtonsoft.Json.Linq;
++using Newtonsoft.Json.Serialization;
+ using System;
++using System.Collections.Generic;
+ using System.Threading.Tasks;
+ 
+ namespace ElectronNET.API
+@@ -182,11 +185,48 @@ namespace ElectronNET.API
+             }
+         }
+ 
++        /// <summary>
++        /// The current application version
++        /// </summary>
++        public Task<SemVer> CurrentVersionAsync
++        {
++            get
++            {
++                return Task.Run<SemVer>(() =>
++                {
++                    var taskCompletionSource = new TaskCompletionSource<SemVer>();
++
++                    BridgeConnector.Socket.On("autoUpdater-currentVersion-get-reply", (result) =>
++                    {
++                        BridgeConnector.Socket.Off("autoUpdater-currentVersion-get-reply");
++                        SemVer version = ((JObject)result).ToObject<SemVer>();
++                        taskCompletionSource.SetResult(version);
++                    });
++                    BridgeConnector.Socket.Emit("autoUpdater-currentVersion-get");
++
++                    return taskCompletionSource.Task;
++                });
++            }
++        }
++
+         /// <summary>
+         /// Get the update channel. Not applicable for GitHub. 
+         /// Doesn’t return channel from the update configuration, only if was previously set.
+         /// </summary>
++        [Obsolete("Use the asynchronous version ChannelAsync instead")]
+         public string Channel
++        {
++            get
++            {
++                return ChannelAsync.Result;
++            }
++        }
++
++        /// <summary>
++        /// Get the update channel. Not applicable for GitHub. 
++        /// Doesn’t return channel from the update configuration, only if was previously set.
++        /// </summary>
++        public Task<string> ChannelAsync
+         {
+             get
+             {
+@@ -199,11 +239,45 @@ namespace ElectronNET.API
+                         BridgeConnector.Socket.Off("autoUpdater-channel-get-reply");
+                         taskCompletionSource.SetResult(result.ToString());
+                     });
+-
+                     BridgeConnector.Socket.Emit("autoUpdater-channel-get");
+ 
+                     return taskCompletionSource.Task;
+-                }).Result;
++                });
++            }
++        }
++
++
++
++        /// <summary>
++        /// The request headers.
++        /// </summary>
++        public Task<Dictionary<string, string>> RequestHeadersAsync
++        {
++            get
++            {
++                return Task.Run(() =>
++                {
++                    var taskCompletionSource = new TaskCompletionSource<Dictionary<string, string>>();
++                    BridgeConnector.Socket.On("autoUpdater-requestHeaders-get-reply", (headers) =>
++                    {
++                        BridgeConnector.Socket.Off("autoUpdater-requestHeaders-get-reply");
++                        Dictionary<string, string> result = ((JObject)headers).ToObject<Dictionary<string, string>>();
++                        taskCompletionSource.SetResult(result);
++                    });
++                    BridgeConnector.Socket.Emit("autoUpdater-requestHeaders-get");
++                    return taskCompletionSource.Task;
++                });
++            }
++        }
++
++        /// <summary>
++        /// The request headers.
++        /// </summary>
++        public Dictionary<string, string> RequestHeaders
++        {
++            set
++            {
++                BridgeConnector.Socket.Emit("autoUpdater-requestHeaders-set", JObject.FromObject(value, _jsonSerializer));
+             }
+         }
+ 
+@@ -416,9 +490,26 @@ namespace ElectronNET.API
+             string guid = Guid.NewGuid().ToString();
+ 
+             BridgeConnector.Socket.On("autoUpdaterCheckForUpdatesComplete" + guid, (updateCheckResult) =>
++            {
++                try
++                {
++                    BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesComplete" + guid);
++                    BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesError" + guid);
++                    taskCompletionSource.SetResult(JObject.Parse(updateCheckResult.ToString()).ToObject<UpdateCheckResult>());
++                }
++                catch (Exception ex)
++                {
++                    taskCompletionSource.SetException(ex);
++                }
++            });
++            BridgeConnector.Socket.On("autoUpdaterCheckForUpdatesError" + guid, (error) =>
+             {
+                 BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesComplete" + guid);
+-                taskCompletionSource.SetResult(JObject.Parse(updateCheckResult.ToString()).ToObject<UpdateCheckResult>());
++                BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesError" + guid);
++                string message = "An error occurred in CheckForUpdatesAsync";
++                if (error != null && !string.IsNullOrEmpty(error.ToString()))
++                    message = JsonConvert.SerializeObject(error);
++                taskCompletionSource.SetException(new Exception(message));
+             });
+ 
+             BridgeConnector.Socket.Emit("autoUpdaterCheckForUpdates", guid);
+@@ -438,9 +529,29 @@ namespace ElectronNET.API
+             string guid = Guid.NewGuid().ToString();
+ 
+             BridgeConnector.Socket.On("autoUpdaterCheckForUpdatesAndNotifyComplete" + guid, (updateCheckResult) =>
++            {
++                try
++                {
++                    BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesAndNotifyComplete" + guid);
++                    BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesAndNotifyError" + guid);
++                    if (updateCheckResult == null)
++                        taskCompletionSource.SetResult(null);
++                    else
++                        taskCompletionSource.SetResult(JObject.Parse(updateCheckResult.ToString()).ToObject<UpdateCheckResult>());
++                }
++                catch (Exception ex)
++                {
++                    taskCompletionSource.SetException(ex);
++                }
++            });
++            BridgeConnector.Socket.On("autoUpdaterCheckForUpdatesAndNotifyError" + guid, (error) =>
+             {
+                 BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesAndNotifyComplete" + guid);
+-                taskCompletionSource.SetResult(JObject.Parse(updateCheckResult.ToString()).ToObject<UpdateCheckResult>());
++                BridgeConnector.Socket.Off("autoUpdaterCheckForUpdatesAndNotifyError" + guid);
++                string message = "An error occurred in autoUpdaterCheckForUpdatesAndNotify";
++                if (error != null)
++                    message = JsonConvert.SerializeObject(error);
++                taskCompletionSource.SetException(new Exception(message));
+             });
+ 
+             BridgeConnector.Socket.Emit("autoUpdaterCheckForUpdatesAndNotify", guid);
+@@ -501,5 +612,10 @@ namespace ElectronNET.API
+ 
+             return taskCompletionSource.Task;
+         }
++
++        private readonly JsonSerializer _jsonSerializer = new JsonSerializer()
++        {
++            ContractResolver = new CamelCasePropertyNamesContractResolver()
++        };
+     }
+ }
+diff --git a/ElectronNET.API/Entities/SemVer.cs b/ElectronNET.API/Entities/SemVer.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1a08f102b06e271818710a387f753c5ed712694
+--- /dev/null
++++ b/ElectronNET.API/Entities/SemVer.cs
+@@ -0,0 +1,59 @@
++﻿namespace ElectronNET.API.Entities
++{
++    /// <summary>
++    /// 
++    /// </summary>
++    public class SemVer
++    {
++        /// <summary>
++        /// 
++        /// </summary>
++       public string  Raw { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public bool Loose { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public SemVerOptions Options { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public int Major { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public int Minor { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public int Patch { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public string Version { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public string[] Build { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public string[] Prerelease { get; set; }
++    }
++
++    /// <summary>
++    /// 
++    /// </summary>
++    public class SemVerOptions {
++        /// <summary>
++        /// 
++        /// </summary>
++        public bool? Loose { get; set; }
++        /// <summary>
++        /// 
++        /// </summary>
++        public bool? IncludePrerelease { get; set; }
++    }
++}
+diff --git a/ElectronNET.API/Entities/WebPreferences.cs b/ElectronNET.API/Entities/WebPreferences.cs
+index 031c78c3b3514c57dc022af5225de40393329779..7d3ceff57a086b3a49581801ff4ee18ad1ed5493 100644
+--- a/ElectronNET.API/Entities/WebPreferences.cs
++++ b/ElectronNET.API/Entities/WebPreferences.cs
+@@ -142,7 +142,7 @@ namespace ElectronNET.API.Entities
+         /// <summary>
+         /// Defaults to 16.
+         /// </summary>
+-        public int DefaultFontSize { get; set; }
++        public int DefaultFontSize { get; set; } = 16;
+ 
+         /// <summary>
+         /// Defaults to 13.
+diff --git a/ElectronNET.CLI/Commands/BuildCommand.cs b/ElectronNET.CLI/Commands/BuildCommand.cs
+index de767241be1aee6f6b776bb8c04f69f3eba69e7a..61ffeee0bd3c91faaee052061fda1da34fce0c57 100644
+--- a/ElectronNET.CLI/Commands/BuildCommand.cs
++++ b/ElectronNET.CLI/Commands/BuildCommand.cs
+@@ -186,7 +186,7 @@ namespace ElectronNET.CLI.Commands
+                 ProcessHelper.CmdExecute($"node build-helper.js " + manifestFileName, tempPath);
+ 
+                 Console.WriteLine($"Package Electron App for Platform {platformInfo.ElectronPackerPlatform}...");
+-                ProcessHelper.CmdExecute($"npx electron-builder --config=./bin/electron-builder.json --{platformInfo.ElectronPackerPlatform} --{electronArch} -c.electronVersion=9.0.5 {electronParams}", tempPath);
++                ProcessHelper.CmdExecute($"npx electron-builder --config=./bin/electron-builder.json --{platformInfo.ElectronPackerPlatform} --{electronArch} -c.electronVersion=9.2.0 {electronParams}", tempPath);
+ 
+                 Console.WriteLine("... done");
+ 
+diff --git a/ElectronNET.Host/ElectronHostHook/connector.js b/ElectronNET.Host/ElectronHostHook/connector.js
+index 5e5a0e8187ce7a70f2387b00dc33a7141fee2984..68734001c506a05045964ba760c5bbf468a8a525 100644
+--- a/ElectronNET.Host/ElectronHostHook/connector.js
++++ b/ElectronNET.Host/ElectronHostHook/connector.js
+@@ -1,6 +1,5 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+-exports.Connector = void 0;
+ class Connector {
+     constructor(socket, 
+     // @ts-ignore
+diff --git a/ElectronNET.Host/ElectronHostHook/connector.js.map b/ElectronNET.Host/ElectronHostHook/connector.js.map
+index be84b69006b544dbc78a0813c7389449a40417db..06a767af16c0b545aaced0db08905e524491f6de 100644
+--- a/ElectronNET.Host/ElectronHostHook/connector.js.map
++++ b/ElectronNET.Host/ElectronHostHook/connector.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"connector.js","sourceRoot":"","sources":["connector.ts"],"names":[],"mappings":";;;AAAA,MAAa,SAAS;IAClB,YAAoB,MAAuB;IACvC,aAAa;IACN,GAAiB;QAFR,WAAM,GAAN,MAAM,CAAiB;QAEhC,QAAG,GAAH,GAAG,CAAc;IAAI,CAAC;IAEjC,EAAE,CAAC,GAAW,EAAE,cAAwB;QACpC,IAAI,CAAC,MAAM,CAAC,EAAE,CAAC,GAAG,EAAE,CAAC,GAAG,IAAW,EAAE,EAAE;YACnC,MAAM,EAAE,GAAW,IAAI,CAAC,GAAG,EAAE,CAAC;YAE9B,IAAI;gBACA,cAAc,CAAC,GAAG,IAAI,EAAE,CAAC,IAAI,EAAE,EAAE;oBAC7B,IAAI,IAAI,EAAE;wBACN,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,WAAW,EAAE,EAAE,EAAE,IAAI,CAAC,CAAC;qBACjD;gBACL,CAAC,CAAC,CAAC;aACN;YAAC,OAAO,KAAK,EAAE;gBACZ,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,QAAQ,EAAE,EAAE,EAAE,qBAAqB,EAAE,KAAK,CAAC,CAAC;aACtE;QACL,CAAC,CAAC,CAAC;IACP,CAAC;CACJ;AApBD,8BAoBC"}
+\ No newline at end of file
++{"version":3,"file":"connector.js","sourceRoot":"","sources":["connector.ts"],"names":[],"mappings":";;AAAA,MAAa,SAAS;IAClB,YAAoB,MAAuB;IACvC,aAAa;IACN,GAAiB;QAFR,WAAM,GAAN,MAAM,CAAiB;QAEhC,QAAG,GAAH,GAAG,CAAc;IAAI,CAAC;IAEjC,EAAE,CAAC,GAAW,EAAE,cAAwB;QACpC,IAAI,CAAC,MAAM,CAAC,EAAE,CAAC,GAAG,EAAE,CAAC,GAAG,IAAW,EAAE,EAAE;YACnC,MAAM,EAAE,GAAW,IAAI,CAAC,GAAG,EAAE,CAAC;YAE9B,IAAI;gBACA,cAAc,CAAC,GAAG,IAAI,EAAE,CAAC,IAAI,EAAE,EAAE;oBAC7B,IAAI,IAAI,EAAE;wBACN,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,WAAW,EAAE,EAAE,EAAE,IAAI,CAAC,CAAC;qBACjD;gBACL,CAAC,CAAC,CAAC;aACN;YAAC,OAAO,KAAK,EAAE;gBACZ,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,QAAQ,EAAE,EAAE,EAAE,qBAAqB,EAAE,KAAK,CAAC,CAAC;aACtE;QACL,CAAC,CAAC,CAAC;IACP,CAAC;CACJ;AApBD,8BAoBC"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/ElectronHostHook/index.js b/ElectronNET.Host/ElectronHostHook/index.js
+index 813f7a1575a58f65bc031e01891c7ca8fec52af4..05a0931218326b17c96bdda3875ecec934933bf8 100644
+--- a/ElectronNET.Host/ElectronHostHook/index.js
++++ b/ElectronNET.Host/ElectronHostHook/index.js
+@@ -1,6 +1,5 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+-exports.HookService = void 0;
+ const connector_1 = require("./connector");
+ class HookService extends connector_1.Connector {
+     constructor(socket, app) {
+diff --git a/ElectronNET.Host/ElectronHostHook/index.js.map b/ElectronNET.Host/ElectronHostHook/index.js.map
+index 868dd903e888458c4b7ef6ddc95e6a50f1a0c17d..40e3a0fd8391faea662e9af86c8c5036383c21da 100644
+--- a/ElectronNET.Host/ElectronHostHook/index.js.map
++++ b/ElectronNET.Host/ElectronHostHook/index.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"index.js","sourceRoot":"","sources":["index.ts"],"names":[],"mappings":";;;AAEA,2CAAwC;AAExC,MAAa,WAAY,SAAQ,qBAAS;IACtC,YAAY,MAAuB,EAAS,GAAiB;QACzD,KAAK,CAAC,MAAM,EAAE,GAAG,CAAC,CAAC;QADqB,QAAG,GAAH,GAAG,CAAc;IAE7D,CAAC;IAED,WAAW;QACP,8CAA8C;IAClD,CAAC;CACJ;AARD,kCAQC"}
+\ No newline at end of file
++{"version":3,"file":"index.js","sourceRoot":"","sources":["index.ts"],"names":[],"mappings":";;AAEA,2CAAwC;AAExC,MAAa,WAAY,SAAQ,qBAAS;IACtC,YAAY,MAAuB,EAAS,GAAiB;QACzD,KAAK,CAAC,MAAM,EAAE,GAAG,CAAC,CAAC;QADqB,QAAG,GAAH,GAAG,CAAc;IAE7D,CAAC;IAED,WAAW;QACP,8CAA8C;IAClD,CAAC;CACJ;AARD,kCAQC"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/autoUpdater.js b/ElectronNET.Host/api/autoUpdater.js
+index 74c7b0cf398a154747ce0ae9a44d721dce7bc669..bbbf9082270bce9664e7aaa8970c462d912fa766 100644
+--- a/ElectronNET.Host/api/autoUpdater.js
++++ b/ElectronNET.Host/api/autoUpdater.js
+@@ -72,21 +72,36 @@ module.exports = (socket) => {
+     socket.on('autoUpdater-updateConfigPath-set', (value) => {
+         electron_updater_1.autoUpdater.updateConfigPath = value;
+     });
++    socket.on('autoUpdater-currentVersion-get', () => {
++        electronSocket.emit('autoUpdater-currentVersion-get-reply', electron_updater_1.autoUpdater.currentVersion);
++    });
+     socket.on('autoUpdater-channel-get', () => {
+         electronSocket.emit('autoUpdater-channel-get-reply', electron_updater_1.autoUpdater.channel || '');
+     });
+     socket.on('autoUpdater-channel-set', (value) => {
+         electron_updater_1.autoUpdater.channel = value;
+     });
++    socket.on('autoUpdater-requestHeaders-get', () => {
++        electronSocket.emit('autoUpdater-requestHeaders-get-reply', electron_updater_1.autoUpdater.requestHeaders);
++    });
++    socket.on('autoUpdater-requestHeaders-set', (value) => {
++        electron_updater_1.autoUpdater.requestHeaders = value;
++    });
+     // Methods ********
+     socket.on('autoUpdaterCheckForUpdatesAndNotify', async (guid) => {
+-        const updateCheckResult = await electron_updater_1.autoUpdater.checkForUpdatesAndNotify();
+-        electronSocket.emit('autoUpdaterCheckForUpdatesAndNotifyComplete' + guid, updateCheckResult);
++        electron_updater_1.autoUpdater.checkForUpdatesAndNotify().then((updateCheckResult) => {
++            electronSocket.emit('autoUpdaterCheckForUpdatesAndNotifyComplete' + guid, updateCheckResult);
++        }).catch((error) => {
++            electronSocket.emit('autoUpdaterCheckForUpdatesAndNotifyError' + guid, error);
++        });
+     });
+     socket.on('autoUpdaterCheckForUpdates', async (guid) => {
+         // autoUpdater.updateConfigPath = path.join(__dirname, 'dev-app-update.yml');
+-        const updateCheckResult = await electron_updater_1.autoUpdater.checkForUpdates();
+-        electronSocket.emit('autoUpdaterCheckForUpdatesComplete' + guid, updateCheckResult);
++        electron_updater_1.autoUpdater.checkForUpdates().then((updateCheckResult) => {
++            electronSocket.emit('autoUpdaterCheckForUpdatesComplete' + guid, updateCheckResult);
++        }).catch((error) => {
++            electronSocket.emit('autoUpdaterCheckForUpdatesError' + guid, error);
++        });
+     });
+     socket.on('autoUpdaterQuitAndInstall', async (isSilent, isForceRunAfter) => {
+         electron_updater_1.autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+diff --git a/ElectronNET.Host/api/autoUpdater.js.map b/ElectronNET.Host/api/autoUpdater.js.map
+index 2c99737a50eacd23f8b54daf82ab4dfa3673a00d..48a6cff0c6b1e00ac2b26418eb3822f5e4914893 100644
+--- a/ElectronNET.Host/api/autoUpdater.js.map
++++ b/ElectronNET.Host/api/autoUpdater.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"autoUpdater.js","sourceRoot":"","sources":["autoUpdater.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
++{"version":3,"file":"autoUpdater.js","sourceRoot":"","sources":["autoUpdater.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/autoUpdater.ts b/ElectronNET.Host/api/autoUpdater.ts
+index f5493e0d4efd18b3bef28ad509bb93f0d0ad58cb..79a92f87c2324aff73e615d7e9f756015cbdb34e 100644
+--- a/ElectronNET.Host/api/autoUpdater.ts
++++ b/ElectronNET.Host/api/autoUpdater.ts
+@@ -93,6 +93,11 @@ export = (socket: SocketIO.Socket) => {
+         autoUpdater.updateConfigPath = value;
+     });
+ 
++    socket.on('autoUpdater-currentVersion-get', () =>
++    {
++        electronSocket.emit('autoUpdater-currentVersion-get-reply', autoUpdater.currentVersion);
++    });
++
+     socket.on('autoUpdater-channel-get', () => {
+         electronSocket.emit('autoUpdater-channel-get-reply', autoUpdater.channel || '');
+     });
+@@ -101,17 +106,39 @@ export = (socket: SocketIO.Socket) => {
+         autoUpdater.channel = value;
+     });
+ 
++    socket.on('autoUpdater-requestHeaders-get', () =>
++    {
++        electronSocket.emit('autoUpdater-requestHeaders-get-reply', autoUpdater.requestHeaders);
++    });
++
++    socket.on('autoUpdater-requestHeaders-set', (value) =>
++    {
++        autoUpdater.requestHeaders = value;
++    });
++
+     // Methods ********
+ 
+-    socket.on('autoUpdaterCheckForUpdatesAndNotify', async (guid) => {
+-        const updateCheckResult = await autoUpdater.checkForUpdatesAndNotify();
+-        electronSocket.emit('autoUpdaterCheckForUpdatesAndNotifyComplete' + guid, updateCheckResult);
++    socket.on('autoUpdaterCheckForUpdatesAndNotify', async (guid) =>
++    {
++        autoUpdater.checkForUpdatesAndNotify().then((updateCheckResult) =>
++        {
++            electronSocket.emit('autoUpdaterCheckForUpdatesAndNotifyComplete' + guid, updateCheckResult);
++        }).catch((error) =>
++        {
++            electronSocket.emit('autoUpdaterCheckForUpdatesAndNotifyError' + guid, error);
++        });
+     });
+ 
+-    socket.on('autoUpdaterCheckForUpdates', async (guid) => {
++    socket.on('autoUpdaterCheckForUpdates', async (guid) =>
++    {
+         // autoUpdater.updateConfigPath = path.join(__dirname, 'dev-app-update.yml');
+-        const updateCheckResult = await autoUpdater.checkForUpdates();
+-        electronSocket.emit('autoUpdaterCheckForUpdatesComplete' + guid, updateCheckResult);
++        autoUpdater.checkForUpdates().then((updateCheckResult) =>
++        {
++            electronSocket.emit('autoUpdaterCheckForUpdatesComplete' + guid, updateCheckResult);
++        }).catch((error) =>
++        {
++            electronSocket.emit('autoUpdaterCheckForUpdatesError' + guid, error);
++        });
+     });
+ 
+     socket.on('autoUpdaterQuitAndInstall', async (isSilent, isForceRunAfter) => {
+diff --git a/ElectronNET.Host/main.js b/ElectronNET.Host/main.js
+index d382fdfb2b603d66c1c57ef1d3de2daaf198bc28..6ea9875820a6c6cf18c42f45dc7474e4f29d7fec 100644
+--- a/ElectronNET.Host/main.js
++++ b/ElectronNET.Host/main.js
+@@ -1,5 +1,6 @@
+ ﻿const { app } = require('electron');
+ const { BrowserWindow } = require('electron');
++const { protocol } = require('electron');
+ const path = require('path');
+ const cProcess = require('child_process').spawn;
+ const portscanner = require('portscanner');
+@@ -51,6 +52,14 @@ if (manifestJsonFile.singleInstance || manifestJsonFile.aspCoreBackendPort) {
+ }
+ 
+ app.on('ready', () => {
++
++    // Fix ERR_UNKNOWN_URL_SCHEME using file protocol
++    // https://github.com/electron/electron/issues/23757
++    protocol.registerFileProtocol('file', (request, callback) => {
++        const pathname = request.url.replace('file:///', '');
++        callback(pathname);
++    });
++    
+     if (isSplashScreenEnabled()) {
+         startSplashScreen();
+     }
+@@ -273,4 +282,4 @@ function getEnvironmentParameter() {
+     }
+ 
+     return '';
+-}
+\ No newline at end of file
++}
+diff --git a/ElectronNET.Host/package-lock.json b/ElectronNET.Host/package-lock.json
+index e36cb852aa84f1eefbefedb67be46a2e160c4134..3bd7d6a4e8f526981105dec1eb7116a6c52d5b32 100644
+--- a/ElectronNET.Host/package-lock.json
++++ b/ElectronNET.Host/package-lock.json
+@@ -437,9 +437,9 @@
+             "dev": true
+         },
+         "electron": {
+-            "version": "9.0.5",
+-            "resolved": "https://registry.npmjs.org/electron/-/electron-9.0.5.tgz",
+-            "integrity": "sha512-bnL9H48LuQ250DML8xUscsKiuSu+xv5umXbpBXYJ0BfvYVmFfNbG3jCfhrsH7aP6UcQKVxOG1R/oQExd0EFneQ==",
++            "version": "9.2.0",
++            "resolved": "https://registry.npmjs.org/electron/-/electron-9.2.0.tgz",
++            "integrity": "sha512-4ecZ3rcGg//Gk4fAK3Jo61T+uh36JhU6HHR/PTujQqQiBw1g4tNPd4R2hGGth2d+7FkRIs5GdRNef7h64fQEMw==",
+             "dev": true,
+             "requires": {
+                 "@electron/get": "^1.0.1",
+@@ -448,9 +448,9 @@
+             },
+             "dependencies": {
+                 "@types/node": {
+-                    "version": "12.12.47",
+-                    "resolved": "https://registry.npmjs.org/@types/node/-/node-12.12.47.tgz",
+-                    "integrity": "sha512-yzBInQFhdY8kaZmqoL2+3U5dSTMrKaYcb561VU+lDzAYvqt+2lojvBEy+hmpSNuXnPTx7m9+04CzWYOUqWME2A==",
++                    "version": "12.12.54",
++                    "resolved": "https://registry.npmjs.org/@types/node/-/node-12.12.54.tgz",
++                    "integrity": "sha512-ge4xZ3vSBornVYlDnk7yZ0gK6ChHf/CHB7Gl1I0Jhah8DDnEQqBzgohYG4FX4p81TNirSETOiSyn+y1r9/IR6w==",
+                     "dev": true
+                 }
+             }
+diff --git a/ElectronNET.Host/package.json b/ElectronNET.Host/package.json
+index 0a974baac6da0523d740aec99b2b2a3dd2d08255..b6c6b735b22f4701e8aea3070e70aa57585938cc 100644
+--- a/ElectronNET.Host/package.json
++++ b/ElectronNET.Host/package.json
+@@ -21,7 +21,7 @@
+     "devDependencies": {
+         "@types/node": "^10.14.4",
+         "@types/socket.io": "^2.1.2",
+-        "electron": "^9.0.5",
++        "electron": "^9.2.0",
+         "tslint": "^6.1.1",
+         "typescript": "^3.8.3"
+     }

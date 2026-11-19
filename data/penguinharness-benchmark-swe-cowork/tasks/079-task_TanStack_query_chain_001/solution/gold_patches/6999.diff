@@ -1,0 +1,371 @@
+diff --git a/packages/angular-query-experimental/src/inject-queries.ts b/packages/angular-query-experimental/src/inject-queries.ts
+index f5f722f2701783f784a8d40b88d9875517b50bbb..7664e9148ca628b4abd3da738bc09089d827ddc9 100644
+--- a/packages/angular-query-experimental/src/inject-queries.ts
++++ b/packages/angular-query-experimental/src/inject-queries.ts
+@@ -11,6 +11,7 @@ import type {
+   QueryKey,
+   QueryObserverOptions,
+   QueryObserverResult,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -52,7 +53,9 @@ type GetOptions<T> =
+               ? QueryObserverOptionsForCreateQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -63,10 +66,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? QueryObserverOptionsForCreateQueries<
+diff --git a/packages/query-core/src/index.ts b/packages/query-core/src/index.ts
+index 830a49f6007336403c343ef5a2a7a842797dfe97..0d6dd2f264b0bd47d57b1f551c7dbc9057bbf4dd 100644
+--- a/packages/query-core/src/index.ts
++++ b/packages/query-core/src/index.ts
+@@ -20,8 +20,9 @@ export {
+   matchQuery,
+   matchMutation,
+   keepPreviousData,
++  skipToken,
+ } from './utils'
+-export type { MutationFilters, QueryFilters, Updater } from './utils'
++export type { MutationFilters, QueryFilters, Updater, SkipToken } from './utils'
+ export { isCancelledError } from './retryer'
+ export {
+   dehydrate,
+diff --git a/packages/query-core/src/infiniteQueryBehavior.ts b/packages/query-core/src/infiniteQueryBehavior.ts
+index 73ddd9e51eff5b86d4057cd5726df2003422e4f7..dd79ba8098796f93e41a5d25f13bedbf322b1aa2 100644
+--- a/packages/query-core/src/infiniteQueryBehavior.ts
++++ b/packages/query-core/src/infiniteQueryBehavior.ts
+@@ -1,4 +1,4 @@
+-import { addToEnd, addToStart } from './utils'
++import { addToEnd, addToStart, skipToken } from './utils'
+ import type { QueryBehavior } from './query'
+ import type {
+   InfiniteData,
+@@ -38,11 +38,20 @@ export function infiniteQueryBehavior<TQueryFnData, TError, TData, TPageParam>(
+ 
+         // Get query function
+         const queryFn =
+-          context.options.queryFn ||
+-          (() =>
+-            Promise.reject(
+-              new Error(`Missing queryFn: '${context.options.queryHash}'`),
+-            ))
++          context.options.queryFn && context.options.queryFn !== skipToken
++            ? context.options.queryFn
++            : () => {
++                if (process.env.NODE_ENV !== 'production') {
++                  if (context.options.queryFn === skipToken) {
++                    console.error(
++                      `Attempted to invoke queryFn when set to skipToken. This is likely a configuration error. Query hash: '${context.options.queryHash}'`,
++                    )
++                  }
++                }
++                return Promise.reject(
++                  new Error(`Missing queryFn: '${context.options.queryHash}'`),
++                )
++              }
+ 
+         // Create function to fetch a page
+         const fetchPage = async (
+diff --git a/packages/query-core/src/query.ts b/packages/query-core/src/query.ts
+index 6018f5071d20bae5cc2dc86d62cc92f72c352c41..fcca677bddefdcc58182e0440d673102af664c80 100644
+--- a/packages/query-core/src/query.ts
++++ b/packages/query-core/src/query.ts
+@@ -1,4 +1,4 @@
+-import { noop, replaceData, timeUntilStale } from './utils'
++import { noop, replaceData, skipToken, timeUntilStale } from './utils'
+ import { notifyManager } from './notifyManager'
+ import { canFetch, createRetryer, isCancelledError } from './retryer'
+ import { Removable } from './removable'
+@@ -387,11 +387,20 @@ export class Query<
+ 
+     // Create fetch function
+     const fetchFn = () => {
+-      if (!this.options.queryFn) {
++      if (process.env.NODE_ENV !== 'production') {
++        if (this.options.queryFn === skipToken) {
++          console.error(
++            `Attempted to invoke queryFn when set to skipToken. This is likely a configuration error. Query hash: '${this.options.queryHash}'`,
++          )
++        }
++      }
++
++      if (!this.options.queryFn || this.options.queryFn === skipToken) {
+         return Promise.reject(
+           new Error(`Missing queryFn: '${this.options.queryHash}'`),
+         )
+       }
++
+       this.#abortSignalConsumed = false
+       if (this.options.persister) {
+         return this.options.persister(
+diff --git a/packages/query-core/src/queryClient.ts b/packages/query-core/src/queryClient.ts
+index d54cacf55c7ba89a88b5c74c2809b70c7ca34561..2f0d4cf0b4ff452f833cafa2b20865cad79753de 100644
+--- a/packages/query-core/src/queryClient.ts
++++ b/packages/query-core/src/queryClient.ts
+@@ -4,6 +4,7 @@ import {
+   hashQueryKeyByOptions,
+   noop,
+   partialMatchKey,
++  skipToken,
+ } from './utils'
+ import { QueryCache } from './queryCache'
+ import { MutationCache } from './mutationCache'
+@@ -537,6 +538,13 @@ export class QueryClient {
+       defaultedOptions.networkMode = 'offlineFirst'
+     }
+ 
++    if (
++      defaultedOptions.enabled !== true &&
++      defaultedOptions.queryFn === skipToken
++    ) {
++      defaultedOptions.enabled = false
++    }
++
+     return defaultedOptions as DefaultedQueryObserverOptions<
+       TQueryFnData,
+       TError,
+diff --git a/packages/query-core/src/types.ts b/packages/query-core/src/types.ts
+index c4b2b29d4d5cd0e2ab0a8a21cab1f3b35582fed4..faaea7bb8403b4149e88dfcfe3abea92ddf45904 100644
+--- a/packages/query-core/src/types.ts
++++ b/packages/query-core/src/types.ts
+@@ -3,7 +3,7 @@
+ import type { MutationState } from './mutation'
+ import type { FetchDirection, Query, QueryBehavior } from './query'
+ import type { RetryDelayValue, RetryValue } from './retryer'
+-import type { QueryFilters, QueryTypeFilter } from './utils'
++import type { QueryFilters, QueryTypeFilter, SkipToken } from './utils'
+ import type { QueryCache } from './queryCache'
+ import type { MutationCache } from './mutationCache'
+ 
+@@ -147,7 +147,7 @@ export interface QueryOptions<
+    * Setting it to `Infinity` will disable garbage collection.
+    */
+   gcTime?: number
+-  queryFn?: QueryFunction<TQueryFnData, TQueryKey, TPageParam>
++  queryFn?: QueryFunction<TQueryFnData, TQueryKey, TPageParam> | SkipToken
+   persister?: QueryPersister<
+     NoInfer<TQueryFnData>,
+     NoInfer<TQueryKey>,
+diff --git a/packages/query-core/src/utils.ts b/packages/query-core/src/utils.ts
+index 91af0759c1c4e86ffc410e36b3aba48ab53b4706..3962b12645bee295e28ed17ebe3895bc173cf9be 100644
+--- a/packages/query-core/src/utils.ts
++++ b/packages/query-core/src/utils.ts
+@@ -342,3 +342,6 @@ export function addToStart<T>(items: Array<T>, item: T, max = 0): Array<T> {
+   const newItems = [item, ...items]
+   return max && newItems.length > max ? newItems.slice(0, -1) : newItems
+ }
++
++export const skipToken = Symbol()
++export type SkipToken = typeof skipToken
+diff --git a/packages/react-query/src/useQueries.ts b/packages/react-query/src/useQueries.ts
+index 34e9b38be0753763ccb7fe75fe1fa7feff935eb2..9da316d90e5f9b39de07cc03ec894ff888ca7505 100644
+--- a/packages/react-query/src/useQueries.ts
++++ b/packages/react-query/src/useQueries.ts
+@@ -32,6 +32,7 @@ import type {
+   QueryClient,
+   QueryFunction,
+   QueryKey,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -73,7 +74,9 @@ type GetOptions<T> =
+               ? UseQueryOptionsForUseQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -84,10 +87,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? UseQueryOptionsForUseQueries<
+@@ -133,7 +135,7 @@ type GetResults<T> =
+               ? GetDefinedOrUndefinedQueryResult<T, TQueryFnData>
+               : // Part 3: responsible for mapping inferred type to results, if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, any>
++                    queryFn?: QueryFunction<infer TQueryFnData, any> | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -143,7 +145,9 @@ type GetResults<T> =
+                     unknown extends TError ? DefaultError : TError
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<infer TQueryFnData, any>
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, any>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? GetDefinedOrUndefinedQueryResult<
+diff --git a/packages/react-query/src/useSuspenseQueries.ts b/packages/react-query/src/useSuspenseQueries.ts
+index 1d58da0c5333452d99e922a95123e02ef1bf55ae..1802e3a207ff879c7e3b4bd111229fc2194c18f1 100644
+--- a/packages/react-query/src/useSuspenseQueries.ts
++++ b/packages/react-query/src/useSuspenseQueries.ts
+@@ -6,6 +6,7 @@ import type {
+   DefaultError,
+   QueryClient,
+   QueryFunction,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -33,7 +34,9 @@ type GetSuspenseOptions<T> =
+               ? UseSuspenseQueryOptions<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -44,10 +47,9 @@ type GetSuspenseOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? UseSuspenseQueryOptions<
+diff --git a/packages/react-query/src/useSuspenseQuery.ts b/packages/react-query/src/useSuspenseQuery.ts
+index 3bf6039d01611fcc4a4b2b387612883095126a4d..9bc53e6fd6a4968c0522855c629ab7aaf3c066f6 100644
+--- a/packages/react-query/src/useSuspenseQuery.ts
++++ b/packages/react-query/src/useSuspenseQuery.ts
+@@ -1,5 +1,5 @@
+ 'use client'
+-import { QueryObserver } from '@tanstack/query-core'
++import { QueryObserver, skipToken } from '@tanstack/query-core'
+ import { useBaseQuery } from './useBaseQuery'
+ import { defaultThrowOnError } from './suspense'
+ import type { UseSuspenseQueryOptions, UseSuspenseQueryResult } from './types'
+@@ -14,6 +14,12 @@ export function useSuspenseQuery<
+   options: UseSuspenseQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+   queryClient?: QueryClient,
+ ): UseSuspenseQueryResult<TData, TError> {
++  if (process.env.NODE_ENV !== 'production') {
++    if (options.queryFn === skipToken) {
++      console.error('skipToken is not allowed for useSuspenseQuery')
++    }
++  }
++
+   return useBaseQuery(
+     {
+       ...options,
+diff --git a/packages/solid-query/src/createQueries.ts b/packages/solid-query/src/createQueries.ts
+index 9fffdf60cbbdb0d14c7ac5d0ad32a2b146ed4242..fc4d8a9368e7da6980573daa59577d2ce95bdb4e 100644
+--- a/packages/solid-query/src/createQueries.ts
++++ b/packages/solid-query/src/createQueries.ts
+@@ -23,6 +23,7 @@ import type {
+   QueryFunction,
+   QueryKey,
+   QueryObserverResult,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -64,7 +65,9 @@ type GetOptions<T> =
+               ? CreateQueryOptionsForCreateQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -75,10 +78,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? CreateQueryOptionsForCreateQueries<
+diff --git a/packages/svelte-query/src/createQueries.ts b/packages/svelte-query/src/createQueries.ts
+index cb8d0c4bd1b9e42c8e667ad8d9acf159237388ee..48eb64fe5ef183062c07b8c76c565433cfe8a7fa 100644
+--- a/packages/svelte-query/src/createQueries.ts
++++ b/packages/svelte-query/src/createQueries.ts
+@@ -14,6 +14,7 @@ import type {
+   QueryKey,
+   QueryObserverOptions,
+   QueryObserverResult,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -55,7 +56,9 @@ type GetOptions<T> =
+               ? QueryObserverOptionsForCreateQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -66,10 +69,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? QueryObserverOptionsForCreateQueries<

@@ -1,0 +1,229 @@
+/*
+Copyright 2021 The KubeOne Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package executorfs
+
+import (
+	"bytes"
+	"fmt"
+	"io/fs"
+	"strconv"
+	"strings"
+	"time"
+
+	"k8c.io/kubeone/pkg/executor"
+	"k8c.io/kubeone/pkg/fail"
+)
+
+var _ executor.MkdirFS = &virtfs{}
+
+func New(conn executor.Interface) executor.MkdirFS {
+	return &virtfs{conn: conn}
+}
+
+type virtfs struct {
+	conn executor.Interface
+}
+
+func (vfs *virtfs) Open(name string) (fs.File, error) {
+	var hadSlashPrefix bool
+	if strings.HasPrefix(name, "/") {
+		name = strings.TrimPrefix(name, "/")
+		hadSlashPrefix = true
+	}
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{
+			Op:   "open",
+			Path: name,
+			Err:  fs.ErrInvalid,
+		}
+	}
+	if hadSlashPrefix {
+		name = "/" + name
+	}
+
+	return &virtfile{
+		conn: vfs.conn,
+		name: name,
+	}, nil
+}
+
+func (vfs *virtfs) Glob(pattern string) ([]string, error) {
+	const cmdTpl = `sudo bash -c 'list=(%s); echo ${list[@]}'`
+
+	var (
+		stdout, stderr strings.Builder
+		cmd            = fmt.Sprintf(cmdTpl, pattern)
+	)
+
+	_, err := vfs.conn.POpen(cmd, nil, &stdout, &stderr)
+	if err != nil {
+		return nil, fail.SSH(&fs.PathError{
+			Op:   "glob",
+			Path: pattern,
+			Err:  fmt.Errorf("glob failed: %w, %s %s", err, stdout.String(), stderr.String()),
+		}, "glob")
+	}
+
+	return strings.Split(stdout.String(), " "), nil
+}
+
+func (vfs *virtfs) MkdirAll(path string, perm fs.FileMode) error {
+	const cmdTpl = `sudo mkdir --mode=%o --parents %q`
+
+	var (
+		stdout, stderr strings.Builder
+		cmd            = fmt.Sprintf(cmdTpl, perm, path)
+	)
+
+	_, err := vfs.conn.POpen(cmd, nil, &stdout, &stderr)
+	if err != nil {
+		return fail.SSH(&fs.PathError{
+			Op:   "mkdir",
+			Path: path,
+			Err:  fmt.Errorf("%w %s %s", err, stdout.String(), stderr.String()),
+		}, "mkdirall")
+	}
+
+	return nil
+}
+
+func (vfs *virtfs) ReadFile(name string) ([]byte, error) {
+	var buf bytes.Buffer
+	var stderr strings.Builder
+
+	_, err := vfs.conn.POpen(fmt.Sprintf("sudo cat %q", name), nil, &buf, &stderr)
+	if err != nil {
+		return nil, fail.SSH(&fs.PathError{
+			Op:   "read",
+			Path: name,
+			Err:  fmt.Errorf("%w %s", err, stderr.String()),
+		}, "read file")
+	}
+
+	return buf.Bytes(), nil
+}
+
+func newSSHFileInfo(name string, conn executor.Interface) (fs.FileInfo, error) {
+	const cmdTpl = `sudo env LC_ALL=C stat --printf='%%s\t%%f\t%%Y\t%%F' -- %s`
+
+	var (
+		stdout, stderr strings.Builder
+		cmd            = fmt.Sprintf(cmdTpl, "'"+strings.ReplaceAll(name, "'", "'\\''")+"'")
+	)
+
+	exitCode, err := conn.POpen(cmd, nil, &stdout, &stderr)
+	if exitCode != 0 || err != nil {
+		if err == nil {
+			err = fmt.Errorf("remote stat exited with status %d: %s", exitCode, strings.TrimSpace(stderr.String()))
+		}
+		return nil, fail.SSH(&fs.PathError{
+			Op:   "stat",
+			Path: name,
+			Err:  err,
+		}, "stat file")
+	}
+
+	fia := strings.Split(stdout.String(), "\t")
+	invalid := func(cause error, field string) (fs.FileInfo, error) {
+		return nil, fail.Runtime(&fs.PathError{Op: "stat", Path: name, Err: cause}, "parsing stat "+field)
+	}
+	if len(fia) != 4 {
+		return invalid(fs.ErrInvalid, "record")
+	}
+	size, err := strconv.ParseInt(fia[0], 10, 64)
+	if err != nil {
+		return invalid(err, "size")
+	}
+	if size < 0 {
+		return invalid(fs.ErrInvalid, "size")
+	}
+	rawMode, err := strconv.ParseUint(fia[1], 16, 32)
+	if err != nil {
+		return invalid(err, "mode")
+	}
+	if rawMode & ^uint64(0177777) != 0 {
+		return invalid(fs.ErrInvalid, "mode")
+	}
+	modTime, err := strconv.ParseInt(fia[2], 10, 64)
+	if err != nil {
+		return invalid(err, "mtime")
+	}
+	// GNU stat reports POSIX mode bits. Go uses distinct high bits for file
+	// types and special permissions; carrying the raw value loses these flags.
+	mode := fs.FileMode(rawMode & 0777)
+	if rawMode&04000 != 0 {
+		mode |= fs.ModeSetuid
+	}
+	if rawMode&02000 != 0 {
+		mode |= fs.ModeSetgid
+	}
+	if rawMode&01000 != 0 {
+		mode |= fs.ModeSticky
+	}
+	validType := false
+	switch rawMode & 0170000 {
+	case 0100000:
+		validType = fia[3] == "regular file" || fia[3] == "regular empty file"
+	case 0040000:
+		mode |= fs.ModeDir
+		validType = fia[3] == "directory"
+	case 0120000:
+		mode |= fs.ModeSymlink
+		validType = fia[3] == "symbolic link"
+	case 0010000:
+		mode |= fs.ModeNamedPipe
+		validType = fia[3] == "fifo"
+	case 0140000:
+		mode |= fs.ModeSocket
+		validType = fia[3] == "socket"
+	case 0020000:
+		mode |= fs.ModeDevice | fs.ModeCharDevice
+		validType = fia[3] == "character special file"
+	case 0060000:
+		mode |= fs.ModeDevice
+		validType = fia[3] == "block special file"
+	}
+	if !validType {
+		return invalid(fs.ErrInvalid, "type")
+	}
+
+	return &fileInfo{
+		name: name,
+		size: size,
+		mode: mode,
+		time: time.Unix(modTime, 0),
+	}, nil
+}
+
+type fileInfo struct {
+	name string
+	size int64
+	mode fs.FileMode
+	time time.Time
+}
+
+func (fi *fileInfo) Size() int64 { return fi.size }
+
+func (fi *fileInfo) Mode() fs.FileMode { return fi.mode }
+
+func (fi *fileInfo) ModTime() time.Time { return fi.time }
+
+func (fi *fileInfo) Name() string { return fi.name }
+
+func (fi *fileInfo) IsDir() bool { return fi.mode.IsDir() }
+
+func (*fileInfo) Sys() interface{} { return nil }

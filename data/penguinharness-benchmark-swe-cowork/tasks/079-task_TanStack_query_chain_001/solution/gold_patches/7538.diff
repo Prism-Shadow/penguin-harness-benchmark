@@ -1,0 +1,125 @@
+diff --git a/integrations/react-next-15/app/client-component.tsx b/integrations/react-next-15/app/client-component.tsx
+index 718fe481869b77efd4c08268f0efd0bfe932e417..29dd7b33c96db4aa856bf43f22fb4c248f88ae5d 100644
+--- a/integrations/react-next-15/app/client-component.tsx
++++ b/integrations/react-next-15/app/client-component.tsx
+@@ -2,13 +2,17 @@
+ 
+ import React from 'react'
+ import { useQuery } from '@tanstack/react-query'
++import { Temporal } from '@js-temporal/polyfill'
+ 
+ export function ClientComponent() {
+   const query = useQuery({
+     queryKey: ['data'],
+     queryFn: async () => {
+       await new Promise((r) => setTimeout(r, 1000))
+-      return 'data from client'
++      return {
++        text: 'data from client',
++        date: Temporal.PlainDate.from('2023-01-01'),
++      }
+     },
+   })
+ 
+@@ -20,5 +24,9 @@ export function ClientComponent() {
+     return <div>An error has occurred!</div>
+   }
+ 
+-  return <div>{query.data}</div>
++  return (
++    <div>
++      {query.data.text} - {query.data.date.toJSON()}
++    </div>
++  )
+ }
+diff --git a/integrations/react-next-15/app/make-query-client.ts b/integrations/react-next-15/app/make-query-client.ts
+index 4bd06b67ab65a443620e7f959f74059825cce136..45da8b644c34bb3803f0a80854b72adc49c0e6fd 100644
+--- a/integrations/react-next-15/app/make-query-client.ts
++++ b/integrations/react-next-15/app/make-query-client.ts
+@@ -1,8 +1,29 @@
++import { Temporal } from '@js-temporal/polyfill'
+ import { QueryClient, defaultShouldDehydrateQuery } from '@tanstack/react-query'
++import { createTson } from 'tupleson'
++import type { TsonType } from 'tupleson'
++
++const plainDate = {
++  deserialize: (v) => Temporal.PlainDate.from(v),
++  key: 'PlainDate',
++  serialize: (v) => v.toJSON(),
++  test: (v) => v instanceof Temporal.PlainDate,
++} satisfies TsonType<Temporal.PlainDate, string>
++
++export const tson = createTson({
++  types: [plainDate],
++})
+ 
+ export function makeQueryClient() {
+   return new QueryClient({
+     defaultOptions: {
++      hydrate: {
++        /**
++         * Called when the query is rebuilt from a prefetched
++         * promise, before the query data is put into the cache.
++         */
++        transformPromise: (promise) => promise.then(tson.deserialize),
++      },
+       queries: {
+         staleTime: 60 * 1000,
+       },
+diff --git a/integrations/react-next-15/app/page.tsx b/integrations/react-next-15/app/page.tsx
+index 013e042596b58087c011c19654f2e54beff8db41..797b25756a97c0794dea91c092e7a6c0bb770bcf 100644
+--- a/integrations/react-next-15/app/page.tsx
++++ b/integrations/react-next-15/app/page.tsx
+@@ -1,7 +1,8 @@
+ import React from 'react'
+ import { HydrationBoundary, dehydrate } from '@tanstack/react-query'
+-import { makeQueryClient } from '@/app/make-query-client'
++import { Temporal } from '@js-temporal/polyfill'
+ import { ClientComponent } from './client-component'
++import { makeQueryClient, tson } from './make-query-client'
+ 
+ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+ 
+@@ -12,7 +13,10 @@ export default async function Home() {
+     queryKey: ['data'],
+     queryFn: async () => {
+       await sleep(2000)
+-      return 'data from server'
++      return tson.serialize({
++        text: 'data from server',
++        date: Temporal.PlainDate.from('2024-01-01'),
++      })
+     },
+   })
+ 
+diff --git a/packages/query-core/src/hydration.ts b/packages/query-core/src/hydration.ts
+index b4cc8b3fb467317fabd877f1a129d9210a3895fe..64d0eb7a2cf97c3579d08c200f5a0b784118754e 100644
+--- a/packages/query-core/src/hydration.ts
++++ b/packages/query-core/src/hydration.ts
+@@ -21,6 +21,7 @@ export interface DehydrateOptions {
+ 
+ export interface HydrateOptions {
+   defaultOptions?: {
++    transformPromise?: (promise: Promise<any>) => Promise<any>
+     queries?: QueryOptions
+     mutations?: MutationOptions<unknown, DefaultError, unknown, unknown>
+   }
+@@ -178,9 +179,17 @@ export function hydrate(
+     }
+ 
+     if (promise) {
++      const transformPromise =
++        client.getDefaultOptions().hydrate?.transformPromise
++
++      // Note: `Promise.resolve` required cause
++      // RSC transformed promises are not thenable
++      const initialPromise =
++        transformPromise?.(Promise.resolve(promise)) ?? promise
++
+       // this doesn't actually fetch - it just creates a retryer
+       // which will re-use the passed `initialPromise`
+-      void query.fetch(undefined, { initialPromise: promise })
++      void query.fetch(undefined, { initialPromise })
+     }
+   })
+ }

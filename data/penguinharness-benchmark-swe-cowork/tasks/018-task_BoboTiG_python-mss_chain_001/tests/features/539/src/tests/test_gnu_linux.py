@@ -1,0 +1,498 @@
+"""This is part of the MSS Python's module.
+Source: https://github.com/BoboTiG/python-mss.
+"""
+
+from __future__ import annotations
+
+import ctypes.util
+import platform
+import threading
+from ctypes import CFUNCTYPE, POINTER, _Pointer, c_int
+from typing import TYPE_CHECKING, Any
+from unittest.mock import Mock, NonCallableMock, patch
+
+import pytest
+
+import mss
+import mss.buffer
+import mss.linux
+import mss.linux.xlib
+from mss import MSS
+from mss.exception import ScreenShotError
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+pyvirtualdisplay = pytest.importorskip("pyvirtualdisplay")
+
+PYPY = platform.python_implementation() == "PyPy"
+
+WIDTH = 200
+HEIGHT = 200
+DEPTH = 24
+
+
+def spy_and_patch(monkeypatch: pytest.MonkeyPatch, obj: Any, name: str) -> Mock:
+    """Replace obj.name with a call-through mock and return the mock."""
+    real = getattr(obj, name)
+    spy = Mock(wraps=real)
+    monkeypatch.setattr(obj, name, spy, raising=False)
+    return spy
+
+
+@pytest.fixture(autouse=True)
+def without_libraries(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Generator[None]:
+    marker = request.node.get_closest_marker("without_libraries")
+    if marker is None:
+        yield None
+        return
+    skip_find = frozenset(marker.args)
+    old_find_library = ctypes.util.find_library
+
+    def new_find_library(name: str, *args: list, **kwargs: dict[str, Any]) -> str | None:
+        if name in skip_find:
+            return None
+        return old_find_library(name, *args, **kwargs)
+
+    # We use a context here so other fixtures or the test itself can use .undo.
+    with monkeypatch.context() as mp:
+        mp.setattr(ctypes.util, "find_library", new_find_library)
+        yield None
+
+
+@pytest.fixture
+def display() -> Generator:
+    with pyvirtualdisplay.Display(size=(WIDTH, HEIGHT), color_depth=DEPTH) as vdisplay:
+        yield vdisplay.new_display_var
+
+
+def test_default_backend(display: str) -> None:
+    with mss.MSS(display=display) as sct:
+        assert isinstance(sct, MSS)
+
+
+@pytest.mark.skipif(PYPY, reason="Failure on PyPy")
+def test_factory_systems(monkeypatch: pytest.MonkeyPatch, backend: str) -> None:
+    """Here, we are testing all systems.
+
+    Too hard to maintain the test for all platforms,
+    so test only on GNU/Linux.
+
+    TODO: Revisit the non-Linux branches before the final PR.  Confirm the
+    intended cross-platform behavior after the strategy refactor and, if
+    appropriate, narrow the accepted exception types again.
+    """
+    # GNU/Linux
+    monkeypatch.setattr(platform, "system", lambda: "LINUX")
+    with mss.MSS(backend=backend) as sct:
+        assert isinstance(sct, MSS)
+    monkeypatch.undo()
+
+    # macOS
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    # ValueError on macOS Big Sur
+    with pytest.raises((ScreenShotError, ValueError)), mss.MSS(backend=backend):
+        pass
+    monkeypatch.undo()
+
+    # Windows
+    monkeypatch.setattr(platform, "system", lambda: "wInDoWs")
+    with pytest.raises((ImportError, ScreenShotError)), mss.MSS(backend=backend):
+        pass
+
+
+def test_arg_display(display: str, backend: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Good value
+    with mss.MSS(display=display, backend=backend):
+        pass
+
+    # Bad `display` (missing ":" in front of the number)
+    with pytest.raises(ScreenShotError), mss.MSS(display="0", backend=backend):
+        pass
+
+    # Invalid `display` that is not trivially distinguishable.
+    with pytest.raises(ScreenShotError), mss.MSS(display=":INVALID", backend=backend):
+        pass
+
+    # No `DISPLAY` in envars
+    # The monkeypatch implementation of delenv seems to interact badly with some other uses of setenv, so we use a
+    # monkeypatch context to isolate it a bit.
+    with monkeypatch.context() as mp:
+        mp.delenv("DISPLAY")
+        with pytest.raises(ScreenShotError), mss.MSS(backend=backend):
+            pass
+
+
+def test_xerror_without_details() -> None:
+    # Opening an invalid display with the Xlib backend will create an XError instance, but since there was no
+    # XErrorEvent, then the details won't be filled in.  Generate one.
+    with pytest.raises(ScreenShotError) as excinfo, mss.MSS(display=":INVALID"):
+        pass
+
+    exc = excinfo.value
+    # Ensure it has no details.
+    assert not exc.details
+    # Ensure it can be stringified.
+    str(exc)
+
+
+@pytest.mark.without_libraries("xcb")
+@patch("mss.linux.xlib._X11", new=None)
+def test_no_xlib_library(backend: str) -> None:
+    with pytest.raises(ScreenShotError), mss.MSS(backend=backend):
+        pass
+
+
+@pytest.mark.without_libraries("xcb-randr")
+@patch("mss.linux.xlib._XRANDR", new=None)
+def test_no_xrandr_extension(backend: str) -> None:
+    with pytest.raises(ScreenShotError), mss.MSS(backend=backend):
+        pass
+
+
+@patch("mss.linux.xlib.MSSImplXlib._is_extension_enabled", new=Mock(return_value=False))
+def test_xrandr_extension_exists_but_is_not_enabled(display: str) -> None:
+    with pytest.raises(ScreenShotError), mss.MSS(display=display, backend="xlib"):
+        pass
+
+
+def test_unsupported_depth(backend: str) -> None:
+    # 8-bit is normally PseudoColor.  If the order of testing the display support changes, this might raise a
+    # different message; just change the match= accordingly.
+    with (
+        pyvirtualdisplay.Display(size=(WIDTH, HEIGHT), color_depth=8) as vdisplay,
+        pytest.raises(ScreenShotError, match=r"\b8\b"),
+        mss.MSS(display=vdisplay.new_display_var, backend=backend) as sct,
+    ):
+        sct.grab(sct.monitors[1])
+
+    # 16-bit is normally TrueColor, but still just 16 bits.
+    with (
+        pyvirtualdisplay.Display(size=(WIDTH, HEIGHT), color_depth=16) as vdisplay,
+        pytest.raises(ScreenShotError, match=r"\b16\b"),
+        mss.MSS(display=vdisplay.new_display_var, backend=backend) as sct,
+    ):
+        sct.grab(sct.monitors[1])
+
+
+def test__is_extension_enabled_unknown_name(display: str) -> None:
+    with mss.MSS(display=display, backend="xlib") as sct:
+        assert isinstance(sct._impl, mss.linux.xlib.MSSImplXlib)  # For Mypy
+        assert not sct._impl._is_extension_enabled("NOEXT")
+
+
+def test_fast_function_for_monitor_details_retrieval(display: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    with mss.MSS(display=display, backend="xlib") as sct:
+        assert isinstance(sct._impl, mss.linux.xlib.MSSImplXlib)  # For Mypy
+        assert hasattr(sct._impl.xrandr, "XRRGetScreenResourcesCurrent")
+        fast_spy = spy_and_patch(monkeypatch, sct._impl.xrandr, "XRRGetScreenResourcesCurrent")
+        slow_spy = spy_and_patch(monkeypatch, sct._impl.xrandr, "XRRGetScreenResources")
+        screenshot_with_fast_fn = sct.grab(sct.monitors[1])
+
+    fast_spy.assert_called()
+    slow_spy.assert_not_called()
+
+    assert set(screenshot_with_fast_fn.rgb) == {0}
+
+
+def test_client_missing_fast_function_for_monitor_details_retrieval(
+    display: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with mss.MSS(display=display, backend="xlib") as sct:
+        assert isinstance(sct._impl, mss.linux.xlib.MSSImplXlib)  # For Mypy
+        assert hasattr(sct._impl.xrandr, "XRRGetScreenResourcesCurrent")
+        # Even though we're going to delete it, we'll still create a fast spy, to make sure that it isn't somehow
+        # getting accessed through a path we hadn't considered.
+        fast_spy = spy_and_patch(monkeypatch, sct._impl.xrandr, "XRRGetScreenResourcesCurrent")
+        slow_spy = spy_and_patch(monkeypatch, sct._impl.xrandr, "XRRGetScreenResources")
+        # If we just delete sct._impl.xrandr.XRRGetScreenResourcesCurrent, it will get recreated automatically by ctypes
+        # the next time it's accessed.  A Mock will remember that the attribute was explicitly deleted and hide it.
+        mock_xrandr = NonCallableMock(wraps=sct._impl.xrandr)
+        del mock_xrandr.XRRGetScreenResourcesCurrent
+        monkeypatch.setattr(sct._impl, "xrandr", mock_xrandr)
+        assert not hasattr(sct._impl.xrandr, "XRRGetScreenResourcesCurrent")
+        screenshot_with_slow_fn = sct.grab(sct.monitors[1])
+
+    fast_spy.assert_not_called()
+    slow_spy.assert_called()
+
+    assert set(screenshot_with_slow_fn.rgb) == {0}
+
+
+def test_server_missing_fast_function_for_monitor_details_retrieval(
+    display: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_xrrqueryversion_type = CFUNCTYPE(
+        c_int,  # Status
+        POINTER(mss.linux.xlib.Display),  # Display*
+        POINTER(c_int),  # int* major
+        POINTER(c_int),  # int* minor
+    )
+
+    @fake_xrrqueryversion_type
+    def fake_xrrqueryversion(_dpy: _Pointer, major_p: _Pointer, minor_p: _Pointer) -> int:
+        major_p[0] = 1
+        minor_p[0] = 2
+        return 1
+
+    with mss.MSS(display=display, backend="xlib") as sct:
+        assert isinstance(sct._impl, mss.linux.xlib.MSSImplXlib)  # For Mypy
+        monkeypatch.setattr(sct._impl.xrandr, "XRRQueryVersion", fake_xrrqueryversion)
+        fast_spy = spy_and_patch(monkeypatch, sct._impl.xrandr, "XRRGetScreenResourcesCurrent")
+        slow_spy = spy_and_patch(monkeypatch, sct._impl.xrandr, "XRRGetScreenResources")
+        screenshot_with_slow_fn = sct.grab(sct.monitors[1])
+
+    fast_spy.assert_not_called()
+    slow_spy.assert_called()
+
+    assert set(screenshot_with_slow_fn.rgb) == {0}
+
+
+def test_with_cursor(display: str, backend: str) -> None:
+    with mss.MSS(display=display, backend=backend) as sct:
+        assert not hasattr(sct._impl, "xfixes")
+        assert not sct.with_cursor
+        screenshot_without_cursor = sct.grab(sct.monitors[1])
+
+    # 1 color: black
+    assert set(screenshot_without_cursor.rgb) == {0}
+
+    with mss.MSS(display=display, backend=backend, with_cursor=True) as sct:
+        if backend == "xlib":
+            assert hasattr(sct._impl, "xfixes")
+        assert sct.with_cursor
+        screenshot_with_cursor = sct.grab(sct.monitors[1])
+
+    # 2 colors: black & white (default cursor is a white cross)
+    assert set(screenshot_with_cursor.rgb) == {0, 255}
+
+
+@patch("mss.linux.xlib._XFIXES", new=None)
+def test_with_cursor_but_not_xfixes_extension_found(display: str) -> None:
+    with mss.MSS(display=display, backend="xlib", with_cursor=True) as sct:
+        assert isinstance(sct._impl, mss.linux.xlib.MSSImplXlib)  # For Mypy
+        assert not hasattr(sct._impl, "xfixes")
+        assert not sct.with_cursor
+
+
+def test_with_cursor_failure(display: str) -> None:
+    with mss.MSS(display=display, backend="xlib", with_cursor=True) as sct:
+        assert isinstance(sct._impl, mss.linux.xlib.MSSImplXlib)  # For Mypy
+        with (
+            patch.object(sct._impl.xfixes, "XFixesGetCursorImage", return_value=None),
+            pytest.raises(ScreenShotError),
+        ):
+            sct.grab(sct.monitors[1])
+
+
+def test_shm_available() -> None:
+    """Verify that the xshmgetimage backend doesn't always fallback.
+
+    Since this backend does an automatic fallback for certain types of
+    anticipated issues, that could cause some failures to be masked.
+    Ensure this isn't happening.
+    """
+    with (
+        pyvirtualdisplay.Display(size=(WIDTH, HEIGHT), color_depth=DEPTH) as vdisplay,
+        mss.MSS(display=vdisplay.new_display_var, backend="xshmgetimage") as sct,
+    ):
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        # The status currently isn't established as final until a grab succeeds.
+        sct.grab(sct.monitors[0])
+        assert sct._impl.shm_status == mss.linux.xshmgetimage.ShmStatus.AVAILABLE
+
+
+def test_shm_fallback() -> None:
+    """Verify that the xshmgetimage backend falls back if MIT-SHM fails.
+
+    The most common case when a fallback is needed is with a TCP
+    connection, such as the one used with ssh relaying.  By using
+    DISPLAY=localhost:99 instead of DISPLAY=:99, we connect over TCP
+    instead of a local-domain socket.  This is sufficient to prevent
+    MIT-SHM from completing its setup: the extension is available, but
+    won't be able to attach a shared memory segment.
+    """
+    with (
+        pyvirtualdisplay.Display(size=(WIDTH, HEIGHT), color_depth=DEPTH, extra_args=["-listen", "tcp"]) as vdisplay,
+        mss.MSS(display=f"localhost{vdisplay.new_display_var}", backend="xshmgetimage") as sct,
+    ):
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        # Ensure that the grab call completes without exception.
+        sct.grab(sct.monitors[0])
+        # Ensure that it really did have to fall back; otherwise, we'd need to change how we test this case.
+        assert sct._impl.shm_status == mss.linux.xshmgetimage.ShmStatus.UNAVAILABLE
+
+
+def test_finalizing_buffer_releases_shm_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that the returned buffer releases its SHM slot when finalized."""
+
+    with mss.MSS(backend="xshmgetimage") as sct:
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        release_spy = spy_and_patch(monkeypatch, sct._impl, "_release_shm_slot")
+
+        screenshot = sct.grab(sct.monitors[0])
+
+        if mss.buffer.FAST_PATH_AVAILABLE:
+            assert release_spy.call_count == 0
+
+        screenshot._raw.release()
+
+    release_spy.assert_called_once()
+
+
+def test_exception_while_wrapping_finalizing_buffer_releases_shm_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify wrapping failures still release the in-use SHM slot."""
+
+    with mss.MSS(backend="xshmgetimage") as sct:
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        release_spy = spy_and_patch(monkeypatch, sct._impl, "_release_shm_slot")
+
+        def boom(_data: memoryview, _finalizer: Any) -> memoryview:
+            msg = "Boom!"
+            raise RuntimeError(msg)
+
+        with monkeypatch.context() as m:
+            m.setattr(mss.linux.xshmgetimage, "finalizing_buffer", boom)
+            with pytest.raises(RuntimeError, match="Boom!"):
+                sct.grab(sct.monitors[0])
+
+        release_spy.assert_called_once()
+
+
+@pytest.mark.skipif(
+    not mss.buffer.FAST_PATH_AVAILABLE,
+    reason="Tests post-3.12 behavior: finalization after close",
+)
+def test_finalizer_after_close_destroys_shm_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that a live buffer finalized after close destroys its SHM slot."""
+
+    with mss.MSS(backend="xshmgetimage") as sct:
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        destroy_spy = spy_and_patch(monkeypatch, sct._impl, "_destroy_shm_slot")
+
+        screenshot = sct.grab(sct.monitors[0])
+
+    destroyed_before_release = destroy_spy.call_count
+
+    screenshot._raw.release()
+
+    assert destroy_spy.call_count == destroyed_before_release + 1
+
+
+@pytest.mark.skipif(
+    not mss.buffer.FAST_PATH_AVAILABLE,
+    reason="Tests post-3.12 behavior: threaded release during close",
+)
+def test_release_thread_during_close_does_not_detach(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify release from another thread during close does not call shm_detach."""
+
+    disconnect_started = threading.Event()
+    allow_disconnect = threading.Event()
+    release_started = threading.Event()
+
+    real_disconnect = mss.linux.xcb.disconnect
+    detach_spy = Mock(wraps=mss.linux.xcb.shm_detach)
+
+    def blocking_disconnect(conn: Any) -> None:
+        disconnect_started.set()
+        assert allow_disconnect.wait(timeout=5), "Timed out waiting to unblock disconnect"
+        real_disconnect(conn)
+
+    with mss.MSS(backend="xshmgetimage") as sct:
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        screenshot = sct.grab(sct.monitors[0])
+
+        monkeypatch.setattr(mss.linux.xcb, "disconnect", blocking_disconnect)
+        monkeypatch.setattr(mss.linux.xcb, "shm_detach", detach_spy)
+
+        close_error: list[BaseException] = []
+        release_error: list[BaseException] = []
+
+        def close_target() -> None:
+            try:
+                sct.close()
+            except BaseException as exc:  # noqa: BLE001
+                close_error.append(exc)
+
+        def release_target() -> None:
+            try:
+                release_started.set()
+                screenshot._raw.release()
+            except BaseException as exc:  # noqa: BLE001
+                release_error.append(exc)
+
+        close_thread = threading.Thread(target=close_target)
+        release_thread = threading.Thread(target=release_target)
+
+        close_thread.start()
+        assert disconnect_started.wait(timeout=5), "Timed out waiting for close to reach disconnect"
+
+        release_thread.start()
+        assert release_started.wait(timeout=5), "Timed out waiting for release thread to start"
+
+        allow_disconnect.set()
+
+        close_thread.join(timeout=5)
+        release_thread.join(timeout=5)
+
+        assert not close_thread.is_alive(), "close thread did not finish"
+        assert not release_thread.is_alive(), "release thread did not finish"
+        assert not close_error
+        assert not release_error
+        detach_spy.assert_not_called()
+
+
+@pytest.mark.skipif(
+    mss.buffer.FAST_PATH_AVAILABLE,
+    reason="Covers behavior only present prior to Python 3.12",
+)
+def test_finalizer_before_close_releases_shm_slot_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that the slow path finalizes the SHM slot before close."""
+
+    with mss.MSS(backend="xshmgetimage") as sct:
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        release_spy = spy_and_patch(monkeypatch, sct._impl, "_release_shm_slot")
+        destroy_spy = spy_and_patch(monkeypatch, sct._impl, "_destroy_shm_slot")
+
+        screenshot = sct.grab(sct.monitors[0])
+
+        # In slow-path environments, the buffer is finalized and released (returned to the pool) immediately.
+        assert release_spy.call_count == 1
+        assert destroy_spy.call_count == 0
+
+    # At this point, the buffer should have been destroyed at close, since the slow path made a copy.
+    assert release_spy.call_count == 1
+    assert destroy_spy.call_count == 1
+
+    screenshot._raw.release()
+
+    assert release_spy.call_count == 1
+    assert destroy_spy.call_count == 1
+
+
+@pytest.mark.skipif(not mss.buffer.FAST_PATH_AVAILABLE, reason="Tests post-3.12 behavior: dynamic pool growth")
+def test_dynamic_shm_growth_allocation_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify dynamic pool growth failure raises instead of switching backends."""
+
+    with mss.MSS(backend="xshmgetimage") as sct:
+        assert isinstance(sct._impl, mss.linux.xshmgetimage.MSSImplXShmGetImage)  # For Mypy
+        monitor = sct.monitors[0]
+
+        first = sct.grab(monitor)
+        second = sct.grab(monitor)
+
+        # Ensure we are in normal SHM operation before inducing a growth failure.
+        assert sct._impl.shm_status == mss.linux.xshmgetimage.ShmStatus.AVAILABLE
+
+        def fail_growth(_size: int) -> Any:
+            msg = "Cannot allocate MIT-SHM buffer"
+            raise ScreenShotError(msg)
+
+        with monkeypatch.context() as m:
+            m.setattr(sct._impl, "_create_shm_slot", fail_growth)
+            with pytest.raises(ScreenShotError, match="Cannot allocate MIT-SHM buffer"):
+                sct.grab(monitor)
+
+        # Keep references alive until after the third grab attempt.
+        assert first.width > 0
+        assert second.width > 0

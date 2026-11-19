@@ -1,0 +1,63 @@
+diff --git a/lib/stripe/v2_type_coercion.rb b/lib/stripe/v2_type_coercion.rb
+--- a/lib/stripe/v2_type_coercion.rb
++++ b/lib/stripe/v2_type_coercion.rb
+@@ -63,7 +63,8 @@ module Stripe
+       when :encode
+         case value
+         when BigDecimal then value.to_s("F")
+-        when Integer, Float then value.to_s
++        when Integer then value.to_s
++        when Float then Kernel.BigDecimal(value.to_s).to_s("F")
+         when Array then value.map { |v| coerce_decimal_string(v, direction) }
+         else value
+         end
+diff --git a/lib/stripe/stripe_client.rb b/lib/stripe/stripe_client.rb
+--- a/lib/stripe/stripe_client.rb
++++ b/lib/stripe/stripe_client.rb
+@@ -67,5 +67,5 @@ module Stripe
+     def parse_event_notification(payload, sig_header, secret, tolerance: Webhook::DEFAULT_TOLERANCE)
+-      payload = payload.force_encoding("UTF-8") if payload.respond_to?(:force_encoding)
++      payload = payload.dup.force_encoding("UTF-8") if payload.respond_to?(:force_encoding)
+ 
+       # v2 events use the same signing mechanism as v1 events
+       Webhook::Signature.verify_header(payload, sig_header, secret, tolerance: tolerance)
+@@ -102,5 +102,5 @@ module Stripe
+       cls = Util.event_notification_classes.fetch(parsed[:type], Stripe::Events::UnknownEventNotification)
+ 
+-      cls.new(parsed, self)
++      cls.new(parsed, with_stripe_context(parsed[:context]))
+     end
+ 
+diff --git a/lib/stripe/webhook.rb b/lib/stripe/webhook.rb
+--- a/lib/stripe/webhook.rb
++++ b/lib/stripe/webhook.rb
+@@ -39,6 +39,8 @@
+               "Use the corresponding #parse_event_notification* method instead"
+       end
+ 
++      raise ArgumentError, "Expected a snapshot event with object 'event'" unless data[:object] == "event"
++
+       Event.construct_from(data, {}, nil, :v1, APIRequestor.active_requestor)
+     end
+     private_class_method :_build_v1_event
+@@ -48,7 +50,9 @@
+       data = JSON.parse(payload, symbolize_names: true)
+ 
+       # Could add as many checks as we want here, but we'll start simple
+-      if data.key?(:detail)
++      if %w[event v2.core.event].include?(data[:object])
++        data
++      elsif data.key?(:detail)
+         # AWS
+         # https://docs.stripe.com/event-destinations/eventbridge#event-structure
+         data[:detail]
+@@ -56,9 +60,6 @@
+         # Azure
+         # https://docs.stripe.com/event-destinations/eventgrid#event-structure
+         data[:data]
+-      elsif %w[event v2.core.event].include?(data[:object])
+-        # Raw Stripe event: pass through as-is
+-        data
+       else
+         raise ArgumentError,
+               "Unrecognized event format. The payload must be an " \

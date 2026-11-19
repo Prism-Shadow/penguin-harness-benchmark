@@ -1,0 +1,1904 @@
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+index be09cd6..ae51193 100644
+--- a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
++++ b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+@@ -1,10 +1,12 @@
+-import { useCallback, useEffect, useMemo } from "react";
++import { useCallback } from "react";
+ import BigNumber from "bignumber.js";
+ import { useTranslation } from "react-i18next";
+-import { formatCurrencyUnitFragment } from "@ledgerhq/live-common/currencies/index";
+ import {
+-  aggregatePayCardBalance,
+-  resolveSelection,
++  formatCurrencyUnit,
++  formatCurrencyUnitFragment,
++} from "@ledgerhq/live-common/currencies/index";
++import {
++  usePayCardBalanceData,
+   type FormattedValue,
+   type PayCardBalanceData,
+ } from "@features/flow-pay-card-balance";
+@@ -14,10 +16,10 @@ import {
+   setPayCardBalanceFilter,
+   type PayCardBalanceFilter,
+ } from "@domain/entity-pay-card";
++import type { Unit } from "@domain/entity-currency-unit";
+ import { useDispatch, useSelector } from "LLD/hooks/redux";
+ import { counterValueCurrencySelector, localeSelector } from "~/renderer/reducers/settings";
+ import { track } from "~/renderer/analytics/segment";
+-import { buildBalanceFilterOptions, tickerForFilter } from "./buildBalanceFilterOptions";
+ import { usePayStablecoins } from "./usePayStablecoins";
+ 
+ export function usePayCardBalance(): PayCardBalanceData {
+@@ -29,57 +31,23 @@ export function usePayCardBalance(): PayCardBalanceData {
+ 
+   const { stablecoins, defaultStablecoins, isLoading, isError } = usePayStablecoins();
+ 
+-  const filterOptions = useMemo(
+-    () =>
+-      buildBalanceFilterOptions({
+-        stablecoins,
+-        defaultStablecoins,
+-        allLabel: t("payTab.balance.filter.allStablecoins"),
+-        locale,
+-        counterValueUnit: counterValueCurrency.units[0],
+-      }),
+-    [stablecoins, defaultStablecoins, t, locale, counterValueCurrency],
+-  );
++  const unit = counterValueCurrency.units[0];
+ 
+-  const effectiveFilter = useMemo(
+-    () =>
+-      resolveSelection(
+-        filter,
+-        filterOptions.map(option => option.id),
+-      ),
+-    [filter, filterOptions],
++  const formatFiat = useCallback(
++    (value: number): string =>
++      formatCurrencyUnit(unit, new BigNumber(value), { locale, showCode: true }),
++    [unit, locale],
+   );
+ 
+-  // Heal a stale persisted selection once data is ready.
+-  useEffect(() => {
+-    if (!isLoading && !isError && effectiveFilter !== filter) {
+-      dispatch(setPayCardBalanceFilter(PAY_CARD_BALANCE_FILTER_ALL));
+-    }
+-  }, [isLoading, isError, effectiveFilter, filter, dispatch]);
+-
+-  // Defaults (USDC/USDT) are keyed by market id; held rows may use a different currencyId.
+-  // Match by ticker so the filtered total stays correct across those ids.
+-  const stablecoinsForAggregate = useMemo(() => {
+-    if (effectiveFilter === PAY_CARD_BALANCE_FILTER_ALL) {
+-      return stablecoins;
+-    }
+-    const ticker = tickerForFilter(effectiveFilter, filterOptions);
+-    if (ticker == null) {
+-      return stablecoins.filter(({ currency }) => currency.id === effectiveFilter);
+-    }
+-    return stablecoins.filter(
+-      ({ currency }) => currency.ticker.toUpperCase() === ticker.toUpperCase(),
+-    );
+-  }, [stablecoins, effectiveFilter, filterOptions]);
+-
+-  const unit = counterValueCurrency.units[0];
++  const formatCrypto = useCallback(
++    (cryptoUnit: Unit, balance: number): string =>
++      formatCurrencyUnit(cryptoUnit, new BigNumber(balance), { locale, showCode: true }),
++    [locale],
++  );
+ 
+   const formatCountervalue = useCallback(
+     (value: number): FormattedValue =>
+-      formatCurrencyUnitFragment(unit, new BigNumber(value), {
+-        locale,
+-        showCode: true,
+-      }),
++      formatCurrencyUnitFragment(unit, new BigNumber(value), { locale, showCode: true }),
+     [unit, locale],
+   );
+ 
+@@ -90,39 +58,26 @@ export function usePayCardBalance(): PayCardBalanceData {
+     [dispatch],
+   );
+ 
++  const onResetFilter = useCallback(() => {
++    dispatch(setPayCardBalanceFilter(PAY_CARD_BALANCE_FILTER_ALL));
++  }, [dispatch]);
++
+   const onTrackEvent = useCallback((event: string, params: Record<string, unknown>) => {
+     track(event, params);
+   }, []);
+ 
+-  return useMemo(() => {
+-    const aggregate = aggregatePayCardBalance({
+-      // Pre-filtered by ticker/id; aggregate with "all" so it sums the prepared list.
+-      stablecoins: stablecoinsForAggregate,
+-      filter: PAY_CARD_BALANCE_FILTER_ALL,
+-      isLoading,
+-      isError,
+-      filterOptions,
+-      formatCountervalue,
+-      onConfirmFilter,
+-      onTrackEvent,
+-    });
+-
+-    return {
+-      ...aggregate,
+-      // Keep the resolved selection for the UI (not the "all" forced into aggregate).
+-      filter: effectiveFilter,
+-      // Funded vs empty depends on any held stablecoin, not the active filter slice.
+-      hasBalance: stablecoins.some(({ value }) => value > 0),
+-    };
+-  }, [
+-    stablecoinsForAggregate,
++  return usePayCardBalanceData({
++    stablecoins,
++    defaultStablecoins,
++    filter,
+     isLoading,
+     isError,
++    allLabel: t("payTab.balance.filter.allStablecoins"),
++    formatFiat,
++    formatCrypto,
+     formatCountervalue,
+-    effectiveFilter,
+-    stablecoins,
+-    filterOptions,
+     onConfirmFilter,
++    onResetFilter,
+     onTrackEvent,
+-  ]);
++  });
+ }
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts
+index b7548a5..413168e 100644
+--- a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts
++++ b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts
+@@ -2,13 +2,9 @@ import { useMemo } from "react";
+ import { useDistribution } from "~/renderer/actions/general";
+ import {
+   useStablecoinTickers,
+-  selectTopAssetsByCategory,
++  useDefaultStablecoins,
++  type DefaultStablecoin,
+ } from "@features/platform-aggregated-assets";
+-import {
+-  useGetAssetsDataInfiniteQuery,
+-  AssetCategory,
+-  mergeAssetsDataPages,
+-} from "@domain/api-aggregated-assets";
+ import {
+   useCategorizedAssets,
+   type CategorizedAssetItem,
+@@ -19,18 +15,6 @@ import {
+   hideEmptyTokenAccountsSelector,
+ } from "~/renderer/reducers/settings";
+ 
+-const STABLECOIN_CATEGORIES = [AssetCategory.Stablecoins];
+-
+-// Always-offered rows, taken from the top of the market-cap-ordered stablecoins (USDC/USDT).
+-const DEFAULT_STABLECOIN_COUNT = 2;
+-
+-export type DefaultStablecoin = Readonly<{
+-  id: string;
+-  ticker: string;
+-  name: string;
+-  magnitude: number;
+-}>;
+-
+ export type PayStablecoins = Readonly<{
+   stablecoins: CategorizedAssetItem[];
+   defaultStablecoins: DefaultStablecoin[];
+@@ -57,14 +41,10 @@ export function usePayStablecoins(): PayStablecoins {
+   } = useStablecoinTickers("lld", __APP_VERSION__);
+ 
+   const {
+-    data: stablecoinAssets,
+-    isLoading: isLoadingStablecoinAssets,
+-    isError: isStablecoinAssetsError,
+-  } = useGetAssetsDataInfiniteQuery({
+-    categories: STABLECOIN_CATEGORIES,
+-    product: "lld",
+-    version: __APP_VERSION__,
+-  });
++    defaultStablecoins,
++    isLoading: isLoadingDefaultStablecoins,
++    isError: isDefaultStablecoinsError,
++  } = useDefaultStablecoins("lld", __APP_VERSION__);
+ 
+   const categorized = useCategorizedAssets(distribution, stablecoinTickers);
+ 
+@@ -73,25 +53,10 @@ export function usePayStablecoins(): PayStablecoins {
+     return categorized.stablecoins.filter(({ currency }) => !blacklist.has(currency.id));
+   }, [categorized.stablecoins, blacklistedTokenIds]);
+ 
+-  const defaultStablecoins = useMemo<DefaultStablecoin[]>(() => {
+-    const merged = mergeAssetsDataPages(stablecoinAssets?.pages);
+-    if (!merged) return [];
+-    const { stablecoins: top } = selectTopAssetsByCategory(merged, stablecoinTickers, {
+-      maxCryptos: 0,
+-      maxStablecoins: DEFAULT_STABLECOIN_COUNT,
+-    });
+-    return top.map(({ currency }) => ({
+-      id: currency.id,
+-      ticker: currency.ticker,
+-      name: currency.name,
+-      magnitude: currency.units[0]?.magnitude ?? 0,
+-    }));
+-  }, [stablecoinAssets, stablecoinTickers]);
+-
+   return {
+     stablecoins,
+     defaultStablecoins,
+-    isLoading: isLoadingStablecoinTickers || isLoadingStablecoinAssets || distribution.isLoading,
+-    isError: isStablecoinTickersError || isStablecoinAssetsError,
++    isLoading: isLoadingStablecoinTickers || isLoadingDefaultStablecoins || distribution.isLoading,
++    isError: isStablecoinTickersError || isDefaultStablecoinsError,
+   };
+ }
+diff --git a/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts b/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+index 7ddb113..e4a9f44 100644
+--- a/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
++++ b/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+@@ -1,79 +1,83 @@
+-import { useCallback, useMemo } from "react";
++import { useCallback } from "react";
+ import BigNumber from "bignumber.js";
+-import { formatCurrencyUnitFragment } from "@ledgerhq/live-common/currencies/index";
+ import {
+-  aggregatePayCardBalance,
++  formatCurrencyUnit,
++  formatCurrencyUnitFragment,
++} from "@ledgerhq/live-common/currencies/index";
++import {
++  usePayCardBalanceData,
+   type FormattedValue,
+   type PayCardBalanceData,
+ } from "@features/flow-pay-card-balance";
+ import {
+   PAY_CARD_BALANCE_FILTER_ALL,
+   selectPayCardBalanceFilter,
++  setPayCardBalanceFilter,
+   type PayCardBalanceFilter,
+ } from "@domain/entity-pay-card";
+-import { useCategorizedAssetsFromPortfolio } from "LLM/hooks/useCategorizedAssetsFromPortfolio";
+-import { useSelector } from "~/context/hooks";
++import type { Unit } from "@domain/entity-currency-unit";
++import { useDispatch, useSelector } from "~/context/hooks";
+ import { useTranslation } from "~/context/Locale";
+ import { counterValueCurrencySelector, localeSelector } from "~/reducers/settings";
++import { track } from "~/analytics";
++import { usePayStablecoins } from "./usePayStablecoins";
+ 
+ export function usePayCardBalance(): PayCardBalanceData {
++  const dispatch = useDispatch();
+   const { t } = useTranslation();
+   const locale = useSelector(localeSelector);
+   const counterValueCurrency = useSelector(counterValueCurrencySelector);
+   const filter = useSelector(selectPayCardBalanceFilter);
+ 
+-  const { categorizedAssets, isLoadingStablecoinTickers, isStablecoinTickersError } =
+-    useCategorizedAssetsFromPortfolio();
++  const { stablecoins, defaultStablecoins, isLoading, isError } = usePayStablecoins();
+ 
+   const unit = counterValueCurrency.units[0];
+ 
++  const formatFiat = useCallback(
++    (value: number): string =>
++      formatCurrencyUnit(unit, new BigNumber(value), { locale, showCode: true }),
++    [unit, locale],
++  );
++
++  const formatCrypto = useCallback(
++    (cryptoUnit: Unit, balance: number): string =>
++      formatCurrencyUnit(cryptoUnit, new BigNumber(balance), { locale, showCode: true }),
++    [locale],
++  );
++
+   const formatCountervalue = useCallback(
+     (value: number): FormattedValue =>
+-      formatCurrencyUnitFragment(unit, new BigNumber(value), {
+-        locale,
+-        showCode: true,
+-      }),
++      formatCurrencyUnitFragment(unit, new BigNumber(value), { locale, showCode: true }),
+     [unit, locale],
+   );
+ 
+-  // Full filter options / confirm wiring lands with the LWD/LWM filter tasks.
+-  const filterOptions = useMemo(
+-    () =>
+-      [
+-        {
+-          id: PAY_CARD_BALANCE_FILTER_ALL,
+-          title: t("payTab.balance.filter.allStablecoins"),
+-          countervalue: 0,
+-          countervalueLabel: "",
+-        },
+-      ] as const,
+-    [t],
++  const onConfirmFilter = useCallback(
++    (next: PayCardBalanceFilter) => {
++      dispatch(setPayCardBalanceFilter(next));
++    },
++    [dispatch],
+   );
+ 
+-  const onConfirmFilter = useCallback((_next: PayCardBalanceFilter) => {}, []);
++  const onResetFilter = useCallback(() => {
++    dispatch(setPayCardBalanceFilter(PAY_CARD_BALANCE_FILTER_ALL));
++  }, [dispatch]);
+ 
+-  return useMemo(
+-    () => ({
+-      ...aggregatePayCardBalance({
+-        stablecoins: categorizedAssets.stablecoins,
+-        filter,
+-        isLoading: isLoadingStablecoinTickers,
+-        isError: isStablecoinTickersError,
+-        filterOptions,
+-        formatCountervalue,
+-        onConfirmFilter,
+-      }),
+-      filterOptions,
+-      onConfirmFilter,
+-    }),
+-    [
+-      categorizedAssets.stablecoins,
+-      filter,
+-      isLoadingStablecoinTickers,
+-      isStablecoinTickersError,
+-      filterOptions,
+-      formatCountervalue,
+-      onConfirmFilter,
+-    ],
+-  );
++  const onTrackEvent = useCallback((event: string, params: Record<string, unknown>) => {
++    track(event, params);
++  }, []);
++
++  return usePayCardBalanceData({
++    stablecoins,
++    defaultStablecoins,
++    filter,
++    isLoading,
++    isError,
++    allLabel: t("payTab.balance.filter.allStablecoins"),
++    formatFiat,
++    formatCrypto,
++    formatCountervalue,
++    onConfirmFilter,
++    onResetFilter,
++    onTrackEvent,
++  });
+ }
+diff --git a/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts b/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts
+new file mode 100644
+index 0000000..50c2299
+--- /dev/null
++++ b/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts
+@@ -0,0 +1,60 @@
++import { useMemo } from "react";
++import VersionNumber from "react-native-version-number";
++import useEnv from "@features/platform-env";
++import {
++  useStablecoinTickers,
++  useDefaultStablecoins,
++  type DefaultStablecoin,
++} from "@features/platform-aggregated-assets";
++import {
++  useCategorizedAssets,
++  type CategorizedAssetItem,
++} from "@ledgerhq/asset-aggregation/assetCategorization/index";
++import { useDistribution } from "~/actions/general";
++import { useSelector } from "~/context/hooks";
++import { blacklistedTokenIdsSelector } from "~/reducers/settings";
++
++export type PayStablecoins = Readonly<{
++  stablecoins: CategorizedAssetItem[];
++  defaultStablecoins: DefaultStablecoin[];
++  isLoading: boolean;
++  isError: boolean;
++}>;
++
++export function usePayStablecoins(): PayStablecoins {
++  const hideEmptyTokenAccount = useEnv("HIDE_EMPTY_TOKEN_ACCOUNTS");
++  const blacklistedTokenIds = useSelector(blacklistedTokenIdsSelector);
++  const version = VersionNumber.appVersion ?? "";
++
++  const distribution = useDistribution({
++    showEmptyAccounts: true,
++    hideEmptyTokenAccount,
++    groupBy: "asset",
++  });
++
++  const {
++    tickers: stablecoinTickers,
++    isLoading: isLoadingStablecoinTickers,
++    isError: isStablecoinTickersError,
++  } = useStablecoinTickers("llm", version);
++
++  const {
++    defaultStablecoins,
++    isLoading: isLoadingDefaultStablecoins,
++    isError: isDefaultStablecoinsError,
++  } = useDefaultStablecoins("llm", version);
++
++  const categorized = useCategorizedAssets(distribution, stablecoinTickers);
++
++  const stablecoins = useMemo(() => {
++    const blacklist = new Set(blacklistedTokenIds ?? []);
++    return categorized.stablecoins.filter(({ currency }) => !blacklist.has(currency.id));
++  }, [categorized.stablecoins, blacklistedTokenIds]);
++
++  return {
++    stablecoins,
++    defaultStablecoins,
++    isLoading: isLoadingStablecoinTickers || isLoadingDefaultStablecoins || distribution.isLoading,
++    isError: isStablecoinTickersError || isDefaultStablecoinsError,
++  };
++}
+diff --git a/features/flow/pay-card-balance/package.json b/features/flow/pay-card-balance/package.json
+index 2ba9ced..97542a6 100644
+--- a/features/flow/pay-card-balance/package.json
++++ b/features/flow/pay-card-balance/package.json
+@@ -28,7 +28,9 @@
+     "unimported": "pnpm knip --directory ../../.. -W features/flow/pay-card-balance"
+   },
+   "dependencies": {
++    "@domain/entity-currency-unit": "workspace:^",
+     "@domain/entity-pay-card": "workspace:^",
++    "@shared/ui-queued-bottom-sheet": "workspace:*",
+     "@ledgerhq/lumen-utils-shared": "catalog:",
+     "@ledgerhq/crypto-icons": "catalog:"
+   },
+diff --git a/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionParts.native.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionParts.native.tsx
+new file mode 100644
+index 0000000..b1fb373
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionParts.native.tsx
+@@ -0,0 +1,82 @@
++import React, { useCallback } from "react";
++import CryptoIcon from "@ledgerhq/crypto-icons/native";
++import {
++  Box,
++  Card,
++  CardContentDescription,
++  CardContentTitle,
++  Spot,
++} from "@ledgerhq/lumen-ui-rnative";
++import { Placeholder } from "@ledgerhq/lumen-ui-rnative/symbols";
++import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
++
++export {
++  CardContent,
++  CardContentDescription,
++  CardContentTitle,
++  CardHeader,
++  CardLeading,
++  CardTrailing,
++} from "@ledgerhq/lumen-ui-rnative";
++
++type FilterOptionCardProps = Readonly<{
++  optionId: PayCardBalanceFilter;
++  selected: boolean;
++  rowKey: string;
++  onSelect: (id: PayCardBalanceFilter) => void;
++  children: React.ReactNode;
++}>;
++
++export function FilterOptionCard({
++  optionId,
++  selected,
++  rowKey,
++  onSelect,
++  children,
++}: FilterOptionCardProps) {
++  const handlePress = useCallback(() => {
++    onSelect(optionId);
++  }, [onSelect, optionId]);
++
++  return (
++    <Card
++      type="interactive"
++      outlined={selected}
++      onPress={handlePress}
++      testID={`pay-card-balance-filter-option-${rowKey}`}
++    >
++      {children}
++    </Card>
++  );
++}
++
++type FilterOptionIconProps = Readonly<{
++  ledgerId?: string;
++  ticker?: string;
++}>;
++
++export function FilterOptionIcon({ ledgerId, ticker }: FilterOptionIconProps) {
++  if (ledgerId == null) {
++    return <Spot appearance="icon" icon={Placeholder} size={48} />;
++  }
++  return <CryptoIcon ledgerId={ledgerId} ticker={ticker ?? ""} size={48} />;
++}
++
++type FilterOptionAmountsProps = Readonly<{
++  countervalueLabel: string;
++  cryptoAmountLabel?: string;
++}>;
++
++export function FilterOptionAmounts({
++  countervalueLabel,
++  cryptoAmountLabel,
++}: FilterOptionAmountsProps) {
++  return (
++    <Box lx={{ alignItems: "flex-end" }}>
++      <CardContentTitle>{countervalueLabel}</CardContentTitle>
++      {cryptoAmountLabel != null ? (
++        <CardContentDescription>{cryptoAmountLabel}</CardContentDescription>
++      ) : null}
++    </Box>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionParts.web.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionParts.web.tsx
+new file mode 100644
+index 0000000..7a9a5af
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionParts.web.tsx
+@@ -0,0 +1,76 @@
++import React, { useCallback } from "react";
++import { CryptoIcon } from "@ledgerhq/crypto-icons";
++import { Card, Spot } from "@ledgerhq/lumen-ui-react";
++import { Placeholder } from "@ledgerhq/lumen-ui-react/symbols";
++import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
++
++export {
++  CardContent,
++  CardContentDescription,
++  CardContentTitle,
++  CardHeader,
++  CardLeading,
++  CardTrailing,
++} from "@ledgerhq/lumen-ui-react";
++
++type FilterOptionCardProps = Readonly<{
++  optionId: PayCardBalanceFilter;
++  selected: boolean;
++  rowKey: string;
++  onSelect: (id: PayCardBalanceFilter) => void;
++  children: React.ReactNode;
++}>;
++
++export function FilterOptionCard({
++  optionId,
++  selected,
++  rowKey,
++  onSelect,
++  children,
++}: FilterOptionCardProps) {
++  const handlePress = useCallback(() => {
++    onSelect(optionId);
++  }, [onSelect, optionId]);
++
++  return (
++    <Card
++      type="interactive"
++      outlined={selected}
++      onClick={handlePress}
++      data-testid={`pay-card-balance-filter-option-${rowKey}`}
++    >
++      {children}
++    </Card>
++  );
++}
++
++type FilterOptionIconProps = Readonly<{
++  ledgerId?: string;
++  ticker?: string;
++}>;
++
++export function FilterOptionIcon({ ledgerId, ticker }: FilterOptionIconProps) {
++  if (ledgerId == null) {
++    return <Spot appearance="icon" icon={Placeholder} size={48} />;
++  }
++  return <CryptoIcon ledgerId={ledgerId} ticker={ticker ?? ""} size={48} />;
++}
++
++type FilterOptionAmountsProps = Readonly<{
++  countervalueLabel: string;
++  cryptoAmountLabel?: string;
++}>;
++
++export function FilterOptionAmounts({
++  countervalueLabel,
++  cryptoAmountLabel,
++}: FilterOptionAmountsProps) {
++  return (
++    <div className="flex flex-col items-end gap-4">
++      <span className="body-2-semi-bold">{countervalueLabel}</span>
++      {cryptoAmountLabel != null ? (
++        <span className="body-3 text-muted">{cryptoAmountLabel}</span>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionRow.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionRow.tsx
+new file mode 100644
+index 0000000..3475345
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterOptionRow.tsx
+@@ -0,0 +1,50 @@
++import React from "react";
++import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
++import {
++  CardContent,
++  CardContentDescription,
++  CardContentTitle,
++  CardHeader,
++  CardLeading,
++  CardTrailing,
++  FilterOptionAmounts,
++  FilterOptionCard,
++  FilterOptionIcon,
++} from "./BalanceFilterOptionParts";
++import type { PayCardBalanceFilterOption } from "../../types";
++
++type BalanceFilterOptionRowProps = Readonly<{
++  option: PayCardBalanceFilterOption;
++  selected: boolean;
++  onSelect: (id: PayCardBalanceFilter) => void;
++}>;
++
++export function BalanceFilterOptionRow({
++  option,
++  selected,
++  onSelect,
++}: BalanceFilterOptionRowProps) {
++  const rowKey = option.ticker?.toLowerCase() ?? "all";
++
++  return (
++    <FilterOptionCard optionId={option.id} selected={selected} rowKey={rowKey} onSelect={onSelect}>
++      <CardHeader>
++        <CardLeading>
++          <FilterOptionIcon ledgerId={option.ledgerId} ticker={option.ticker} />
++          <CardContent>
++            <CardContentTitle>{option.title}</CardContentTitle>
++            {option.ticker != null ? (
++              <CardContentDescription>{option.ticker}</CardContentDescription>
++            ) : null}
++          </CardContent>
++        </CardLeading>
++        <CardTrailing>
++          <FilterOptionAmounts
++            countervalueLabel={option.countervalueLabel}
++            cryptoAmountLabel={option.cryptoAmountLabel}
++          />
++        </CardTrailing>
++      </CardHeader>
++    </FilterOptionCard>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterDialog.web.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPicker.tsx
+similarity index 73%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterDialog.web.tsx
+rename to features/flow/pay-card-balance/src/components/Filter/BalanceFilterPicker.tsx
+index be9756e..8910728 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterDialog.web.tsx
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPicker.tsx
+@@ -1,10 +1,10 @@
+ import React from "react";
+ import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
+-import { BalanceFilterDialogView } from "./BalanceFilterDialogView";
+-import { useBalanceFilterDialogViewModel } from "./useBalanceFilterDialogViewModel";
+-import type { PayCardBalanceFilterLabels, PayCardBalanceFilterOption } from "./types";
++import { BalanceFilterPickerView } from "./BalanceFilterPickerView";
++import { useBalanceFilterPickerViewModel } from "./useBalanceFilterPickerViewModel";
++import type { PayCardBalanceFilterLabels, PayCardBalanceFilterOption } from "../../types";
+ 
+-export type BalanceFilterDialogProps = Readonly<{
++export type BalanceFilterPickerProps = Readonly<{
+   isOpen: boolean;
+   filter: PayCardBalanceFilter;
+   options: readonly PayCardBalanceFilterOption[];
+@@ -14,7 +14,7 @@ export type BalanceFilterDialogProps = Readonly<{
+   onTrackEvent?: (event: string, params: Record<string, unknown>) => void;
+ }>;
+ 
+-export function BalanceFilterDialog({
++export function BalanceFilterPicker({
+   isOpen,
+   filter,
+   options,
+@@ -22,8 +22,8 @@ export function BalanceFilterDialog({
+   onClose,
+   onConfirmFilter,
+   onTrackEvent,
+-}: BalanceFilterDialogProps) {
+-  const { draftFilter, onSelectDraft, onConfirm } = useBalanceFilterDialogViewModel({
++}: BalanceFilterPickerProps) {
++  const { draftFilter, onSelectDraft, onConfirm } = useBalanceFilterPickerViewModel({
+     isOpen,
+     activeFilter: filter,
+     options,
+@@ -33,7 +33,7 @@ export function BalanceFilterDialog({
+   });
+ 
+   return (
+-    <BalanceFilterDialogView
++    <BalanceFilterPickerView
+       isOpen={isOpen}
+       draftFilter={draftFilter}
+       options={options}
+diff --git a/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPickerView.native.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPickerView.native.tsx
+new file mode 100644
+index 0000000..fd7cc14
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPickerView.native.tsx
+@@ -0,0 +1,72 @@
++import React from "react";
++import {
++  Banner,
++  BottomSheetFooter,
++  BottomSheetHeader,
++  BottomSheetScrollView,
++  Box,
++  Button,
++} from "@ledgerhq/lumen-ui-rnative";
++import { QueuedBottomSheet } from "@shared/ui-queued-bottom-sheet";
++import type { BalanceFilterPickerViewProps } from "../../types";
++import { BalanceFilterOptionRow } from "./BalanceFilterOptionRow";
++
++export function BalanceFilterPickerView({
++  isOpen,
++  draftFilter,
++  options,
++  labels,
++  onClose,
++  onSelectDraft,
++  onConfirm,
++}: BalanceFilterPickerViewProps) {
++  return (
++    <QueuedBottomSheet
++      isRequestingToBeOpened={isOpen}
++      onClose={onClose}
++      enableDynamicSizing
++      maxDynamicContentSize="fullWithOffset"
++      testID="pay-card-balance-filter-sheet"
++    >
++      {isOpen ? (
++        <>
++          <BottomSheetHeader
++            spacing
++            density="expanded"
++            title={labels.filterDialogTitle}
++            description={labels.filterDialogDescription}
++          />
++          {/* Scrollable asset list: only the options scroll, the footer below stays pinned. */}
++          <BottomSheetScrollView>
++            <Box
++              lx={{ flexDirection: "column", gap: "s8", paddingBottom: "s16" }}
++              testID="pay-card-balance-filter-picker"
++            >
++              {options.map(option => (
++                <BalanceFilterOptionRow
++                  key={option.id}
++                  option={option}
++                  selected={option.id === draftFilter}
++                  onSelect={onSelectDraft}
++                />
++              ))}
++              <Banner appearance="info" title={labels.filterDialogBanner} />
++            </Box>
++          </BottomSheetScrollView>
++          <BottomSheetFooter lx={{ gap: "s16" }}>
++            <Button
++              appearance="base"
++              size="lg"
++              isFull
++              onPress={onConfirm}
++              accessibilityLabel={labels.confirm}
++              testID="pay-card-balance-filter-confirm"
++            >
++              {labels.confirm}
++            </Button>
++          </BottomSheetFooter>
++        </>
++      ) : null}
++    </QueuedBottomSheet>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPickerView.web.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPickerView.web.tsx
+new file mode 100644
+index 0000000..92d85c0
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPickerView.web.tsx
+@@ -0,0 +1,72 @@
++import React, { useCallback } from "react";
++import {
++  Banner,
++  Button,
++  Dialog,
++  DialogBody,
++  DialogContent,
++  DialogFooter,
++  DialogHeader,
++} from "@ledgerhq/lumen-ui-react";
++import type { BalanceFilterPickerViewProps } from "../../types";
++import { BalanceFilterOptionRow } from "./BalanceFilterOptionRow";
++
++export function BalanceFilterPickerView({
++  isOpen,
++  draftFilter,
++  options,
++  labels,
++  onClose,
++  onSelectDraft,
++  onConfirm,
++}: BalanceFilterPickerViewProps) {
++  const handleOpenChange = useCallback(
++    (open: boolean) => {
++      if (!open) {
++        onClose();
++      }
++    },
++    [onClose],
++  );
++
++  if (!isOpen) {
++    return null;
++  }
++
++  return (
++    <Dialog open onOpenChange={handleOpenChange}>
++      <DialogContent>
++        <DialogHeader
++          density="expanded"
++          title={labels.filterDialogTitle}
++          description={labels.filterDialogDescription}
++          onClose={onClose}
++        />
++        <DialogBody className="flex flex-col gap-8">
++          <div className="flex flex-col gap-8" data-testid="pay-card-balance-filter-picker">
++            {options.map(option => (
++              <BalanceFilterOptionRow
++                key={option.id}
++                option={option}
++                selected={option.id === draftFilter}
++                onSelect={onSelectDraft}
++              />
++            ))}
++          </div>
++          <Banner appearance="info" title={labels.filterDialogBanner} />
++        </DialogBody>
++        <DialogFooter className="flex-col gap-16">
++          <Button
++            appearance="base"
++            size="lg"
++            className="w-full"
++            onClick={onConfirm}
++            data-testid="pay-card-balance-filter-confirm"
++          >
++            {labels.confirm}
++          </Button>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterPill.web.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPill.web.tsx
+similarity index 94%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterPill.web.tsx
+rename to features/flow/pay-card-balance/src/components/Filter/BalanceFilterPill.web.tsx
+index 62b264e..c35cbea 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterPill.web.tsx
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterPill.web.tsx
+@@ -1,7 +1,7 @@
+ import React from "react";
+ import { CryptoIcon } from "@ledgerhq/crypto-icons";
+ import { MediaButton } from "@ledgerhq/lumen-ui-react";
+-import type { PayCardBalanceFilterOption } from "./types";
++import type { PayCardBalanceFilterOption } from "../../types";
+ 
+ type BalanceFilterPillProps = Readonly<{
+   allStablecoinsLabel: string;
+diff --git a/features/flow/pay-card-balance/src/components/Filter/BalanceFilterSelect.native.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterSelect.native.tsx
+new file mode 100644
+index 0000000..6d1ecb0
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterSelect.native.tsx
+@@ -0,0 +1,15 @@
++import React from "react";
++import type { PayCardBalanceFilterOption } from "../../types";
++import { BalanceFilterSelectView } from "./BalanceFilterSelectView.native";
++import { useBalanceFilterSelectViewModel } from "./useBalanceFilterSelectViewModel";
++
++export type BalanceFilterSelectProps = Readonly<{
++  allStablecoinsLabel: string;
++  /** Applied option, or `undefined` when "all" is active. */
++  selectedOption?: PayCardBalanceFilterOption;
++  onOpenFilter: () => void;
++}>;
++
++export function BalanceFilterSelect(props: BalanceFilterSelectProps) {
++  return <BalanceFilterSelectView {...useBalanceFilterSelectViewModel(props)} />;
++}
+diff --git a/features/flow/pay-card-balance/src/components/Filter/BalanceFilterSelectView.native.tsx b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterSelectView.native.tsx
+new file mode 100644
+index 0000000..e47a4cd
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/BalanceFilterSelectView.native.tsx
+@@ -0,0 +1,31 @@
++import React from "react";
++import CryptoIcon from "@ledgerhq/crypto-icons/native";
++import { MediaButton } from "@ledgerhq/lumen-ui-rnative";
++import type { BalanceFilterSelectViewModel } from "./useBalanceFilterSelectViewModel";
++
++type BalanceFilterSelectViewProps = BalanceFilterSelectViewModel;
++
++export function BalanceFilterSelectView({
++  label,
++  ledgerId,
++  ticker,
++  onPress,
++}: BalanceFilterSelectViewProps) {
++  const leadingContent =
++    ledgerId != null ? (
++      <CryptoIcon ledgerId={ledgerId} ticker={ticker ?? ""} size={24} />
++    ) : undefined;
++
++  return (
++    <MediaButton
++      size="sm"
++      leadingContent={leadingContent}
++      leadingContentShape="rounded"
++      onPress={onPress}
++      accessibilityLabel={label}
++      testID="pay-card-balance-filter-pill"
++    >
++      {label}
++    </MediaButton>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/useBalanceFilterDialogViewModel.ts b/features/flow/pay-card-balance/src/components/Filter/useBalanceFilterPickerViewModel.ts
+similarity index 82%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/useBalanceFilterDialogViewModel.ts
+rename to features/flow/pay-card-balance/src/components/Filter/useBalanceFilterPickerViewModel.ts
+index 67d41d2..11fb109 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/useBalanceFilterDialogViewModel.ts
++++ b/features/flow/pay-card-balance/src/components/Filter/useBalanceFilterPickerViewModel.ts
+@@ -1,15 +1,15 @@
+ import { useCallback, useEffect, useState } from "react";
+ import { PAY_CARD_BALANCE_FILTER_ALL, type PayCardBalanceFilter } from "@domain/entity-pay-card";
+-import type { BalanceFilterDialogViewModel, BalanceFilterDialogViewModelParams } from "./types";
++import type { BalanceFilterPickerViewModel, BalanceFilterPickerViewModelParams } from "../../types";
+ 
+-export function useBalanceFilterDialogViewModel({
++export function useBalanceFilterPickerViewModel({
+   isOpen,
+   activeFilter,
+   options,
+   onConfirmFilter,
+   onClose,
+   onTrackEvent,
+-}: BalanceFilterDialogViewModelParams): BalanceFilterDialogViewModel {
++}: BalanceFilterPickerViewModelParams): BalanceFilterPickerViewModel {
+   const [draftFilter, setDraftFilter] = useState<PayCardBalanceFilter>(activeFilter);
+ 
+   useEffect(() => {
+diff --git a/features/flow/pay-card-balance/src/components/Filter/useBalanceFilterSelectViewModel.ts b/features/flow/pay-card-balance/src/components/Filter/useBalanceFilterSelectViewModel.ts
+new file mode 100644
+index 0000000..ba37d53
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Filter/useBalanceFilterSelectViewModel.ts
+@@ -0,0 +1,29 @@
++import type { PayCardBalanceFilterOption } from "../../types";
++
++export type BalanceFilterSelectViewModelParams = Readonly<{
++  allStablecoinsLabel: string;
++  /** Applied option, or `undefined` when "all" is active. */
++  selectedOption?: PayCardBalanceFilterOption;
++  onOpenFilter: () => void;
++}>;
++
++export type BalanceFilterSelectViewModel = Readonly<{
++  label: string;
++  /** Ledger currency id for the leading crypto icon. Absent for the "all" row. */
++  ledgerId?: string;
++  ticker?: string;
++  onPress: () => void;
++}>;
++
++export function useBalanceFilterSelectViewModel({
++  allStablecoinsLabel,
++  selectedOption,
++  onOpenFilter,
++}: BalanceFilterSelectViewModelParams): BalanceFilterSelectViewModel {
++  return {
++    label: selectedOption?.ticker ?? selectedOption?.title ?? allStablecoinsLabel,
++    ledgerId: selectedOption?.ledgerId,
++    ticker: selectedOption?.ticker,
++    onPress: onOpenFilter,
++  };
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalance.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalance.tsx
+similarity index 84%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalance.tsx
+rename to features/flow/pay-card-balance/src/components/Hero/PayCardBalance.tsx
+index ef272ce..53bf034 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalance.tsx
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalance.tsx
+@@ -1,6 +1,6 @@
+ import React from "react";
+ import { PayCardBalanceView } from "./PayCardBalanceView";
+-import type { PayCardBalanceProps } from "./types";
++import type { PayCardBalanceProps } from "../../types";
+ import { usePayCardBalanceViewModel } from "./usePayCardBalanceViewModel";
+ 
+ export function PayCardBalance(props: PayCardBalanceProps) {
+diff --git a/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceBody.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceBody.tsx
+new file mode 100644
+index 0000000..6d29ae8
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceBody.tsx
+@@ -0,0 +1,34 @@
++import React from "react";
++import type { PayCardBalanceViewProps } from "../../types";
++import { PayCardBalanceEmptyState } from "./PayCardBalanceEmptyState";
++import { PayCardBalanceFundedState } from "./PayCardBalanceFundedState";
++import { BalanceFilterPicker } from "../Filter/BalanceFilterPicker";
++
++export function PayCardBalanceBody(props: PayCardBalanceViewProps) {
++  if (props.displayMode !== "funded") {
++    return <PayCardBalanceEmptyState labels={props.labels} />;
++  }
++
++  return (
++    <>
++      <PayCardBalanceFundedState
++        balance={props.balance}
++        formatCountervalue={props.formatCountervalue}
++        isLoading={props.isLoading}
++        allStablecoinsLabel={props.labels.allStablecoins}
++        selectedOption={props.selectedOption}
++        onOpenFilter={props.onOpenFilter}
++        actionTiles={props.actionTiles}
++      />
++      <BalanceFilterPicker
++        isOpen={props.isFilterOpen}
++        filter={props.filter}
++        options={props.options}
++        labels={props.labels}
++        onClose={props.onCloseFilter}
++        onConfirmFilter={props.onConfirmFilter}
++        onTrackEvent={props.onTrackEvent}
++      />
++    </>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.native.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceEmptyState.native.tsx
+similarity index 91%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.native.tsx
+rename to features/flow/pay-card-balance/src/components/Hero/PayCardBalanceEmptyState.native.tsx
+index e3d9764..7845045 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.native.tsx
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceEmptyState.native.tsx
+@@ -1,6 +1,6 @@
+ import React from "react";
+ import { Box, Text } from "@ledgerhq/lumen-ui-rnative";
+-import type { PayCardBalanceEmptyLabels } from "./types";
++import type { PayCardBalanceEmptyLabels } from "../../types";
+ 
+ type PayCardBalanceEmptyStateProps = Readonly<{
+   labels: PayCardBalanceEmptyLabels;
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.web.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceEmptyState.web.tsx
+similarity index 88%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.web.tsx
+rename to features/flow/pay-card-balance/src/components/Hero/PayCardBalanceEmptyState.web.tsx
+index 6717859..9b3e57e 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.web.tsx
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceEmptyState.web.tsx
+@@ -1,5 +1,5 @@
+ import React from "react";
+-import type { PayCardBalanceEmptyLabels } from "./types";
++import type { PayCardBalanceEmptyLabels } from "../../types";
+ 
+ type PayCardBalanceEmptyStateProps = Readonly<{
+   labels: PayCardBalanceEmptyLabels;
+diff --git a/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceFundedState.native.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceFundedState.native.tsx
+new file mode 100644
+index 0000000..334d141
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceFundedState.native.tsx
+@@ -0,0 +1,47 @@
++import React from "react";
++import { AmountDisplay, Box } from "@ledgerhq/lumen-ui-rnative";
++import { ActionTiles } from "../ActionTiles";
++import type { ActionTilesProps } from "../ActionTiles";
++import type { FormattedValue, PayCardBalanceFilterOption } from "../../types";
++import { BalanceFilterSelect } from "../Filter/BalanceFilterSelect.native";
++
++type PayCardBalanceFundedStateProps = Readonly<{
++  balance: number;
++  formatCountervalue: (value: number) => FormattedValue;
++  isLoading: boolean;
++  actionTiles?: ActionTilesProps;
++  allStablecoinsLabel: string;
++  selectedOption?: PayCardBalanceFilterOption;
++  onOpenFilter: () => void;
++}>;
++
++export function PayCardBalanceFundedState({
++  balance,
++  formatCountervalue,
++  isLoading,
++  allStablecoinsLabel,
++  selectedOption,
++  onOpenFilter,
++  actionTiles,
++}: PayCardBalanceFundedStateProps) {
++  return (
++    <Box
++      lx={{ alignItems: "center", justifyContent: "center", gap: "s16", paddingVertical: "s32" }}
++      testID="pay-card-balance-funded-state"
++    >
++      <AmountDisplay
++        value={balance}
++        formatter={formatCountervalue}
++        loading={isLoading}
++        size="md"
++        testID="pay-card-balance-amount"
++      />
++      <BalanceFilterSelect
++        allStablecoinsLabel={allStablecoinsLabel}
++        selectedOption={selectedOption}
++        onOpenFilter={onOpenFilter}
++      />
++      {actionTiles && <ActionTiles {...actionTiles} />}
++    </Box>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.web.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceFundedState.web.tsx
+similarity index 94%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.web.tsx
+rename to features/flow/pay-card-balance/src/components/Hero/PayCardBalanceFundedState.web.tsx
+index 8dc372b..61021f8 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.web.tsx
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceFundedState.web.tsx
+@@ -1,9 +1,9 @@
+ import React from "react";
+ import { AmountDisplay } from "@ledgerhq/lumen-ui-react";
+-import type { FormattedValue, PayCardBalanceFilterOption } from "./types";
+-import { BalanceFilterPill } from "./BalanceFilterPill";
+ import { ActionTiles } from "../ActionTiles";
+ import type { ActionTilesProps } from "../ActionTiles";
++import type { FormattedValue, PayCardBalanceFilterOption } from "../../types";
++import { BalanceFilterPill } from "../Filter/BalanceFilterPill";
+ 
+ type PayCardBalanceFundedStateProps = Readonly<{
+   balance: number;
+diff --git a/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceView.native.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceView.native.tsx
+new file mode 100644
+index 0000000..df1bb7e
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceView.native.tsx
+@@ -0,0 +1,12 @@
++import React from "react";
++import { Box } from "@ledgerhq/lumen-ui-rnative";
++import type { PayCardBalanceViewProps } from "../../types";
++import { PayCardBalanceBody } from "./PayCardBalanceBody";
++
++export function PayCardBalanceView(props: PayCardBalanceViewProps) {
++  return (
++    <Box lx={{ paddingHorizontal: "s16" }} testID="pay-card-balance">
++      <PayCardBalanceBody {...props} />
++    </Box>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceView.web.tsx b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceView.web.tsx
+new file mode 100644
+index 0000000..736276d
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/Hero/PayCardBalanceView.web.tsx
+@@ -0,0 +1,13 @@
++import React from "react";
++import { Divider } from "@ledgerhq/lumen-ui-react";
++import type { PayCardBalanceViewProps } from "../../types";
++import { PayCardBalanceBody } from "./PayCardBalanceBody";
++
++export function PayCardBalanceView(props: PayCardBalanceViewProps) {
++  return (
++    <div className="flex flex-col gap-24" data-testid="pay-card-balance">
++      <PayCardBalanceBody {...props} />
++      <Divider orientation="horizontal" />
++    </div>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/usePayCardBalanceViewModel.ts b/features/flow/pay-card-balance/src/components/Hero/usePayCardBalanceViewModel.ts
+similarity index 95%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/usePayCardBalanceViewModel.ts
+rename to features/flow/pay-card-balance/src/components/Hero/usePayCardBalanceViewModel.ts
+index b961fee..28855fe 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/usePayCardBalanceViewModel.ts
++++ b/features/flow/pay-card-balance/src/components/Hero/usePayCardBalanceViewModel.ts
+@@ -1,7 +1,7 @@
+ import { useCallback, useMemo, useState } from "react";
+ import { PAY_CARD_BALANCE_FILTER_ALL } from "@domain/entity-pay-card";
+-import { resolveSelection } from "./resolveSelection";
+-import type { PayCardBalanceProps, PayCardBalanceViewProps } from "./types";
++import { resolveSelection } from "../../logic/resolveSelection";
++import type { PayCardBalanceProps, PayCardBalanceViewProps } from "../../types";
+ 
+ export function usePayCardBalanceViewModel({
+   status,
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterDialogView.web.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterDialogView.web.tsx
+deleted file mode 100644
+index 3fb5750..0000000
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/BalanceFilterDialogView.web.tsx
++++ /dev/null
+@@ -1,122 +0,0 @@
+-import React, { useCallback } from "react";
+-import { CryptoIcon } from "@ledgerhq/crypto-icons";
+-import {
+-  Banner,
+-  Button,
+-  Card,
+-  CardContent,
+-  CardContentDescription,
+-  CardContentTitle,
+-  CardHeader,
+-  CardLeading,
+-  CardTrailing,
+-  Dialog,
+-  DialogBody,
+-  DialogContent,
+-  DialogHeader,
+-  Spot,
+-} from "@ledgerhq/lumen-ui-react";
+-import { Bundle } from "@ledgerhq/lumen-ui-react/symbols";
+-import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
+-import type { PayCardBalanceFilterLabels, PayCardBalanceFilterOption } from "./types";
+-
+-export type BalanceFilterDialogViewProps = Readonly<{
+-  isOpen: boolean;
+-  draftFilter: PayCardBalanceFilter;
+-  options: readonly PayCardBalanceFilterOption[];
+-  labels: PayCardBalanceFilterLabels;
+-  onClose: () => void;
+-  onSelectDraft: (filter: PayCardBalanceFilter) => void;
+-  onConfirm: () => void;
+-}>;
+-
+-export function BalanceFilterDialogView({
+-  isOpen,
+-  draftFilter,
+-  options,
+-  labels,
+-  onClose,
+-  onSelectDraft,
+-  onConfirm,
+-}: BalanceFilterDialogViewProps) {
+-  const handleOpenChange = useCallback(
+-    (open: boolean) => {
+-      if (!open) {
+-        onClose();
+-      }
+-    },
+-    [onClose],
+-  );
+-
+-  if (!isOpen) {
+-    return null;
+-  }
+-
+-  return (
+-    <Dialog open onOpenChange={handleOpenChange}>
+-      <DialogContent>
+-        <DialogHeader
+-          density="expanded"
+-          title={labels.filterDialogTitle}
+-          description={labels.filterDialogDescription}
+-          onClose={onClose}
+-        />
+-        <DialogBody className="flex flex-col gap-16">
+-          <div className="flex flex-col gap-8" data-testid="pay-card-balance-filter-dialog">
+-            {options.map(option => {
+-              const selected = option.id === draftFilter;
+-              const rowKey = option.ticker?.toLowerCase() ?? "all";
+-              return (
+-                <Card
+-                  key={option.id}
+-                  type="interactive"
+-                  outlined={selected}
+-                  onClick={() => onSelectDraft(option.id)}
+-                  data-testid={`pay-card-balance-filter-option-${rowKey}`}
+-                >
+-                  <CardHeader>
+-                    <CardLeading>
+-                      {option.ledgerId != null ? (
+-                        <CryptoIcon
+-                          ledgerId={option.ledgerId}
+-                          ticker={option.ticker ?? ""}
+-                          size={48}
+-                        />
+-                      ) : (
+-                        <Spot appearance="icon" icon={Bundle} size={48} />
+-                      )}
+-                      <CardContent>
+-                        <CardContentTitle>{option.title}</CardContentTitle>
+-                        {option.ticker != null ? (
+-                          <CardContentDescription>{option.ticker}</CardContentDescription>
+-                        ) : null}
+-                      </CardContent>
+-                    </CardLeading>
+-                    <CardTrailing>
+-                      <div className="flex flex-col items-end gap-4">
+-                        <span className="body-2-semi-bold">{option.countervalueLabel}</span>
+-                        {option.cryptoAmountLabel != null ? (
+-                          <span className="body-3 text-muted">{option.cryptoAmountLabel}</span>
+-                        ) : null}
+-                      </div>
+-                    </CardTrailing>
+-                  </CardHeader>
+-                </Card>
+-              );
+-            })}
+-          </div>
+-          <Banner appearance="info" title={labels.filterDialogBanner} />
+-          <Button
+-            appearance="base"
+-            size="lg"
+-            className="w-full"
+-            onClick={onConfirm}
+-            data-testid="pay-card-balance-filter-confirm"
+-          >
+-            {labels.confirm}
+-          </Button>
+-        </DialogBody>
+-      </DialogContent>
+-    </Dialog>
+-  );
+-}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.native.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.native.tsx
+deleted file mode 100644
+index 21cc9de..0000000
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.native.tsx
++++ /dev/null
+@@ -1,34 +0,0 @@
+-import React from "react";
+-import { AmountDisplay, Box } from "@ledgerhq/lumen-ui-rnative";
+-import type { FormattedValue } from "./types";
+-import { ActionTiles } from "../ActionTiles";
+-import type { ActionTilesProps } from "../ActionTiles";
+-
+-type PayCardBalanceFundedStateProps = Readonly<{
+-  balance: number;
+-  formatCountervalue: (value: number) => FormattedValue;
+-  isLoading: boolean;
+-  actionTiles?: ActionTilesProps;
+-}>;
+-
+-export function PayCardBalanceFundedState({
+-  balance,
+-  formatCountervalue,
+-  isLoading,
+-  actionTiles,
+-}: PayCardBalanceFundedStateProps) {
+-  return (
+-    <Box lx={{ paddingVertical: "s32", gap: "s16" }} testID="pay-card-balance-funded-state">
+-      <Box lx={{ alignItems: "center", justifyContent: "center" }}>
+-        <AmountDisplay
+-          value={balance}
+-          formatter={formatCountervalue}
+-          loading={isLoading}
+-          size="md"
+-          testID="pay-card-balance-amount"
+-        />
+-      </Box>
+-      {actionTiles && <ActionTiles {...actionTiles} />}
+-    </Box>
+-  );
+-}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.native.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.native.tsx
+deleted file mode 100644
+index 89bdb58..0000000
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.native.tsx
++++ /dev/null
+@@ -1,22 +0,0 @@
+-import React from "react";
+-import { Box } from "@ledgerhq/lumen-ui-rnative";
+-import type { PayCardBalanceViewProps } from "./types";
+-import { PayCardBalanceEmptyState } from "./PayCardBalanceEmptyState";
+-import { PayCardBalanceFundedState } from "./PayCardBalanceFundedState";
+-
+-export function PayCardBalanceView(props: PayCardBalanceViewProps) {
+-  return (
+-    <Box lx={{ paddingHorizontal: "s16" }} testID="pay-card-balance">
+-      {props.displayMode === "funded" ? (
+-        <PayCardBalanceFundedState
+-          balance={props.balance}
+-          formatCountervalue={props.formatCountervalue}
+-          isLoading={props.isLoading}
+-          actionTiles={props.actionTiles}
+-        />
+-      ) : (
+-        <PayCardBalanceEmptyState labels={props.labels} />
+-      )}
+-    </Box>
+-  );
+-}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.web.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.web.tsx
+deleted file mode 100644
+index a49b528..0000000
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.web.tsx
++++ /dev/null
+@@ -1,38 +0,0 @@
+-import React from "react";
+-import { Divider } from "@ledgerhq/lumen-ui-react";
+-import type { PayCardBalanceViewProps } from "./types";
+-import { PayCardBalanceEmptyState } from "./PayCardBalanceEmptyState";
+-import { PayCardBalanceFundedState } from "./PayCardBalanceFundedState";
+-import { BalanceFilterDialog } from "./BalanceFilterDialog";
+-
+-export function PayCardBalanceView(props: PayCardBalanceViewProps) {
+-  return (
+-    <div className="flex flex-col gap-24" data-testid="pay-card-balance">
+-      {props.displayMode === "funded" ? (
+-        <>
+-          <PayCardBalanceFundedState
+-            balance={props.balance}
+-            formatCountervalue={props.formatCountervalue}
+-            isLoading={props.isLoading}
+-            allStablecoinsLabel={props.labels.allStablecoins}
+-            selectedOption={props.selectedOption}
+-            onOpenFilter={props.onOpenFilter}
+-            actionTiles={props.actionTiles}
+-          />
+-          <BalanceFilterDialog
+-            isOpen={props.isFilterOpen}
+-            filter={props.filter}
+-            options={props.options}
+-            labels={props.labels}
+-            onClose={props.onCloseFilter}
+-            onConfirmFilter={props.onConfirmFilter}
+-            onTrackEvent={props.onTrackEvent}
+-          />
+-        </>
+-      ) : (
+-        <PayCardBalanceEmptyState labels={props.labels} />
+-      )}
+-      <Divider orientation="horizontal" />
+-    </div>
+-  );
+-}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/index.ts b/features/flow/pay-card-balance/src/components/PayCardBalance/index.ts
+deleted file mode 100644
+index c600389..0000000
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/index.ts
++++ /dev/null
+@@ -1,4 +0,0 @@
+-export * from "./PayCardBalance";
+-export * from "./aggregatePayCardBalance";
+-export * from "./resolveSelection";
+-export * from "./types";
+diff --git a/features/flow/pay-card-balance/src/exports.ts b/features/flow/pay-card-balance/src/exports.ts
+new file mode 100644
+index 0000000..ecfdf96
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/exports.ts
+@@ -0,0 +1,8 @@
++export * from "./components/Hero/PayCardBalance";
++export * from "./components/ActionTiles";
++export * from "./hooks/usePayCardBalanceData";
++export * from "./logic/aggregatePayCardBalance";
++export * from "./logic/buildBalanceFilterOptions";
++export * from "./logic/buildPayCardBalanceData";
++export * from "./logic/resolveSelection";
++export * from "./types";
+diff --git a/features/flow/pay-card-balance/src/hooks/usePayCardBalanceData.ts b/features/flow/pay-card-balance/src/hooks/usePayCardBalanceData.ts
+new file mode 100644
+index 0000000..2bae938
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/hooks/usePayCardBalanceData.ts
+@@ -0,0 +1,76 @@
++import { useEffect, useMemo } from "react";
++import type { Unit } from "@domain/entity-currency-unit";
++import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
++import type { DefaultStablecoin, PayCardStablecoinItem } from "../logic/buildBalanceFilterOptions";
++import { buildPayCardBalanceData } from "../logic/buildPayCardBalanceData";
++import type { FormattedValue, PayCardBalanceData } from "../types";
++
++export type UsePayCardBalanceDataParams = Readonly<{
++  stablecoins: readonly PayCardStablecoinItem[];
++  defaultStablecoins: readonly DefaultStablecoin[];
++  filter: PayCardBalanceFilter;
++  isLoading: boolean;
++  isError: boolean;
++  allLabel: string;
++  formatFiat: (value: number) => string;
++  formatCrypto: (unit: Unit, balance: number) => string;
++  formatCountervalue: (value: number) => FormattedValue;
++  onConfirmFilter: (filter: PayCardBalanceFilter) => void;
++  onResetFilter: () => void;
++  onTrackEvent?: (event: string, params: Record<string, unknown>) => void;
++}>;
++
++// Host-facing data hook: both apps feed their portfolio source + formatters and get back
++// the ready-to-render `PayCardBalanceData`, plus the stale-filter self-heal side effect.
++export function usePayCardBalanceData({
++  stablecoins,
++  defaultStablecoins,
++  filter,
++  isLoading,
++  isError,
++  allLabel,
++  formatFiat,
++  formatCrypto,
++  formatCountervalue,
++  onConfirmFilter,
++  onResetFilter,
++  onTrackEvent,
++}: UsePayCardBalanceDataParams): PayCardBalanceData {
++  const { data, shouldResetFilter } = useMemo(
++    () =>
++      buildPayCardBalanceData({
++        stablecoins,
++        defaultStablecoins,
++        filter,
++        isLoading,
++        isError,
++        allLabel,
++        formatFiat,
++        formatCrypto,
++        formatCountervalue,
++        onConfirmFilter,
++        onTrackEvent,
++      }),
++    [
++      stablecoins,
++      defaultStablecoins,
++      filter,
++      isLoading,
++      isError,
++      allLabel,
++      formatFiat,
++      formatCrypto,
++      formatCountervalue,
++      onConfirmFilter,
++      onTrackEvent,
++    ],
++  );
++
++  useEffect(() => {
++    if (shouldResetFilter) {
++      onResetFilter();
++    }
++  }, [shouldResetFilter, onResetFilter]);
++
++  return data;
++}
+diff --git a/features/flow/pay-card-balance/src/index.native.ts b/features/flow/pay-card-balance/src/index.native.ts
+index 123b053..fd0b179 100644
+--- a/features/flow/pay-card-balance/src/index.native.ts
++++ b/features/flow/pay-card-balance/src/index.native.ts
+@@ -1,2 +1 @@
+-export * from "./components/PayCardBalance";
+-export * from "./components/ActionTiles";
++export * from "./exports";
+diff --git a/features/flow/pay-card-balance/src/index.ts b/features/flow/pay-card-balance/src/index.ts
+index 123b053..fd0b179 100644
+--- a/features/flow/pay-card-balance/src/index.ts
++++ b/features/flow/pay-card-balance/src/index.ts
+@@ -1,2 +1 @@
+-export * from "./components/PayCardBalance";
+-export * from "./components/ActionTiles";
++export * from "./exports";
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/aggregatePayCardBalance.ts b/features/flow/pay-card-balance/src/logic/aggregatePayCardBalance.ts
+similarity index 55%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/aggregatePayCardBalance.ts
+rename to features/flow/pay-card-balance/src/logic/aggregatePayCardBalance.ts
+index 2aae125..d8a939f 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/aggregatePayCardBalance.ts
++++ b/features/flow/pay-card-balance/src/logic/aggregatePayCardBalance.ts
+@@ -1,6 +1,12 @@
+ import { PAY_CARD_BALANCE_FILTER_ALL } from "@domain/entity-pay-card";
++import { tickerForFilter } from "./buildBalanceFilterOptions";
+ import { resolveSelection } from "./resolveSelection";
+-import type { PayCardBalanceData, PayCardBalanceStatus, PayCardPortfolioPort } from "./types";
++import type {
++  PayCardBalanceData,
++  PayCardBalanceStatus,
++  PayCardPortfolioPort,
++  PayCardStablecoin,
++} from "../types";
+ 
+ // Filters stablecoins by the active filter, sums their
+ // countervalues and maps the loading/error flags to a single status.
+@@ -16,11 +22,26 @@ export function aggregatePayCardBalance({
+ }: PayCardPortfolioPort): PayCardBalanceData {
+   const optionIds = filterOptions.map(option => option.id);
+   const effectiveFilter = resolveSelection(filter, optionIds);
++
++  // Defaults (USDC/USDT) are keyed by market id; held rows may use a different currencyId.
++  // Match by ticker so the filtered total stays correct across those ids, falling back to id.
++  const ticker =
++    effectiveFilter === PAY_CARD_BALANCE_FILTER_ALL
++      ? undefined
++      : tickerForFilter(effectiveFilter, filterOptions);
++
++  const matchesFilter = ({ currency }: PayCardStablecoin): boolean => {
++    if (effectiveFilter === PAY_CARD_BALANCE_FILTER_ALL) {
++      return true;
++    }
++    if (ticker == null) {
++      return currency.id === effectiveFilter;
++    }
++    return currency.ticker.toUpperCase() === ticker.toUpperCase();
++  };
++
+   const stableBalance = stablecoins
+-    .filter(
+-      ({ currency }) =>
+-        effectiveFilter === PAY_CARD_BALANCE_FILTER_ALL || currency.id === effectiveFilter,
+-    )
++    .filter(matchesFilter)
+     .reduce((total, { value }) => total + value, 0);
+ 
+   const hasBalance = stablecoins.some(({ value }) => value > 0);
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/buildBalanceFilterOptions.ts b/features/flow/pay-card-balance/src/logic/buildBalanceFilterOptions.ts
+similarity index 60%
+rename from apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/buildBalanceFilterOptions.ts
+rename to features/flow/pay-card-balance/src/logic/buildBalanceFilterOptions.ts
+index 2494328..23a55c9 100644
+--- a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/buildBalanceFilterOptions.ts
++++ b/features/flow/pay-card-balance/src/logic/buildBalanceFilterOptions.ts
+@@ -1,20 +1,42 @@
+-import BigNumber from "bignumber.js";
+-import { formatCurrencyUnit } from "@ledgerhq/live-common/currencies/index";
+ import type { Unit } from "@domain/entity-currency-unit";
+ import { PAY_CARD_BALANCE_FILTER_ALL } from "@domain/entity-pay-card";
+-import type { PayCardBalanceFilterOption } from "@features/flow-pay-card-balance";
+-import type { CategorizedAssetItem } from "@ledgerhq/asset-aggregation/assetCategorization/index";
+-import type { DefaultStablecoin } from "./usePayStablecoins";
++import type { PayCardBalanceFilterOption } from "../types";
+ 
+-function formatCrypto(unit: Unit, balance: number, locale: string): string {
+-  return formatCurrencyUnit(unit, new BigNumber(balance), { locale, showCode: true });
+-}
++/** Always-offered stablecoin (USDC/USDT), taken from the top of the market-cap list. */
++export type DefaultStablecoin = Readonly<{
++  id: string;
++  ticker: string;
++  name: string;
++  magnitude: number;
++}>;
++
++/** Minimal held-stablecoin shape consumed by {@link buildBalanceFilterOptions}. */
++export type PayCardStablecoinItem = Readonly<{
++  currency: Readonly<{
++    id: string;
++    name: string;
++    ticker: string;
++    units: readonly Unit[];
++  }>;
++  balance: number;
++  value: number;
++}>;
++
++export type BuildBalanceFilterOptionsParams = Readonly<{
++  stablecoins: readonly PayCardStablecoinItem[];
++  defaultStablecoins: readonly DefaultStablecoin[];
++  allLabel: string;
++  /** Formats a fiat countervalue, e.g. `(1000) => "$1,000.00"`. */
++  formatFiat: (value: number) => string;
++  /** Formats a crypto amount for a unit, e.g. `(usdcUnit, 1_000_000_000) => "1,000.00 USDC"`. */
++  formatCrypto: (unit: Unit, balance: number) => string;
++}>;
+ 
+ function assetOption(
+   id: string,
+-  item: CategorizedAssetItem,
+-  locale: string,
++  item: PayCardStablecoinItem,
+   formatFiat: (value: number) => string,
++  formatCrypto: (unit: Unit, balance: number) => string,
+   override?: Pick<DefaultStablecoin, "name" | "ticker">,
+ ): PayCardBalanceFilterOption {
+   return {
+@@ -24,7 +46,7 @@ function assetOption(
+     ledgerId: id,
+     countervalue: item.value,
+     countervalueLabel: formatFiat(item.value),
+-    cryptoAmountLabel: formatCrypto(item.currency.units[0], item.balance, locale),
++    cryptoAmountLabel: formatCrypto(item.currency.units[0], item.balance),
+   };
+ }
+ 
+@@ -32,19 +54,10 @@ export function buildBalanceFilterOptions({
+   stablecoins,
+   defaultStablecoins,
+   allLabel,
+-  locale,
+-  counterValueUnit,
+-}: Readonly<{
+-  stablecoins: readonly CategorizedAssetItem[];
+-  defaultStablecoins: readonly DefaultStablecoin[];
+-  allLabel: string;
+-  locale: string;
+-  counterValueUnit: Unit;
+-}>): PayCardBalanceFilterOption[] {
+-  const formatFiat = (value: number): string =>
+-    formatCurrencyUnit(counterValueUnit, new BigNumber(value), { locale, showCode: true });
+-
+-  const byTicker = new Map<string, CategorizedAssetItem>();
++  formatFiat,
++  formatCrypto,
++}: BuildBalanceFilterOptionsParams): PayCardBalanceFilterOption[] {
++  const byTicker = new Map<string, PayCardStablecoinItem>();
+   for (const item of stablecoins) {
+     byTicker.set(item.currency.ticker.toUpperCase(), item);
+   }
+@@ -64,7 +77,7 @@ export function buildBalanceFilterOptions({
+   for (const coin of defaultStablecoins) {
+     const held = byTicker.get(coin.ticker.toUpperCase());
+     if (held) {
+-      options.push(assetOption(coin.id, held, locale, formatFiat, coin));
++      options.push(assetOption(coin.id, held, formatFiat, formatCrypto, coin));
+     } else {
+       const unit: Unit = { name: coin.name, code: coin.ticker, magnitude: coin.magnitude };
+       options.push({
+@@ -74,7 +87,7 @@ export function buildBalanceFilterOptions({
+         ledgerId: coin.id,
+         countervalue: 0,
+         countervalueLabel: formatFiat(0),
+-        cryptoAmountLabel: formatCrypto(unit, 0, locale),
++        cryptoAmountLabel: formatCrypto(unit, 0),
+       });
+     }
+   }
+@@ -83,7 +96,7 @@ export function buildBalanceFilterOptions({
+     .filter(item => !defaultTickers.has(item.currency.ticker.toUpperCase()))
+     .sort((a, b) => b.value - a.value || a.currency.ticker.localeCompare(b.currency.ticker));
+   for (const item of others) {
+-    options.push(assetOption(item.currency.id, item, locale, formatFiat));
++    options.push(assetOption(item.currency.id, item, formatFiat, formatCrypto));
+   }
+ 
+   return options;
+diff --git a/features/flow/pay-card-balance/src/logic/buildPayCardBalanceData.ts b/features/flow/pay-card-balance/src/logic/buildPayCardBalanceData.ts
+new file mode 100644
+index 0000000..e2aad5a
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/logic/buildPayCardBalanceData.ts
+@@ -0,0 +1,68 @@
++import type { Unit } from "@domain/entity-currency-unit";
++import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
++import { aggregatePayCardBalance } from "./aggregatePayCardBalance";
++import {
++  buildBalanceFilterOptions,
++  type DefaultStablecoin,
++  type PayCardStablecoinItem,
++} from "./buildBalanceFilterOptions";
++import type { FormattedValue, PayCardBalanceData } from "../types";
++
++export type BuildPayCardBalanceDataParams = Readonly<{
++  stablecoins: readonly PayCardStablecoinItem[];
++  defaultStablecoins: readonly DefaultStablecoin[];
++  filter: PayCardBalanceFilter;
++  isLoading: boolean;
++  isError: boolean;
++  allLabel: string;
++  formatFiat: (value: number) => string;
++  formatCrypto: (unit: Unit, balance: number) => string;
++  formatCountervalue: (value: number) => FormattedValue;
++  onConfirmFilter: (filter: PayCardBalanceFilter) => void;
++  onTrackEvent?: (event: string, params: Record<string, unknown>) => void;
++}>;
++
++export type BuildPayCardBalanceDataResult = Readonly<{
++  data: PayCardBalanceData;
++  /** True once data is ready and the persisted filter was healed away from the host value. */
++  shouldResetFilter: boolean;
++}>;
++
++// Builds the filter options and aggregates the balance in one place so both apps
++// only supply their portfolio source and formatters.
++export function buildPayCardBalanceData({
++  stablecoins,
++  defaultStablecoins,
++  filter,
++  isLoading,
++  isError,
++  allLabel,
++  formatFiat,
++  formatCrypto,
++  formatCountervalue,
++  onConfirmFilter,
++  onTrackEvent,
++}: BuildPayCardBalanceDataParams): BuildPayCardBalanceDataResult {
++  const filterOptions = buildBalanceFilterOptions({
++    stablecoins,
++    defaultStablecoins,
++    allLabel,
++    formatFiat,
++    formatCrypto,
++  });
++
++  const data = aggregatePayCardBalance({
++    stablecoins,
++    filter,
++    isLoading,
++    isError,
++    filterOptions,
++    formatCountervalue,
++    onConfirmFilter,
++    onTrackEvent,
++  });
++
++  const shouldResetFilter = !isLoading && !isError && data.filter !== filter;
++
++  return { data, shouldResetFilter };
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/resolveSelection.ts b/features/flow/pay-card-balance/src/logic/resolveSelection.ts
+similarity index 100%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/resolveSelection.ts
+rename to features/flow/pay-card-balance/src/logic/resolveSelection.ts
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts b/features/flow/pay-card-balance/src/types.ts
+similarity index 86%
+rename from features/flow/pay-card-balance/src/components/PayCardBalance/types.ts
+rename to features/flow/pay-card-balance/src/types.ts
+index fe75707..c176410 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts
++++ b/features/flow/pay-card-balance/src/types.ts
+@@ -1,6 +1,6 @@
+ import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
+ import type { FormattedValue } from "@ledgerhq/lumen-utils-shared";
+-import type { ActionTilesProps } from "../ActionTiles/types";
++import type { ActionTilesProps } from "./components/ActionTiles/types";
+ 
+ // Shared by both platforms (`AmountDisplay`);
+ export type { FormattedValue };
+@@ -38,7 +38,7 @@ export type PayCardBalanceFilterOption = Readonly<{
+ }>;
+ 
+ export type PayCardStablecoin = Readonly<{
+-  currency: Readonly<{ id: string }>;
++  currency: Readonly<{ id: string; ticker: string }>;
+   value: number;
+ }>;
+ 
+@@ -103,9 +103,9 @@ export type PayCardBalanceViewProps =
+       actionTiles?: ActionTilesProps;
+     }>;
+ 
+-export type BalanceFilterDialogViewModelParams = Readonly<{
++export type BalanceFilterPickerViewModelParams = Readonly<{
+   isOpen: boolean;
+-  /** Active (resolved) filter, used to seed the draft when the dialog opens. */
++  /** Active (resolved) filter, used to seed the draft when the picker opens. */
+   activeFilter: PayCardBalanceFilter;
+   options: readonly PayCardBalanceFilterOption[];
+   onConfirmFilter: (filter: PayCardBalanceFilter) => void;
+@@ -113,8 +113,19 @@ export type BalanceFilterDialogViewModelParams = Readonly<{
+   onTrackEvent?: (event: string, params: Record<string, unknown>) => void;
+ }>;
+ 
+-export type BalanceFilterDialogViewModel = Readonly<{
++export type BalanceFilterPickerViewModel = Readonly<{
+   draftFilter: PayCardBalanceFilter;
+   onSelectDraft: (filter: PayCardBalanceFilter) => void;
+   onConfirm: () => void;
+ }>;
++
++/** Presentation props shared by the web dialog and native bottom-sheet views. */
++export type BalanceFilterPickerViewProps = Readonly<{
++  isOpen: boolean;
++  draftFilter: PayCardBalanceFilter;
++  options: readonly PayCardBalanceFilterOption[];
++  labels: PayCardBalanceFilterLabels;
++  onClose: () => void;
++  onSelectDraft: (filter: PayCardBalanceFilter) => void;
++  onConfirm: () => void;
++}>;

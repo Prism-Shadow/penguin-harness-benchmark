@@ -1,0 +1,784 @@
+diff --git a/.eslintrc.js b/.eslintrc.js
+index a552660036ee7ebce36e8df76dfff18a47dcd34f..19c5446ec82b2961c44ebea85f6277e1f1cee0dd 100644
+--- a/.eslintrc.js
++++ b/.eslintrc.js
+@@ -26,6 +26,12 @@ module.exports = {
+ 
+     'disable-features/disable-async-await': 'error',
+     'disable-features/disable-generator-functions': 'error',
++    'import/no-unresolved': [
++      'error',
++      {
++        ignore: ['@ember/template-compiler'],
++      },
++    ],
+   },
+ 
+   settings: {
+diff --git a/packages/@ember/-internals/glimmer/lib/component-managers/outlet.ts b/packages/@ember/-internals/glimmer/lib/component-managers/outlet.ts
+index 4503ffcb43d78ba0113ba83b42d3453ec2265539..449576f44833d8af91b5e7de77108e3cb8196301 100644
+--- a/packages/@ember/-internals/glimmer/lib/component-managers/outlet.ts
++++ b/packages/@ember/-internals/glimmer/lib/component-managers/outlet.ts
+@@ -1,25 +1,23 @@
+ import type { InternalOwner } from '@ember/-internals/owner';
++import type { Nullable } from '@ember/-internals/utility-types';
+ import { assert } from '@ember/debug';
+ import EngineInstance from '@ember/engine/instance';
+ import { _instrumentStart } from '@ember/instrumentation';
++import { precompileTemplate } from '@ember/template-compilation';
+ import type {
+-  CapturedArguments,
+   CompilableProgram,
+   ComponentDefinition,
+-  CapabilityMask,
+   CustomRenderNode,
+   Destroyable,
+   Environment,
+   InternalComponentCapabilities,
+-  Template,
+   VMArguments,
+   WithCreateInstance,
+   WithCustomDebugRenderTree,
+ } from '@glimmer/interfaces';
+-import type { Nullable } from '@ember/-internals/utility-types';
+ import { capabilityFlagsFrom } from '@glimmer/manager';
+ import type { Reference } from '@glimmer/reference';
+-import { createConstRef, valueForRef } from '@glimmer/reference';
++import { UNDEFINED_REFERENCE, valueForRef } from '@glimmer/reference';
+ import { EMPTY_ARGS } from '@glimmer/runtime';
+ import { unwrapTemplate } from '@glimmer/util';
+ 
+@@ -33,19 +31,18 @@ function instrumentationPayload(def: OutletDefinitionState) {
+ }
+ 
+ interface OutletInstanceState {
+-  self: Reference;
+-  outletBucket?: {};
+-  engineBucket?: { mountPoint: string };
+-  engine?: EngineInstance;
++  engine?: {
++    instance: EngineInstance;
++    mountPoint: string;
++  };
+   finalize: () => void;
+ }
+ 
+ export interface OutletDefinitionState {
+   ref: Reference<OutletState | undefined>;
+   name: string;
+-  template: Template;
++  template: object;
+   controller: unknown;
+-  model: unknown;
+ }
+ 
+ const CAPABILITIES: InternalComponentCapabilities = {
+@@ -64,9 +61,11 @@ const CAPABILITIES: InternalComponentCapabilities = {
+   hasSubOwner: false,
+ };
+ 
++const CAPABILITIES_MASK = capabilityFlagsFrom(CAPABILITIES);
++
+ class OutletComponentManager
+   implements
+-    WithCreateInstance<OutletInstanceState>,
++    WithCreateInstance<OutletInstanceState, OutletDefinitionState>,
+     WithCustomDebugRenderTree<OutletInstanceState, OutletDefinitionState>
+ {
+   create(
+@@ -79,19 +78,21 @@ class OutletComponentManager
+     let parentStateRef = dynamicScope.get('outletState');
+     let currentStateRef = definition.ref;
+ 
++    // This is the actual primary responsibility of the outlet component –
++    // it represents the switching from one route component/template into
++    // the next. The rest only exists to support the debug render tree and
++    // the old-school (and unreliable) instrumentation.
+     dynamicScope.set('outletState', currentStateRef);
+ 
+     let state: OutletInstanceState = {
+-      self: createConstRef(definition.controller, 'this'),
+       finalize: _instrumentStart('render.outlet', instrumentationPayload, definition),
+     };
+ 
+     if (env.debugRenderTree !== undefined) {
+-      state.outletBucket = {};
+-
+       let parentState = valueForRef(parentStateRef);
+-      let parentOwner = parentState && parentState.render && parentState.render.owner;
+-      let currentOwner = valueForRef(currentStateRef)!.render!.owner;
++      let parentOwner = parentState?.render?.owner;
++      let currentState = valueForRef(currentStateRef);
++      let currentOwner = currentState?.render?.owner;
+ 
+       if (parentOwner && parentOwner !== currentOwner) {
+         assert(
+@@ -99,12 +100,13 @@ class OutletComponentManager
+           currentOwner instanceof EngineInstance
+         );
+ 
+-        let mountPoint = currentOwner.mountPoint;
+-
+-        state.engine = currentOwner;
++        let { mountPoint } = currentOwner;
+ 
+         if (mountPoint) {
+-          state.engineBucket = { mountPoint };
++          state.engine = {
++            mountPoint,
++            instance: currentOwner,
++          };
+         }
+       }
+     }
+@@ -112,21 +114,18 @@ class OutletComponentManager
+     return state;
+   }
+ 
+-  getDebugName({ name }: OutletDefinitionState) {
+-    return name;
++  getDebugName({ name }: OutletDefinitionState): string {
++    return `{{outlet}} for ${name}`;
+   }
+ 
+   getDebugCustomRenderTree(
+-    definition: OutletDefinitionState,
+-    state: OutletInstanceState,
+-    args: CapturedArguments
++    _definition: OutletDefinitionState,
++    state: OutletInstanceState
+   ): CustomRenderNode[] {
+     let nodes: CustomRenderNode[] = [];
+ 
+-    assert('[BUG] outletBucket must be set', state.outletBucket);
+-
+     nodes.push({
+-      bucket: state.outletBucket,
++      bucket: state,
+       type: 'outlet',
+       // "main" used to be the outlet name, keeping it around for compatibility
+       name: 'main',
+@@ -135,26 +134,17 @@ class OutletComponentManager
+       template: undefined,
+     });
+ 
+-    if (state.engineBucket) {
++    if (state.engine) {
+       nodes.push({
+-        bucket: state.engineBucket,
++        bucket: state.engine,
+         type: 'engine',
+-        name: state.engineBucket.mountPoint,
++        name: state.engine.mountPoint,
+         args: EMPTY_ARGS,
+-        instance: state.engine,
++        instance: state.engine.instance,
+         template: undefined,
+       });
+     }
+ 
+-    nodes.push({
+-      bucket: state,
+-      type: 'route-template',
+-      name: definition.name,
+-      args: args,
+-      instance: definition.controller,
+-      template: unwrapTemplate(definition.template).moduleName,
+-    });
+-
+     return nodes;
+   }
+ 
+@@ -162,8 +152,8 @@ class OutletComponentManager
+     return CAPABILITIES;
+   }
+ 
+-  getSelf({ self }: OutletInstanceState) {
+-    return self;
++  getSelf() {
++    return UNDEFINED_REFERENCE;
+   }
+ 
+   didCreate() {}
+@@ -182,30 +172,27 @@ class OutletComponentManager
+ 
+ const OUTLET_MANAGER = new OutletComponentManager();
+ 
+-export class OutletComponentDefinition
++const OUTLET_COMPONENT_TEMPLATE = precompileTemplate(
++  '<@Component @controller={{@controller}} @model={{@model}} />',
++  { strictMode: true }
++);
++
++export class OutletComponent
+   implements
+     ComponentDefinition<OutletDefinitionState, OutletInstanceState, OutletComponentManager>
+ {
+   // handle is not used by this custom definition
+   public handle = -1;
+-
+-  public resolvedName: string;
++  public resolvedName = null;
++  public manager = OUTLET_MANAGER;
++  public capabilities = CAPABILITIES_MASK;
+   public compilable: CompilableProgram;
+-  public capabilities: CapabilityMask;
+-
+-  constructor(
+-    public state: OutletDefinitionState,
+-    public manager: OutletComponentManager = OUTLET_MANAGER
+-  ) {
+-    let capabilities = manager.getCapabilities();
+-    this.capabilities = capabilityFlagsFrom(capabilities);
+-    this.compilable = capabilities.wrapped
+-      ? unwrapTemplate(state.template).asWrappedLayout()
+-      : unwrapTemplate(state.template).asLayout();
+-    this.resolvedName = state.name;
++
++  constructor(owner: InternalOwner, public state: OutletDefinitionState) {
++    this.compilable = unwrapTemplate(OUTLET_COMPONENT_TEMPLATE(owner)).asLayout();
+   }
+ }
+ 
+-export function createRootOutlet(outletView: OutletView): OutletComponentDefinition {
+-  return new OutletComponentDefinition(outletView.state);
++export function createRootOutlet(outletView: OutletView): OutletComponent {
++  return new OutletComponent(outletView.owner, outletView.state);
+ }
+diff --git a/packages/@ember/-internals/glimmer/lib/component-managers/route-template.ts b/packages/@ember/-internals/glimmer/lib/component-managers/route-template.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4277f89323dac564d563a711e8a2ab57c6b39873
+--- /dev/null
++++ b/packages/@ember/-internals/glimmer/lib/component-managers/route-template.ts
+@@ -0,0 +1,162 @@
++import type { InternalOwner } from '@ember/-internals/owner';
++import { _instrumentStart } from '@ember/instrumentation';
++import type {
++  CapturedArguments,
++  CompilableProgram,
++  ComponentDefinition,
++  CustomRenderNode,
++  Destroyable,
++  InternalComponentCapabilities,
++  Template,
++  VMArguments,
++  WithCreateInstance,
++  WithCustomDebugRenderTree,
++} from '@glimmer/interfaces';
++import type { Nullable } from '@ember/-internals/utility-types';
++import { DEBUG } from '@glimmer/env';
++import { capabilityFlagsFrom } from '@glimmer/manager';
++import type { Reference } from '@glimmer/reference';
++import { createDebugAliasRef, valueForRef } from '@glimmer/reference';
++import { curry, type CurriedValue } from '@glimmer/runtime';
++import { unwrapTemplate } from '@glimmer/util';
++import { CurriedType } from '@glimmer/vm';
++
++interface RouteTemplateInstanceState {
++  self: Reference;
++  controller: unknown;
++}
++
++export interface RouteTemplateDefinitionState {
++  name: string;
++  templateName: string;
++}
++
++const CAPABILITIES: InternalComponentCapabilities = {
++  dynamicLayout: false,
++  dynamicTag: false,
++  prepareArgs: false,
++  createArgs: true,
++  attributeHook: false,
++  elementHook: false,
++  createCaller: false,
++  dynamicScope: false,
++  updateHook: false,
++  createInstance: true,
++  wrapped: false,
++  willDestroy: false,
++  hasSubOwner: false,
++};
++
++const CAPABILITIES_MASK = capabilityFlagsFrom(CAPABILITIES);
++
++class RouteTemplateManager
++  implements
++    WithCreateInstance<RouteTemplateInstanceState, RouteTemplateDefinitionState>,
++    WithCustomDebugRenderTree<RouteTemplateInstanceState, RouteTemplateDefinitionState>
++{
++  create(
++    _owner: InternalOwner,
++    _definition: RouteTemplateDefinitionState,
++    args: VMArguments
++  ): RouteTemplateInstanceState {
++    let self = args.named.get('controller');
++
++    if (DEBUG) {
++      self = createDebugAliasRef!('this', self);
++    }
++
++    let controller = valueForRef(self);
++
++    return { self, controller };
++  }
++
++  getSelf({ self }: RouteTemplateInstanceState): Reference {
++    return self;
++  }
++
++  getDebugName({ name }: RouteTemplateDefinitionState) {
++    return `route-template (${name})`;
++  }
++
++  getDebugCustomRenderTree(
++    { name, templateName }: RouteTemplateDefinitionState,
++    state: RouteTemplateInstanceState,
++    args: CapturedArguments
++  ): CustomRenderNode[] {
++    return [
++      {
++        bucket: state,
++        type: 'route-template',
++        name,
++        args,
++        instance: state.controller,
++        template: templateName,
++      },
++    ];
++  }
++
++  getCapabilities(): InternalComponentCapabilities {
++    return CAPABILITIES;
++  }
++
++  didRenderLayout() {}
++  didUpdateLayout() {}
++
++  didCreate() {}
++  didUpdate() {}
++
++  getDestroyable(): Nullable<Destroyable> {
++    return null;
++  }
++}
++
++const ROUTE_TEMPLATE_MANAGER = new RouteTemplateManager();
++
++/**
++ * This "upgrades" a route template into a invocable component. Conceptually
++ * it can be 1:1 for each unique `Template`, but it's also cheap to construct,
++ * so unless the stability is desirable for other reasons, it's probably not
++ * worth caching this.
++ */
++export class RouteTemplate
++  implements
++    ComponentDefinition<
++      RouteTemplateDefinitionState,
++      RouteTemplateInstanceState,
++      RouteTemplateManager
++    >
++{
++  // handle is not used by this custom definition
++  public handle = -1;
++  public resolvedName: string;
++  public state: RouteTemplateDefinitionState;
++  public manager = ROUTE_TEMPLATE_MANAGER;
++  public capabilities = CAPABILITIES_MASK;
++  public compilable: CompilableProgram;
++
++  constructor(name: string, template: Template) {
++    let unwrapped = unwrapTemplate(template);
++    // TODO This actually seems inaccurate – it ultimately came from the
++    // outlet's name. Also, setting this overrides `getDebugName()` in that
++    // message. Is that desirable?
++    this.resolvedName = name;
++    this.state = { name, templateName: unwrapped.moduleName };
++    this.compilable = unwrapped.asLayout();
++  }
++}
++
++// TODO a lot these fields are copied from the adjacent existing components
++// implementation, haven't looked into who cares about `ComponentDefinition`
++// and if it is appropriate here. It seems like this version is intended to
++// be used with `curry` which probably isn't necessary here. It could be the
++// case that we just want to do something more similar to `InternalComponent`
++// (the one we used to implement `Input` and `LinkTo`). For now it follows
++// the same pattern to get things going.
++export function makeRouteTemplate(
++  owner: InternalOwner,
++  name: string,
++  template: Template
++): CurriedValue {
++  let routeTemplate = new RouteTemplate(name, template);
++  return curry(CurriedType.Component, routeTemplate, owner, null, true);
++}
+diff --git a/packages/@ember/-internals/glimmer/lib/renderer.ts b/packages/@ember/-internals/glimmer/lib/renderer.ts
+index 1c9c0e44469f25a2a35a2c546d22a55c1f615dc2..2e64e1714994f60bcf451a14131132336f5fc797 100644
+--- a/packages/@ember/-internals/glimmer/lib/renderer.ts
++++ b/packages/@ember/-internals/glimmer/lib/renderer.ts
+@@ -31,14 +31,16 @@ import { createConstRef, UNDEFINED_REFERENCE, valueForRef } from '@glimmer/refer
+ import type { CurriedValue } from '@glimmer/runtime';
+ import {
+   clientBuilder,
++  createCapturedArgs,
+   curry,
+   DOMChanges,
+   DOMTreeConstruction,
++  EMPTY_POSITIONAL,
+   inTransaction,
+   renderMain,
+   runtimeContext,
+ } from '@glimmer/runtime';
+-import { unwrapTemplate } from '@glimmer/util';
++import { dict, unwrapTemplate } from '@glimmer/util';
+ import { CURRENT_TAG, validateTag, valueForTag } from '@glimmer/validator';
+ import type { SimpleDocument, SimpleElement, SimpleNode } from '@simple-dom/interface';
+ import RSVP from 'rsvp';
+@@ -51,6 +53,7 @@ import { EmberEnvironmentDelegate } from './environment';
+ import ResolverImpl from './resolver';
+ import type { OutletState } from './utils/outlet';
+ import OutletView from './views/outlet';
++import { makeRouteTemplate } from './component-managers/route-template';
+ 
+ export type IBuilder = (env: Environment, cursor: Cursor) => ElementBuilder;
+ 
+@@ -370,10 +373,37 @@ export class Renderer {
+   // renderer HOOKS
+ 
+   appendOutletView(view: OutletView, target: SimpleElement): void {
+-    let definition = createRootOutlet(view);
++    // TODO: This bypasses the {{outlet}} syntax so logically duplicates
++    // some of the set up code. Since this is all internal (or is it?),
++    // we can refactor this to do something more direct/less convoluted
++    // and with less setup, but get it working first
++    let outlet = createRootOutlet(view);
++    let { name, /* controller, */ template } = view.state;
++
++    let named = dict<Reference>();
++
++    named['Component'] = createConstRef(
++      makeRouteTemplate(view.owner, name, template as Template),
++      '@Component'
++    );
++
++    // TODO: is this guaranteed to be undefined? It seems to be the
++    // case in the `OutletView` class. Investigate how much that class
++    // exists as an internal implementation detail only, or if it was
++    // used outside of core. As far as I can tell, test-helpers uses
++    // it but only for `setOutletState`.
++    // named['controller'] = createConstRef(controller, '@controller');
++    // Update: at least according to the debug render tree tests, we
++    // appear to always expect this to be undefined. Not a definitive
++    // source by any means, but is useful evidence
++    named['controller'] = UNDEFINED_REFERENCE;
++    named['model'] = UNDEFINED_REFERENCE;
++
++    let args = createCapturedArgs(named, EMPTY_POSITIONAL);
++
+     this._appendDefinition(
+       view,
+-      curry(CurriedType.Component, definition, view.owner, null, true),
++      curry(CurriedType.Component, outlet, view.owner, args, true),
+       target
+     );
+   }
+diff --git a/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts b/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts
+index debf7a97eb923c8da513bd9f5013ac61834d74ea..bbaedf026c181c96bb36996770bfbaf9ed89835d 100644
+--- a/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts
++++ b/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts
+@@ -1,20 +1,22 @@
+ import type { InternalOwner } from '@ember/-internals/owner';
+ import { assert } from '@ember/debug';
+ import { DEBUG } from '@glimmer/env';
+-import type { CapturedArguments, DynamicScope } from '@glimmer/interfaces';
++import type { CapturedArguments, DynamicScope, Template } from '@glimmer/interfaces';
+ import { CurriedType } from '@glimmer/vm';
+ import type { Reference } from '@glimmer/reference';
+ import {
+   childRefFromParts,
+   createComputeRef,
++  createConstRef,
+   createDebugAliasRef,
+   valueForRef,
+ } from '@glimmer/reference';
+ import type { CurriedValue } from '@glimmer/runtime';
+ import { createCapturedArgs, curry, EMPTY_POSITIONAL } from '@glimmer/runtime';
+ import { dict } from '@glimmer/util';
+-import type { OutletDefinitionState } from '../component-managers/outlet';
+-import { OutletComponentDefinition } from '../component-managers/outlet';
++import { hasInternalComponentManager } from '@glimmer/manager';
++import { OutletComponent, type OutletDefinitionState } from '../component-managers/outlet';
++import { makeRouteTemplate } from '../component-managers/route-template';
+ import { internalHelper } from '../helpers/internal-helper';
+ import type { OutletState } from '../utils/outlet';
+ 
+@@ -56,18 +58,87 @@ export const outletHelper = internalHelper(
+     });
+ 
+     let lastState: OutletDefinitionState | null = null;
+-    let definition: CurriedValue | null = null;
++    let outlet: CurriedValue | null = null;
+ 
+     return createComputeRef(() => {
+       let outletState = valueForRef(outletRef);
+       let state = stateFor(outletRef, outletState);
+ 
+-      if (!validate(state, lastState)) {
++      // This code is deliberately using the behavior in glimmer-vm where in
++      // <@Component />, the component is considered stabled via `===`, and
++      // will continue to re-render in-place as long as the `===` holds, but
++      // when it changes to a different object, it teardown the old component
++      // (running destructors, etc), and render the component in its place (or
++      // nothing if the new value is nullish. Here we are carefully exploiting
++      // that fact, and returns the same stable object so long as it is the
++      // same route, but return a different one when the route changes. On the
++      // other hand, changing the model only intentionally do not teardown the
++      // component and instead re-render in-place.
++      if (!isStable(state, lastState)) {
+         lastState = state;
+ 
+         if (state !== null) {
++          // If we are crossing an engine mount point, this is how the owner
++          // gets switched.
++          let outletOwner = outletState?.render?.owner ?? owner;
++
+           let named = dict<Reference>();
+ 
++          // Here we either have a raw template that needs to be normalized,
++          // or a component that we can render as-is. `RouteTemplate` upgrades
++          // the template into a component so we can have a unified code path.
++          // We still store the original `template` value, because we rely on
++          // its identity for the stability check, and the `RouteTemplate`
++          // wrapper doesn't dedup for us.
++          let template = state.template;
++          let component: object;
++
++          if (hasInternalComponentManager(template)) {
++            component = template;
++          } else {
++            if (DEBUG) {
++              // We don't appear to have a standard way or a brand to check, but for the
++              // purpose of avoiding obvious user errors, this probably gets you close
++              // enough.
++              let isTemplate = (template: unknown): template is Template => {
++                if (template === null || typeof template !== 'object') {
++                  return false;
++                } else {
++                  let t = template as Partial<Template>;
++                  return t.result === 'ok' || t.result === 'error';
++                }
++              };
++
++              // We made it past the `TemplateFactory` instantiation before
++              // getting here, so either we got unlucky where the invalid type
++              // happens to be a function that didn't mind taking owner as an
++              // argument, or this was directly set by something like test
++              // helpers.
++              if (!isTemplate(template)) {
++                let label: string;
++
++                try {
++                  label = `\`${String(template)}\``;
++                } catch {
++                  label = 'an unknown object';
++                }
++
++                assert(
++                  `Failed to render the \`${state.name}\` route: expected ` +
++                    `a component or Template object, but got ${label}.`
++                );
++              }
++            }
++
++            component = makeRouteTemplate(outletOwner, state.name, template as Template);
++          }
++
++          // Component is stable for the lifetime of the outlet
++          named['Component'] = createConstRef(component, '@Component');
++
++          // Controller is stable for the lifetime of the outlet
++          named['controller'] = createConstRef(state.controller, '@controller');
++
+           // Create a ref for the model
+           let modelRef = childRefFromParts(outletRef, ['render', 'model']);
+ 
+@@ -93,19 +164,21 @@ export const outletHelper = internalHelper(
+           }
+ 
+           let args = createCapturedArgs(named, EMPTY_POSITIONAL);
+-          definition = curry(
++
++          // Package up everything
++          outlet = curry(
+             CurriedType.Component,
+-            new OutletComponentDefinition(state),
+-            outletState?.render?.owner ?? owner,
++            new OutletComponent(owner, state),
++            outletOwner,
+             args,
+             true
+           );
+         } else {
+-          definition = null;
++          outlet = null;
+         }
+       }
+ 
+-      return definition;
++      return outlet;
+     });
+   }
+ );
+@@ -118,23 +191,26 @@ function stateFor(
+   let render = outlet.render;
+   if (render === undefined) return null;
+   let template = render.template;
+-  if (template === undefined) return null;
++  // The type doesn't actually allow for `null`, but if we make it past this
++  // point it is really important that we have _something_ to render. We could
++  // assert, but that is probably overly strict for very little to gain.
++  if (template === undefined || template === null) return null;
+ 
+   return {
+     ref,
+     name: render.name,
+     template,
+     controller: render.controller,
+-    model: render.model,
+   };
+ }
+ 
+-function validate(state: OutletDefinitionState | null, lastState: OutletDefinitionState | null) {
+-  if (state === null) {
+-    return lastState === null;
+-  }
+-  if (lastState === null) {
++function isStable(
++  state: OutletDefinitionState | null,
++  lastState: OutletDefinitionState | null
++): boolean {
++  if (state === null || lastState === null) {
+     return false;
+   }
++
+   return state.template === lastState.template && state.controller === lastState.controller;
+ }
+diff --git a/packages/@ember/-internals/glimmer/lib/utils/outlet.ts b/packages/@ember/-internals/glimmer/lib/utils/outlet.ts
+index 741c4a20fd79cbd915ac6ebd2bfdfb12c29a41fe..61cb1ead2567eb9d88f7083b5738a7efd8d620ae 100644
+--- a/packages/@ember/-internals/glimmer/lib/utils/outlet.ts
++++ b/packages/@ember/-internals/glimmer/lib/utils/outlet.ts
+@@ -25,9 +25,10 @@ export interface RenderState {
+   model: unknown;
+ 
+   /**
+-   * The template (the route template to use in the {{outlet}})
++   * The route's template – this is either a Template or a component, and it
++   * gets normalized during the render process.
+    */
+-  template: Template | undefined;
++  template: Template | object | undefined;
+ }
+ 
+ export interface OutletState {
+diff --git a/packages/@ember/-internals/glimmer/lib/views/outlet.ts b/packages/@ember/-internals/glimmer/lib/views/outlet.ts
+index dc97e2b627678ee00083af817175b293ca135f73..7cc9be26e739e0eeff650098396d45684906e567 100644
+--- a/packages/@ember/-internals/glimmer/lib/views/outlet.ts
++++ b/packages/@ember/-internals/glimmer/lib/views/outlet.ts
+@@ -90,7 +90,6 @@ export default class OutletView {
+       name: TOP_LEVEL_NAME,
+       template,
+       controller: undefined,
+-      model: undefined,
+     };
+   }
+ 
+diff --git a/packages/@ember/routing/route.ts b/packages/@ember/routing/route.ts
+index cfab81cfe5afa7e5c9c6d8647c7e88b4496c3d00..618b7cea1bb3f6e7ef614492e29709a5275688bd 100644
+--- a/packages/@ember/routing/route.ts
++++ b/packages/@ember/routing/route.ts
+@@ -24,6 +24,7 @@ import EngineInstance from '@ember/engine/instance';
+ import { dependentKeyCompat } from '@ember/object/compat';
+ import { once } from '@ember/runloop';
+ import { DEBUG } from '@glimmer/env';
++import { hasInternalComponentManager } from '@glimmer/manager';
+ import type { RenderState } from '@ember/-internals/glimmer';
+ import type { TemplateFactory } from '@glimmer/interfaces';
+ import type { InternalRouteInfo, Route as IRoute, Transition, TransitionState } from 'router_js';
+@@ -1836,21 +1837,73 @@ function buildRenderState(route: Route): RenderState {
+ 
+   let model = route.currentModel;
+ 
+-  let template = owner.lookup(`template:${route.templateName || name}`) as
++  let templateFactoryOrComponent = owner.lookup(`template:${route.templateName || name}`) as
+     | TemplateFactory
++    | object // This is meant to be a component
+     | undefined;
+ 
++  // Now we support either a component or a template to be returned by this
++  // resolver call, but if it's a `TemplateFactory`, we need to instantiate
++  // it into a `Template`, since that's what `RenderState` wants. We can't
++  // easily change it, it's intimate API used by @ember/test-helpers and the
++  // like. We could compatibly allow `Template` | `TemplateFactory`, and that's
++  // what it used to do but we _just_ went through deprecations to get that
++  // removed. It's also not ideal since once you mix the two types, they are
++  // not exactly easy to tell apart.
++  //
++  // It may also be tempting to just normalize `Template` into `RouteTemplate`
++  // here, and we could. However, this is not the only entrypoint where this
++  // `RenderState` is made – @ember/test-helpers punches through an impressive
++  // amount of private API to set it directly, and this feature would also be
++  // useful for them. So, even if we had normalized here, we'd still have to
++  // check and do that again during render anyway.
++  let template: object;
++
++  if (templateFactoryOrComponent) {
++    if (hasInternalComponentManager(templateFactoryOrComponent)) {
++      template = templateFactoryOrComponent;
++    } else {
++      if (DEBUG && typeof templateFactoryOrComponent !== 'function') {
++        let label: string;
++
++        try {
++          label = `\`${String(templateFactoryOrComponent)}\``;
++        } catch {
++          label = 'an unknown object';
++        }
++
++        assert(
++          `Failed to render the ${name} route, expected ` +
++            `\`template:${route.templateName || name}\` to resolve into ` +
++            `a component or a \`TemplateFactory\`, got: ${label}. ` +
++            `Most likely an improperly defined class or an invalid module export.`
++        );
++      }
++
++      template = (templateFactoryOrComponent as TemplateFactory)(owner);
++    }
++  } else {
++    // default `{{outlet}}`
++    template = route._topLevelViewTemplate(owner);
++  }
++
+   let render: RenderState = {
+     owner,
+     name,
+     controller,
+     model,
+-    template: template?.(owner) ?? route._topLevelViewTemplate(owner),
++    template,
+   };
+ 
+   if (DEBUG) {
+     let LOG_VIEW_LOOKUPS = get(route._router, 'namespace.LOG_VIEW_LOOKUPS');
+-    if (LOG_VIEW_LOOKUPS && !template) {
++    // This is covered by tests and the existing code was deliberately
++    // targeting the value prior to normalization, but is this message actually
++    // accurate? It seems like we will always default the `{{outlet}}` template
++    // so I'm not sure about "Nothing will be rendered?" (who consumes these
++    // logs anyway? as lookups happen more infrequently now I doubt this is all
++    // that useful)
++    if (LOG_VIEW_LOOKUPS && !templateFactoryOrComponent) {
+       info(`Could not find "${name}" template. Nothing will be rendered`, {
+         fullName: `template:${name}`,
+       });

@@ -1,0 +1,334 @@
+diff --git a/app/assets/stylesheets/errbit.css.erb b/app/assets/stylesheets/errbit.css.erb
+index 0688503..9930be2 100644
+--- a/app/assets/stylesheets/errbit.css.erb
++++ b/app/assets/stylesheets/errbit.css.erb
+@@ -540,8 +540,8 @@ a.button.active {
+   display: inline-block;
+ }
+ 
+-/* Watchers / Issue Tracker / Notification Forms */
+-div.watcher.nested .watcher_params, div.issue_tracker.nested .tracker_params, div.notification_service.nested .notification_params {
++/* Issue Tracker / Notification Forms */
++div.issue_tracker.nested .tracker_params, div.notification_service.nested .notification_params {
+   display: none;
+ }
+ 
+diff --git a/app/controllers/application_controller.rb b/app/controllers/application_controller.rb
+index c50e060..f4bc107 100644
+--- a/app/controllers/application_controller.rb
++++ b/app/controllers/application_controller.rb
+@@ -1,16 +1,9 @@
+ class ApplicationController < ActionController::Base
+   protect_from_forgery
+ 
+-  before_filter :authenticate_user_from_token!
+-  before_filter :authenticate_user!
+-  before_filter :set_time_zone
+-
+-  # Devise override - After login, if there is only one app,
+-  # redirect to that app's path instead of the root path (apps#index).
+-  def stored_location_for(resource)
+-    location = super || root_path
+-    (location == root_path && current_user.apps.count == 1) ? app_path(current_user.apps.first) : location
+-  end
++  before_action :authenticate_user_from_token!
++  before_action :authenticate_user!
++  before_action :set_time_zone
+ 
+   rescue_from ActionController::RedirectBackError, :with => :redirect_to_root
+ 
+diff --git a/app/controllers/apps_controller.rb b/app/controllers/apps_controller.rb
+index beeea5e..1acc3f5 100644
+--- a/app/controllers/apps_controller.rb
++++ b/app/controllers/apps_controller.rb
+@@ -7,12 +7,10 @@ class AppsController < ApplicationController
+   before_action :parse_notice_at_notices_or_set_default, :only => [:create, :update]
+   respond_to :html
+ 
+-  expose(:app_scope) {
+-    (current_user.admin? ? App : current_user.apps)
+-  }
++  expose(:app_scope) { App }
+ 
+   expose(:apps) {
+-    app_scope.all.sort.map { |app| AppDecorator.new(app) }
++    app_scope.asc(:name).map { |app| AppDecorator.new(app) }
+   }
+ 
+   expose(:app, ancestor: :app_scope, attributes: :app_params)
+diff --git a/app/controllers/comments_controller.rb b/app/controllers/comments_controller.rb
+index 01cd064..4572599 100644
+--- a/app/controllers/comments_controller.rb
++++ b/app/controllers/comments_controller.rb
+@@ -1,6 +1,6 @@
+ class CommentsController < ApplicationController
+-  before_filter :find_app
+-  before_filter :find_problem
++  before_action :find_app
++  before_action :find_problem
+ 
+   def create
+     @comment = Comment.new(comment_params.merge(:user_id => current_user.id))
+@@ -27,10 +27,6 @@ class CommentsController < ApplicationController
+   protected
+     def find_app
+       @app = App.find(params[:app_id])
+-
+-      # Mongoid Bug: could not chain: current_user.apps.find_by_id!
+-      # apparently finding by 'watchers.email' and 'id' is broken
+-      raise(Mongoid::Errors::DocumentNotFound.new(App,@app.id)) unless current_user.admin? || current_user.watching?(@app)
+     end
+ 
+     def find_problem
+diff --git a/app/controllers/deploys_controller.rb b/app/controllers/deploys_controller.rb
+index 4490a07..da8d9d3 100644
+--- a/app/controllers/deploys_controller.rb
++++ b/app/controllers/deploys_controller.rb
+@@ -2,8 +2,8 @@ class DeploysController < ApplicationController
+ 
+   protect_from_forgery :except => :create
+ 
+-  skip_before_filter :verify_authenticity_token, :only => :create
+-  skip_before_filter :authenticate_user!, :only => :create
++  skip_before_action :verify_authenticity_token, :only => :create
++  skip_before_action :authenticate_user!, :only => :create
+ 
+   def create
+     @app = App.find_by_api_key!(params[:api_key])
+@@ -12,13 +12,9 @@ class DeploysController < ApplicationController
+   end
+ 
+   def index
+-    # See AppsController#find_app for the reasoning behind this code.
+-    app = App.find(params[:app_id])
+-    raise Mongoid::Errors::DocumentNotFound.new(App, app.id) unless current_user.admin? || current_user.watching?(app)
+-
+-    @deploys = Kaminari.paginate_array(app.deploys.order_by(:created_at.desc)).
++    @app = App.find(params[:app_id])
++    @deploys = Kaminari.paginate_array(@app.deploys.order_by(:created_at.desc)).
+       page(params[:page]).per(10)
+-    @app = app
+   end
+ 
+   private
+diff --git a/app/controllers/problems_controller.rb b/app/controllers/problems_controller.rb
+index 866bb34..71b77fd 100644
+--- a/app/controllers/problems_controller.rb
++++ b/app/controllers/problems_controller.rb
+@@ -13,8 +13,7 @@ class ProblemsController < ApplicationController
+   ]
+ 
+   expose(:app_scope) {
+-    apps = current_user.admin? ? App.all : current_user.apps
+-    params[:app_id] ? apps.where(:_id => params[:app_id]) : apps
++    params[:app_id] ? App.where(:_id => params[:app_id]) : App.all
+   }
+ 
+   expose(:app) {
+@@ -34,11 +33,11 @@ class ProblemsController < ApplicationController
+   }
+ 
+   expose(:problems) {
+-    pro = Problem.for_apps(
+-      app_scope
+-    ).in_env(
+-      params_environement
+-    ).all_else_unresolved(all_errs).ordered_by(params_sort, params_order)
++    pro = Problem
++      .for_apps(app_scope)
++      .in_env(params_environement)
++      .all_else_unresolved(all_errs)
++      .ordered_by(params_sort, params_order)
+ 
+     if request.format == :html
+       pro.page(params[:page]).per(current_user.per_page)
+diff --git a/app/controllers/watchers_controller.rb b/app/controllers/watchers_controller.rb
+index 63c8d43..3fb8f32 100644
+--- a/app/controllers/watchers_controller.rb
++++ b/app/controllers/watchers_controller.rb
+@@ -5,23 +5,16 @@ class WatchersController < ApplicationController
+     App.find(params[:app_id])
+   end
+ 
+-  expose(:watcher) do
+-    app.watchers.where(:user_id => params[:id]).first
+-  end
+-
+-  before_filter :require_watcher_edit_priviledges, :only => [:destroy]
+-
+   def destroy
++    watcher = app.watchers.where(:user_id => params[:id]).first
+     app.watchers.delete(watcher)
+-    flash[:success] = "That's sad. #{watcher.label} is no longer watcher."
+-    redirect_to root_path
++    flash[:success] = t('.success', app: app.name)
++    redirect_to app_path(app)
+   end
+ 
+-  private
+-
+-  def require_watcher_edit_priviledges
+-    redirect_to(root_path) unless current_user == watcher.user || current_user.admin?
++  def update
++    app.watchers.create(user_id: current_user.id)
++    flash[:success] = t('.success', app: app.name)
++    redirect_to app_path(app)
+   end
+-
+ end
+-
+diff --git a/app/interactors/user_destroy.rb b/app/interactors/user_destroy.rb
+index 8453962..ba99655 100644
+--- a/app/interactors/user_destroy.rb
++++ b/app/interactors/user_destroy.rb
+@@ -4,8 +4,11 @@ class UserDestroy
+   end
+ 
+   def destroy
++    App.watched_by(@user).each do |app|
++      watcher = app.watchers.where(user_id: @user.id).first
++      app.watchers.delete(watcher)
++    end
++
+     @user.destroy
+-    @user.watchers.each(&:destroy)
+   end
+-
+ end
+diff --git a/app/models/app.rb b/app/models/app.rb
+index 0ff1203..c581ba1 100644
+--- a/app/models/app.rb
++++ b/app/models/app.rb
+@@ -23,7 +23,6 @@ class App
+     pre_processed: true,
+     default: ->{ BSON::ObjectId.new.to_s }
+ 
+-
+   embeds_many :watchers
+   embeds_many :deploys
+   embeds_one :issue_tracker, :class_name => 'IssueTracker'
+@@ -48,6 +47,14 @@ class App
+   accepts_nested_attributes_for :notification_service, :allow_destroy => true,
+     :reject_if => proc { |attrs| !NotificationService.subclasses.map(&:to_s).include?(attrs[:type].to_s) }
+ 
++  scope :watched_by, ->(user) do
++    where watchers: { "$elemMatch" => { "user_id" => user.id } }
++  end
++
++  def watched_by?(user)
++    watchers.pluck("user_id").include? user.id
++  end
++
+   # Acceps a hash with the following attributes:
+   #
+   # * <tt>:error_class</tt> - the class of error (required to create a new Problem)
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 15d8de1..5ff7273 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -41,17 +41,11 @@ class User
+   validates_presence_of :name
+   validates_uniqueness_of :github_login, :allow_nil => true
+ 
+-  has_many :apps, :foreign_key => 'watchers.user_id'
+-
+   if Errbit::Config.user_has_username
+     field :username
+     validates_presence_of :username
+   end
+ 
+-  def watchers
+-    apps.map(&:watchers).flatten.select {|w| w.user_id.to_s == id.to_s}
+-  end
+-
+   def per_page
+     super || PER_PAGE
+   end
+diff --git a/app/views/apps/_fields.html.haml b/app/views/apps/_fields.html.haml
+index 0d43a25..d44de9b 100644
+--- a/app/views/apps/_fields.html.haml
++++ b/app/views/apps/_fields.html.haml
+@@ -44,21 +44,6 @@
+   = f.check_box :notify_all_users
+   = f.label :notify_all_users, 'Send notifications to all users'
+ 
+-
+-%fieldset.watchers.nested-wrapper{:style => app_decorate.notify_user_display}
+-  %legend Watchers
+-  = f.fields_for :watchers do |w|
+-    %div.watcher.nested
+-      %div.choose
+-        = w.radio_button :watcher_type, :user
+-        = w.label :watcher_type_user, 'User'
+-        = w.radio_button :watcher_type, :email
+-        = label_tag :watcher_type_email, 'Email Address', :for => label_for_attr(w, 'watcher_type_email')
+-      %div.watcher_params.user{:class => w.object.email.blank? ? 'chosen' : nil}
+-        = w.select :user_id, users.map{|u| [u.name,u.id.to_s]}, :include_blank => '-- Select a User --'
+-      %div.watcher_params.email{:class => w.object.email.present? ? 'chosen' : nil}
+-        = w.text_field :email
+-
+ %div.checkbox
+   = f.check_box :resolve_errs_on_deploy
+   = f.label :resolve_errs_on_deploy, 'Resolve errs on deploy'
+diff --git a/app/views/apps/show.html.haml b/app/views/apps/show.html.haml
+index 850332d..afdd893 100644
+--- a/app/views/apps/show.html.haml
++++ b/app/views/apps/show.html.haml
+@@ -19,8 +19,11 @@
+   - else
+     = link_to t('.all_errs'), app_path(app, :all_errs => true), :class => 'button'
+ 
+-  - if current_user.watching?(app)
+-    = link_to t('.unwatch'),  app_watcher_path({:app_id => app, :id => current_user.id}), :method => :delete, :class => 'button', :confirm => t('.are_you_sure')
++  - if app.watched_by?(current_user)
++    = link_to t('.unwatch'), app_watcher_path(app_id: app, id: current_user.id), method: :delete, class: 'button'
++  - else
++    = link_to t('.watch'), app_watcher_path(app_id: app, id: current_user.id), method: :put, class: 'button'
++
+ %h3#watchers_toggle
+   =t('.watchers')
+   %span.click_span=t('.show_hide')
+diff --git a/config/locales/en.yml b/config/locales/en.yml
+index a7fa455..803ec19 100644
+--- a/config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -124,6 +124,7 @@ en:
+       unresolved_errs: unresolved errors
+       unwatch: unwatch
+       user_or_email: User or Email
++      watch: watch
+       watchers: Watchers
+       when:  When
+       who: Who
+@@ -139,4 +140,8 @@ en:
+       cancel: 'cancel'
+       seriously: 'Seriously?'
+       update: 'Update App'
+-
++  watchers:
++    destroy:
++      success: "You are no longer watching %{app}"
++    update:
++      success: "You are now watching %{app}"
+diff --git a/config/routes.rb b/config/routes.rb
+index fcf1e3d..63c58b0 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -42,7 +42,7 @@ Rails.application.routes.draw do
+       end
+     end
+     resources :deploys, :only => [:index]
+-    resources :watchers, :only => [:destroy]
++    resources :watchers, :only => [:destroy, :update]
+     member do
+       post :regenerate_api_key
+     end
+@@ -60,7 +60,7 @@ Rails.application.routes.draw do
+     end
+   end
+ 
+-  match '/api/v3/projects/:project_id/notices' => 'api/v3/notices#create', via: [:post, :options]
++  match '/api/v3/projects/:project_id/create-notice' => 'api/v3/notices#create', via: [:post]
+ 
+   root :to => 'apps#index'
+ end

@@ -1,0 +1,57 @@
+diff --git a/app/controllers/concerns/log_events.rb b/app/controllers/concerns/log_events.rb
+index a4c1dced..1aa004cf 100644
+--- a/app/controllers/concerns/log_events.rb
++++ b/app/controllers/concerns/log_events.rb
+@@ -38,7 +38,7 @@ module LogEvents
+   def log_event(push, kind)
+     return if audit_log_limit_reached?(push.audit_logs)
+ 
+-    ip = request.env["HTTP_X_FORWARDED_FOR"].blank? ? request.env["REMOTE_ADDR"] : request.env["HTTP_X_FORWARDED_FOR"]
++    ip = request.remote_ip
+ 
+     # Limit retrieved values to 256 characters
+     user_agent = request.env["HTTP_USER_AGENT"].to_s[0, 255]
+diff --git a/test/controllers/concerns/log_events_test.rb b/test/controllers/concerns/log_events_test.rb
+index 970a6909..2b5ba953 100644
+--- a/test/controllers/concerns/log_events_test.rb
++++ b/test/controllers/concerns/log_events_test.rb
+@@ -196,14 +196,29 @@ class LogEventsTest < ActionController::TestCase
+   end
+ 
+   # Test log_event method - IP address handling
+-  test "log_event uses HTTP_X_FORWARDED_FOR when present" do
++  test "log_event ignores spoofed X-Forwarded-For from untrusted clients" do
+     @request.env["HTTP_X_FORWARDED_FOR"] = "203.0.113.50, 192.168.1.1"
++    @request.env["REMOTE_ADDR"] = "203.0.113.99"
++
++    @controller.log_view(@push)
++
++    log = AuditLog.last
++    assert_equal "203.0.113.99", log.ip
++  end
++
++  test "log_event uses client IP from X-Forwarded-For when REMOTE_ADDR is a trusted proxy" do
++    original_trusted_proxies = Rails.application.config.action_dispatch.trusted_proxies
++    Rails.application.config.action_dispatch.trusted_proxies = [IPAddr.new("10.0.0.0/8")]
++
++    @request.env["HTTP_X_FORWARDED_FOR"] = "203.0.113.50, 10.0.0.1"
+     @request.env["REMOTE_ADDR"] = "10.0.0.1"
+ 
+     @controller.log_view(@push)
+ 
+     log = AuditLog.last
+-    assert_equal "203.0.113.50, 192.168.1.1", log.ip
++    assert_equal "203.0.113.50", log.ip
++  ensure
++    Rails.application.config.action_dispatch.trusted_proxies = original_trusted_proxies
+   end
+ 
+   test "log_event uses REMOTE_ADDR when HTTP_X_FORWARDED_FOR is nil" do
+@@ -222,7 +237,6 @@ class LogEventsTest < ActionController::TestCase
+     @controller.log_view(@push)
+ 
+     log = AuditLog.last
+-    # Now correctly falls back to REMOTE_ADDR when HTTP_X_FORWARDED_FOR is empty
+     assert_equal "10.0.0.3", log.ip
+   end
+ 

@@ -1,0 +1,448 @@
+diff --git a/db/migrate/20110422152027_move_notices_to_separate_collection.rb b/db/migrate/20110422152027_move_notices_to_separate_collection.rb
+deleted file mode 100644
+index f7aacfd..0000000
+--- a/db/migrate/20110422152027_move_notices_to_separate_collection.rb
++++ /dev/null
+@@ -1,38 +0,0 @@
+-class MoveNoticesToSeparateCollection < Mongoid::Migration
+-  def self.up
+-    errs_coll = connection["errs"]
+-
+-    # copy embedded Notices into a separate collection
+-    errs = errs_coll.find.select(notices: 1)
+-    errs.each do |err|
+-      next unless err['notices']
+-
+-      # This Err was created after the Problem->Err->Notice redesign
+-      next if err['app_id'].nil? or err['problem_id']
+-
+-      e = Err.find(err['_id'])
+-      # disable email notifications
+-      old_notify = e.app.notify_on_errs?
+-      e.app.update_attribute(:notify_on_errs, false)
+-      puts "Copying notices for Err #{err['_id']}"
+-      err['notices'].each do |notice|
+-        e.notices.create!(notice)
+-      end
+-      e.app.update_attribute(:notify_on_errs, old_notify)
+-      errs_coll.find({ "_id" => err['_id']}).update({ "$unset" => { "notices" => 1}})
+-    end
+-    (
+-      Problem.where(:environment => '') |
+-      Problem.where(:environment => nil) |
+-      Problem.where(:environment => {})
+-    ).each {|pr|
+-      pr.update_attributes(:environment => 'old')
+-    }
+-    Rake::Task["errbit:db:update_notices_count"].invoke
+-    Rake::Task["errbit:db:update_problem_attrs"].invoke
+-  end
+-
+-  def self.down
+-  end
+-end
+-
+diff --git a/db/migrate/20110812135951_move_issue_trackers_to_sti.rb b/db/migrate/20110812135951_move_issue_trackers_to_sti.rb
+deleted file mode 100644
+index 3c042b3..0000000
+--- a/db/migrate/20110812135951_move_issue_trackers_to_sti.rb
++++ /dev/null
+@@ -1,36 +0,0 @@
+-class MoveIssueTrackersToSti < Mongoid::Migration
+-  def self.up
+-    App.all.each do |app|
+-      # Update all embedded issue trackers to use STI patterns.
+-      # All issue trackers now subclass the IssueTracker model,
+-      # and their class is stored in the '_type' field, which is
+-      # also aliased to 'type'.
+-      tracker = app.attributes['issue_tracker']
+-      if tracker && tracker['issue_tracker_type']
+-        tracker['_type'] = case tracker['issue_tracker_type']
+-        when 'lighthouseapp'; "IssueTrackers::LighthouseTracker"
+-        when 'redmine'; "IssueTrackers::RedmineTracker"
+-        when 'pivotal'; "IssueTrackers::PivotalLabsTracker"
+-        when 'fogbugz'; "IssueTrackers::FogbugzTracker"
+-        when 'mingle'; "IssueTrackers::MingleTracker"
+-        else; nil
+-        end
+-
+-        if tracker['issue_tracker_type'] == "none"
+-          App.collection.where({ _id: app.id }).update({
+-            "$unset" => { :issue_tracker => 1 }
+-          })
+-        else
+-          tracker.delete('issue_tracker_type')
+-          App.collection.where({ _id: app.id }).update({
+-            "$set" => { :issue_tracker => tracker }
+-          })
+-        end
+-      end
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+-
+diff --git a/db/migrate/20110905134638_link_errs_to_problems.rb b/db/migrate/20110905134638_link_errs_to_problems.rb
+deleted file mode 100644
+index 74f2384..0000000
+--- a/db/migrate/20110905134638_link_errs_to_problems.rb
++++ /dev/null
+@@ -1,33 +0,0 @@
+-class LinkErrsToProblems < Mongoid::Migration
+-  def self.up
+-    puts "== Migrating from Errs to Problems..."
+-
+-    puts "==== Copy err.klass to notice.klass..."
+-    Notice.all.each do |notice|
+-      if notice.err && (klass = notice.err['klass'])
+-        notice.update_attribute(:klass, klass)
+-      end
+-    end
+-
+-    puts "==== Create a Problem for each Err..."
+-    Err.all.each do |err|
+-      if err['app_id'] && app = App.where(:_id => err['app_id']).first
+-        err.problem = app.problems.create(:_id => err.id)
+-        err.problem.resolve! if err.resolved
+-        # don't bother checking err for issue link, if it ain't got one the NoMethodError
+-        # is raised, else this works fine.
+-        err.problem.update_attribute(:issue_link, err.issue_link) rescue NoMethodError
+-        err.save
+-      end
+-    end
+-
+-    puts "==== Updating problem cached attributes..."
+-    Rake::Task["errbit:db:update_problem_attrs"].invoke
+-    puts "==== Updating notice counts..."
+-    Rake::Task["errbit:db:update_notices_count"].invoke
+-  end
+-
+-  def self.down
+-  end
+-end
+-
+diff --git a/db/migrate/20111019163257_add_problem_comments_count.rb b/db/migrate/20111019163257_add_problem_comments_count.rb
+deleted file mode 100644
+index 6c3f190..0000000
+--- a/db/migrate/20111019163257_add_problem_comments_count.rb
++++ /dev/null
+@@ -1,10 +0,0 @@
+-class AddProblemCommentsCount < Mongoid::Migration
+-  def self.up
+-    Problem.all.each do |problem|
+-      problem.update_attributes(:comments_count => problem.comments.count)
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20111102173347_cache_problem_statistics_fix.rb b/db/migrate/20111102173347_cache_problem_statistics_fix.rb
+deleted file mode 100644
+index 1f2b19b..0000000
+--- a/db/migrate/20111102173347_cache_problem_statistics_fix.rb
++++ /dev/null
+@@ -1,33 +0,0 @@
+-class CacheProblemStatisticsFix < Mongoid::Migration
+-  def self.up
+-    Problem.all.each do |problem|
+-      messages = {}
+-      hosts = {}
+-      user_agents = {}
+-      problem.notices.each do |notice|
+-      	messages    = count_attribute(messages, notice.message)
+-        hosts       = count_attribute(hosts, notice.host)
+-        user_agents = count_attribute(user_agents, notice.user_agent_string)
+-      end
+-      problem.update_attributes(:messages => messages, :hosts => hosts, :user_agents => user_agents)
+-    end
+-  end
+-
+-  def self.down
+-    Problem.all.each do |problem|
+-      problem.update_attributes(:messages => {}, :hosts => {}, :user_agents => {})
+-    end
+-  end
+-
+-  private
+-    def self.count_attribute(counter, value)
+-      index = Digest::MD5.hexdigest(value.to_s)
+-      if counter[index].nil?
+-        counter[index] = {'value' => value, 'count' => 1}
+-      else
+-        counter[index]['count'] += 1
+-      end
+-  	  counter
+-  	end
+-
+-end
+diff --git a/db/migrate/20120530005915_rename_klass_to_error_class.rb b/db/migrate/20120530005915_rename_klass_to_error_class.rb
+deleted file mode 100644
+index e752b35..0000000
+--- a/db/migrate/20120530005915_rename_klass_to_error_class.rb
++++ /dev/null
+@@ -1,13 +0,0 @@
+-class RenameKlassToErrorClass < Mongoid::Migration
+-  def self.up
+-    [Problem, Err, Notice].each do |model|
+-      model.collection.find.update({'$rename' => {'klass' => 'error_class'}}, :multi => true, :safe => true)
+-    end
+-  end
+-
+-  def self.down
+-    [Problem, Err, Notice].each do |model|
+-      model.collection.find.update({'$rename' => {'error_class' => 'klass'}}, :multi => true, :safe => true)
+-    end
+-  end
+-end
+diff --git a/db/migrate/20120603112130_change_github_url_to_github_repo.rb b/db/migrate/20120603112130_change_github_url_to_github_repo.rb
+deleted file mode 100644
+index c2ce2a4..0000000
+--- a/db/migrate/20120603112130_change_github_url_to_github_repo.rb
++++ /dev/null
+@@ -1,30 +0,0 @@
+-class ChangeGithubUrlToGithubRepo < Mongoid::Migration
+-  def self.normalize_github_repo(repo)
+-    return if repo.blank?
+-    github_host = URI.parse(Errbit::Config.github_url).host
+-    github_host = Regexp.escape(github_host)
+-    repo.strip!
+-    repo.sub!(/(git@|https?:\/\/)#{github_host}(\/|:)/, '')
+-    repo.sub!(/\.git$/, '')
+-    repo
+-  end
+-
+-  def self.up
+-    App.collection.find.update({'$rename' => {'github_url' => 'github_repo'}}, :multi => true, :safe => true)
+-    App.all.each do |app|
+-      normalized_repo = self.normalize_github_repo(app.attributes['github_repo'])
+-      App.collection.where({ _id: app.id }).update({
+-        "$set" => { :github_repo =>  normalized_repo }
+-      })
+-    end
+-  end
+-
+-  def self.down
+-    App.collection.find.update({'$rename' => {'github_repo' => 'github_url'}}, :multi => true, :safe => true)
+-    App.all.each do |app|
+-      unless app.github_repo.include?("github.com")
+-        app.update_attribute :github_url, "https://github.com/" << app.github_url
+-      end
+-    end
+-  end
+-end
+diff --git a/db/migrate/20120605091105_set_issue_type_on_problems.rb b/db/migrate/20120605091105_set_issue_type_on_problems.rb
+deleted file mode 100644
+index 0d206c2..0000000
+--- a/db/migrate/20120605091105_set_issue_type_on_problems.rb
++++ /dev/null
+@@ -1,12 +0,0 @@
+-class SetIssueTypeOnProblems < Mongoid::Migration
+-  def self.up
+-    Problem.all.each do |p|
+-      if p.issue_link.present? && p.app.issue_tracker_configured?
+-        p.update_attribute :issue_type, p.app.issue_tracker.label
+-      end
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20120822195841_set_first_notice_at_on_problems.rb b/db/migrate/20120822195841_set_first_notice_at_on_problems.rb
+deleted file mode 100644
+index 5c19c2c..0000000
+--- a/db/migrate/20120822195841_set_first_notice_at_on_problems.rb
++++ /dev/null
+@@ -1,10 +0,0 @@
+-class SetFirstNoticeAtOnProblems < Mongoid::Migration
+-  def self.up
+-    Problem.all.each do |problem|
+-      problem.update_attribute :first_notice_at, problem.notices.order_by([:created_at, :asc]).first.try(:created_at)
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20120829034812_ensure_that_problems_last_notice_at_is_not_nil.rb b/db/migrate/20120829034812_ensure_that_problems_last_notice_at_is_not_nil.rb
+deleted file mode 100644
+index df64baf..0000000
+--- a/db/migrate/20120829034812_ensure_that_problems_last_notice_at_is_not_nil.rb
++++ /dev/null
+@@ -1,23 +0,0 @@
+-class EnsureThatProblemsLastNoticeAtIsNotNil < Mongoid::Migration
+-  def self.up
+-    Problem.where("$or" => [{:last_notice_at => nil}, {:first_notice_at => nil}]).each do |problem|
+-      first_notice = problem.notices.order_by([:created_at, :asc]).first
+-
+-      # Destroy problems with no notices
+-      if first_notice.nil?
+-        problem.destroy
+-        next
+-      end
+-
+-      last_notice = problem.notices.order_by([:created_at, :asc]).last
+-
+-      problem.update_attributes!({
+-        :first_notice_at => first_notice.created_at,
+-        :last_notice_at => last_notice.created_at
+-      })
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20121003223358_extract_backtraces.rb b/db/migrate/20121003223358_extract_backtraces.rb
+deleted file mode 100644
+index f518cf2..0000000
+--- a/db/migrate/20121003223358_extract_backtraces.rb
++++ /dev/null
+@@ -1,16 +0,0 @@
+-class ExtractBacktraces < Mongoid::Migration
+-  def self.up
+-    say "It could take long time (hours if you have many Notices)"
+-    Notice.unscoped.where(backtrace_id: nil).each do |notice|
+-      next if notice.backtrace.present? || notice['backtrace'].nil?
+-      backtrace = Backtrace.find_or_create(:raw => notice['backtrace'] || [])
+-      notice.unset(:backtrace)
+-      notice.backtrace = backtrace
+-      notice.save!
+-    end
+-    say "run `db.repairDatabase()` (in mongodb console) to recover deleted space"
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20121005142110_regenerate_err_fingerprints.rb b/db/migrate/20121005142110_regenerate_err_fingerprints.rb
+deleted file mode 100644
+index 424a80b..0000000
+--- a/db/migrate/20121005142110_regenerate_err_fingerprints.rb
++++ /dev/null
+@@ -1,15 +0,0 @@
+-class RegenerateErrFingerprints < Mongoid::Migration
+-  def self.up
+-    Err.all.each do |err|
+-      if err.notices.any? && err.problem
+-        err.update_attribute(
+-          :fingerprint,
+-          Fingerprint.generate(err.notices.first, err.app.api_key)
+-        )
+-      end
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20130208135718_allow_custom_xmpp_on_gtalk.rb.rb b/db/migrate/20130208135718_allow_custom_xmpp_on_gtalk.rb.rb
+deleted file mode 100644
+index 2d2a36b..0000000
+--- a/db/migrate/20130208135718_allow_custom_xmpp_on_gtalk.rb.rb
++++ /dev/null
+@@ -1,17 +0,0 @@
+-class AllowCustomXmppOnGtalk < Mongoid::Migration
+-  def self.up
+-    App.all.each do |app|
+-      if app.notification_service and app.notification_service._type.include?("Gtalk")
+-        user_id = app.notification_service.room_id
+-        app.notification_service.update_attributes(:service => 'talk.google.com',
+-                                                   :service_url => "http://www.google.com/talk/",
+-                                                   :user_id => user_id,
+-                                                   :room_id => nil)
+-                                                   
+-      end
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20130212112719_add_interval_field_for_notifications.rb b/db/migrate/20130212112719_add_interval_field_for_notifications.rb
+deleted file mode 100644
+index f2512e5..0000000
+--- a/db/migrate/20130212112719_add_interval_field_for_notifications.rb
++++ /dev/null
+@@ -1,12 +0,0 @@
+-class AddIntervalFieldForNotifications < Mongoid::Migration
+-  def self.up
+-    App.all.each do |app|
+-      if app.notification_service
+-        app.notification_service.update_attributes(:notify_at_notices => [0])
+-      end
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20131011155638_extract_issue_tracker.rb b/db/migrate/20131011155638_extract_issue_tracker.rb
+deleted file mode 100644
+index e5503b9..0000000
+--- a/db/migrate/20131011155638_extract_issue_tracker.rb
++++ /dev/null
+@@ -1,48 +0,0 @@
+-class ExtractIssueTracker < Mongoid::Migration
+-
+-  TRACKER_MAPPING = {
+-    'ErrbitTracPlugin::IssueTracker' => 'trac',
+-    'IssueTrackers::BitbucketIssuesTracker' => 'bitbucket',
+-    'IssueTrackers::FogbugzTracker' => 'fogbugz',
+-    'IssueTrackers::GithubIssuesTracker' => 'github',
+-    'IssueTrackers::GitlabTracker' => 'gitlab',
+-    'IssueTrackers::JiraTracker' => 'jira',
+-    'IssueTrackers::LighthouseTracker' => 'lighthouse',
+-    'IssueTrackers::PivotalLabsTracker' => 'pivotal',
+-    'IssueTrackers::RedmineTracker' => 'redmine',
+-    'IssueTrackers::UnfuddleTracker' => 'unfuddle'
+-  }
+-
+-  def self.up
+-    App.all.each do |app|
+-      require 'pry'
+-      binding.pry
+-      next unless app.attributes['issue_tracker'].present?
+-      next unless app.attributes['issue_tracker']['_type'].present?
+-
+-      options = app['issue_tracker'].dup
+-      options.delete('_type')
+-      options.delete('_id')
+-
+-      _type = app.attributes['issue_tracker']['_type']
+-      updated_at = options.delete('updated_at')
+-      created_at = options.delete('created_at')
+-
+-      if TRACKER_MAPPING.include?(_type)
+-        tracker = {
+-          'type_tracker' => TRACKER_MAPPING[_type],
+-          'options' => options,
+-          'updated_at' => updated_at,
+-          'created_at' => created_at
+-        }
+-
+-        App.collection.where({ _id: app.id }).update({
+-          "$set" => { :issue_tracker => tracker }
+-        })
+-      end
+-    end
+-  end
+-
+-  def self.down
+-  end
+-end
+diff --git a/db/migrate/20131206152837_add_min_app_version_to_apps.rb b/db/migrate/20131206152837_add_min_app_version_to_apps.rb
+deleted file mode 100644
+index 7ca74f5..0000000
+--- a/db/migrate/20131206152837_add_min_app_version_to_apps.rb
++++ /dev/null
+@@ -1,5 +0,0 @@
+-class AddMinAppVersionToApps < Mongoid::Migration
+-  def change
+-    add_column :apps, :current_app_version, :string
+-  end
+-end
+\ No newline at end of file

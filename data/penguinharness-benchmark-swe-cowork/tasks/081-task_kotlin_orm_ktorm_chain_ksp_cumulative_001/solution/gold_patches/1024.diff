@@ -1,0 +1,203 @@
+diff --git a/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts b/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts
+index 7a0794b0ae7fc253a039300ad93550c76da0a7f7..3c2766dba8ee152105e9f53d27e465c0032f1e5b 100644
+--- a/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts
++++ b/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts
+@@ -10,5 +10,8 @@ dependencies {
+     compileOnly(kotlin("compiler"))
+     compileOnly("org.apache.maven:maven-core:3.9.3")
+     implementation("com.google.devtools.ksp:symbol-processing-cmdline:1.9.0-1.0.13")
+-    implementation(project(":ktorm-ksp-compiler"))
++    implementation(project(":ktorm-ksp-compiler")) {
++        exclude(group = "com.pinterest.ktlint", module = "ktlint-rule-engine")
++        exclude(group = "com.pinterest.ktlint", module = "ktlint-ruleset-standard")
++    }
+ }
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+index 1658eeb102199f5cc16ab0da9fc3be70e0e34bd8..db501103e4c04e512b87c376f0d78a1f4228a214 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+@@ -23,6 +23,7 @@ import com.google.devtools.ksp.symbol.KSFile
+ import org.ktorm.ksp.annotation.Table
+ import org.ktorm.ksp.compiler.formatter.CodeFormatter
+ import org.ktorm.ksp.compiler.formatter.KtLintCodeFormatter
++import org.ktorm.ksp.compiler.formatter.StandaloneKtLintCodeFormatter
+ import org.ktorm.ksp.compiler.generator.FileGenerator
+ import org.ktorm.ksp.compiler.parser.MetadataParser
+ import org.ktorm.ksp.compiler.util.isValid
+@@ -48,32 +49,39 @@ public class KtormProcessorProvider : SymbolProcessorProvider {
+ 
+     private fun doProcess(resolver: Resolver, environment: SymbolProcessorEnvironment): List<KSAnnotated> {
+         val (symbols, deferral) = resolver.getSymbolsWithAnnotation(Table::class.jvmName).partition { it.isValid() }
++        if (symbols.isNotEmpty()) {
++            val parser = MetadataParser(resolver, environment)
++            val formatter = getCodeFormatter(environment)
+ 
+-        val parser = MetadataParser(resolver, environment)
+-        for (symbol in symbols) {
+-            if (symbol is KSClassDeclaration) {
++            for (symbol in symbols) {
++                if (symbol !is KSClassDeclaration) {
++                    continue
++                }
++
++                // Parse table metadata from the symbol.
+                 val table = parser.parseTableMetadata(symbol)
+-                generateFile(table, environment)
+-            }
+-        }
+ 
+-        return deferral
+-    }
++                // Generate file spec by kotlinpoet.
++                val fileSpec = FileGenerator.generate(table, environment)
+ 
+-    private fun generateFile(table: TableMetadata, environment: SymbolProcessorEnvironment) {
+-        // Generate file spec by kotlinpoet.
+-        val fileSpec = FileGenerator.generate(table, environment)
++                // Beautify the generated code.
++                val formattedCode = formatter.format(fileSpec.toString())
+ 
+-        // Beautify the generated code.
+-        val formattedCode = getCodeFormatter(environment).format(fileSpec.toString())
++                // Output the formatted code.
++                val dependencies = Dependencies(false, *table.getDependencyFiles().toTypedArray())
++                val file = environment.codeGenerator.createNewFile(dependencies, fileSpec.packageName, fileSpec.name)
++                file.bufferedWriter(Charsets.UTF_8).use { it.write(formattedCode) }
++            }
++        }
+ 
+-        // Output the formatted code.
+-        val dependencies = Dependencies(false, *table.getDependencyFiles().toTypedArray())
+-        val file = environment.codeGenerator.createNewFile(dependencies, fileSpec.packageName, fileSpec.name)
+-        file.writer(Charsets.UTF_8).use { it.write(formattedCode) }
++        return deferral
+     }
+ 
+     private fun getCodeFormatter(environment: SymbolProcessorEnvironment): CodeFormatter {
++        if (!environment.options["ktorm.ktlintExecutable"].isNullOrBlank()) {
++            return StandaloneKtLintCodeFormatter(environment)
++        }
++
+         try {
+             return KtLintCodeFormatter(environment)
+         } catch (_: ClassNotFoundException) {
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/KtLintCodeFormatter.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/KtLintCodeFormatter.kt
+index 1e8f9ffbfe7ae4d879c9e6fef5e585c50986fa39..aeeee6626e5f439e99e7fad35280b09448577fd2 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/KtLintCodeFormatter.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/KtLintCodeFormatter.kt
+@@ -33,7 +33,7 @@ internal class KtLintCodeFormatter(val environment: SymbolProcessorEnvironment)
+             .toSet(),
+         editorConfigDefaults = EditorConfigDefaults(
+             EditorConfigLoader.default_().load(
+-                Resources.ofClassPath(javaClass.classLoader, "/ktorm-ksp-compiler/.editorconfig", Charsets.UTF_8)
++                Resources.ofClassPath(javaClass.classLoader, "ktorm-ksp-compiler/.editorconfig", Charsets.UTF_8)
+             )
+         )
+     )
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/StandaloneKtLintCodeFormatter.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/StandaloneKtLintCodeFormatter.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c714ea7afa98b3a451c360eaa4c12e671546e13
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/StandaloneKtLintCodeFormatter.kt
+@@ -0,0 +1,101 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.formatter
++
++import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
++import java.io.File
++
++internal class StandaloneKtLintCodeFormatter(val environment: SymbolProcessorEnvironment) : CodeFormatter {
++    private val command = buildCommand()
++
++    init {
++        environment.logger.info("[ktorm-ksp-compiler] init standalone ktlint code formatter with command: $command")
++    }
++
++    override fun format(code: String): String {
++        try {
++            val p = Runtime.getRuntime().exec(command)
++            p.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(preprocessCode(code)) }
++            p.waitFor()
++
++            if (p.exitValue() == 0) {
++                return p.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
++            } else {
++                val msg = p.errorStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
++                environment.logger.error("[ktorm-ksp-compiler] ktlint exit with code: ${p.exitValue()}\n$msg")
++                return code
++            }
++        } catch (e: Throwable) {
++            environment.logger.exception(e)
++            return code
++        }
++    }
++
++    private fun buildCommand(): String {
++        val isJava8 =
++            try { Class.forName("java.lang.reflect.InaccessibleObjectException"); false }
++            catch (_: ClassNotFoundException) { true }
++
++        val java = findJavaExecutable()
++        val ktlint = environment.options["ktorm.ktlintExecutable"]!!
++        val config = createEditorConfigFile()
++
++        if (isJava8) {
++            return "$java -jar $ktlint --format --stdin --log-level=none --editorconfig=$config"
++        } else {
++            val jvmArgs = "--add-opens java.base/java.lang=ALL-UNNAMED"
++            return "$java $jvmArgs -jar $ktlint --format --stdin --log-level=none --editorconfig=$config"
++        }
++    }
++
++    private fun findJavaExecutable(): String {
++        var file = File(File(System.getProperty("java.home"), "bin"), "java")
++        if (!file.exists()) {
++            file = File(File(System.getProperty("java.home"), "bin"), "java.exe")
++        }
++
++        if (file.exists()) {
++            return file.path
++        } else {
++            throw IllegalStateException("Could not find java executable.")
++        }
++    }
++
++    private fun createEditorConfigFile(): String {
++        val file = File.createTempFile("ktlint", ".editorconfig")
++        file.deleteOnExit()
++
++        file.outputStream().use { output ->
++            javaClass.classLoader.getResourceAsStream("ktorm-ksp-compiler/.editorconfig")!!.use { input ->
++                input.copyTo(output)
++            }
++        }
++
++        return file.path
++    }
++
++    private fun preprocessCode(code: String): String {
++        return code
++            .replace(Regex("""\(\s*"""), "(")
++            .replace(Regex("""\s*\)"""), ")")
++            .replace(Regex(""",\s*"""), ", ")
++            .replace(Regex(""",\s*\)"""), ")")
++            .replace(Regex("""\s+get\(\)\s="""), " get() =")
++            .replace(Regex("""\s+=\s+"""), " = ")
++            .replace("import org.ktorm.ksp.`annotation`", "import org.ktorm.ksp.annotation")
++    }
++}

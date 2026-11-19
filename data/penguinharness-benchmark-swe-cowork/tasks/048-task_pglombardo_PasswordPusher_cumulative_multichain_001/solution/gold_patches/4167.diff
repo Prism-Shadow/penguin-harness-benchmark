@@ -1,0 +1,3214 @@
+diff --git a/app/controllers/api/base_controller.rb b/app/controllers/api/base_controller.rb
+index a41eb8e5..ea241494 100644
+--- a/app/controllers/api/base_controller.rb
++++ b/app/controllers/api/base_controller.rb
+@@ -24,7 +24,7 @@ class Api::BaseController < ApplicationController
+       head :unauthorized
+ 
+     elsif params["controller"] == "api/v2/pushes"
+-      if %w[audit active expired].include?(params["action"])
++      if %w[audit active expired notify_by_email].include?(params["action"])
+         # These v2 endpoints require a valid token
+         head :unauthorized
+       end
+diff --git a/app/controllers/api/v2/pushes_controller.rb b/app/controllers/api/v2/pushes_controller.rb
+index 1ed007d6..fe839b25 100644
+--- a/app/controllers/api/v2/pushes_controller.rb
++++ b/app/controllers/api/v2/pushes_controller.rb
+@@ -3,15 +3,117 @@
+ class Api::V2::PushesController < Api::V1::PushesController
+   before_action :force_json_format
+ 
++  before_action :set_push, only: %i[show preview audit destroy notify_by_email]
++
++  rate_limit to: 5, within: 1.minute, only: :notify_by_email,
++    by: -> { current_user&.id },
++    with: -> { render json: {error: I18n._("Too many email notification requests. Please try again in a minute.")}, status: :too_many_requests }
++
++  # POST /api/v2/pushes.json
++  #
++  # v1's create is duplicated here so that v1 can stay untouched by the
++  # notify_by_email feature. APIv1 is deprecated; the v1/v2 controllers
++  # will be split out entirely in a follow-up PR.
++  def create
++    permitted_params = push_params
++
++    authenticate_user! if requires_authentication_for_create?(permitted_params)
++
++    permitted_notify_by_email_params = permitted_params.delete(:notify_by_email)
++
++    @push = Push.new(permitted_params)
++
++    if !permitted_params[:kind].present?
++      @push.kind = if request.path.include?("/f.json")
++        "file"
++      elsif request.path.include?("/r.json")
++        "url"
++      elsif request.path.include?("/p.json") && permitted_params.key?(:files)
++        "file"
++      else
++        "text"
++      end
++    end
++
++    @push.user = current_user if user_signed_in?
++
++    assign_deletable_by_viewer(@push, permitted_params)
++    assign_retrieval_step(@push, permitted_params)
++
++    if permitted_notify_by_email_params.present?
++      assign_notify_by_email_params(@push, permitted_notify_by_email_params)
++    end
++
++    if @push.save
++      log_creation(@push)
++      log_creation_email_send(@push)
++
++      render template: "pushes/show", status: :created
++    else
++      render json: @push.errors, status: :unprocessable_content
++    end
++  end
++
++  def audit
++    authenticate_user!
++
++    if @push.user != current_user
++      render json: {error: I18n._("That push doesn't belong to you.")}, status: :forbidden
++      return
++    end
++
++    page = validate_page_parameter
++    return if page.nil?
++
++    @audit_logs = @push.audit_logs
++      .order(created_at: :desc)
++      .page(page)
++      .per(50)
++
++    @secret_url = helpers.secret_url(@push)
++    render template: "pushes/audit", status: :ok
++  end
++
++  def notify_by_email
++    authenticate_user!
++
++    if @push.user != current_user
++      render json: {error: I18n._("That push doesn't belong to you.")}, status: :forbidden
++      return
++    end
++
++    permitted_notify_by_email_params = params.permit(:recipients, :locale)
++    assign_notify_by_email_params(@push, permitted_notify_by_email_params, required: true)
++
++    if @push.valid?
++      log_creation_email_send(@push)
++      render json: {message: I18n._("Recipient(s) are added to the queue to be sent.")}, status: :created
++    else
++      render json: @push.errors, status: :unprocessable_entity
++    end
++  end
++
+   private
+ 
+   def force_json_format
+     request.format = :json
+   end
+ 
++  def set_push
++    @push = if action_name == "audit"
++      Push.includes(audit_logs: :notify_by_email).find_by!(url_token: params[:id])
++    else
++      Push.includes(:audit_logs).find_by!(url_token: params[:id])
++    end
++  rescue ActiveRecord::RecordNotFound
++    respond_to do |format|
++      format.json { render json: {error: "not-found"}.to_json, status: :not_found }
++    end
++  end
++
+   def push_params
+     permitted = params.require(:push).permit(:name, :kind, :expire_after_days, :expire_after_views,
+-      :deletable_by_viewer, :retrieval_step, :payload, :note, :passphrase, files: [])
++      :deletable_by_viewer, :retrieval_step, :payload, :note, :passphrase, notify_by_email: [:recipients, :locale], files: [])
+ 
+     # For v2 requests, file uploads imply a file push unless kind is explicit.
+     if permitted[:kind].blank? && permitted[:files].present?
+@@ -23,4 +125,11 @@ class Api::V2::PushesController < Api::V1::PushesController
+     Rails.logger.error("Error in push_params: #{e.message}")
+     raise e
+   end
++
++  def assign_notify_by_email_params(push, permitted_params, required: false)
++    push.notify_by_email_recipients = permitted_params[:recipients]
++    push.notify_by_email_locale = permitted_params[:locale]
++    push.notify_by_email_creator = current_user if user_signed_in?
++    push.notify_by_email_required = required
++  end
+ end
+diff --git a/app/controllers/api/v2/version_controller.rb b/app/controllers/api/v2/version_controller.rb
+index fe2b0518..da7e026c 100644
+--- a/app/controllers/api/v2/version_controller.rb
++++ b/app/controllers/api/v2/version_controller.rb
+@@ -21,7 +21,7 @@ class Api::V2::VersionController < Api::BaseController
+       },
+       pushes: {
+         enabled: true,
+-        email_auto_dispatch: false,
++        email_auto_dispatch: Settings.notify_by_email_available?,
+         file_attachments: {
+           enabled: Settings.enable_file_pushes,
+           requires_authentication: true
+diff --git a/app/controllers/concerns/log_events.rb b/app/controllers/concerns/log_events.rb
+index 1aa004cf..c783df56 100644
+--- a/app/controllers/concerns/log_events.rb
++++ b/app/controllers/concerns/log_events.rb
+@@ -23,6 +23,12 @@ module LogEvents
+     log_event(push, :creation)
+   end
+ 
++  def log_creation_email_send(push)
++    return unless push.notify_by_email_recipients.present?
++
++    log_event(push, :creation_email_send)
++  end
++
+   def log_update(push)
+     log_event(push, :edit)
+   end
+diff --git a/app/controllers/madmin/notify_by_emails_controller.rb b/app/controllers/madmin/notify_by_emails_controller.rb
+new file mode 100644
+index 00000000..7a16446b
+--- /dev/null
++++ b/app/controllers/madmin/notify_by_emails_controller.rb
+@@ -0,0 +1,4 @@
++module Madmin
++  class NotifyByEmailsController < Madmin::ResourceController
++  end
++end
+diff --git a/app/controllers/pushes_controller.rb b/app/controllers/pushes_controller.rb
+index 51fc6ee2..d1852ad4 100644
+--- a/app/controllers/pushes_controller.rb
++++ b/app/controllers/pushes_controller.rb
+@@ -12,17 +12,6 @@ class PushesController < BaseController
+     by: -> { current_user&.id },
+     with: -> { redirect_to preview_push_path(@push), alert: I18n._("Too many email notification requests. Please try again in a minute.") }
+ 
+-  rate_limit to: 5, within: 1.minute, only: :access,
+-    by: -> { params[:id] },
+-    scope: :passphrase_attempts, name: "per-push",
+-    with: -> { redirect_to passphrase_push_path(@push), alert: I18n._("Too many passphrase attempts. Please try again in a minute.") }
+-
+-  rate_limit to: 5, within: 1.minute, only: :show,
+-    if: -> { params[:passphrase].present? },
+-    by: -> { params[:id] },
+-    scope: :passphrase_attempts, name: "per-push",
+-    with: -> { redirect_to passphrase_push_path(@push), alert: I18n._("Too many passphrase attempts. Please try again in a minute.") }
+-
+   def show
+     # This push may have expired since the last view.  Validate the push
+     # expiration before doing anything.
+diff --git a/app/helpers/pushes_helper.rb b/app/helpers/pushes_helper.rb
+index 36a7b1c1..cf2dca76 100644
+--- a/app/helpers/pushes_helper.rb
++++ b/app/helpers/pushes_helper.rb
+@@ -9,6 +9,12 @@ module PushesHelper
+     PUSH_PAYLOAD_AUTO_REBLUR_SECONDS
+   end
+ 
++  # Returns a human-readable string for push expiration (days only), e.g. "5 days" or "1 day".
++  def format_days_remaining(push)
++    days = push.days_remaining
++    "#{days} #{n_("day", "days", days)}"
++  end
++
+   def filesize(size)
+     units = %w[B KiB MiB GiB TiB Pib EiB ZiB]
+ 
+diff --git a/app/javascript/controllers/select_dropdown_controller.js b/app/javascript/controllers/select_dropdown_controller.js
+new file mode 100644
+index 00000000..6eb1c275
+--- /dev/null
++++ b/app/javascript/controllers/select_dropdown_controller.js
+@@ -0,0 +1,28 @@
++import { Controller } from "@hotwired/stimulus"
++
++export default class extends Controller {
++  static targets = [ "menuButtonInner", "field" ]
++
++  connect() {
++    this.restoreSelectedValue();
++  }
++
++  select(event) {
++    this.fieldTarget.value = event.currentTarget.dataset.lang;
++    const template = event.currentTarget.querySelector('template');
++    this.menuButtonInnerTarget.replaceChildren(template.content.cloneNode(true));
++  }
++
++  restoreSelectedValue() {
++    const selectedLang = this.fieldTarget.value;
++    if (selectedLang) {
++      const selectedOption = this.element.querySelector(`[data-lang="${selectedLang}"]`);
++      if (selectedOption) {
++        const template = selectedOption.querySelector('template');
++        if (template) {
++          this.menuButtonInnerTarget.replaceChildren(template.content.cloneNode(true));
++        }
++      }
++    }
++  }
++}
+diff --git a/app/jobs/send_notify_by_email_job.rb b/app/jobs/send_notify_by_email_job.rb
+new file mode 100644
+index 00000000..d799af45
+--- /dev/null
++++ b/app/jobs/send_notify_by_email_job.rb
+@@ -0,0 +1,60 @@
++# frozen_string_literal: true
++
++class SendNotifyByEmailJob < ApplicationJob
++  queue_as :default
++
++  retry_on Net::SMTPServerBusy, Net::OpenTimeout, Timeout::Error, Errno::ECONNRESET,
++    wait: :polynomially_longer, attempts: 3
++
++  def perform(notify_by_email_id)
++    notify_by_email = NotifyByEmail.find_by(id: notify_by_email_id)
++
++    if notify_by_email.nil?
++      Rails.logger.error "[SendNotifyByEmailJob] NotifyByEmail not found: #{notify_by_email_id}"
++
++      return
++    end
++
++    notify_by_email.assign_fields_to_push
++    push = notify_by_email.push
++
++    unless push.valid?
++      notify_by_email.update(status: :failed, error_message: push.errors.full_messages.join(". ") + ".", proceed_at: Time.current)
++
++      return
++    end
++
++    return unless notify_by_email.pending?
++
++    successful_sends = []
++
++    begin
++      notify_by_email.processing!
++
++      locale = notify_by_email.locale
++      recipients = notify_by_email.recipients.split(",").map(&:strip)
++
++      recipients.each do |recipient|
++        mail = PushCreatedMailer.with(push: push, recipient: recipient, locale: locale).notify
++        mail.deliver_now
++        successful_sends << recipient
++      rescue => e
++        Rails.logger.error "[SendNotifyByEmailJob] Error sending email (#{e.class}): #{e.message} (#{e.backtrace&.first})"
++      end
++
++      status, error_message = if successful_sends.size == recipients.size
++        [:completed, nil]
++      elsif successful_sends.empty?
++        [:failed, I18n._("No emails were sent successfully.")]
++      else
++        [:partially_failed, I18n._("Some emails could not be sent.")]
++      end
++
++      notify_by_email.update!(successful_sends: successful_sends.join(","), status: status, error_message: error_message, proceed_at: Time.current)
++    rescue => e
++      Rails.logger.error "[SendNotifyByEmailJob] Batch failed (#{e.class}): #{e.message} (#{e.backtrace&.first})"
++
++      notify_by_email.update(successful_sends: successful_sends.join(","), status: :failed, error_message: _("An unexpected error occurred while sending the email."), proceed_at: Time.current)
++    end
++  end
++end
+diff --git a/app/madmin/resources/audit_log_resource.rb b/app/madmin/resources/audit_log_resource.rb
+index c20d0dad..661aba12 100644
+--- a/app/madmin/resources/audit_log_resource.rb
++++ b/app/madmin/resources/audit_log_resource.rb
+@@ -11,6 +11,7 @@ class AuditLogResource < Madmin::Resource
+   # Associations
+   attribute :push
+   attribute :user
++  attribute :notify_by_email
+ 
+   # Add scopes to easily filter records
+   # scope :published
+diff --git a/app/madmin/resources/notify_by_email_resource.rb b/app/madmin/resources/notify_by_email_resource.rb
+new file mode 100644
+index 00000000..e2959361
+--- /dev/null
++++ b/app/madmin/resources/notify_by_email_resource.rb
+@@ -0,0 +1,16 @@
++class NotifyByEmailResource < Madmin::Resource
++  # Attributes
++  attribute :id, form: false
++  attribute :recipients, form: false
++  attribute :locale, form: false
++  attribute :status
++  attribute :successful_sends
++  attribute :error_message
++  attribute :proceed_at
++  attribute :created_at, form: false
++  attribute :updated_at, form: false
++
++  # Associations
++  attribute :audit_log, form: false
++  attribute :push, form: false
++end
+diff --git a/app/madmin/resources/user_resource.rb b/app/madmin/resources/user_resource.rb
+index 68260da0..49756bac 100644
+--- a/app/madmin/resources/user_resource.rb
++++ b/app/madmin/resources/user_resource.rb
+@@ -24,6 +24,8 @@ class UserResource < Madmin::Resource
+   attribute :authentication_token, index: false, form: false
+   attribute :preferred_language, index: false
+   attribute :otp_required_for_login, index: true, form: false
++  attribute :email_sent_count, index: true
++  attribute :email_sent_count_reset_at, index: true
+ 
+   # Associations
+   attribute :pushes
+diff --git a/app/mailers/push_created_mailer.rb b/app/mailers/push_created_mailer.rb
+new file mode 100644
+index 00000000..f583feaf
+--- /dev/null
++++ b/app/mailers/push_created_mailer.rb
+@@ -0,0 +1,49 @@
++# frozen_string_literal: true
++
++class PushCreatedMailer < ApplicationMailer
++  helper PushesHelper
++  include Rails.application.routes.url_helpers
++  include ApplicationHelper
++
++  def notify
++    @push = params[:push]
++    locale = permitted_locale?(params[:locale]) ? params[:locale] : I18n.default_locale
++
++    I18n.with_locale(locale || I18n.default_locale) do
++      @secret_url = mailer_secret_push_url(@push, params[:locale])
++      @sender = @push.user&.email.presence || _("Someone")
++      @subject = _("You have received a push")
++      mail(
++        to: params[:recipient],
++        subject: @subject
++      )
++    end
++  end
++
++  private
++
++  def mailer_secret_push_url(push, selected_locale)
++    raw_url = if push.retrieval_step
++      Settings.override_base_url ? Settings.override_base_url + preliminary_push_path(push) : preliminary_push_url(push)
++    else
++      Settings.override_base_url ? Settings.override_base_url + push_path(push) : push_url(push)
++    end
++
++    # Delete any existing ?locale= query parameter
++    raw_url = raw_url.split("?").first
++
++    if permitted_locale?(selected_locale)
++      # Append the locale query parameter
++      raw_url += "?locale=#{selected_locale}"
++    end
++
++    # Support forced https links with FORCE_SSL env var
++    raw_url = raw_url.gsub(/http:/i, "https:") if ENV.key?("FORCE_SSL")
++
++    raw_url
++  end
++
++  def permitted_locale?(locale)
++    I18n.config.available_locales_set.include?(locale)
++  end
++end
+diff --git a/app/models/audit_log.rb b/app/models/audit_log.rb
+index bdc4419e..14523da1 100644
+--- a/app/models/audit_log.rb
++++ b/app/models/audit_log.rb
+@@ -3,12 +3,29 @@
+ class AuditLog < ApplicationRecord
+   MAX_AUDIT_LOGS_PER_PUSH_OR_PULL = 2000
+ 
+-  enum :kind, [:creation, :view, :failed_view, :expire, :failed_passphrase, :admin_view, :owner_view, :edit], validate: true
++  enum :kind, [:creation, :view, :failed_view, :expire, :failed_passphrase, :admin_view, :owner_view, :edit, :creation_email_send], validate: true
+ 
+   belongs_to :push
+   belongs_to :user, optional: true
+ 
++  has_one :notify_by_email, dependent: :destroy
++
++  with_options on: :create, if: :creation_email_send? do |create|
++    create.before_validation :build_associated_notify_by_email
++
++    create.validates :user, presence: true
++  end
++
+   def subject_name
+     user&.email || "❓"
+   end
++
++  private
++
++  def build_associated_notify_by_email
++    build_notify_by_email(
++      recipients: push.notify_by_email_recipients,
++      locale: push.notify_by_email_locale
++    )
++  end
+ end
+diff --git a/app/models/concerns/pwpush/notifiable_by_email.rb b/app/models/concerns/pwpush/notifiable_by_email.rb
+new file mode 100644
+index 00000000..1c0f45b8
+--- /dev/null
++++ b/app/models/concerns/pwpush/notifiable_by_email.rb
+@@ -0,0 +1,82 @@
++# frozen_string_literal: true
++
++module Pwpush
++  module NotifiableByEmail
++    extend ActiveSupport::Concern
++    MAX_NOTIFY_BY_EMAILS = 5
++
++    included do
++      attr_accessor :notify_by_email_recipients, :notify_by_email_locale, :notify_by_email_required, :notify_by_email_creator, :notify_by_email_skip_limit_validation
++
++      has_many :notify_by_emails_audit_logs, -> { where(kind: :creation_email_send) }, class_name: "AuditLog", dependent: :destroy
++      has_many :notify_by_emails, through: :notify_by_emails_audit_logs
++
++      validate :notify_by_email_availability, if: -> { notify_by_email_recipients.present? }
++      validates :notify_by_email_recipients, multiple_emails: {max_emails: MAX_NOTIFY_BY_EMAILS}
++      validates :notify_by_email_recipients, presence: true, if: :notify_by_email_required
++      validates :notify_by_email_locale, allow_blank: true, allow_nil: true, inclusion: {in: I18n.available_locales.map(&:to_s)}
++      validate :notify_by_email_limit, unless: :notify_by_email_skip_limit_validation
++
++      def notify_by_email_allowed_for?(cur_user)
++        notify_by_email_available? && cur_user.present? && (!persisted? || (cur_user == user))
++      end
++
++      def notify_by_email_available?
++        Settings.notify_by_email_available?
++      end
++    end
++
++    private
++
++    def notify_by_email_limit
++      return if notify_by_email_recipients.blank?
++
++      # This validation is done by multiple_emails validator
++      return if notify_by_emails.none?
++
++      new_count = notify_by_email_recipients.split(",").count
++      remaining = MAX_NOTIFY_BY_EMAILS - total_notify_by_emails_count
++
++      if new_count > remaining
++        errors.add(:base, _("You can notify up to %{count} email(s) and you have already sent emails to %{total_count} recipients") % {count: MAX_NOTIFY_BY_EMAILS, total_count: total_notify_by_emails_count})
++      end
++    end
++
++    def total_notify_by_emails_count
++      return 0 if notify_by_emails.none?
++
++      notify_by_emails.sum(&:recipients_count)
++    end
++
++    def notify_by_email_availability
++      unless notify_by_email_available?
++        errors.add(:base, _("Notifying by email is not available"))
++
++        return
++      end
++
++      notify_by_email_custom_validations
++
++      unless notify_by_email_creator.present?
++        errors.add(:base, _("Notifying by email is not allowed for unknown users"))
++
++        return
++      end
++
++      unless notify_by_email_creator == user
++        errors.add(:base, _("Notifying by email is allowed for only owners"))
++
++        return
++      end
++
++      if notify_by_email_creator.email_limit_reached?
++        errors.add(:base, _("The maximum number of emails has been reached for today"))
++      end
++    end
++
++    # Override this method in the model to add custom validations
++    def notify_by_email_custom_validations
++      nil
++    end
++  end
++end
+diff --git a/app/models/notify_by_email.rb b/app/models/notify_by_email.rb
+new file mode 100644
+index 00000000..21946dc0
+--- /dev/null
++++ b/app/models/notify_by_email.rb
+@@ -0,0 +1,52 @@
++# frozen_string_literal: true
++
++class NotifyByEmail < ApplicationRecord
++  # audit_log_id is readonly because related audit_log is strongly coupled to notify_by_email record.
++  attr_readonly :recipients, :recipients_count, :locale, :audit_log_id
++
++  enum :status, [:pending, :processing, :completed, :partially_failed, :failed], validate: true
++
++  before_create :set_recipients_count
++
++  after_create :increment_email_sent_count
++  after_create_commit :send_notify_by_email
++
++  belongs_to :audit_log
++
++  has_one :push, through: :audit_log
++  has_one :user, through: :audit_log
++
++  has_encrypted :recipients, :locale, :successful_sends, :error_message
++
++  def increment_email_sent_count
++    # Reset count if it's a new day
++    if user.email_sent_count_reset_at.nil? || user.email_sent_count_reset_at.before?(Time.current.beginning_of_day)
++      user.update(
++        email_sent_count: recipients_count,
++        email_sent_count_reset_at: Time.current
++      )
++    else
++      user.update(email_sent_count: user.email_sent_count + recipients_count)
++    end
++  end
++
++  def assign_fields_to_push
++    return unless persisted?
++
++    push.notify_by_email_recipients = recipients
++    push.notify_by_email_locale = locale
++    push.notify_by_email_creator = user
++    push.notify_by_email_skip_limit_validation = true
++    push.notify_by_email_required = true
++  end
++
++  private
++
++  def set_recipients_count
++    self.recipients_count = recipients.split(",").count
++  end
++
++  def send_notify_by_email
++    SendNotifyByEmailJob.perform_later(id)
++  end
++end
+diff --git a/app/models/push.rb b/app/models/push.rb
+index 60351dfb..d2141462 100644
+--- a/app/models/push.rb
++++ b/app/models/push.rb
+@@ -3,6 +3,8 @@
+ require "addressable/uri"
+ 
+ class Push < ApplicationRecord
++  include Pwpush::NotifiableByEmail
++
+   enum :kind, [:text, :file, :url, :qr], validate: true
+ 
+   validate :check_enabled_push_kinds, on: :create
+@@ -232,4 +234,12 @@ class Push < ApplicationRecord
+   def deleted
+     audit_logs.where(kind: AuditLog.kinds[:expire]).exists?
+   end
++
++  private
++
++  def notify_by_email_custom_validations
++    if expired?
++      errors.add(:base, _("You cannot notify by email for an expired push."))
++    end
++  end
+ end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index c0172999..27740f8d 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -19,4 +19,21 @@ class User < ApplicationRecord
+   def admin?
+     admin
+   end
++
++  # Returns true when the user has hit the daily cap on notification emails
++  # (Settings.notify_by_email.daily_limit).
++  #
++  # Semantics:
++  # * nil  -> no cap (feature is unlimited for this user)
++  # * 0    -> feature disabled (always treated as "limit reached")
++  # * >0   -> compare to today's dispatch count
++  def email_limit_reached?
++    limit = Settings.notify_by_email&.daily_limit
++    return false if limit.nil?
++    return true if limit.to_i.zero?
++
++    email_sent_count_reset_at.present? &&
++      !email_sent_count_reset_at.before?(Time.current.beginning_of_day) &&
++      email_sent_count >= limit.to_i
++  end
+ end
+diff --git a/app/validators/multiple_emails_validator.rb b/app/validators/multiple_emails_validator.rb
+new file mode 100644
+index 00000000..242b238f
+--- /dev/null
++++ b/app/validators/multiple_emails_validator.rb
+@@ -0,0 +1,36 @@
++# frozen_string_literal: true
++
++class MultipleEmailsValidator < ActiveModel::EachValidator
++  # Email regex pattern matching the one used in app/models/feedback.rb:8
++  EMAIL_REGEX = /\A([\w.%+-]+)@([\w-]+\.)+(\w{2,})\z/i
++
++  # Validates comma-separated emails with count and format validation
++  #
++  # @param record [ActiveRecord::Base] The model instance being validated
++  # @param attribute [Symbol] The attribute being validated
++  # @param value [String] The comma-separated email string
++  # @return [void]
++  def validate_each(record, attribute, value)
++    return if value.blank?
++
++    max_emails = options[:max_emails] || 5
++    emails = value.split(",").map(&:strip)
++
++    if value.end_with?(",") || emails.any?(&:blank?)
++      record.errors.add(attribute, I18n._("has commas used in the wrong way"))
++      return
++    end
++
++    if emails.map(&:downcase).uniq.count != emails.count
++      record.errors.add(attribute, I18n._("contains duplicate emails"))
++    end
++
++    if emails.count > max_emails
++      record.errors.add(attribute, I18n._("contains more than %{count} email(s)") % {count: max_emails})
++    end
++
++    unless emails.all? { |email| email.match?(EMAIL_REGEX) }
++      record.errors.add(attribute, I18n._("contains invalid email(s)"))
++    end
++  end
++end
+diff --git a/app/views/audit_logs/_log_creation_email_send.html.erb b/app/views/audit_logs/_log_creation_email_send.html.erb
+new file mode 100644
+index 00000000..9c9c584f
+--- /dev/null
++++ b/app/views/audit_logs/_log_creation_email_send.html.erb
+@@ -0,0 +1,51 @@
++<% notify_by_email = audit_log.notify_by_email %>
++
++<% status_class = case notify_by_email.status
++  when "completed" then "list-group-item-success"
++  when "processing", "pending" then "list-group-item-info"
++  when "partially_failed" then "list-group-item-warning"
++  when "failed" then "list-group-item-danger"
++  else "list-group-item-info"
++end %>
++
++<% status_icon = case notify_by_email.status
++  when "completed" then "bi-envelope-check"
++  when "processing" then "bi-hourglass-split"
++  when "pending" then "bi-envelope"
++  when "partially_failed" then "bi-envelope-exclamation"
++  when "failed" then "bi-envelope-x"
++  else "bi-envelope"
++end %>
++
++<div class="list-group-item list-group-item-action <%= status_class %>">
++  <em class="bi <%= status_icon %>"></em>
++  <%= (_('Email notification(s) queued on %{date}') % {
++      date: local_time(notify_by_email.created_at, :long)
++  }).html_safe %>
++
++  <br>
++
++  <div>
++    <strong><%= _('Status:') %></strong> <code><%= notify_by_email.status.humanize %></code>
++  </div>
++
++  <div>
++    <strong><%= _('To:') %></strong> <code><%= notify_by_email.recipients %></code>
++  </div>
++
++  <% if notify_by_email.partially_failed? %>
++    <div>
++      <strong><%= _('Sent:') %></strong> <code><%= notify_by_email.successful_sends %></code>
++    </div>
++  <% end %>
++
++  <% if notify_by_email.error_message.present? %>
++    <div>
++      <strong><%= _('Error:') %></strong> <span><%= notify_by_email.error_message %></span>
++    </div>
++  <% end %>
++
++  <div>
++    <strong><%= _('Proceed At:') %></strong> <span><%= notify_by_email.proceed_at.blank? ? _('Not yet') : local_time(notify_by_email.proceed_at, :long) %></span>
++  </div>
++</div>
+diff --git a/app/views/madmin/application/_navigation.html.erb b/app/views/madmin/application/_navigation.html.erb
+index 7af3f83a..84bbbbf0 100644
+--- a/app/views/madmin/application/_navigation.html.erb
++++ b/app/views/madmin/application/_navigation.html.erb
+@@ -66,6 +66,13 @@
+         </svg>
+         Audit Logs
+       <% end %>
++
++      <%= link_to madmin_notify_by_emails_path, class: "d-flex align-items-center px-3 py-2 text-decoration-none rounded-3 transition-all #{'bg-primary bg-opacity-10 text-primary fw-semibold' if current_page?(madmin_notify_by_emails_path)} #{'text-dark hover-bg-light' unless current_page?(madmin_notify_by_emails_path)}" do %>
++        <svg class="me-3" width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
++          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
++        </svg>
++        Notify By Emails
++      <% end %>
+     </div>
+   </div>
+ 
+diff --git a/app/views/pages/api.html.erb b/app/views/pages/api.html.erb
+index 66cd9d6a..9c553101 100644
+--- a/app/views/pages/api.html.erb
++++ b/app/views/pages/api.html.erb
+@@ -115,6 +115,9 @@
+                 <tr><td><code>passphrase</code></td><td>string</td><td><%= _("No") %></td><td><%= _("Requires this passphrase to retrieve the payload.") %></td></tr>
+                 <tr><td><code>name</code></td><td>string</td><td><%= _("No") %></td><td><%= _("Optional label shown to the owner.") %></td></tr>
+                 <tr><td><code>note</code></td><td>string</td><td><%= _("No") %></td><td><%= _("Optional owner-only note.") %></td></tr>
++                <tr><td><code>notify_by_email</code></td><td>object</td><td><%= _("No") %></td><td><%= _("Optional recipients for the push creation email.") %></td></tr>
++                <tr><td><code>notify_by_email.recipients</code></td><td>string</td><td><%= _("No") %></td><td><%= _("Optional recipients for the push creation email. Comma-separated list of email addresses. Maximum 5 emails.") %></td></tr>
++                <tr><td><code>notify_by_email.locale</code></td><td>string</td><td><%= _("No") %></td><td><%= _("Optional locale for the push creation email. See the list of available locales in the") %> <a href="#supported-locales"><%= _("Supported Locales") %></a> <%= _("section. Defaults to #{I18n.default_locale}.") %></td></tr>
+               </tbody>
+             </table>
+           </div>
+@@ -125,7 +128,11 @@
+     "expire_after_views": 5,
+     "passphrase": "optional-passphrase",
+     "deletable_by_viewer": true,
+-    "retrieval_step": true
++    "retrieval_step": true,
++    "notify_by_email": {
++      "recipients": "email1@example.com, email2@example.com",
++      "locale": "fr"
++    }
+   }
+ }</code></pre>
+           <p class="mb-2 mt-3"><strong><%= _("cURL example (JSON body):") %></strong></p>
+@@ -204,6 +211,62 @@
+         </div>
+       </div>
+ 
++      <div class="card mb-4">
++        <div class="card-body">
++          <h3 class="h5 mb-2"><code>POST /api/v2/pushes/:url_token/notify_by_email</code></h3>
++          <p class="mb-2"><%= _("Send an email to notify the push creation to the specified recipients.") %></p>
++          <div class="table-responsive mb-3">
++            <table class="table table-sm">
++              <thead>
++                <tr>
++                  <th><%= _("Parameter") %></th>
++                  <th><%= _("Type") %></th>
++                  <th><%= _("Required") %></th>
++                  <th><%= _("Description") %></th>
++                </tr>
++              </thead>
++              <tbody>
++                <tr><td><code>recipients</code></td><td>string</td><td><%= _("Yes") %></td><td><%= _("Comma-separated list of email addresses. Maximum 5 emails.") %></td></tr>
++                <tr><td><code>locale</code></td><td>string</td><td><%= _("No") %></td><td><%= _("Locale for the email notification. See the list of available locales in the") %> <a href="#supported-locales"><%= _("Supported Locales") %></a> <%= _("section. Defaults to #{I18n.default_locale}.") %></td></tr>
++              </tbody>
++            </table>
++          </div>
++          <p class="mb-2"><strong><%= _("cURL example:") %></strong></p>
++          <pre class="bg-light border rounded p-3 mb-0"><code>curl -X POST "https://<%= request.host %>/api/v2/pushes/YOUR_URL_TOKEN/notify_by_email" \
++  -H "Authorization: Bearer YOUR_API_TOKEN" \
++  -H "Content-Type: application/json" \
++  -d '{
++    "recipients": "email1@example.com, email2@example.com",
++    "locale": "fr"
++  }'</code></pre>
++        </div>
++      </div>
++
++      <div class="card mb-4" id="supported-locales">
++        <div class="card-body">
++          <h2 class="h5"><%= _("Supported Locales") %></h2>
++          <p class="mb-2"><%= _("The following locales are supported for API requests that accept a locale parameter:") %></p>
++          <div class="table-responsive">
++            <table class="table table-sm">
++              <thead>
++                <tr>
++                  <th><%= _("Locale Code") %></th>
++                  <th><%= _("Language") %></th>
++                </tr>
++              </thead>
++              <tbody>
++                <% I18n.available_locales.sort.each do |locale| %>
++                  <tr>
++                    <td><code><%= locale %></code></td>
++                    <td><%= Settings.language_codes[locale] %></td>
++                  </tr>
++                <% end %>
++              </tbody>
++            </table>
++          </div>
++        </div>
++      </div>
++
+       <div class="card mb-4">
+         <div class="card-body">
+           <h2 class="h5"><%= _("HTTP Status Codes") %></h2>
+diff --git a/app/views/push_created_mailer/notify.html.erb b/app/views/push_created_mailer/notify.html.erb
+new file mode 100644
+index 00000000..2de4f4a3
+--- /dev/null
++++ b/app/views/push_created_mailer/notify.html.erb
+@@ -0,0 +1,16 @@
++<h1 style="font-weight:400;line-height: 1.25; text-align: center;">
++  <%= (_("%{sender} has sent you a push") % { sender: @sender }) %>
++</h1>
++
++<p>
++  <%= _("Please find the secret link below to access the sensitive information.") %>
++</p>
++
++<p><%= _("Secret link:") %> <a href="<%= @secret_url %>"><%= @secret_url %></a></p>
++
++<h4 style="font-weight: bold; margin-top: 40px;"><%= _('Important Notes:') %></h4>
++<ul style="padding: 0px; list-style-position: inside">
++  <li><%= _("This link is valid for %{remaining}, or until %{views} views, whichever occurs first.") % { remaining: format_days_remaining(@push), views: @push.expire_after_views } %></li>
++  <li><%= _("For added security, you may be prompted to enter a passphrase (provided separately) to access the content.") %></li>
++  <li><%= _("Upon expiration, this secret link and all content are permanently deleted.") %></li>
++</ul>
+diff --git a/app/views/push_created_mailer/notify.text.erb b/app/views/push_created_mailer/notify.text.erb
+new file mode 100644
+index 00000000..96fb3bee
+--- /dev/null
++++ b/app/views/push_created_mailer/notify.text.erb
+@@ -0,0 +1 @@
++<%= push_share_message_text(@push, secret_url: @secret_url) %>
+\ No newline at end of file
+diff --git a/app/views/pushes/_files_form.html.erb b/app/views/pushes/_files_form.html.erb
+index 5b205069..233c3e50 100644
+--- a/app/views/pushes/_files_form.html.erb
++++ b/app/views/pushes/_files_form.html.erb
+@@ -117,6 +117,7 @@
+                                                     autocomplete: "off",
+                                                     placeholder: _('Optional: Require recipients to enter a passphrase to view this push') }) %>
+                 </div>
++                <%= render 'shared/notify_by_email', f: f %>
+             </div>
+ 
+             <%= render 'shared/additional_options' do %>
+diff --git a/app/views/pushes/_form.html.erb b/app/views/pushes/_form.html.erb
+index f9f2f7ac..b8df06fa 100644
+--- a/app/views/pushes/_form.html.erb
++++ b/app/views/pushes/_form.html.erb
+@@ -123,6 +123,7 @@
+                                                     autocomplete: "off",
+                                                     placeholder: _('Optional: Require recipients to enter a passphrase to view this push') }) %>
+                 </div>
++                <%= render 'shared/notify_by_email', f: f %>
+             </div>
+ 
+             <%= render 'shared/additional_options' do %>
+diff --git a/app/views/pushes/_push.json.jbuilder b/app/views/pushes/_push.json.jbuilder
+index 4e342d7c..a1e27ed9 100644
+--- a/app/views/pushes/_push.json.jbuilder
++++ b/app/views/pushes/_push.json.jbuilder
+@@ -20,6 +20,13 @@ if %w[create active expired].include?(controller.action_name)
+   json.name push.name
+ end
+ 
++if controller.action_name == "create" && push.notify_by_email_recipients.present?
++  json.notify_by_email do
++    json.recipients push.notify_by_email_recipients
++    json.locale push.notify_by_email_locale
++  end
++end
++
+ if controller.action_name == "show"
+   json.payload push.payload
+ 
+diff --git a/app/views/pushes/_qr_form.html.erb b/app/views/pushes/_qr_form.html.erb
+index dd7f8dfc..5c4c194d 100644
+--- a/app/views/pushes/_qr_form.html.erb
++++ b/app/views/pushes/_qr_form.html.erb
+@@ -113,6 +113,7 @@
+                                                     autocomplete: "off",
+                                                     placeholder: _('Optional: Require recipients to enter a passphrase to view this push') }) %>
+                 </div>
++                <%= render 'shared/notify_by_email', f: f %>
+             </div>
+ 
+             <%= render 'shared/additional_options' do %>
+diff --git a/app/views/pushes/_url_form.html.erb b/app/views/pushes/_url_form.html.erb
+index 9bb1eb54..c794bac6 100644
+--- a/app/views/pushes/_url_form.html.erb
++++ b/app/views/pushes/_url_form.html.erb
+@@ -86,6 +86,7 @@
+                                                     autocomplete: "off",
+                                                     placeholder: _('Optional: Require recipients to enter a passphrase to view this push') }) %>
+                 </div>
++                <%= render 'shared/notify_by_email', f: f %>
+             </div>
+ 
+             <%= render 'shared/additional_options' do %>
+diff --git a/app/views/pushes/audit.json.jbuilder b/app/views/pushes/audit.json.jbuilder
+new file mode 100644
+index 00000000..3767e573
+--- /dev/null
++++ b/app/views/pushes/audit.json.jbuilder
+@@ -0,0 +1,19 @@
++json.logs @audit_logs do |audit_log|
++  json.ip audit_log.ip
++  json.user_agent audit_log.user_agent
++  json.referrer audit_log.referrer
++  json.kind audit_log.kind
++  json.created_at audit_log.created_at
++  json.updated_at audit_log.updated_at
++
++  if audit_log.kind == "creation_email_send"
++    json.notify_by_email do
++      json.recipients audit_log.notify_by_email.recipients
++      json.locale audit_log.notify_by_email.locale
++      json.status audit_log.notify_by_email.status
++      json.error_message audit_log.notify_by_email.error_message if audit_log.notify_by_email.error_message.present?
++      json.successful_sends audit_log.notify_by_email.successful_sends
++      json.proceed_at audit_log.notify_by_email.proceed_at
++    end
++  end
++end
+diff --git a/app/views/pushes/preview.html.erb b/app/views/pushes/preview.html.erb
+index 50c16806..6fd635d0 100644
+--- a/app/views/pushes/preview.html.erb
++++ b/app/views/pushes/preview.html.erb
+@@ -2,6 +2,8 @@
+ 
+ <div class="container-xl py-4 py-lg-5">
+ 
++    <%= render partial: "pushes/error", locals: {push: @push} %>
++
+     <%# Header %>
+     <div class="text-center mb-4">
+       <h2 class="fw-semibold mb-2">
+@@ -121,12 +123,57 @@
+                   <em class="bi bi-pencil me-1"></em><%= _('Edit') %>
+                 <% end %>
+               <% end %>
++              <% if @push.notify_by_email_allowed_for?(current_user) %>
++                <button class="btn btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#notifyByEmailCollapse" aria-expanded="<%= @push.notify_by_email_recipients.present? %>" aria-controls="notifyByEmailCollapse">
++                  <em class="bi bi-envelope me-1"></em><%= _('Notify by Email') %>
++                </button>
++              <% end %>
+             </div>
+           </div>
+         </div>
+       </div>
+     </div>
+ 
++    <% if @push.notify_by_email_allowed_for?(current_user) %>
++      <%# Notify by email %>
++      <div class="collapse mb-4 <%= 'show' if @push.notify_by_email_recipients.present? %>" id="notifyByEmailCollapse">
++        <div class="card border-0 shadow-sm">
++          <div class="card-header bg-transparent">
++            <em class="bi bi-envelope me-1"></em><%= _('Notify by Email') %>
++          </div>
++          <div class="card-body">
++            <% if current_user.email_limit_reached? %>
++              <div class="alert alert-info mb-0">
++                <%= _('You have reached the maximum number of emails you can send today.') %>
++              </div>
++            <% else %>
++              <%= form_for @push, url: notify_by_email_push_path(@push), method: :post, local: true do |f| %>
++                <div class="mb-2">
++                  <%= f.label :notify_by_email_recipients, _('Email Recipients'), class: "form-label fw-semibold" %>
++                  <div class="input-group">
++                    <span class="input-group-text">
++                      <i class="bi bi-envelope" aria-hidden="true"></i>
++                    </span>
++                    <%= f.text_field :notify_by_email_recipients,
++                        class: "form-control",
++                        placeholder: _('email1@example.com, email2@example.com'),
++                        required: true %>
++                    <%= render "shared/notify_by_email_locale", f: f %>
++                  </div>
++                  <div class="form-text">
++                    <%= _('Enter email addresses separated by commas (maximum 5 emails).') %>
++                  </div>
++                </div>
++                <div class="text-end">
++                  <%= f.submit _('Send Emails'), class: "btn btn-success" %>
++                </div>
++              <% end %>
++            <% end %>
++          </div>
++        </div>
++      </div>
++    <% end %>
++
+     <%# Language tip %>
+     <div class="text-muted small text-center px-2">
+       <p class="mb-1">
+diff --git a/app/views/shared/_notify_by_email.html.erb b/app/views/shared/_notify_by_email.html.erb
+new file mode 100644
+index 00000000..de14b2cc
+--- /dev/null
++++ b/app/views/shared/_notify_by_email.html.erb
+@@ -0,0 +1,23 @@
++<% if (action_name != 'edit') && f.object.notify_by_email_allowed_for?(current_user) %>
++  <div class="row">
++    <div class="col">
++      <label class="form-label fw-medium mt-3"><%= _('Auto-Dispatch: Send Secret Link To') %></label>
++      <% if current_user.present? && current_user.email_limit_reached? %>
++        <div class="alert alert-info">
++          <%= _('You have reached the maximum number of emails you can send today.') %>
++        </div>
++      <% else %>
++        <div class="input-group">
++          <span class="input-group-text">
++            <i class="bi bi-envelope" aria-hidden="true"></i>
++          </span>
++          <%= f.text_field :notify_by_email_recipients, class: "form-control", placeholder: _('recipient@example.com, another@example.com') %>
++          <%= render "shared/notify_by_email_locale", f: f %>
++        </div>
++        <div class="form-text">
++          <%= _('Separate multiple addresses with commas (max 5).') %>
++        </div>
++      <% end %>
++    </div>
++  </div>
++<% end %>
+diff --git a/app/views/shared/_notify_by_email_locale.html.erb b/app/views/shared/_notify_by_email_locale.html.erb
+new file mode 100644
+index 00000000..21b51168
+--- /dev/null
++++ b/app/views/shared/_notify_by_email_locale.html.erb
+@@ -0,0 +1,49 @@
++<% if Settings.language_codes %>
++  <div data-controller="select-dropdown">
++    <%= f.hidden_field :notify_by_email_locale, data: {"select-dropdown-target": "field"} %>
++
++    <button
++      type="button"
++      class="btn btn-primary dropdown-toggle rounded-start-0"
++      data-bs-toggle="dropdown"
++      aria-expanded="false"
++      aria-haspopup="true"
++      title="<%= _('Select the language for the secret link') %>"
++      aria-label="<%= _('Select the language for the secret link') %>">
++      <span class="me-2" data-select-dropdown-target="menuButtonInner">🌎</span>
++    </button>
++
++    <ul class="dropdown-menu dropdown-menu-end ">
++      <li><span class="dropdown-item-text"><%= _('Secret Link Language') %></span></li>
++      <li><hr class="dropdown-divider"></li>
++      <% if Settings.language_codes %>
++        <li class="m-0 p-0">
++          <div class="dropdown-item m-0 py-1 px-3 text-muted text-wrap overflow-hidden" data-action="click->select-dropdown#select" data-lang="">
++            <template>
++              🌎
++            </template>
++            🌎 <%= _('Autodetect the recipient\'s language') %>
++          </div>
++        </li>
++        <li class="p-0">
++          <div class="container p-0 m-0">
++            <div class="row overflow-y-auto p-0 m-0" style="max-height: 450px;">
++              <% I18n.available_locales.each do |lang| %>
++                <div class="col-12 col-md-6 col-lg-4 m-0 p-0" data-action="click->select-dropdown#select" data-lang="<%= lang %>">
++                  <div class="dropdown-item m-0 py-1 px-3 text-muted text-wrap overflow-hidden">
++                    <template>
++                      <em class="fi fi-<%= Settings.country_codes[lang] %>"></em>
++                      <%= Settings.language_codes[lang] %>
++                    </template>
++                    <em class="fi fi-<%= Settings.country_codes[lang] %>"></em>
++                    <%= Settings.language_codes[lang] %>
++                  </div>
++                </div>
++              <% end %>
++            </div>
++          </div>
++        </li>
++      <% end %>
++    </ul>
++  </div>
++<% end %>
+diff --git a/bin/dev b/bin/dev
+index d80a02db..c19fc020 100755
+--- a/bin/dev
++++ b/bin/dev
+@@ -8,4 +8,8 @@ fi
+ # Default to port 3000 if not specified
+ export PORT="${PORT:-3000}"
+ 
+-exec foreman start -f Procfile.dev --env /dev/null "$@"
++if [ -f .env ]; then
++  exec foreman start -f Procfile.dev --env .env "$@"
++else
++  exec foreman start -f Procfile.dev --env /dev/null "$@"
++fi
+diff --git a/config/defaults/settings.yml b/config/defaults/settings.yml
+index a2b90eef..87f3190e 100644
+--- a/config/defaults/settings.yml
++++ b/config/defaults/settings.yml
+@@ -1167,6 +1167,26 @@ throttling:
+   # Environment Variable Override: PWP__THROTTLING__SECOND='20'
+   second: 60
+ 
++### Notify by Email
++#
++# Configure the "Notify by Email" (auto-dispatch) feature.
++# When a signed-in user creates a push, they can optionally have the
++# application email the secret link to one or more recipients on their behalf.
++#
++# See https://docs.pwpush.com/docs/notify-by-email/
++#
++notify_by_email:
++  # Per-user daily cap on the number of notification emails that may be
++  # dispatched. Applies across all pushes owned by the user.
++  #
++  # Set to 0 to disable the feature entirely.
++  # Set to null (or leave unset) for no cap.
++  #
++  # Default: 500
++  #
++  # Environment Variable Override: PWP__NOTIFY_BY_EMAIL__DAILY_LIMIT='100'
++  daily_limit: 500
++
+ ### Purge After
+ #
+ # Set the time after which expired pushes, including metadata like
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 085310d2..e4ee9a3a 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -28,7 +28,10 @@ Rails.application.configure do
+   # Show full error reports and disable caching.
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
+-  config.cache_store = :null_store
++  # Use an in-memory cache in tests so features that depend on it
++  # (e.g. ActionController::RateLimiting) function end-to-end.
++  # Tests that touch cache state should call `Rails.cache.clear` in setup.
++  config.cache_store = :memory_store
+ 
+   # Raise exceptions instead of rendering exception templates.
+   config.action_dispatch.show_exceptions = :rescuable
+diff --git a/config/initializers/1_settings.rb b/config/initializers/1_settings.rb
+index ef0451a7..8dc82bb6 100644
+--- a/config/initializers/1_settings.rb
++++ b/config/initializers/1_settings.rb
+@@ -35,3 +35,11 @@ Settings.reload!
+ load_legacy_environment_variables
+ 
+ # rubocop:enable Layout/LineLength
++
++module SettingsExtensions
++  def notify_by_email_available?
++    !disable_logins && mail&.smtp_address.present?
++  end
++end
++
++Settings.extend(SettingsExtensions)
+diff --git a/config/routes/madmin.rb b/config/routes/madmin.rb
+index 76646913..b0741b1f 100644
+--- a/config/routes/madmin.rb
++++ b/config/routes/madmin.rb
+@@ -6,6 +6,7 @@ authenticated :user, lambda { |u| u.admin? } do
+       resources :variant_records
+     end
+     resources :audit_logs
++    resources :notify_by_emails
+     resources :pushes
+     resources :users, except: [:edit, :update]
+     root to: "dashboard#show"
+diff --git a/config/routes/pushes.rb b/config/routes/pushes.rb
+index e289a6da..6619cac7 100644
+--- a/config/routes/pushes.rb
++++ b/config/routes/pushes.rb
+@@ -18,5 +18,6 @@ constraints(format: :html) do
+     delete "expire", on: :member
+     get "audit", on: :member
+     delete "delete_file", on: :member
++    post "notify_by_email", on: :member
+   end
+ end
+diff --git a/config/routes/pwp_api.rb b/config/routes/pwp_api.rb
+index 6994e6a1..508f26f7 100644
+--- a/config/routes/pwp_api.rb
++++ b/config/routes/pwp_api.rb
+@@ -8,6 +8,7 @@ constraints(format: :json) do
+         get "audit", on: :member
+         get "active", on: :collection
+         get "expired", on: :collection
++        post "notify_by_email", on: :member
+       end
+     end
+   end
+diff --git a/config/settings.yml b/config/settings.yml
+index a2b90eef..87f3190e 100644
+--- a/config/settings.yml
++++ b/config/settings.yml
+@@ -1167,6 +1167,26 @@ throttling:
+   # Environment Variable Override: PWP__THROTTLING__SECOND='20'
+   second: 60
+ 
++### Notify by Email
++#
++# Configure the "Notify by Email" (auto-dispatch) feature.
++# When a signed-in user creates a push, they can optionally have the
++# application email the secret link to one or more recipients on their behalf.
++#
++# See https://docs.pwpush.com/docs/notify-by-email/
++#
++notify_by_email:
++  # Per-user daily cap on the number of notification emails that may be
++  # dispatched. Applies across all pushes owned by the user.
++  #
++  # Set to 0 to disable the feature entirely.
++  # Set to null (or leave unset) for no cap.
++  #
++  # Default: 500
++  #
++  # Environment Variable Override: PWP__NOTIFY_BY_EMAIL__DAILY_LIMIT='100'
++  daily_limit: 500
++
+ ### Purge After
+ #
+ # Set the time after which expired pushes, including metadata like
+diff --git a/db/migrate/20260427190300_create_notify_by_emails.rb b/db/migrate/20260427190300_create_notify_by_emails.rb
+new file mode 100644
+index 00000000..7b1fdaa9
+--- /dev/null
++++ b/db/migrate/20260427190300_create_notify_by_emails.rb
+@@ -0,0 +1,18 @@
++# frozen_string_literal: true
++
++class CreateNotifyByEmails < ActiveRecord::Migration[8.1]
++  def change
++    create_table :notify_by_emails do |t|
++      t.references :audit_log, null: false, foreign_key: true
++      t.text :recipients_ciphertext, null: false
++      t.integer :recipients_count, default: 0, null: false
++      t.text :successful_sends_ciphertext
++      t.text :locale_ciphertext
++      t.integer :status, default: 0, null: false
++      t.text :error_message_ciphertext
++
++      t.datetime :proceed_at
++      t.timestamps
++    end
++  end
++end
+diff --git a/db/migrate/20260509010000_add_daily_email_usage_to_users.rb b/db/migrate/20260509010000_add_daily_email_usage_to_users.rb
+new file mode 100644
+index 00000000..d94c55dc
+--- /dev/null
++++ b/db/migrate/20260509010000_add_daily_email_usage_to_users.rb
+@@ -0,0 +1,10 @@
++# frozen_string_literal: true
++
++class AddDailyEmailUsageToUsers < ActiveRecord::Migration[8.1]
++  def change
++    change_table :users, bulk: true do |t|
++      t.integer :email_sent_count, default: 0, null: false
++      t.datetime :email_sent_count_reset_at
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index af822d37..2ccaab0e 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_03_21_120000) do
++ActiveRecord::Schema[8.1].define(version: 2026_05_09_010000) do
+   create_table "active_storage_attachments", force: :cascade do |t|
+     t.integer "blob_id", null: false
+     t.datetime "created_at", precision: nil, null: false
+@@ -62,6 +62,20 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_21_120000) do
+     t.index ["name"], name: "index_data_migration_statuses_on_name", unique: true
+   end
+ 
++  create_table "notify_by_emails", force: :cascade do |t|
++    t.integer "audit_log_id", null: false
++    t.datetime "created_at", null: false
++    t.text "error_message_ciphertext"
++    t.text "locale_ciphertext"
++    t.datetime "proceed_at"
++    t.text "recipients_ciphertext", null: false
++    t.integer "recipients_count", default: 0, null: false
++    t.integer "status", default: 0, null: false
++    t.text "successful_sends_ciphertext"
++    t.datetime "updated_at", null: false
++    t.index ["audit_log_id"], name: "index_notify_by_emails_on_audit_log_id"
++  end
++
+   create_table "pushes", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.boolean "deletable_by_viewer", default: true
+@@ -82,6 +96,14 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_21_120000) do
+     t.index ["user_id"], name: "index_pushes_on_user_id"
+   end
+ 
++  create_table "site_settings", force: :cascade do |t|
++    t.datetime "created_at", null: false
++    t.string "key", null: false
++    t.datetime "updated_at", null: false
++    t.text "value"
++    t.index ["key"], name: "index_site_settings_on_key", unique: true
++  end
++
+   create_table "solid_queue_blocked_executions", force: :cascade do |t|
+     t.string "concurrency_key", null: false
+     t.datetime "created_at", null: false
+@@ -213,6 +235,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_21_120000) do
+     t.datetime "current_sign_in_at", precision: nil
+     t.string "current_sign_in_ip"
+     t.string "email", default: "", null: false
++    t.integer "email_sent_count", default: 0, null: false
++    t.datetime "email_sent_count_reset_at"
+     t.string "encrypted_password", default: "", null: false
+     t.integer "failed_attempts", default: 0
+     t.integer "last_otp_timestep"
+@@ -259,6 +283,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_21_120000) do
+   add_foreign_key "active_storage_attachments", "active_storage_blobs", column: "blob_id"
+   add_foreign_key "active_storage_variant_records", "active_storage_blobs", column: "blob_id"
+   add_foreign_key "audit_logs", "pushes"
++  add_foreign_key "notify_by_emails", "audit_logs"
+   add_foreign_key "pushes", "users"
+   add_foreign_key "solid_queue_blocked_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
+   add_foreign_key "solid_queue_claimed_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
+diff --git a/test/controllers/concerns/log_events_test.rb b/test/controllers/concerns/log_events_test.rb
+index 2b5ba953..48e305b3 100644
+--- a/test/controllers/concerns/log_events_test.rb
++++ b/test/controllers/concerns/log_events_test.rb
+@@ -10,11 +10,12 @@ end
+ class LogEventsTest < ActionController::TestCase
+   tests LogEventsTestController
+   include Devise::Test::ControllerHelpers
++  include ActiveJob::TestHelper
+ 
+   setup do
+     @push = pushes(:test_push)
+     @user = users(:luca)
+-    AuditLog.delete_all
++    AuditLog.destroy_all
+   end
+ 
+   # Test log_view method
+@@ -161,6 +162,52 @@ class LogEventsTest < ActionController::TestCase
+     assert_not_equal @push, log.push
+   end
+ 
++  test "log_creation_email_send creates an audit_log and notify_by_email" do
++    @request.env["REMOTE_ADDR"] = "172.16.0.1"
++    @request.env["HTTP_USER_AGENT"] = "TestAgent/1.0"
++    @request.env["HTTP_REFERER"] = "https://test.com"
++
++    sign_in @user
++
++    @push.notify_by_email_recipients = "test@test.com"
++    @push.notify_by_email_locale = "en"
++    @push.notify_by_email_creator = @user
++
++    assert_difference "AuditLog.count", 1 do
++      assert_difference "NotifyByEmail.count", 1 do
++        @controller.log_creation_email_send(@push)
++      end
++    end
++
++    assert_equal 1, AuditLog.count
++    log = AuditLog.last
++    assert_equal :creation_email_send, log.kind.to_sym
++    assert_equal @push, log.push
++    assert_equal "172.16.0.1", log.ip
++    assert_equal "TestAgent/1.0", log.user_agent
++    assert_equal "https://test.com", log.referrer
++
++    notify_by_email = NotifyByEmail.last
++    assert_equal "test@test.com", notify_by_email.recipients
++    assert_equal "en", notify_by_email.locale
++    assert_equal @push, notify_by_email.push
++    assert_equal "pending", notify_by_email.status
++  end
++
++  test "log_creation_email_send does not create audit_log or notify_by_email record when notify_by_email_recipients is blank" do
++    sign_in @user
++
++    @push.notify_by_email_recipients = ""
++
++    refute_enqueued_jobs do
++      assert_no_difference "AuditLog.count" do
++        assert_no_difference "NotifyByEmail.count" do
++          @controller.log_creation_email_send(@push)
++        end
++      end
++    end
++  end
++
+   # Test log_failed_passphrase method
+   test "log_failed_passphrase creates failed_passphrase audit log" do
+     @request.env["REMOTE_ADDR"] = "192.168.0.1"
+@@ -328,7 +375,7 @@ class LogEventsTest < ActionController::TestCase
+     kinds = [:creation, :view, :failed_view, :expire, :failed_passphrase, :owner_view, :admin_view]
+ 
+     kinds.each do |kind|
+-      AuditLog.delete_all
++      AuditLog.destroy_all
+       push = Push.create!(
+         kind: "text",
+         payload: "test",
+diff --git a/test/controllers/pushes_controller_test.rb b/test/controllers/pushes_controller_test.rb
+index 6714ced9..3ffc28c2 100644
+--- a/test/controllers/pushes_controller_test.rb
++++ b/test/controllers/pushes_controller_test.rb
+@@ -16,20 +16,9 @@ class PushesControllerTest < ActionDispatch::IntegrationTest
+ 
+   teardown do
+     Settings.reload!
+-    Rails.application.reload_routes!
+   end
+ 
+   # new
+-  test "notify_by_email_recipients field is not shown when feature is disabled" do
+-    Settings.notify_by_email.enabled = false
+-    Rails.application.reload_routes!
+-
+-    get new_push_path
+-
+-    assert_response :success
+-    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 0
+-  end
+-
+   test "notify_by_email_recipients field is shown when mail service is configured and user is signed in" do
+     get new_push_path
+ 
+@@ -97,25 +86,6 @@ class PushesControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
+-  test "create doesn't enqueue SendNotifyByEmailJob when feature is disabled" do
+-    Settings.notify_by_email.enabled = false
+-    Rails.application.reload_routes!
+-
+-    assert_no_enqueued_jobs(only: SendNotifyByEmailJob) do
+-      post pushes_path, params: {
+-        push: {
+-          kind: "text",
+-          payload: "secret",
+-          notify_by_email_recipients: "someone@example.com",
+-          notify_by_email_locale: "fr"
+-        }
+-      }
+-
+-      assert_response :unprocessable_content
+-      assert_includes response.body, "Notifying by email is not available"
+-    end
+-  end
+-
+   test "create doesn't enqueue SendNotifyByEmailJob when email service is not configured" do
+     Settings.mail.smtp_address = nil
+ 
+@@ -167,16 +137,6 @@ class PushesControllerTest < ActionDispatch::IntegrationTest
+   end
+ 
+   # preview
+-  test "preview does not show notify_by_email when feature is disabled" do
+-    Settings.notify_by_email.enabled = false
+-    Rails.application.reload_routes!
+-
+-    get preview_push_path(@push)
+-
+-    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 0
+-    assert_select "div.collapse#notifyByEmailCollapse", count: 0
+-  end
+-
+   test "preview shows notify_by_email_recipients field when user is signed in and email service is configured" do
+     get preview_push_path(@push)
+ 
+@@ -185,20 +145,6 @@ class PushesControllerTest < ActionDispatch::IntegrationTest
+   end
+ 
+   # notify_by_email
+-  test "notify_by_email returns not found when feature is disabled" do
+-    Settings.notify_by_email.enabled = false
+-    Rails.application.reload_routes!
+-
+-    post "/p/#{@push.url_token}/notify_by_email", params: {
+-      push: {
+-        notify_by_email_recipients: "recipient@example.com",
+-        notify_by_email_locale: "en"
+-      }
+-    }
+-
+-    assert_response :not_found
+-  end
+-
+   test "notify_by_email enqueues SendNotifyByEmailJob when user is signed in and params present" do
+     assert_enqueued_with(job: SendNotifyByEmailJob) do
+       post notify_by_email_push_path(@push), params: {
+@@ -277,22 +223,6 @@ class PushesControllerTest < ActionDispatch::IntegrationTest
+     assert_nil flash[:notice]
+   end
+ 
+-  test "access is rate limited after five attempts per push" do
+-
+-    @push.update!(passphrase: "secret")
+-
+-    5.times do |i|
+-      post access_push_path(@push), params: {passphrase: "wrong#{i}"}
+-      assert_response :redirect
+-    end
+-
+-    post access_push_path(@push), params: {passphrase: "wrong5"}
+-
+-    assert_response :redirect
+-    assert_redirected_to passphrase_push_path(@push)
+-    assert_match(/Too many passphrase attempts/, flash[:alert])
+-  end
+-
+   test "notify_by_email is rate limited after five bursts per user" do
+     Rails.cache.clear
+ 
+diff --git a/test/fixtures/audit_logs.yml b/test/fixtures/audit_logs.yml
+index a73aece1..fa4f4c87 100644
+--- a/test/fixtures/audit_logs.yml
++++ b/test/fixtures/audit_logs.yml
+@@ -25,3 +25,11 @@ failed_view:
+   ip: 127.0.0.1
+   created_at: <%= Time.current %>
+   updated_at: <%= Time.current %>
++
++creation_email_send:
++  user: giuliana
++  push: test_push
++  kind: creation_email_send
++  ip: 127.0.0.1
++  created_at: <%= Time.current %>
++  updated_at: <%= Time.current %>
+diff --git a/test/fixtures/notify_by_emails.yml b/test/fixtures/notify_by_emails.yml
+new file mode 100644
+index 00000000..eb4f5c19
+--- /dev/null
++++ b/test/fixtures/notify_by_emails.yml
+@@ -0,0 +1,9 @@
++one: 
++  audit_log: creation_email_send
++  recipients_ciphertext: <%= NotifyByEmail.generate_recipients_ciphertext("one@example.com").inspect %>
++  recipients_count: 1
++  locale_ciphertext: <%= NotifyByEmail.generate_locale_ciphertext("en").inspect %>
++  status: pending
++  successful_sends_ciphertext: 
++  created_at: <%= Time.current %>
++  updated_at: <%= Time.current %>
+\ No newline at end of file
+diff --git a/test/helpers/pushes_helper_test.rb b/test/helpers/pushes_helper_test.rb
+index a75c4036..171c4837 100644
+--- a/test/helpers/pushes_helper_test.rb
++++ b/test/helpers/pushes_helper_test.rb
+@@ -99,6 +99,28 @@ class PushesHelperTest < ActionView::TestCase
+     assert_equal "1.0 GiB", filesize(1024 * 1024 * 1024) # 1 GB
+   end
+ 
++  # Tests for format_days_remaining helper
++  test "format_days_remaining returns plural days string" do
++    push = Push.new(kind: "text")
++    push.stub(:days_remaining, 5) do
++      assert_equal "5 days", format_days_remaining(push)
++    end
++  end
++
++  test "format_days_remaining returns singular day when 1" do
++    push = Push.new(kind: "text")
++    push.stub(:days_remaining, 1) do
++      assert_equal "1 day", format_days_remaining(push)
++    end
++  end
++
++  test "format_days_remaining returns 0 days when 0" do
++    push = Push.new(kind: "text")
++    push.stub(:days_remaining, 0) do
++      assert_equal "0 days", format_days_remaining(push)
++    end
++  end
++
+   # Tests for checkbox_options_for_push helper
+   test "checkbox_options_for_push includes x-default for new push" do
+     push = Push.new(kind: "text")
+diff --git a/test/integration/api/api_v2_pushes_test.rb b/test/integration/api/api_v2_pushes_test.rb
+index 2e0ed0b4..0ed3dba5 100644
+--- a/test/integration/api/api_v2_pushes_test.rb
++++ b/test/integration/api/api_v2_pushes_test.rb
+@@ -163,6 +163,49 @@ class ApiV2PushesTest < ActionDispatch::IntegrationTest
+     assert_response :success
+   end
+ 
++  def test_audit_includes_notify_by_email_details
++    push = pushes(:test_push)
++    owner = users(:giuliana)
++
++    get "/api/v2/pushes/#{push.url_token}/audit",
++      headers: bearer_headers(owner),
++      as: :json
++
++    body = JSON.parse(response.body)
++    log = body["logs"].select { |view| view["kind"] == "creation_email_send" }.first
++
++    assert_equal "en", log["notify_by_email"]["locale"]
++    assert_equal "one@example.com", log["notify_by_email"]["recipients"]
++    assert_equal "pending", log["notify_by_email"]["status"]
++    assert_nil log["notify_by_email"]["successful_sends"]
++    assert_nil log["notify_by_email"]["proceed_at"]
++  end
++
++  def test_audit_includes_notify_by_email_details_for_completed_notify_by_email
++    push = pushes(:test_push)
++    notify_by_email = notify_by_emails(:one)
++    owner = users(:giuliana)
++
++    Settings.stub(:notify_by_email_available?, true) do
++      travel_to Time.zone.local(2026, 1, 1, 1, 0, 0) do
++        SendNotifyByEmailJob.perform_now(notify_by_email.id)
++      end
++    end
++
++    get "/api/v2/pushes/#{push.url_token}/audit",
++      headers: bearer_headers(owner),
++      as: :json
++
++    body = JSON.parse(response.body)
++    log = body["logs"].find { |log| log["kind"] == "creation_email_send" }
++
++    assert_equal "one@example.com", log["notify_by_email"]["recipients"]
++    assert_equal "en", log["notify_by_email"]["locale"]
++    assert_equal "completed", log["notify_by_email"]["status"]
++    assert_equal "one@example.com", log["notify_by_email"]["successful_sends"]
++    assert_equal "2026-01-01T01:00:00.000Z", log["notify_by_email"]["proceed_at"]
++  end
++
+   def test_active_allows_authenticated_access
+     user = users(:one)
+ 
+@@ -359,4 +402,172 @@ class ApiV2PushesTest < ActionDispatch::IntegrationTest
+     body = JSON.parse(response.body)
+     assert body["error"].present?
+   end
++
++  def test_create_with_notify_by_email_params_adds_a_job_to_the_queue
++    Settings.mail.smtp_address = "smtp.example.com"
++    user = users(:one)
++
++    send_email_job = assert_enqueued_with(job: SendNotifyByEmailJob) do
++      post "/api/v2/pushes",
++        params: {
++          push: {
++            payload: "some-secret",
++            notify_by_email: {
++              recipients: "recipient@example.com",
++              locale: "en"
++            }
++          }
++        },
++        headers: bearer_headers(user),
++        as: :json
++
++      assert_response :success
++    end
++
++    notify_by_email_id = send_email_job.arguments.first
++    notify_by_email = NotifyByEmail.find(notify_by_email_id)
++
++    assert_equal "recipient@example.com", notify_by_email.recipients
++    assert_equal "en", notify_by_email.locale
++
++    body = JSON.parse(response.body)
++    assert_equal "recipient@example.com", body["notify_by_email"]["recipients"]
++    assert_equal "en", body["notify_by_email"]["locale"]
++  end
++
++  def test_create_with_notify_by_email_params_fails_when_email_service_is_not_configured
++    user = users(:one)
++
++    post "/api/v2/pushes",
++      params: {
++        push: {
++          payload: "some-secret",
++          notify_by_email: {
++            recipients: "recipient@example.com",
++            locale: "en"
++          }
++        }
++      },
++      headers: bearer_headers(user),
++      as: :json
++
++    assert_response :unprocessable_entity
++    body = JSON.parse(response.body)
++    assert_equal "Notifying by email is not available", body["base"][0]
++  end
++
++  def test_create_with_notify_by_email_params_fails_when_user_is_not_signed_in
++    Settings.mail.smtp_address = "smtp.example.com"
++
++    post "/api/v2/pushes",
++      params: {
++        push: {
++          payload: "some-secret",
++          notify_by_email: {
++            recipients: "recipient@example.com",
++            locale: "en"
++          }
++        }
++      },
++      as: :json
++
++    assert_response :unprocessable_entity
++    body = JSON.parse(response.body)
++    assert_equal "Notifying by email is not allowed for unknown users", body["base"][0]
++  end
++
++  def test_notify_by_email_with_valid_params_returns_json_created
++    Settings.mail.smtp_address = "smtp.example.com"
++    push = pushes(:test_push)
++    owner = push.user
++
++    send_email_job = assert_enqueued_with(job: SendNotifyByEmailJob) do
++      post "/api/v2/pushes/#{push.url_token}/notify_by_email",
++        params: {
++          recipients: "recipient@example.com",
++          locale: "en"
++        },
++        headers: bearer_headers(owner),
++        as: :json
++
++      assert_response :success
++      assert_equal "Recipient(s) are added to the queue to be sent.", JSON.parse(response.body)["message"]
++    end
++
++    notify_by_email_id = send_email_job.arguments.first
++    notify_by_email = NotifyByEmail.find(notify_by_email_id)
++
++    assert_equal "recipient@example.com", notify_by_email.recipients
++    assert_equal "en", notify_by_email.locale
++    assert_equal push, notify_by_email.push
++  end
++
++  def test_notify_by_email_with_valid_params_returns_error_when_email_service_is_not_configured
++    push = pushes(:test_push)
++    owner = push.user
++
++    post "/api/v2/pushes/#{push.url_token}/notify_by_email",
++      params: {
++        recipients: "recipient@example.com",
++        locale: "en"
++      },
++      headers: bearer_headers(owner),
++      as: :json
++
++    assert_response :unprocessable_entity
++
++    body = JSON.parse(response.body)
++    assert_equal "Notifying by email is not available", body["base"][0]
++  end
++
++  def test_notify_by_email_requires_authentication
++    push = pushes(:test_push)
++
++    post "/api/v2/pushes/#{push.url_token}/notify_by_email",
++      params: {
++        recipients: "recipient@example.com",
++        locale: "en"
++      },
++      as: :json
++
++    assert_response :unauthorized
++  end
++
++  def test_notify_by_email_forbidden_for_non_owner
++    push = pushes(:test_push)
++    non_owner = users(:one)
++
++    post "/api/v2/pushes/#{push.url_token}/notify_by_email",
++      params: {
++        recipients: "recipient@example.com",
++        locale: "en"
++      },
++      headers: bearer_headers(non_owner),
++      as: :json
++
++    assert_response :forbidden
++  end
++
++  def test_notify_by_email_is_rate_limited_after_five_bursts_per_user
++    Rails.cache.clear
++    Settings.mail.smtp_address = "smtp.example.com"
++    push = pushes(:test_push)
++    owner = push.user
++
++    5.times do |i|
++      post "/api/v2/pushes/#{push.url_token}/notify_by_email",
++        params: {recipients: "recipient#{i}@example.com", locale: "en"},
++        headers: bearer_headers(owner),
++        as: :json
++    end
++
++    post "/api/v2/pushes/#{push.url_token}/notify_by_email",
++      params: {recipients: "recipient5@example.com", locale: "en"},
++      headers: bearer_headers(owner),
++      as: :json
++
++    assert_response :too_many_requests
++    body = JSON.parse(response.body)
++    assert_match(/Too many email notification requests/, body["error"])
++  end
+ end
+diff --git a/test/integration/password/password_creation_test.rb b/test/integration/password/password_creation_test.rb
+index 5111cae9..d11ed155 100644
+--- a/test/integration/password/password_creation_test.rb
++++ b/test/integration/password/password_creation_test.rb
+@@ -188,4 +188,34 @@ class PasswordCreationTest < ActionDispatch::IntegrationTest
+     # at all so we set false - NOT deletable by viewers
+     assert(delete_button.empty?)
+   end
++
++  def test_password_creation_with_auto_dispatch_emails
++    Settings.mail.smtp_address = "smtp.example.com"
++    @user = users(:luca)
++    sign_in @user
++
++    get new_push_path(tab: "text")
++    assert_response :success
++
++    job = assert_enqueued_with(job: SendNotifyByEmailJob) do
++      post pushes_path, params: {
++        push: {
++          kind: "text",
++          payload: "testpw",
++          notify_by_email_recipients: "test@example.com",
++          notify_by_email_locale: "fr"
++        }
++      }
++      assert_response :redirect
++
++      follow_redirect!
++      assert_response :success
++    end
++
++    assert_emails 1 do
++      job.perform_now
++    end
++  ensure
++    Settings.reload!
++  end
+ end
+diff --git a/test/integration/password/password_edit_test.rb b/test/integration/password/password_edit_test.rb
+index b7d81365..8841ac5f 100644
+--- a/test/integration/password/password_edit_test.rb
++++ b/test/integration/password/password_edit_test.rb
+@@ -507,4 +507,29 @@ class PasswordEditTest < ActionDispatch::IntegrationTest
+     # Verify save block is present when creating
+     assert_select "div#cookie-save", true, "Save block should be visible when creating"
+   end
++
++  test "cannot update notify_by_email_recipients and notify_by_email_locale, this fields are skipped during update" do
++    push = Push.create!(
++      kind: "text",
++      payload: "Password",
++      user: @luca
++    )
++
++    patch push_path(push), params: {
++      push: {
++        notify_by_email_recipients: "test@example.com",
++        notify_by_email_locale: "fr"
++      }
++    }
++
++    assert_response :redirect
++
++    follow_redirect!
++    assert_response :success
++
++    push.reload
++    assert_equal "Password", push.payload
++    assert_nil push.notify_by_email_recipients
++    assert_nil push.notify_by_email_locale
++  end
+ end
+diff --git a/test/integration/password/password_notify_by_email_test.rb b/test/integration/password/password_notify_by_email_test.rb
+new file mode 100644
+index 00000000..53b94384
+--- /dev/null
++++ b/test/integration/password/password_notify_by_email_test.rb
+@@ -0,0 +1,40 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class PasswordNotifyByEmailTest < ActionDispatch::IntegrationTest
++  include Devise::Test::IntegrationHelpers
++
++  setup do
++    Settings.mail.smtp_address = "smtp.example.com"
++
++    @push = pushes(:test_push)
++    @user = @push.user
++    sign_in @user
++  end
++
++  teardown do
++    Settings.reload!
++  end
++
++  def test_password_notify_by_email
++    get preview_push_path(@push)
++
++    assert_response :success
++
++    assert_select "input[name='push[notify_by_email_recipients]']", count: 1
++    assert_select "input[name='push[notify_by_email_locale]']", count: 1
++
++    job = assert_enqueued_with(job: SendNotifyByEmailJob) do
++      post notify_by_email_push_path(@push), params: {push: {notify_by_email_recipients: "test@example.com", notify_by_email_locale: "fr"}}
++      assert_response :redirect
++
++      follow_redirect!
++      assert_response :success
++    end
++
++    notify_by_email = NotifyByEmail.find(job.arguments.first)
++    assert_equal "test@example.com", notify_by_email.recipients
++    assert_equal "fr", notify_by_email.locale
++  end
++end
+diff --git a/test/mailers/previews/push_created_mailer_preview.rb b/test/mailers/previews/push_created_mailer_preview.rb
+new file mode 100644
+index 00000000..5c256943
+--- /dev/null
++++ b/test/mailers/previews/push_created_mailer_preview.rb
+@@ -0,0 +1,66 @@
++# frozen_string_literal: true
++
++# Preview all emails at http://localhost:3000/rails/mailers/push_created_mailer
++class PushCreatedMailerPreview < ActionMailer::Preview
++  # Preview the push notification email
++  # http://localhost:3000/rails/mailers/push_created_mailer/notify
++  def notify
++    push = sample_push
++    PushCreatedMailer.with(
++      push: push,
++      recipient: "recipient@example.com"
++    ).notify
++  end
++
++  # Preview with a specific locale (e.g., Spanish)
++  # http://localhost:3000/rails/mailers/push_created_mailer/notify_with_locale
++  def notify_with_locale
++    push = sample_push
++    PushCreatedMailer.with(
++      push: push,
++      recipient: "recipient@example.com",
++      locale: "es"
++    ).notify
++  end
++
++  # Preview with retrieval step enabled
++  # http://localhost:3000/rails/mailers/push_created_mailer/notify_with_retrieval_step
++  def notify_with_retrieval_step
++    push = sample_push(retrieval_step: true)
++    PushCreatedMailer.with(
++      push: push,
++      recipient: "recipient@example.com"
++    ).notify
++  end
++
++  private
++
++  def sample_push(options = {})
++    user = build_sample_user
++
++    push = Push.new(
++      kind: :text,
++      payload: "This is a sample secret payload for preview purposes.",
++      expire_after_days: 7,
++      expire_after_views: 5,
++      retrieval_step: options[:retrieval_step] || false,
++      user: user,
++      created_at: Time.current
++    )
++
++    # Apply any additional options
++    push.retrieval_step = options[:retrieval_step] if options.key?(:retrieval_step)
++
++    # Need to trigger validations to set the default values
++    push.valid?
++
++    push
++  end
++
++  def build_sample_user
++    User.new(
++      email: "sender@example.com",
++      created_at: Time.current
++    )
++  end
++end
+diff --git a/test/mailers/push_created_mailer_test.rb b/test/mailers/push_created_mailer_test.rb
+new file mode 100644
+index 00000000..2b3beb2f
+--- /dev/null
++++ b/test/mailers/push_created_mailer_test.rb
+@@ -0,0 +1,109 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class PushCreatedMailerTest < ActionMailer::TestCase
++  setup do
++    @push = pushes(:test_push)
++    @user = @push.user
++  end
++
++  test "notify sends to emails" do
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    assert_equal ["one@example.com"], mail.to
++  end
++
++  test "notify includes subject" do
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    assert mail.subject.present?, "subject should be present"
++    assert_equal "You have received a push", mail.subject
++  end
++
++  test "notify body includes secret URL" do
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++    mail.deliver_now
++
++    assert_includes mail.body.encoded, @push.url_token
++  end
++
++  test "notify uses push url for non-retrieval-step push" do
++    @push.assign_attributes(retrieval_step: false)
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    assert_includes mail.body.encoded, "/p/#{@push.url_token}"
++  end
++
++  test "notify uses preliminary url when retrieval_step is true" do
++    @push.assign_attributes(retrieval_step: true)
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    # Preliminary step path is /p/:url_token/r
++    assert_includes mail.body.encoded, "/p/#{@push.url_token}/r"
++  end
++
++  test "notify delivers successfully" do
++    assert_emails 1 do
++      PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify.deliver_now
++    end
++  end
++
++  test "notify includes locale in secret URL when notify_by_email_locale is set" do
++    @push.assign_attributes(notify_by_email_locale: "fr")
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com", locale: "fr").notify
++
++    assert_includes mail.html_part.body.encoded, "locale=fr"
++    assert_includes mail.text_part.body.encoded, "locale=fr"
++  end
++
++  test "notify URL has no locale param when notify_by_email_locale is blank" do
++    @push.assign_attributes(notify_by_email_locale: nil)
++    @push.save
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    assert_includes mail.body.encoded, "/p/#{@push.url_token}"
++    # Secret URL is built without ?locale= when locale is blank
++    refute_includes mail.html_part.body.encoded, "locale="
++    refute_includes mail.text_part.body.encoded, "locale="
++  end
++
++  test "notify html body includes sender email" do
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    assert_includes mail.html_part.body.decoded, @user.email
++    assert_includes mail.html_part.body.decoded, "has sent you a push"
++  end
++
++  test "notify body includes expiration days and views" do
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    assert_includes mail.html_part.body.decoded, "valid for 7 days, or until 99 views, whichever occurs first"
++    assert_includes mail.text_part.body.decoded, "valid for 7 days, or 97 views, whichever occurs first"
++  end
++
++  test "notify HTML part secret link has full clickable URL in href" do
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++
++    assert_includes mail.html_part.body.decoded, @push.url_token
++  end
++
++  test "notify secret URL uses https if FORCE_SSL is set" do
++    ENV.stub(:key?, true) do
++      mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++      assert_includes mail.body.encoded, "https://"
++    end
++  end
++
++  test "notify secret URL uses override_base_url if set" do
++    Settings.override_base_url = "http://custom.example.com"
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++    assert_includes mail.body.encoded, "http://custom.example.com"
++
++    Settings.override_base_url = "https://custom.example.com"
++    mail = PushCreatedMailer.with(push: @push, recipient: "one@example.com").notify
++    assert_includes mail.body.encoded, "https://custom.example.com"
++  ensure
++    Settings.reload!
++  end
++end
+diff --git a/test/models/audit_log_test.rb b/test/models/audit_log_test.rb
+index 029a1b96..b6cf2bcf 100644
+--- a/test/models/audit_log_test.rb
++++ b/test/models/audit_log_test.rb
+@@ -15,7 +15,6 @@ class AuditLogTest < ActiveSupport::TestCase
+       expire_after_views: 5
+     )
+ 
+-    # Create a user without using fixtures
+     @luca = users(:luca)
+   end
+ 
+@@ -51,6 +50,16 @@ class AuditLogTest < ActiveSupport::TestCase
+     assert_equal @luca, audit_log.user
+   end
+ 
++  test "must belong to a user if creating a notify_by_email" do
++    audit_log = AuditLog.new(kind: :creation_email_send, push: @push)
++    assert_not audit_log.valid?
++    assert_includes audit_log.errors.full_messages, "User can't be blank"
++
++    audit_log = AuditLog.new(kind: :creation_email_send, push: @push, user: @luca)
++    assert audit_log.valid?
++    assert_equal @luca, audit_log.user
++  end
++
+   test "subject_name returns user email when user exists" do
+     audit_log = AuditLog.new(kind: :view, push: @push, user: @luca)
+     assert_equal @luca.email, audit_log.subject_name
+diff --git a/test/models/concerns/pwpush/notifiable_by_email_test.rb b/test/models/concerns/pwpush/notifiable_by_email_test.rb
+new file mode 100644
+index 00000000..4ba2db13
+--- /dev/null
++++ b/test/models/concerns/pwpush/notifiable_by_email_test.rb
+@@ -0,0 +1,177 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class Pwpush::NotifiableByEmailTest < ActiveSupport::TestCase
++  setup do
++    Settings.mail.smtp_address = "smtp.example.com"
++
++    @push = pushes(:test_push)
++
++    @user = @push.user
++    @other_user = users(:luca)
++
++    @push.notify_by_email_required = true
++    @push.notify_by_email_recipients = "test@example.com"
++    @push.notify_by_email_creator = @user
++  end
++
++  teardown do
++    Settings.reload!
++  end
++
++  test "does not require notify_by_email_recipients when notify_by_email_required is false" do
++    @push.notify_by_email_required = false
++    @push.notify_by_email_recipients = nil
++
++    assert @push.valid?
++  end
++
++  # Test notify_by_email_recipients validation - presence when required
++  test "validates presence of notify_by_email_recipients when notify_by_email_required is true" do
++    @push.notify_by_email_recipients = nil
++
++    assert_not @push.valid?
++    assert_includes @push.errors[:notify_by_email_recipients], "can't be blank"
++  end
++
++  # Test notify_by_email_locale validation
++  test "accepts valid locale in notify_by_email_locale" do
++    @push.notify_by_email_locale = "en"
++
++    assert @push.valid?
++  end
++
++  test "accepts blank notify_by_email_locale" do
++    @push.notify_by_email_locale = nil
++
++    assert @push.valid?
++  end
++
++  test "rejects invalid locale in notify_by_email_locale" do
++    @push.notify_by_email_locale = "invalid_locale"
++
++    assert_not @push.valid?
++    assert_includes @push.errors[:notify_by_email_locale], "is not included in the list"
++  end
++
++  # Test notify_by_email_availability validation
++  test "rejects email notification when feature is not enabled" do
++    Settings.mail.smtp_address = nil
++
++    @push.notify_by_email_recipients = "test@example.com"
++
++    assert_not @push.valid?
++    assert_includes @push.errors[:base], "Notifying by email is not available"
++  end
++
++  test "rejects email notification when creator is not set" do
++    @push.notify_by_email_creator = nil
++
++    assert_not @push.valid?
++    assert_includes @push.errors[:base], "Notifying by email is not allowed for unknown users"
++  end
++
++  test "rejects email notification when creator does not match push user" do
++    @push.notify_by_email_creator = @other_user
++
++    assert @other_user != @user
++    assert_not @push.valid?
++    assert_includes @push.errors[:base], "Notifying by email is allowed for only owners"
++  end
++
++  # Test notify_by_email_limit validation
++  test "accepts up to 5 email recipients for a new push" do
++    push = Push.new(kind: "text", payload: "test", user: @user)
++
++    emails = Array.new(5) { |i| "user#{i}@example.com" }.join(",")
++    push.notify_by_email_recipients = emails
++    push.notify_by_email_creator = @user
++
++    assert push.valid?
++  end
++
++  test "rejects more than 5 email recipients for a new push" do
++    push = Push.new(kind: "text", payload: "test", user: @user)
++
++    emails = Array.new(6) { |i| "user#{i}@example.com" }.join(",")
++    push.notify_by_email_recipients = emails
++    push.notify_by_email_creator = @user
++
++    refute push.valid?
++    assert_includes push.errors[:notify_by_email_recipients], "contains more than 5 email(s)"
++  end
++
++  test "accepts emails within remaining limit for existing push with previous notifications" do
++    notify_by_email = notify_by_emails(:one)
++
++    assert_equal 1, notify_by_email.recipients_count
++
++    emails = Array.new(4) { |i| "user#{i}@example.com" }.join(",")
++    @push.notify_by_email_recipients = emails
++
++    assert @push.valid?
++  end
++
++  test "rejects emails when remaining limit is exceeded for a new push with previous notifications" do
++    notify_by_email = notify_by_emails(:one)
++
++    assert_equal 1, notify_by_email.recipients_count
++
++    emails = Array.new(5) { |i| "user#{i}@example.com" }.join(",")
++    @push.notify_by_email_recipients = emails
++
++    assert_not @push.valid?
++    assert_includes @push.errors[:base], "You can notify up to 5 email(s) and you have already sent emails to 1 recipients"
++  end
++
++  test "rejects email notification for an expired push" do
++    @push.notify_by_email_recipients = nil
++    @push.notify_by_email_required = false
++    @push.expire!
++    @push.notify_by_email_recipients = "test@example.com"
++
++    assert_not @push.valid?
++    assert_includes @push.errors[:base], "You cannot notify by email for an expired push."
++  end
++
++  # Test associations
++  test "has_many notify_by_emails_audit_logs returns audit logs with creation_email_send kind" do
++    assert @push.notify_by_emails_audit_logs.exists?
++    assert @push.notify_by_emails_audit_logs.all? { |log| log.creation_email_send? }
++  end
++
++  test "has_many notify_by_emails through audit logs" do
++    assert_equal 1, @push.notify_by_emails.count
++    assert @push.notify_by_emails.first.is_a?(NotifyByEmail)
++  end
++
++  # Test multiple_emails validator integration
++  test "rejects invalid email format in notify_by_email_recipients" do
++    @push.notify_by_email_recipients = "invalid-email-format"
++
++    assert_not @push.valid?
++    assert @push.errors[:notify_by_email_recipients].any? { |m| m.include?("invalid email") }
++  end
++
++  # Test attr_accessor attributes
++  test "notify_by_email_recipients is accessible" do
++    @push.notify_by_email_recipients = "test@example.com"
++    assert_equal "test@example.com", @push.notify_by_email_recipients
++  end
++
++  test "notify_by_email_locale is accessible" do
++    @push.notify_by_email_locale = "fr"
++    assert_equal "fr", @push.notify_by_email_locale
++  end
++
++  test "notify_by_email_required is accessible" do
++    @push.notify_by_email_required = true
++    assert_equal true, @push.notify_by_email_required
++  end
++
++  test "notify_by_email_creator is accessible" do
++    @push.notify_by_email_creator = @user
++    assert_equal @user, @push.notify_by_email_creator
++  end
++end
+diff --git a/test/models/notify_by_email_test.rb b/test/models/notify_by_email_test.rb
+new file mode 100644
+index 00000000..7c982d62
+--- /dev/null
++++ b/test/models/notify_by_email_test.rb
+@@ -0,0 +1,211 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class NotifyByEmailTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
++  setup do
++    @push = pushes(:test_push)
++    @user = users(:giuliana)
++    @push.notify_by_email_recipients = "one@example.com, two@example.com"
++    @push.notify_by_email_locale = "en"
++
++    # Create an audit log with user for proper testing
++    @audit_log = AuditLog.build(
++      push: @push,
++      kind: :creation_email_send,
++      user: @user,
++      ip: "127.0.0.1"
++    )
++
++    travel_to Time.current.beginning_of_day + 6.hours
++  end
++
++  teardown do
++    travel_back
++  end
++
++  # Test associations
++  test "should belong to audit_log" do
++    notify = NotifyByEmail.new
++    assert_not notify.valid?
++    assert_includes notify.errors[:audit_log], "must exist"
++
++    notify.audit_log = @audit_log
++    notify.recipients = "test@example.com"
++    assert notify.valid?
++  end
++
++  test "should have push through audit_log" do
++    notify = notify_by_emails(:one)
++    assert_equal @push, notify.push
++  end
++
++  test "should have user through audit_log" do
++    @audit_log.save!
++
++    assert_equal @user, @audit_log.notify_by_email.user
++  end
++
++  # Test status enum
++  test "should have valid status values" do
++    valid_statuses = [:pending, :processing, :completed, :partially_failed, :failed]
++
++    valid_statuses.each do |status|
++      notify = NotifyByEmail.new(
++        audit_log: @audit_log,
++        recipients: "test@example.com",
++        status: status
++      )
++      assert notify.valid?, "#{status} should be a valid status"
++    end
++  end
++
++  test "should not accept invalid status" do
++    notify = NotifyByEmail.new(
++      audit_log: @audit_log,
++      recipients: "test@example.com",
++      status: :invalid_status
++    )
++    assert_not notify.valid?
++    assert_includes notify.errors[:status], "is not included in the list"
++  end
++
++  test "default status should be pending" do
++    notify = NotifyByEmail.new(audit_log: @audit_log, recipients: "test@example.com")
++    assert notify.pending?
++  end
++
++  # Test readonly attributes
++  test "recipients should be readonly after creation" do
++    notify = notify_by_emails(:one)
++
++    assert_raises(ActiveRecord::ReadonlyAttributeError) do
++      notify.recipients = "changed@example.com"
++      notify.save
++    end
++  end
++
++  test "recipients_count should be readonly after creation" do
++    notify = notify_by_emails(:one)
++
++    assert_raises(ActiveRecord::ReadonlyAttributeError) do
++      notify.recipients_count = 99
++      notify.save
++    end
++  end
++
++  test "locale should be readonly after creation" do
++    notify = notify_by_emails(:one)
++
++    assert_raises(ActiveRecord::ReadonlyAttributeError) do
++      notify.locale = "fr"
++      notify.save
++    end
++  end
++
++  test "audit_log_id should be readonly after creation" do
++    other_audit_log = audit_logs(:creation)
++    notify = notify_by_emails(:one)
++
++    assert_raises(ActiveRecord::ReadonlyAttributeError) do
++      notify.audit_log_id = other_audit_log.id
++      notify.save
++    end
++  end
++
++  # Test set_recipients_count callback
++  test "set_recipients_count sets count based on single recipient" do
++    @push.notify_by_email_recipients = "test@example.com"
++    @audit_log.save!
++
++    assert_equal 1, @audit_log.notify_by_email.recipients_count
++  end
++
++  test "set_recipients_count sets count based on multiple recipients" do
++    @audit_log.save!
++
++    assert_equal 2, @audit_log.notify_by_email.recipients_count
++  end
++
++  # Test increment_email_sent_count
++  test "increment_email_sent_count updates user email_sent_count on first email of day" do
++    @user.update(email_sent_count: 0, email_sent_count_reset_at: nil)
++
++    @audit_log.save!
++
++    @user.reload
++    assert_equal 2, @user.email_sent_count
++    assert @user.email_sent_count_reset_at.present?
++  end
++
++  test "increment_email_sent_count increments user email_sent_count on subsequent emails same day" do
++    @user.update(email_sent_count: 2, email_sent_count_reset_at: Time.current)
++
++    @audit_log.save!
++
++    @user.reload
++    assert_equal 4, @user.email_sent_count
++  end
++
++  test "increment_email_sent_count resets count when new day starts" do
++    @user.update(email_sent_count: 10, email_sent_count_reset_at: 1.day.ago)
++
++    @audit_log.save!
++
++    @user.reload
++    assert_equal 2, @user.email_sent_count
++  end
++
++  # Test send_notify_by_email callback
++  test "send_notify_by_email enqueues SendNotifyByEmailJob after creation" do
++    assert_enqueued_jobs 1, only: SendNotifyByEmailJob do
++      @audit_log.save!
++    end
++  end
++
++  # Test encrypted attributes
++  test "recipients is encrypted" do
++    notify = NotifyByEmail.build(
++      audit_log: @audit_log,
++      recipients: "encrypted@example.com"
++    )
++
++    assert_equal "encrypted@example.com", notify.recipients
++    assert_not_equal "encrypted@example.com", notify.recipients_ciphertext
++  end
++
++  test "locale is encrypted" do
++    notify = NotifyByEmail.build(
++      audit_log: @audit_log,
++      recipients: "test@example.com",
++      locale: "fr"
++    )
++
++    assert_equal "fr", notify.locale
++    assert_not_equal "fr", notify.locale_ciphertext
++  end
++
++  test "successful_sends is encrypted" do
++    notify = NotifyByEmail.build(
++      audit_log: @audit_log,
++      recipients: "test@example.com",
++      successful_sends: "success@example.com"
++    )
++
++    assert_equal "success@example.com", notify.successful_sends
++    assert_not_equal "success@example.com", notify.successful_sends_ciphertext
++  end
++
++  test "error_message is encrypted" do
++    notify = NotifyByEmail.build(
++      audit_log: @audit_log,
++      recipients: "test@example.com",
++      error_message: "Error occurred"
++    )
++
++    assert_equal "Error occurred", notify.error_message
++    assert_not_equal "Error occurred", notify.error_message_ciphertext
++  end
++end
+diff --git a/test/models/password_test.rb b/test/models/password_test.rb
+index 9ef8207c..ea1a46aa 100644
+--- a/test/models/password_test.rb
++++ b/test/models/password_test.rb
+@@ -3,6 +3,8 @@
+ require "test_helper"
+ 
+ class PasswordTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
+   test "should create password with name" do
+     password = Push.new(
+       kind: "text",
+@@ -49,4 +51,46 @@ class PasswordTest < ActiveSupport::TestCase
+     json = JSON.parse(password.to_json({}))
+     assert_not json.key?("name")
+   end
++
++  test "should save password if notify_by_email_recipients and notify_by_email_locale are set and user is defined" do
++    Settings.mail.smtp_address = "smtp.example.com"
++    user = users(:giuliana)
++
++    password = Push.new(
++      kind: "text",
++      payload: "test_payload",
++      notify_by_email_recipients: "test@example.com",
++      notify_by_email_locale: "fr",
++      user: user
++    )
++    password.notify_by_email_creator = user
++
++    assert password.valid?
++  ensure
++    Settings.reload!
++  end
++
++  test "should reject more than 5 emails in notify_by_email_recipients for pushes" do
++    emails = 6.times.map { |i| "u#{i}@example.com" }.join(", ")
++    password = Push.new(
++      kind: "text",
++      payload: "test_payload",
++      notify_by_email_recipients: emails
++    )
++
++    assert_not password.valid?
++    assert password.errors[:notify_by_email_recipients].any? { |m| m.include?("5") || m.include?("at most") }
++  end
++
++  test "should reject invalid notify_by_email_locale for pushes" do
++    password = Push.new(
++      kind: "text",
++      payload: "test_payload",
++      notify_by_email_recipients: "test@example.com",
++      notify_by_email_locale: "zz"
++    )
++
++    assert_not password.valid?
++    assert password.errors[:notify_by_email_locale].present?
++  end
+ end
+diff --git a/test/models/user_test.rb b/test/models/user_test.rb
+index 2362dba1..539b12db 100644
+--- a/test/models/user_test.rb
++++ b/test/models/user_test.rb
+@@ -7,6 +7,11 @@ class UserTest < ActiveSupport::TestCase
+ 
+   setup do
+     @luca = users(:luca)
++    travel_to Time.current.beginning_of_day + 6.hours
++  end
++
++  teardown do
++    travel_back
+   end
+ 
+   test "should have pushes" do
+@@ -31,4 +36,55 @@ class UserTest < ActiveSupport::TestCase
+     @luca.reload
+     assert @luca.admin?
+   end
++
++  test "email_limit_reached? returns true when email_sent_count is greater than or equal to daily limit" do
++    Settings.notify_by_email.daily_limit = 100
++    @luca.update(email_sent_count: 100, email_sent_count_reset_at: Time.current)
++
++    assert @luca.email_limit_reached?
++  ensure
++    Settings.reload!
++  end
++
++  test "email_limit_reached? returns false when email_sent_count is less than daily limit" do
++    Settings.notify_by_email.daily_limit = 100
++    @luca.update(email_sent_count: 99, email_sent_count_reset_at: Time.current)
++
++    refute @luca.email_limit_reached?
++  ensure
++    Settings.reload!
++  end
++
++  test "email_limit_reached? returns false when email_sent_count_reset_at is before the beginning of the day" do
++    @luca.update(email_sent_count: 500, email_sent_count_reset_at: 2.day.ago)
++
++    refute @luca.email_limit_reached?
++  end
++
++  test "email_limit_reached? counts a reset_at exactly at beginning_of_day as today (no fail-open at midnight)" do
++    Settings.notify_by_email.daily_limit = 10
++    @luca.update(email_sent_count: 10, email_sent_count_reset_at: Time.current.beginning_of_day)
++
++    assert @luca.email_limit_reached?
++  ensure
++    Settings.reload!
++  end
++
++  test "email_limit_reached? returns false when daily_limit is nil (unlimited)" do
++    Settings.notify_by_email.daily_limit = nil
++    @luca.update(email_sent_count: 10_000, email_sent_count_reset_at: Time.current)
++
++    refute @luca.email_limit_reached?
++  ensure
++    Settings.reload!
++  end
++
++  test "email_limit_reached? returns true when daily_limit is 0 (feature disabled)" do
++    Settings.notify_by_email.daily_limit = 0
++    @luca.update(email_sent_count: 0, email_sent_count_reset_at: Time.current)
++
++    assert @luca.email_limit_reached?
++  ensure
++    Settings.reload!
++  end
+ end
+diff --git a/test/system/notify_by_email_test.rb b/test/system/notify_by_email_test.rb
+new file mode 100644
+index 00000000..00b8439e
+--- /dev/null
++++ b/test/system/notify_by_email_test.rb
+@@ -0,0 +1,70 @@
++# frozen_string_literal: true
++
++require "application_system_test_case"
++
++class NotifyByEmailTest < ApplicationSystemTestCase
++  include Devise::Test::IntegrationHelpers
++  include ActiveJob::TestHelper
++  include ActionMailer::TestHelper
++
++  setup do
++    Settings.mail.smtp_address = "smtp.example.com"
++
++    @push = pushes(:test_push)
++    @user = @push.user
++    sign_in @user
++  end
++
++  teardown do
++    Settings.reload!
++  end
++
++  test "notify by email with valid recipients" do
++    visit preview_push_path(@push)
++    click_on "Notify by Email"
++
++    assert_selector "input[name='push[notify_by_email_recipients]']", count: 1
++    assert_selector "input[name='push[notify_by_email_locale]']", count: 1, visible: :hidden
++
++    fill_in "push[notify_by_email_recipients]", with: "test@example.com"
++    click_on "Send Emails"
++
++    assert_text "Recipient(s) are added to the queue to be sent."
++  end
++
++  test "notify by email with invalid recipients" do
++    visit preview_push_path(@push)
++    click_on "Notify by Email"
++
++    fill_in "push[notify_by_email_recipients]", with: "test@example.com, invalid-email"
++    click_on "Send Emails"
++
++    assert_text "Notify by email recipients contains invalid email(s)"
++  end
++
++  test "notify_by_email creation and sending emails" do
++    AuditLog.destroy_all
++
++    visit preview_push_path(@push)
++    click_on "Notify by Email"
++
++    assert_difference "NotifyByEmail.count", 1 do
++      assert_enqueued_jobs 1, only: SendNotifyByEmailJob do
++        fill_in "push[notify_by_email_recipients]", with: "test@example.com, test2@example.com"
++        click_on "Send Emails"
++
++        assert_text "Recipient(s) are added to the queue to be sent."
++      end
++    end
++
++    notify_by_email = NotifyByEmail.last
++    emails = capture_emails do
++      SendNotifyByEmailJob.perform_now(notify_by_email.id)
++    end
++
++    assert_equal 2, emails.size
++    recipients = emails.map(&:to).flatten
++    assert_includes recipients, "test@example.com"
++    assert_includes recipients, "test2@example.com"
++  end
++end
+diff --git a/test/system/push_creation_workflows_test.rb b/test/system/push_creation_workflows_test.rb
+index b8ea8ed7..79de215f 100644
+--- a/test/system/push_creation_workflows_test.rb
++++ b/test/system/push_creation_workflows_test.rb
+@@ -83,6 +83,19 @@ class PushCreationWorkflowsTest < ApplicationSystemTestCase
+     assert_text "Push Created", wait: 5
+   end
+ 
++  test "password push creation with auto-dispatch emails" do
++    Settings.mail.smtp_address = "smtp.example.com"
++
++    visit new_push_path(tab: "text")
++
++    fill_in "push_payload", with: "TestPassword"
++    fill_in "push_notify_by_email_recipients", with: "test@example.com"
++
++    click_button "Push It!"
++
++    assert_text "Push Created", wait: 5
++  end
++
+   test "password push form validation" do
+     visit new_push_path(tab: "text")
+ 
+diff --git a/test/test_helper.rb b/test/test_helper.rb
+index a4361887..0c0531ef 100644
+--- a/test/test_helper.rb
++++ b/test/test_helper.rb
+@@ -24,6 +24,13 @@ class ActiveSupport::TestCase
+ 
+   # Setup all fixtures in test/fixtures/*.yml for all tests in alphabetical order.
+   fixtures :all
++
++  # Ensure cache-backed features (e.g. ActionController::RateLimiting) start
++  # each test with a clean slate.
++  setup do
++    Rails.cache.clear
++  end
++
+   # Add more helper methods to be used by all tests here...
+ 
+   def assert_audit_log_created(push, kind)
+diff --git a/test/unit/clean_up_pushes_job_test.rb b/test/unit/clean_up_pushes_job_test.rb
+index a73a3d90..289024c5 100644
+--- a/test/unit/clean_up_pushes_job_test.rb
++++ b/test/unit/clean_up_pushes_job_test.rb
+@@ -5,7 +5,7 @@ require "test_helper"
+ class CleanUpPushesJobTest < ActiveSupport::TestCase
+   setup do
+     # Clear all pushes before running tests
+-    AuditLog.delete_all
++    AuditLog.destroy_all
+     Push.delete_all
+     User.delete_all
+ 
+diff --git a/test/unit/expire_pushes_job_test.rb b/test/unit/expire_pushes_job_test.rb
+index cc2e51e7..4856473f 100644
+--- a/test/unit/expire_pushes_job_test.rb
++++ b/test/unit/expire_pushes_job_test.rb
+@@ -5,8 +5,7 @@ require "test_helper"
+ class ExpirePushesJobTest < ActiveSupport::TestCase
+   setup do
+     # Clear all pushes before running tests
+-    AuditLog.delete_all
+-    Push.delete_all
++    Push.destroy_all
+     User.delete_all
+ 
+     # Set default URL options for test environment to avoid missing host errors
+diff --git a/test/unit/purge_expired_pushes_job_test.rb b/test/unit/purge_expired_pushes_job_test.rb
+index 3c140020..96352d8d 100644
+--- a/test/unit/purge_expired_pushes_job_test.rb
++++ b/test/unit/purge_expired_pushes_job_test.rb
+@@ -8,7 +8,7 @@ class PurgeExpiredPushesJobTest < ActiveSupport::TestCase
+     Settings.purge_after = "3 months"
+ 
+     # Clear all pushes before running tests
+-    AuditLog.delete_all
++    AuditLog.destroy_all
+     Push.delete_all
+   end
+ 
+diff --git a/test/unit/send_notify_by_email_job_test.rb b/test/unit/send_notify_by_email_job_test.rb
+new file mode 100644
+index 00000000..6ee3305e
+--- /dev/null
++++ b/test/unit/send_notify_by_email_job_test.rb
+@@ -0,0 +1,106 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class SendNotifyByEmailJobTest < ActiveJob::TestCase
++  include ActionMailer::TestHelper
++  setup do
++    Settings.mail.smtp_address = "smtp.example.com"
++
++    @push = pushes(:test_push)
++    @notify_by_email = notify_by_emails(:one)
++  end
++
++  teardown do
++    Settings.reload!
++  end
++
++  test "sends email to specified recipient" do
++    mails = capture_emails do
++      SendNotifyByEmailJob.perform_now(@notify_by_email.id)
++    end
++
++    mail = mails.first
++    assert_equal ["one@example.com"], mail.to
++    assert_equal "You have received a push", mail.subject
++  end
++
++  test "perform update notify_by_email status to completed after sending" do
++    SendNotifyByEmailJob.perform_now(@notify_by_email.id)
++
++    @notify_by_email.reload
++    assert_equal "completed", @notify_by_email.status
++    assert_equal "one@example.com", @notify_by_email.successful_sends
++  end
++
++  test "perform update notify_by_email status to failed after sending" do
++    failing_mail = Minitest::Mock.new
++    failing_mail.expect(:deliver_now, -> { raise StandardError, "test error" })
++
++    PushCreatedMailer.stub(:with, failing_mail) do
++      SendNotifyByEmailJob.perform_now(@notify_by_email.id)
++    end
++
++    @notify_by_email.reload
++    assert_equal "failed", @notify_by_email.status
++    assert_equal "", @notify_by_email.successful_sends
++    assert_equal "No emails were sent successfully.", @notify_by_email.error_message
++  end
++
++  test "perform does not send mail when notify_by_email is not pending" do
++    @notify_by_email.update(status: "processing")
++    assert_emails 0 do
++      SendNotifyByEmailJob.perform_now(@notify_by_email.id)
++    end
++  end
++
++  test "perform does not send mail when recipients are blank" do
++    # Bypass readonly attribute
++    @notify_by_email.update_columns(recipients_ciphertext: "")
++    SendNotifyByEmailJob.perform_now(@notify_by_email.id)
++
++    @notify_by_email.reload
++    assert_equal "failed", @notify_by_email.status
++    assert @notify_by_email.successful_sends.blank?
++    assert_equal "Notify by email recipients can't be blank.", @notify_by_email.error_message
++  end
++
++  test "perform does not send mail when notifying by email is not available" do
++    Settings.mail.smtp_address = nil
++
++    SendNotifyByEmailJob.perform_now(@notify_by_email.id)
++
++    @notify_by_email.reload
++    assert_equal "failed", @notify_by_email.status, "Status should be failed"
++    assert_equal "Notifying by email is not available.", @notify_by_email.error_message
++  end
++
++  test "perform logs error and does not send mail if notify_by_email is not found" do
++    invalid_id = -1
++    logger = Minitest::Mock.new
++    logger.expect(:error, nil, ["[SendNotifyByEmailJob] NotifyByEmail not found: #{invalid_id}"])
++
++    Rails.stub(:logger, logger) do
++      SendNotifyByEmailJob.perform_now(invalid_id)
++    end
++
++    assert logger.verify
++  end
++
++  test "perform logs error and does not send mail if an unexpected error occurs" do
++    @notify_by_email.stub(:processing!, -> { raise StandardError, "test error" }) do
++      NotifyByEmail.stub(:find_by, @notify_by_email) do
++        SendNotifyByEmailJob.perform_now(@notify_by_email.id)
++      end
++    end
++
++    @notify_by_email.reload
++    assert_equal "failed", @notify_by_email.status
++    assert_empty @notify_by_email.successful_sends
++    assert_equal "An unexpected error occurred while sending the email.", @notify_by_email.error_message
++  end
++
++  test "perform uses default queue" do
++    assert_equal "default", SendNotifyByEmailJob.new.queue_name
++  end
++end
+diff --git a/test/validators/multiple_emails_validator_test.rb b/test/validators/multiple_emails_validator_test.rb
+new file mode 100644
+index 00000000..6c4c8b8f
+--- /dev/null
++++ b/test/validators/multiple_emails_validator_test.rb
+@@ -0,0 +1,193 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class MultipleEmailsValidatorTest < ActiveSupport::TestCase
++  # Create a test model that uses the validator
++  class TestModel
++    include ActiveModel::Model
++    include ActiveModel::Validations
++
++    attr_accessor :email_list, :custom_email_list
++
++    validates :email_list, multiple_emails: true
++    validates :custom_email_list, multiple_emails: {max_emails: 3}
++  end
++
++  def setup
++    @model = TestModel.new
++  end
++
++  # Test valid cases
++  test "accepts blank values" do
++    @model.email_list = ""
++    assert @model.valid?
++
++    @model.email_list = nil
++    assert @model.valid?
++  end
++
++  test "accepts single valid email" do
++    @model.email_list = "test@example.com"
++    assert @model.valid?
++  end
++
++  test "accepts multiple valid emails" do
++    @model.email_list = "test@example.com,user@domain.org"
++    assert @model.valid?
++  end
++
++  test "accepts emails with whitespace" do
++    @model.email_list = " test@example.com , user@domain.org "
++    assert @model.valid?
++  end
++
++  test "accepts emails with various valid formats" do
++    valid_emails = [
++      "simple@example.com",
++      "very.common@example.com",
++      "test+tag@example.com",
++      "user.name+tag@example.co.uk",
++      "x@example.com"
++    ]
++
++    @model.email_list = valid_emails.join(",")
++    assert @model.valid?
++  end
++
++  # Test whitespace handling
++  test "strips whitespace from individual emails" do
++    @model.email_list = "  test@example.com  ,  user@domain.org  "
++    assert @model.valid?
++  end
++
++  test "accepts up to default maximum of 5 emails" do
++    emails = Array.new(5) { |i| "user#{i}@example.com" }
++    @model.email_list = emails.join(",")
++    assert @model.valid?
++  end
++
++  # Test invalid cases - email format
++  test "rejects invalid email formats" do
++    invalid_emails = [
++      "plainaddress",
++      "@missingdomain.com",
++      "missing@.com",
++      "missing@domain",
++      "spaces in@email.com",
++      "email@",
++      "email@.com"
++    ]
++
++    invalid_emails.each do |invalid_email|
++      @model.email_list = invalid_email
++      assert_not @model.valid?, "Should reject invalid email: #{invalid_email}"
++      assert_includes @model.errors[:email_list].first, "contains invalid email(s)"
++    end
++  end
++
++  test "rejects mixed valid and invalid emails" do
++    @model.email_list = "valid@example.com,invalid-email,another@valid.com"
++    assert_not @model.valid?
++    assert_includes @model.errors[:email_list].first, "contains invalid email(s)"
++  end
++
++  # Test email count limits
++  test "rejects more than default maximum of 5 emails" do
++    emails = Array.new(6) { |i| "user#{i}@example.com" }
++    @model.email_list = emails.join(",")
++    assert_not @model.valid?
++    assert_includes @model.errors[:email_list].first, "contains more than 5 email(s)"
++  end
++
++  test "respects custom max_emails option" do
++    # Should accept up to 3 emails
++    emails = Array.new(3) { |i| "user#{i}@example.com" }
++    @model.custom_email_list = emails.join(",")
++    assert @model.valid?
++
++    # Test custom max_emails - should reject more than 3 emails
++    emails = Array.new(4) { |i| "user#{i}@example.com" }
++    @model.custom_email_list = emails.join(",")
++    assert_not @model.valid?
++    assert_includes @model.errors[:custom_email_list].first, "contains more than 3 email(s)"
++    assert_equal 1, @model.errors[:custom_email_list].count
++  end
++
++  # Test edge cases with commas
++  test "handles empty strings from comma splits" do
++    @model.email_list = "test@example.com,,another@example.com"
++    assert_not @model.valid?
++    # Should fail because empty string doesn't match email regex
++    assert_match(/has commas used in the wrong way/, @model.errors[:email_list].first)
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  test "rejects emails that are only whitespace" do
++    @model.email_list = "test@example.com,   ,user@domain.org"
++    assert_not @model.valid?
++    # Should fail because whitespace-only string doesn't match email regex after strip
++    assert_match(/has commas used in the wrong way/, @model.errors[:email_list].first)
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  # Test error message format
++  test "includes the invalid email in error message" do
++    @model.email_list = "valid@example.com,invalid-email-format"
++    assert_not @model.valid?
++    assert_includes @model.errors[:email_list].first, "contains invalid email(s)"
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  test "handles duplicate emails" do
++    @model.email_list = "test@example.com, test@example.com"
++    assert_not @model.valid?
++    assert_includes @model.errors[:email_list].first, "contains duplicate emails"
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  test "treats case-differing addresses as duplicates" do
++    @model.email_list = "user@Example.com, USER@example.COM"
++    assert_not @model.valid?
++    assert_includes @model.errors[:email_list].first, "contains duplicate emails"
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  test "handles trailing comma" do
++    @model.email_list = "test@example.com,"
++    assert_not @model.valid?
++    # Should fail because commas are used in the wrong way
++    assert_match(/has commas used in the wrong way/, @model.errors[:email_list].first)
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  test "handles leading comma" do
++    @model.email_list = ",test@example.com"
++    assert_not @model.valid?
++    # Should fail because commas are used in the wrong way
++    assert_match(/has commas used in the wrong way/, @model.errors[:email_list].first)
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  test "handles multiple blank emails with only one error message" do
++    @model.email_list = "   , test@example.com,   ,user@domain.org, "
++    assert_not @model.valid?
++    assert_includes @model.errors[:email_list].first, "has commas used in the wrong way"
++    assert_equal 1, @model.errors[:email_list].count
++  end
++
++  test "shows correct count in max emails error message" do
++    emails = Array.new(6) { |i| "user#{i}@example.com" }
++    @model.email_list = emails.join(",")
++    assert_not @model.valid?
++    assert_equal "contains more than 5 email(s)", @model.errors[:email_list].first
++    assert_equal 1, @model.errors[:email_list].count
++
++    # Test custom max_emails
++    emails = Array.new(4) { |i| "user#{i}@example.com" }
++    @model.custom_email_list = emails.join(",")
++    assert_not @model.valid?
++    assert_equal "contains more than 3 email(s)", @model.errors[:custom_email_list].first
++    assert_equal 1, @model.errors[:custom_email_list].count
++  end
++end

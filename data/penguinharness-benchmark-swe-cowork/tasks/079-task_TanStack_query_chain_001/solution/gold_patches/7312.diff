@@ -1,0 +1,484 @@
+diff --git a/packages/query-core/src/hydration.ts b/packages/query-core/src/hydration.ts
+index 4e6b58e4f04ef87f19ff6d424ed84bd6728dc67d..0b0f0906864d492b65d3f32154e5069fbc83cbec 100644
+--- a/packages/query-core/src/hydration.ts
++++ b/packages/query-core/src/hydration.ts
+@@ -1,13 +1,14 @@
+-import type { QueryClient } from './queryClient'
+-import type { Query, QueryState } from './query'
+ import type {
+   MutationKey,
+   MutationMeta,
+   MutationOptions,
++  MutationScope,
+   QueryKey,
+   QueryMeta,
+   QueryOptions,
+ } from './types'
++import type { QueryClient } from './queryClient'
++import type { Query, QueryState } from './query'
+ import type { Mutation, MutationState } from './mutation'
+ 
+ // TYPES
+@@ -28,6 +29,7 @@ interface DehydratedMutation {
+   mutationKey?: MutationKey
+   state: MutationState
+   meta?: MutationMeta
++  scope?: MutationScope
+ }
+ 
+ interface DehydratedQuery {
+@@ -48,6 +50,7 @@ function dehydrateMutation(mutation: Mutation): DehydratedMutation {
+   return {
+     mutationKey: mutation.options.mutationKey,
+     state: mutation.state,
++    ...(mutation.options.scope && { scope: mutation.options.scope }),
+     ...(mutation.meta && { meta: mutation.meta }),
+   }
+ }
+@@ -115,15 +118,14 @@ export function hydrate(
+   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+   const queries = (dehydratedState as DehydratedState).queries || []
+ 
+-  mutations.forEach((dehydratedMutation) => {
++  mutations.forEach(({ state, ...mutationOptions }) => {
+     mutationCache.build(
+       client,
+       {
+         ...options?.defaultOptions?.mutations,
+-        mutationKey: dehydratedMutation.mutationKey,
+-        meta: dehydratedMutation.meta,
++        ...mutationOptions,
+       },
+-      dehydratedMutation.state,
++      state,
+     )
+   })
+ 
+diff --git a/packages/query-core/src/mutation.ts b/packages/query-core/src/mutation.ts
+index 79d87c0d730744144a9cbbf057fbf9169009a477..69f9d6286b9f7b107a1744e747a540aab9a8ea2b 100644
+--- a/packages/query-core/src/mutation.ts
++++ b/packages/query-core/src/mutation.ts
+@@ -1,6 +1,6 @@
+ import { notifyManager } from './notifyManager'
+ import { Removable } from './removable'
+-import { canFetch, createRetryer } from './retryer'
++import { createRetryer } from './retryer'
+ import type {
+   DefaultError,
+   MutationMeta,
+@@ -17,7 +17,6 @@ interface MutationConfig<TData, TError, TVariables, TContext> {
+   mutationId: number
+   mutationCache: MutationCache
+   options: MutationOptions<TData, TError, TVariables, TContext>
+-  defaultOptions?: MutationOptions<TData, TError, TVariables, TContext>
+   state?: MutationState<TData, TError, TVariables, TContext>
+ }
+ 
+@@ -46,6 +45,7 @@ interface FailedAction<TError> {
+ 
+ interface PendingAction<TVariables, TContext> {
+   type: 'pending'
++  isPaused: boolean
+   variables?: TVariables
+   context?: TContext
+ }
+@@ -89,7 +89,6 @@ export class Mutation<
+   readonly mutationId: number
+ 
+   #observers: Array<MutationObserver<TData, TError, TVariables, TContext>>
+-  #defaultOptions?: MutationOptions<TData, TError, TVariables, TContext>
+   #mutationCache: MutationCache
+   #retryer?: Retryer<TData>
+ 
+@@ -97,7 +96,6 @@ export class Mutation<
+     super()
+ 
+     this.mutationId = config.mutationId
+-    this.#defaultOptions = config.defaultOptions
+     this.#mutationCache = config.mutationCache
+     this.#observers = []
+     this.state = config.state || getDefaultState()
+@@ -107,9 +105,9 @@ export class Mutation<
+   }
+ 
+   setOptions(
+-    options?: MutationOptions<TData, TError, TVariables, TContext>,
++    options: MutationOptions<TData, TError, TVariables, TContext>,
+   ): void {
+-    this.options = { ...this.#defaultOptions, ...options }
++    this.options = options
+ 
+     this.updateGcTime(this.options.gcTime)
+   }
+@@ -164,36 +162,34 @@ export class Mutation<
+   }
+ 
+   async execute(variables: TVariables): Promise<TData> {
+-    const executeMutation = () => {
+-      this.#retryer = createRetryer({
+-        fn: () => {
+-          if (!this.options.mutationFn) {
+-            return Promise.reject(new Error('No mutationFn found'))
+-          }
+-          return this.options.mutationFn(variables)
+-        },
+-        onFail: (failureCount, error) => {
+-          this.#dispatch({ type: 'failed', failureCount, error })
+-        },
+-        onPause: () => {
+-          this.#dispatch({ type: 'pause' })
+-        },
+-        onContinue: () => {
+-          this.#dispatch({ type: 'continue' })
+-        },
+-        retry: this.options.retry ?? 0,
+-        retryDelay: this.options.retryDelay,
+-        networkMode: this.options.networkMode,
+-      })
+-
+-      return this.#retryer.promise
+-    }
++    this.#retryer = createRetryer({
++      fn: () => {
++        if (!this.options.mutationFn) {
++          return Promise.reject(new Error('No mutationFn found'))
++        }
++        return this.options.mutationFn(variables)
++      },
++      onFail: (failureCount, error) => {
++        this.#dispatch({ type: 'failed', failureCount, error })
++      },
++      onPause: () => {
++        this.#dispatch({ type: 'pause' })
++      },
++      onContinue: () => {
++        this.#dispatch({ type: 'continue' })
++      },
++      retry: this.options.retry ?? 0,
++      retryDelay: this.options.retryDelay,
++      networkMode: this.options.networkMode,
++      canRun: () => this.#mutationCache.canRun(this),
++    })
+ 
+     const restored = this.state.status === 'pending'
++    const isPaused = !this.#retryer.canStart()
+ 
+     try {
+       if (!restored) {
+-        this.#dispatch({ type: 'pending', variables })
++        this.#dispatch({ type: 'pending', variables, isPaused })
+         // Notify cache callback
+         await this.#mutationCache.config.onMutate?.(
+           variables,
+@@ -205,10 +201,11 @@ export class Mutation<
+             type: 'pending',
+             context,
+             variables,
++            isPaused,
+           })
+         }
+       }
+-      const data = await executeMutation()
++      const data = await this.#retryer.start()
+ 
+       // Notify cache callback
+       await this.#mutationCache.config.onSuccess?.(
+@@ -268,6 +265,8 @@ export class Mutation<
+       } finally {
+         this.#dispatch({ type: 'error', error: error as TError })
+       }
++    } finally {
++      this.#mutationCache.runNext(this)
+     }
+   }
+ 
+@@ -300,7 +299,7 @@ export class Mutation<
+             failureCount: 0,
+             failureReason: null,
+             error: null,
+-            isPaused: !canFetch(this.options.networkMode),
++            isPaused: action.isPaused,
+             status: 'pending',
+             variables: action.variables,
+             submittedAt: Date.now(),
+diff --git a/packages/query-core/src/mutationCache.ts b/packages/query-core/src/mutationCache.ts
+index 628b63e1ed4def3944c3ab61467ed8528f359e05..1663b50cef3053a6143c529f21cef378c8493dc7 100644
+--- a/packages/query-core/src/mutationCache.ts
++++ b/packages/query-core/src/mutationCache.ts
+@@ -82,14 +82,13 @@ type MutationCacheListener = (event: MutationCacheNotifyEvent) => void
+ // CLASS
+ 
+ export class MutationCache extends Subscribable<MutationCacheListener> {
+-  #mutations: Array<Mutation<any, any, any, any>>
++  #mutations: Map<string, Array<Mutation<any, any, any, any>>>
+   #mutationId: number
+-  #resuming: Promise<unknown> | undefined
+ 
+   constructor(public config: MutationCacheConfig = {}) {
+     super()
+-    this.#mutations = []
+-    this.#mutationId = 0
++    this.#mutations = new Map()
++    this.#mutationId = Date.now()
+   }
+ 
+   build<TData, TError, TVariables, TContext>(
+@@ -110,25 +109,59 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+   }
+ 
+   add(mutation: Mutation<any, any, any, any>): void {
+-    this.#mutations.push(mutation)
++    const scope = scopeFor(mutation)
++    const mutations = this.#mutations.get(scope) ?? []
++    mutations.push(mutation)
++    this.#mutations.set(scope, mutations)
+     this.notify({ type: 'added', mutation })
+   }
+ 
+   remove(mutation: Mutation<any, any, any, any>): void {
+-    this.#mutations = this.#mutations.filter((x) => x !== mutation)
++    const scope = scopeFor(mutation)
++    if (this.#mutations.has(scope)) {
++      const mutations = this.#mutations
++        .get(scope)
++        ?.filter((x) => x !== mutation)
++      if (mutations) {
++        if (mutations.length === 0) {
++          this.#mutations.delete(scope)
++        } else {
++          this.#mutations.set(scope, mutations)
++        }
++      }
++    }
++
+     this.notify({ type: 'removed', mutation })
+   }
+ 
++  canRun(mutation: Mutation<any, any, any, any>): boolean {
++    const firstPendingMutation = this.#mutations
++      .get(scopeFor(mutation))
++      ?.find((m) => m.state.status === 'pending')
++
++    // we can run if there is no current pending mutation (start use-case)
++    // or if WE are the first pending mutation (continue use-case)
++    return !firstPendingMutation || firstPendingMutation === mutation
++  }
++
++  runNext(mutation: Mutation<any, any, any, any>): Promise<unknown> {
++    const foundMutation = this.#mutations
++      .get(scopeFor(mutation))
++      ?.find((m) => m !== mutation && m.state.isPaused)
++
++    return foundMutation?.continue() ?? Promise.resolve()
++  }
++
+   clear(): void {
+     notifyManager.batch(() => {
+-      this.#mutations.forEach((mutation) => {
++      this.getAll().forEach((mutation) => {
+         this.remove(mutation)
+       })
+     })
+   }
+ 
+   getAll(): Array<Mutation> {
+-    return this.#mutations
++    return [...this.#mutations.values()].flat()
+   }
+ 
+   find<
+@@ -141,15 +174,13 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+   ): Mutation<TData, TError, TVariables, TContext> | undefined {
+     const defaultedFilters = { exact: true, ...filters }
+ 
+-    return this.#mutations.find((mutation) =>
++    return this.getAll().find((mutation) =>
+       matchMutation(defaultedFilters, mutation),
+-    )
++    ) as Mutation<TData, TError, TVariables, TContext> | undefined
+   }
+ 
+   findAll(filters: MutationFilters = {}): Array<Mutation> {
+-    return this.#mutations.filter((mutation) =>
+-      matchMutation(filters, mutation),
+-    )
++    return this.getAll().filter((mutation) => matchMutation(filters, mutation))
+   }
+ 
+   notify(event: MutationCacheNotifyEvent) {
+@@ -161,21 +192,16 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+   }
+ 
+   resumePausedMutations(): Promise<unknown> {
+-    this.#resuming = (this.#resuming ?? Promise.resolve())
+-      .then(() => {
+-        const pausedMutations = this.#mutations.filter((x) => x.state.isPaused)
+-        return notifyManager.batch(() =>
+-          pausedMutations.reduce(
+-            (promise, mutation) =>
+-              promise.then(() => mutation.continue().catch(noop)),
+-            Promise.resolve() as Promise<unknown>,
+-          ),
+-        )
+-      })
+-      .then(() => {
+-        this.#resuming = undefined
+-      })
++    const pausedMutations = this.getAll().filter((x) => x.state.isPaused)
+ 
+-    return this.#resuming
++    return notifyManager.batch(() =>
++      Promise.all(
++        pausedMutations.map((mutation) => mutation.continue().catch(noop)),
++      ),
++    )
+   }
+ }
++
++function scopeFor(mutation: Mutation<any, any, any, any>) {
++  return mutation.options.scope?.id ?? String(mutation.mutationId)
++}
+diff --git a/packages/query-core/src/query.ts b/packages/query-core/src/query.ts
+index 5cfaa23561048383bdded677187b6c5c7d3fa8e1..21c1a7cb5e947656aac544b7d7d0ec9ba2ff1d44 100644
+--- a/packages/query-core/src/query.ts
++++ b/packages/query-core/src/query.ts
+@@ -527,9 +527,10 @@ export class Query<
+       retry: context.options.retry,
+       retryDelay: context.options.retryDelay,
+       networkMode: context.options.networkMode,
++      canRun: () => true,
+     })
+ 
+-    return this.#retryer.promise
++    return this.#retryer.start()
+   }
+ 
+   #dispatch(action: Action<TData, TError>): void {
+diff --git a/packages/query-core/src/retryer.ts b/packages/query-core/src/retryer.ts
+index 3a0dace8218d2d7055a12d377ec78f37c7ecf5e7..fb1584aad95005badef098c24fd15d1f81fdde2e 100644
+--- a/packages/query-core/src/retryer.ts
++++ b/packages/query-core/src/retryer.ts
+@@ -16,6 +16,7 @@ interface RetryerConfig<TData = unknown, TError = DefaultError> {
+   retry?: RetryValue<TError>
+   retryDelay?: RetryDelayValue<TError>
+   networkMode: NetworkMode | undefined
++  canRun: () => boolean
+ }
+ 
+ export interface Retryer<TData = unknown> {
+@@ -24,6 +25,8 @@ export interface Retryer<TData = unknown> {
+   continue: () => Promise<unknown>
+   cancelRetry: () => void
+   continueRetry: () => void
++  canStart: () => boolean
++  start: () => Promise<TData>
+ }
+ 
+ export type RetryValue<TError> = boolean | number | ShouldRetryFunction<TError>
+@@ -69,7 +72,7 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+   let isRetryCancelled = false
+   let failureCount = 0
+   let isResolved = false
+-  let continueFn: ((value?: unknown) => boolean) | undefined
++  let continueFn: ((value?: unknown) => void) | undefined
+   let promiseResolve: (data: TData) => void
+   let promiseReject: (error: TError) => void
+ 
+@@ -93,9 +96,12 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+     isRetryCancelled = false
+   }
+ 
+-  const shouldPause = () =>
+-    !focusManager.isFocused() ||
+-    (config.networkMode !== 'always' && !onlineManager.isOnline())
++  const canContinue = () =>
++    focusManager.isFocused() &&
++    (config.networkMode === 'always' || onlineManager.isOnline()) &&
++    config.canRun()
++
++  const canStart = () => canFetch(config.networkMode) && config.canRun()
+ 
+   const resolve = (value: any) => {
+     if (!isResolved) {
+@@ -118,11 +124,9 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+   const pause = () => {
+     return new Promise((continueResolve) => {
+       continueFn = (value) => {
+-        const canContinue = isResolved || !shouldPause()
+-        if (canContinue) {
++        if (isResolved || canContinue()) {
+           continueResolve(value)
+         }
+-        return canContinue
+       }
+       config.onPause?.()
+     }).then(() => {
+@@ -184,10 +188,7 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+         sleep(delay)
+           // Pause if the document is not visible or when the device is offline
+           .then(() => {
+-            if (shouldPause()) {
+-              return pause()
+-            }
+-            return
++            return canContinue() ? undefined : pause()
+           })
+           .then(() => {
+             if (isRetryCancelled) {
+@@ -199,21 +200,24 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+       })
+   }
+ 
+-  // Start loop
+-  if (canFetch(config.networkMode)) {
+-    run()
+-  } else {
+-    pause().then(run)
+-  }
+-
+   return {
+     promise,
+     cancel,
+     continue: () => {
+-      const didContinue = continueFn?.()
+-      return didContinue ? promise : Promise.resolve()
++      continueFn?.()
++      return promise
+     },
+     cancelRetry,
+     continueRetry,
++    canStart,
++    start: () => {
++      // Start loop
++      if (canStart()) {
++        run()
++      } else {
++        pause().then(run)
++      }
++      return promise
++    },
+   }
+ }
+diff --git a/packages/query-core/src/types.ts b/packages/query-core/src/types.ts
+index b7bcc1ffbc824fa538bb106aa1b2ebc2281c6c74..7492cb862afd1fc528eda23d518711115903f011 100644
+--- a/packages/query-core/src/types.ts
++++ b/packages/query-core/src/types.ts
+@@ -715,6 +715,10 @@ export type MutationKey = ReadonlyArray<unknown>
+ 
+ export type MutationStatus = 'idle' | 'pending' | 'success' | 'error'
+ 
++export type MutationScope = {
++  id: string
++}
++
+ export type MutationMeta = Register extends {
+   mutationMeta: infer TMutationMeta
+ }
+@@ -760,6 +764,7 @@ export interface MutationOptions<
+   gcTime?: number
+   _defaulted?: boolean
+   meta?: MutationMeta
++  scope?: MutationScope
+ }
+ 
+ export interface MutationObserverOptions<

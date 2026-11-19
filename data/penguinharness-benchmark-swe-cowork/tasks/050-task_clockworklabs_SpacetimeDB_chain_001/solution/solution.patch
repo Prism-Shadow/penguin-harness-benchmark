@@ -1,0 +1,3683 @@
+diff --git a/package.json b/package.json
+index 68d23327193facfdb342b25b59de2308563268b5..19ae19e3168f10d0dd3b3437049c1cfe5dbb201f 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "spacetimedb",
+-  "version": "2.0.3",
++  "version": "2.1.0",
+   "description": "API and ABI bindings for the SpacetimeDB TypeScript module library",
+   "homepage": "https://github.com/clockworklabs/SpacetimeDB#readme",
+   "bugs": {
+@@ -114,7 +114,7 @@
+       "name": "esm (gzip)",
+       "path": "dist/index.mjs",
+       "gzip": true,
+-      "limit": "40 kB"
++      "limit": "48 kB"
+     },
+     {
+       "name": "esm (uncompressed)",
+diff --git a/src/lib/algebraic_type.ts b/src/lib/algebraic_type.ts
+index 7ddd3f93d660358950a9ccef2df69b7e89ae64d9..c325797af753c2787a882a40c935200d0b0863e5 100644
+--- a/src/lib/algebraic_type.ts
++++ b/src/lib/algebraic_type.ts
+@@ -535,7 +535,11 @@ const view = reader.view;
+ ${ty.elements
+   .map(({ name, algebraicType: { tag } }) =>
+     tag in primitiveJSName
+-      ? `\
++      ? tag === 'Bool'
++        ? `\
++result.${name} = view.getUint8(reader.offset) !== 0;
++reader.offset += 1;`
++        : `\
+ result.${name} = view.get${primitiveJSName[tag as JSPrimitives]}(reader.offset, ${primitiveSizes[tag] > 1 ? 'true' : ''});
+ reader.offset += ${primitiveSizes[tag]};`
+       : `result.${name} = reader.read${tag}();`
+diff --git a/src/lib/binary_reader.ts b/src/lib/binary_reader.ts
+index 98850e791767f02f8b49cfe2c78a740c674bcecc..5d68506426db097317230af4c4d48ef20b75ce25 100644
+--- a/src/lib/binary_reader.ts
++++ b/src/lib/binary_reader.ts
+@@ -25,8 +25,11 @@ export default class BinaryReader {
+     this.offset = 0;
+   }
+ 
+-  reset(view: DataView) {
+-    this.view = view;
++  reset(input: Uint8Array | DataView) {
++    this.view =
++      input instanceof DataView
++        ? input
++        : new DataView(input.buffer, input.byteOffset, input.byteLength);
+     this.offset = 0;
+   }
+ 
+diff --git a/src/lib/binary_writer.ts b/src/lib/binary_writer.ts
+index 144427284c5348b8e0d9ab904d4d0a4d605112d8..048ecccb50159311c68ca4417e2f035c4e660e95 100644
+--- a/src/lib/binary_writer.ts
++++ b/src/lib/binary_writer.ts
+@@ -42,6 +42,10 @@ export default class BinaryWriter {
+     this.buffer = typeof init === 'number' ? new ResizableBuffer(init) : init;
+   }
+ 
++  clear() {
++    this.offset = 0;
++  }
++
+   reset(buffer: ResizableBuffer) {
+     this.buffer = buffer;
+     this.offset = 0;
+@@ -59,7 +63,7 @@ export default class BinaryWriter {
+     return fromByteArray(this.getBuffer());
+   }
+ 
+-  getBuffer(): Uint8Array {
++  getBuffer(): Uint8Array<ArrayBuffer> {
+     return new Uint8Array(this.buffer.buffer, 0, this.offset);
+   }
+ 
+@@ -89,6 +93,12 @@ export default class BinaryWriter {
+     this.offset += 1;
+   }
+ 
++  writeBytes(value: Uint8Array): void {
++    this.expandBuffer(value.length);
++    new Uint8Array(this.buffer.buffer, this.offset, value.length).set(value);
++    this.offset += value.length;
++  }
++
+   writeI8(value: number): void {
+     this.expandBuffer(1);
+     this.view.setInt8(this.offset, value);
+diff --git a/src/lib/filter.ts b/src/lib/filter.ts
+index 544801e7e9853154595060f2d3696a4ce3347330..869f36d239d3e10b8974ac6d0ca3b4ce15859ccc 100644
+--- a/src/lib/filter.ts
++++ b/src/lib/filter.ts
+@@ -1,7 +1,8 @@
+ import type { RowType, UntypedTableDef } from './table';
++import { Timestamp } from './timestamp';
+ import { Uuid } from './uuid';
+ 
+-export type Value = string | number | boolean | Uuid;
++export type Value = string | number | boolean | Uuid | Timestamp;
+ 
+ export type Expr<Column extends string> =
+   | { type: 'eq'; key: Column; value: Value }
+@@ -77,6 +78,13 @@ export function evaluate<Column extends string>(
+         if (v instanceof Uuid && typeof expr.value === 'string') {
+           return v.toString() === expr.value;
+         }
++
++        if (v instanceof Timestamp) {
++          // Value of the Column and passed Value are both Timestamps so compare microseconds.
++          if (expr.value instanceof Timestamp) {
++            return v.microsSinceUnixEpoch === expr.value.microsSinceUnixEpoch;
++          }
++        }
+       }
+       return false;
+     }
+@@ -103,6 +111,9 @@ function formatValue(v: Value): string {
+       if (v instanceof Uuid) {
+         return `'${v.toString()}'`;
+       }
++      if (v instanceof Timestamp) {
++        return `'${v.toISOString()}'`;
++      }
+ 
+       return '';
+     }
+diff --git a/src/lib/indexes.ts b/src/lib/indexes.ts
+index 84a131589fd701f9fb3ca99160b50e68c9443dc1..0b507ff3bae9d913c14fd9dc021e1dd693307134 100644
+--- a/src/lib/indexes.ts
++++ b/src/lib/indexes.ts
+@@ -9,7 +9,7 @@ import type { ColumnIsUnique } from './constraints';
+  * existing column names are referenced.
+  */
+ export type IndexOpts<AllowedCol extends string> = {
+-  accessor?: string;
++  accessor: string;
+   name?: string;
+ } & (
+   | { algorithm: 'btree'; columns: readonly AllowedCol[] }
+diff --git a/src/lib/query.ts b/src/lib/query.ts
+index 4519381904e73e66e9ead29df6c8849cdef5cc22..37743ccd0be13bf6b85a396ebd3e3629b8d8c56f 100644
+--- a/src/lib/query.ts
++++ b/src/lib/query.ts
+@@ -11,6 +11,7 @@ import type {
+   TypeBuilder,
+ } from './type_builders';
+ import type { Values } from './type_util';
++import type { Bool as SatsBool } from './algebraic_type_variants';
+ 
+ /**
+  * Helper to get the set of table names.
+@@ -65,7 +66,7 @@ type From<TableDef extends TypedTableDef> = RowTypedQuery<
+   Readonly<{
+     toSql(): string;
+     where(
+-      predicate: (row: RowExpr<TableDef>) => BooleanExpr<TableDef>
++      predicate: (row: RowExpr<TableDef>) => PredicateExpr<TableDef>
+     ): From<TableDef>;
+     rightSemijoin<RightTable extends TypedTableDef>(
+       other: TableRef<RightTable>,
+@@ -93,7 +94,7 @@ type SemijoinBuilder<TableDef extends TypedTableDef> = RowTypedQuery<
+   Readonly<{
+     toSql(): string;
+     where(
+-      predicate: (row: RowExpr<TableDef>) => BooleanExpr<TableDef>
++      predicate: (row: RowExpr<TableDef>) => PredicateExpr<TableDef>
+     ): SemijoinBuilder<TableDef>;
+     /** @deprecated No longer needed — builder is already a valid query. */
+     build(): Query<TableDef>;
+@@ -120,7 +121,7 @@ class SemijoinImpl<TableDef extends TypedTableDef>
+   }
+ 
+   where(
+-    predicate: (row: RowExpr<TableDef>) => BooleanExpr<TableDef>
++    predicate: (row: RowExpr<TableDef>) => PredicateExpr<TableDef>
+   ): SemijoinImpl<TableDef> {
+     const nextSourceQuery = this.sourceQuery.where(predicate);
+     return new SemijoinImpl<TableDef>(
+@@ -167,9 +168,9 @@ class FromBuilder<TableDef extends TypedTableDef>
+   ) {}
+ 
+   where(
+-    predicate: (row: RowExpr<TableDef>) => BooleanExpr<TableDef>
++    predicate: (row: RowExpr<TableDef>) => PredicateExpr<TableDef>
+   ): FromBuilder<TableDef> {
+-    const newCondition = predicate(this.table.cols);
++    const newCondition = normalizePredicateExpr(predicate(this.table.cols));
+     const nextWhere = this.whereClause
+       ? this.whereClause.and(newCondition)
+       : newCondition;
+@@ -308,7 +309,7 @@ class TableRefImpl<TableDef extends TypedTableDef>
+   }
+ 
+   where(
+-    predicate: (row: RowExpr<TableDef>) => BooleanExpr<TableDef>
++    predicate: (row: RowExpr<TableDef>) => PredicateExpr<TableDef>
+   ): FromBuilder<TableDef> {
+     return this.asFrom().where(predicate);
+   }
+@@ -347,7 +348,8 @@ function createRowExpr<TableDef extends TypedTableDef>(
+       columnBuilder.typeBuilder.algebraicType as InferSpacetimeTypeOfColumn<
+         TableDef,
+         typeof columnName
+-      >
++      >,
++      columnBuilder.columnMetadata.name
+     );
+     row[columnName] = Object.freeze(column);
+   }
+@@ -437,7 +439,10 @@ export class ColumnExpression<
+   ColumnName extends ColumnNames<TableDef>,
+ > {
+   readonly type = 'column' as const;
++  // This is the column accessor
+   readonly column: ColumnName;
++  // The name of the column in the database.
++  readonly columnName: string;
+   readonly table: TableDef['sourceName'];
+   // phantom: actual runtime value is undefined
+   readonly tsValueType?: RowType<TableDef>[ColumnName];
+@@ -446,10 +451,12 @@ export class ColumnExpression<
+   constructor(
+     table: TableDef['sourceName'],
+     column: ColumnName,
+-    spacetimeType: InferSpacetimeTypeOfColumn<TableDef, ColumnName>
++    spacetimeType: InferSpacetimeTypeOfColumn<TableDef, ColumnName>,
++    columnName?: string
+   ) {
+     this.table = table;
+     this.column = column;
++    this.columnName = columnName || column;
+     this.spacetimeType = spacetimeType;
+   }
+ 
+@@ -628,6 +635,11 @@ export type ValueExpr<TableDef extends TypedTableDef, Value> =
+   | LiteralExpr<Value & LiteralValue>
+   | ColumnExprForValue<TableDef, Value>;
+ 
++type PredicateExpr<TableDef extends TypedTableDef> =
++  | BooleanExpr<TableDef>
++  | ColumnExprForValue<TableDef, SatsBool>
++  | boolean;
++
+ type LiteralExpr<Value> = {
+   type: 'literal';
+   value: Value;
+@@ -654,6 +666,24 @@ function normalizeValue(val: ValueInput<any>): ValueExpr<any, any> {
+   return literal(val as LiteralValue);
+ }
+ 
++function normalizePredicateExpr<TableDef extends TypedTableDef>(
++  value: PredicateExpr<TableDef>
++): BooleanExpr<TableDef> {
++  if (value instanceof BooleanExpr) return value;
++  if (typeof value === 'boolean') {
++    return new BooleanExpr({
++      type: 'eq',
++      left: literal(value),
++      right: literal(true),
++    });
++  }
++  return new BooleanExpr({
++    type: 'eq',
++    left: value as ValueExpr<TableDef, any>,
++    right: literal(true),
++  });
++}
++
+ type EqExpr<Table extends TypedTableDef = any> = BooleanExpr<Table>;
+ 
+ type BooleanExprData<Table extends TypedTableDef> = (
+@@ -686,15 +716,38 @@ type BooleanExprData<Table extends TypedTableDef> = (
+   _tableType?: Table;
+ };
+ 
++type AndOrMixedTableScopeError = {
++  readonly 'Cannot combine predicates from different table scopes with and/or. In semijoin on(...), keep only the join equality and move extra predicates to .where(...).': never;
++};
++
++type RequireSameAndOrTable<
++  Expected extends TypedTableDef,
++  Actual extends TypedTableDef,
++> = [Expected] extends [Actual]
++  ? [Actual] extends [Expected]
++    ? unknown
++    : AndOrMixedTableScopeError
++  : AndOrMixedTableScopeError;
++
+ export class BooleanExpr<Table extends TypedTableDef> {
+   constructor(readonly data: BooleanExprData<Table>) {}
+ 
+-  and(other: BooleanExpr<Table>): BooleanExpr<Table> {
+-    return new BooleanExpr({ type: 'and', clauses: [this.data, other.data] });
++  and<OtherTable extends TypedTableDef>(
++    other: BooleanExpr<OtherTable> & RequireSameAndOrTable<Table, OtherTable>
++  ): BooleanExpr<Table> {
++    return new BooleanExpr({
++      type: 'and',
++      clauses: [this.data, other.data as BooleanExprData<Table>],
++    });
+   }
+ 
+-  or(other: BooleanExpr<Table>): BooleanExpr<Table> {
+-    return new BooleanExpr({ type: 'or', clauses: [this.data, other.data] });
++  or<OtherTable extends TypedTableDef>(
++    other: BooleanExpr<OtherTable> & RequireSameAndOrTable<Table, OtherTable>
++  ): BooleanExpr<Table> {
++    return new BooleanExpr({
++      type: 'or',
++      clauses: [this.data, other.data as BooleanExprData<Table>],
++    });
+   }
+ 
+   not(): BooleanExpr<Table> {
+@@ -708,28 +761,40 @@ export function not<T extends TypedTableDef>(
+   return new BooleanExpr({ type: 'not', clause: clause.data });
+ }
+ 
+-export function and<T extends TypedTableDef>(
+-  ...clauses: readonly [BooleanExpr<T>, BooleanExpr<T>, ...BooleanExpr<T>[]]
+-): BooleanExpr<T> {
++export function and<
++  Table extends TypedTableDef,
++  OtherTable extends TypedTableDef,
++>(
++  first: BooleanExpr<Table>,
++  second: BooleanExpr<OtherTable> & RequireSameAndOrTable<Table, OtherTable>,
++  ...rest: readonly BooleanExpr<Table>[]
++): BooleanExpr<Table> {
++  const clauses = [first, second, ...rest];
+   return new BooleanExpr({
+     type: 'and',
+     clauses: clauses.map(c => c.data) as [
+-      BooleanExprData<T>,
+-      BooleanExprData<T>,
+-      ...BooleanExprData<T>[],
++      BooleanExprData<Table>,
++      BooleanExprData<Table>,
++      ...BooleanExprData<Table>[],
+     ],
+   });
+ }
+ 
+-export function or<T extends TypedTableDef>(
+-  ...clauses: readonly [BooleanExpr<T>, BooleanExpr<T>, ...BooleanExpr<T>[]]
+-): BooleanExpr<T> {
++export function or<
++  Table extends TypedTableDef,
++  OtherTable extends TypedTableDef,
++>(
++  first: BooleanExpr<Table>,
++  second: BooleanExpr<OtherTable> & RequireSameAndOrTable<Table, OtherTable>,
++  ...rest: readonly BooleanExpr<Table>[]
++): BooleanExpr<Table> {
++  const clauses = [first, second, ...rest];
+   return new BooleanExpr({
+     type: 'or',
+     clauses: clauses.map(c => c.data) as [
+-      BooleanExprData<T>,
+-      BooleanExprData<T>,
+-      ...BooleanExprData<T>[],
++      BooleanExprData<Table>,
++      BooleanExprData<Table>,
++      ...BooleanExprData<Table>[],
+     ],
+   });
+ }
+@@ -779,7 +844,7 @@ function valueExprToSql<Table extends TypedTableDef>(
+     return literalValueToSql(expr.value);
+   }
+   const table = tableAlias ?? expr.table;
+-  return `${quoteIdentifier(table)}.${quoteIdentifier(expr.column)}`;
++  return `${quoteIdentifier(table)}.${quoteIdentifier(expr.columnName)}`;
+ }
+ 
+ function literalValueToSql(value: unknown): string {
+diff --git a/src/lib/reducers.ts b/src/lib/reducers.ts
+index a4252ba68c05951b5bcd51072d3483661b04ffb1..0eae2adc2a9753e2e3096aa4377d50babe855fbe 100644
+--- a/src/lib/reducers.ts
++++ b/src/lib/reducers.ts
+@@ -103,6 +103,8 @@ export interface JwtClaims {
+  */
+ export type ReducerCtx<SchemaDef extends UntypedSchemaDef> = Readonly<{
+   sender: Identity;
++  databaseIdentity: Identity;
++  /** @deprecated Use `databaseIdentity` instead. */
+   identity: Identity;
+   timestamp: Timestamp;
+   connectionId: ConnectionId | null;
+diff --git a/src/lib/schema.ts b/src/lib/schema.ts
+index fed510ba74f91fbf04fedfcce87a493a2eff596b..be9edc9e113f837ae6e9b5378b94f13d1f73f278 100644
+--- a/src/lib/schema.ts
++++ b/src/lib/schema.ts
+@@ -61,20 +61,35 @@ export interface TableToSchema<
+   accessorName: AccName;
+   columns: T['rowType']['row'];
+   rowType: T['rowSpacetimeType'];
++  // Declarative user-provided table-level indexes.
+   indexes: T['idxs'];
++  // Resolved runtime index metadata used by runtime consumers (e.g. TableCache).
++  resolvedIndexes: readonly UntypedIndex<keyof T['rowType']['row'] & string>[];
+   constraints: T['constraints'];
+ }
+ 
+ export function tablesToSchema<
+   const T extends Record<string, UntypedTableSchema>,
+ >(ctx: ModuleContext, tables: T): TablesToSchema<T> {
++  // `TablesToSchema<T>['tables']` is intentionally readonly in the public type,
++  // but we need a mutable builder while materializing it from entries.
++  type MutableTableDefs = {
++    -readonly [AccName in keyof TablesToSchema<T>['tables']]: TablesToSchema<T>['tables'][AccName];
++  };
++  const tableDefs = Object.create(null) as MutableTableDefs;
++  for (const [accName, schema] of Object.entries(tables) as [
++    keyof T & string,
++    T[keyof T & string],
++  ][]) {
++    tableDefs[accName] = tableToSchema(
++      accName,
++      schema,
++      schema.tableDef(ctx, accName)
++    ) as TablesToSchema<T>['tables'][typeof accName];
++  }
++
+   return {
+-    tables: Object.fromEntries(
+-      Object.entries(tables).map(([accName, schema]) => [
+-        accName,
+-        tableToSchema(accName, schema, schema.tableDef(ctx, accName)),
+-      ])
+-    ) as TablesToSchema<T>['tables'],
++    tables: tableDefs as TablesToSchema<T>['tables'],
+   };
+ }
+ 
+@@ -90,6 +105,46 @@ export function tableToSchema<
+     schema.rowType.algebraicType.value.elements[i].name;
+ 
+   type AllowedCol = keyof T['rowType']['row'] & string;
++  // Build fully-resolved runtime index metadata from the host-facing RawTableDef.
++  // This is intentionally separate from `schema.idxs`, which keeps the original
++  // user-declared `IndexOpts` shape for type-level inference.
++  const resolvedIndexes: UntypedIndex<AllowedCol>[] = tableDef.indexes.map(
++    idx => {
++      const accessorName = idx.accessorName;
++      if (typeof accessorName !== 'string' || accessorName.length === 0) {
++        throw new TypeError(
++          `Index '${idx.sourceName ?? '<unknown>'}' on table '${tableDef.sourceName}' is missing accessor name`
++        );
++      }
++
++      const columnIds =
++        idx.algorithm.tag === 'Direct'
++          ? [idx.algorithm.value]
++          : idx.algorithm.value;
++
++      const unique = tableDef.constraints.some(
++        c =>
++          c.data.tag === 'Unique' &&
++          c.data.value.columns.every(col => columnIds.includes(col))
++      );
++
++      const algorithm = (
++        {
++          BTree: 'btree',
++          Hash: 'hash',
++          Direct: 'direct',
++        } as const
++      )[idx.algorithm.tag];
++
++      return {
++        name: accessorName,
++        unique,
++        algorithm,
++        columns: columnIds.map(getColName) as AllowedCol[],
++      };
++    }
++  );
++
+   return {
+     // For client,`schama.tableName` will always be there as canonical name.
+     // For module, if explicit name is not provided via `name`, accessor name will
+@@ -98,29 +153,16 @@ export function tableToSchema<
+     accessorName: accName,
+     columns: schema.rowType.row, // typed as T[i]['rowType']['row'] under TablesToSchema<T>
+     rowType: schema.rowSpacetimeType,
++    // Keep declarative indexes in their original shape for type-level consumers.
++    indexes: schema.idxs,
+     constraints: tableDef.constraints.map(c => ({
+       name: c.sourceName,
+       constraint: 'unique',
+       columns: c.data.value.columns.map(getColName) as [string],
+     })),
+-    // TODO: horrible horrible horrible. we smuggle this `Array<UntypedIndex>`
+-    // by casting it to an `Array<IndexOpts>` as `TableToSchema` expects.
+-    // This is then used in `TableCacheImpl.constructor` and who knows where else.
+-    // We should stop lying about our types.
+-    indexes: tableDef.indexes.map((idx): UntypedIndex<AllowedCol> => {
+-      const columnIds =
+-        idx.algorithm.tag === 'Direct'
+-          ? [idx.algorithm.value]
+-          : idx.algorithm.value;
+-      return {
+-        name: idx.accessorName!,
+-        unique: tableDef.constraints.some(c =>
+-          c.data.value.columns.every(col => columnIds.includes(col))
+-        ),
+-        algorithm: idx.algorithm.tag.toLowerCase() as 'btree',
+-        columns: columnIds.map(getColName),
+-      };
+-    }) as T['idxs'],
++    // Expose resolved runtime indexes separately so runtime users don't have to
++    // reinterpret `indexes` with unsafe casts.
++    resolvedIndexes,
+     tableDef,
+     ...(tableDef.isEvent ? { isEvent: true } : {}),
+   };
+diff --git a/src/lib/table.ts b/src/lib/table.ts
+index f51763e5211b256f8d647037747581e89516fdd5..1d37b2e83c324f1c7f2ea8e11ad5e9c9ad101265 100644
+--- a/src/lib/table.ts
++++ b/src/lib/table.ts
+@@ -17,6 +17,7 @@ import type {
+   Indexes,
+   IndexOpts,
+   ReadonlyIndexes,
++  UntypedIndex,
+ } from './indexes';
+ import ScheduleAt from './schedule_at';
+ import type { TableSchema } from './table_schema';
+@@ -116,7 +117,25 @@ export type UntypedTableDef = {
+   columns: Record<string, ColumnBuilder<any, any, ColumnMetadata<any>>>;
+   // This is really just a ProductType where all the elements have names.
+   rowType: RowBuilder<RowObj>['algebraicType']['value'];
++  /**
++   * Declarative multi-column indexes supplied by user code in `table({ indexes: [...] }, ...)`.
++   *
++   * This is intentionally the *declarative* shape (`IndexOpts`) because a lot of
++   * type-level behavior is derived from these entries (for example query-builder
++   * inference over composite indexes).
++   */
+   indexes: readonly IndexOpts<any>[];
++  /**
++   * Fully-resolved runtime indexes materialized from `RawTableDefV10`.
++   *
++   * This contains both:
++   * 1) field-level indexes inferred from column metadata, and
++   * 2) explicit table-level indexes.
++   *
++   * Runtime consumers like `TableCacheImpl` should use this field instead of
++   * reinterpreting `indexes` as runtime index metadata.
++   */
++  resolvedIndexes: readonly UntypedIndex<any>[];
+   constraints: readonly ConstraintOpts<any>[];
+   tableDef: RawTableDefV10;
+   isEvent?: boolean;
+@@ -244,6 +263,13 @@ export interface TableMethods<TableDef extends UntypedTableDef>
+ 
+   /** Delete a row equal to `row`. Returns true if something was deleted. */
+   delete(row: Prettify<RowType<TableDef>>): boolean;
++
++  /**
++   * Clears the table of all rows.
++   * Returns the number of rows deleted,
++   * i.e., the return value of `this.count()` before this call.
++   */
++  clear(): bigint;
+ }
+ 
+ /**
+@@ -380,7 +406,8 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
+       });
+     }
+ 
+-    if (meta.defaultValue) {
++    // Check for defaultValue on the property to allow for 0, false, '', and undefined as defaults
++    if (Object.prototype.hasOwnProperty.call(meta, 'defaultValue')) {
+       const writer = new BinaryWriter(16);
+       builder.serialize(writer, meta.defaultValue);
+       defaultValues.push({
+@@ -400,6 +427,14 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
+ 
+   // convert explicit multi‑column indexes coming from options.indexes
+   for (const indexOpts of userIndexes ?? []) {
++    const accessor = indexOpts.accessor;
++    if (typeof accessor !== 'string' || accessor.length === 0) {
++      const tableLabel = name ?? '<unnamed>';
++      const indexLabel = indexOpts.name ?? '<unnamed>';
++      throw new TypeError(
++        `Index '${indexLabel}' on table '${tableLabel}' must define a non-empty 'accessor'`
++      );
++    }
+     let algorithm: RawIndexAlgorithm;
+     switch (indexOpts.algorithm) {
+       case 'btree':
+@@ -418,16 +453,19 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
+         algorithm = { tag: 'Direct', value: colIds.get(indexOpts.column)! };
+         break;
+     }
+-    // unnamed indexes will be assigned a globally unique name
+-    // The name users supply is actually the accessor name which will be used
+-    // in TypeScript to access the index. This will be used verbatim.
+-    // This is confusing because it is not the index name and there is
+-    // no actual way for the user to set the actual index name.
+-    // I think we should standardize: name and accessorName as the way to set
+-    // the name and accessor name of an index across all SDKs.
++
++    // Unnamed indexes are assigned a globally unique source name.
++    // `accessor` controls the TypeScript property used to access the index.
++    // `name` (if present) is preserved as the canonical schema name.
++    //
++    // IMPORTANT: we intentionally do not reject duplicate accessor names here.
++    // This preserves existing behavior for raw table definitions. Downstream
++    // runtime consumers decide how duplicates are resolved:
++    // - server runtime merges duplicate accessors onto one accessor object
++    // - client cache assignment is last-write-wins for duplicate accessors
+     indexes.push({
+       sourceName: undefined,
+-      accessorName: indexOpts.accessor,
++      accessorName: accessor,
+       algorithm,
+       canonicalName: indexOpts.name,
+     });
+@@ -496,7 +534,9 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
+         isEvent,
+       };
+     },
+-    idxs: {} as OptsIndices<Opts>,
++    // Preserve the declared index options as runtime data so `tableToSchema`
++    // can expose them without type-smuggling.
++    idxs: userIndexes as OptsIndices<Opts>,
+     constraints: constraints as OptsConstraints<Opts>,
+     schedule,
+   };
+diff --git a/src/react/index.ts b/src/react/index.ts
+index b32fbdf4b80d2994bae98684b267a118163abd10..3b3e64aba489a486aab91e7cffa4aa58fccfd06f 100644
+--- a/src/react/index.ts
++++ b/src/react/index.ts
+@@ -2,3 +2,4 @@ export * from './SpacetimeDBProvider.ts';
+ export { useSpacetimeDB } from './useSpacetimeDB.ts';
+ export { useTable } from './useTable.ts';
+ export { useReducer } from './useReducer.ts';
++export { useProcedure } from './useProcedure.ts';
+diff --git a/src/react/useProcedure.ts b/src/react/useProcedure.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f688335f3405f9e0fb3d015ca3ffb279e6e36b3
+--- /dev/null
++++ b/src/react/useProcedure.ts
+@@ -0,0 +1,60 @@
++import { useCallback, useEffect, useRef } from 'react';
++import type { UntypedProcedureDef } from '../sdk/procedures';
++import { useSpacetimeDB } from './useSpacetimeDB';
++import type {
++  ProcedureParamsType,
++  ProcedureReturnType,
++} from '../sdk/type_utils';
++
++export function useProcedure<ProcedureDef extends UntypedProcedureDef>(
++  procedureDef: ProcedureDef
++): (
++  ...params: ProcedureParamsType<ProcedureDef>
++) => Promise<ProcedureReturnType<ProcedureDef>> {
++  const { getConnection, isActive } = useSpacetimeDB();
++  const procedureName = procedureDef.accessorName;
++
++  // Holds calls made before the connection exists
++  const queueRef = useRef<
++    {
++      params: ProcedureParamsType<ProcedureDef>;
++      resolve: (val: any) => void;
++      reject: (err: unknown) => void;
++    }[]
++  >([]);
++
++  // Flush when we finally have a connection
++  useEffect(() => {
++    const conn = getConnection();
++    if (!conn) {
++      return;
++    }
++    const fn = (conn.procedures as any)[procedureName] as (
++      ...p: ProcedureParamsType<ProcedureDef>
++    ) => Promise<ProcedureReturnType<ProcedureDef>>;
++    if (queueRef.current.length) {
++      const pending = queueRef.current.splice(0);
++      for (const item of pending) {
++        fn(...item.params).then(item.resolve, item.reject);
++      }
++    }
++  }, [getConnection, procedureName, isActive]);
++
++  return useCallback(
++    (...params: ProcedureParamsType<ProcedureDef>) => {
++      const conn = getConnection();
++      if (!conn) {
++        return new Promise<ProcedureReturnType<ProcedureDef>>(
++          (resolve, reject) => {
++            queueRef.current.push({ params, resolve, reject });
++          }
++        );
++      }
++      const fn = (conn.procedures as any)[procedureName] as (
++        ...p: ProcedureParamsType<ProcedureDef>
++      ) => Promise<ProcedureReturnType<ProcedureDef>>;
++      return fn(...params);
++    },
++    [getConnection, procedureName]
++  );
++}
+diff --git a/src/react/useTable.ts b/src/react/useTable.ts
+index 5d3c1edd86ce42a5a2ee152e76a8e597a498ce2e..906d5d74892d2e51b365aa741818c6c4abbb6f0a 100644
+--- a/src/react/useTable.ts
++++ b/src/react/useTable.ts
+@@ -24,6 +24,8 @@ export interface UseTableCallbacks<RowType> {
+   onInsert?: (row: RowType) => void;
+   onDelete?: (row: RowType) => void;
+   onUpdate?: (oldRow: RowType, newRow: RowType) => void;
++  /** Whether the subscription is active. Defaults to `true`. */
++  enabled?: boolean;
+ }
+ 
+ type MembershipChange = 'enter' | 'leave' | 'stayIn' | 'stayOut';
+@@ -67,6 +69,7 @@ export function useTable<TableDef extends UntypedTableDef>(
+   callbacks?: UseTableCallbacks<Prettify<RowType<TableDef>>>
+ ): [readonly Prettify<RowType<TableDef>>[], boolean] {
+   type UseTableRowType = RowType<TableDef>;
++  const enabled = callbacks?.enabled ?? true;
+   const accessorName = getQueryAccessorName(query);
+   const whereExpr = getQueryWhereClause(query);
+ 
+@@ -93,6 +96,9 @@ export function useTable<TableDef extends UntypedTableDef>(
+     readonly Prettify<UseTableRowType>[],
+     boolean,
+   ] => {
++    if (!enabled) {
++      return [[], true];
++    }
+     const connection = connectionState.getConnection();
+     if (!connection) {
+       return [[], false];
+@@ -104,8 +110,10 @@ export function useTable<TableDef extends UntypedTableDef>(
+         ) as Prettify<UseTableRowType>[])
+       : (Array.from(table.iter()) as Prettify<UseTableRowType>[]);
+     return [result, subscribeApplied];
++    // TODO: investigating refactoring so that this is no longer necessary, as we have had genuine bugs with missed deps.
++    // See https://github.com/clockworklabs/SpacetimeDB/pull/4580.
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [connectionState, accessorName, querySql, subscribeApplied]);
++  }, [connectionState, accessorName, querySql, subscribeApplied, enabled]);
+ 
+   // Invalidate the cached snapshot when computeSnapshot changes (e.g. when
+   // subscribeApplied flips to true) so getSnapshot() recomputes on the next
+@@ -115,6 +123,10 @@ export function useTable<TableDef extends UntypedTableDef>(
+   }, [computeSnapshot]);
+ 
+   useEffect(() => {
++    if (!enabled) {
++      setSubscribeApplied(false);
++      return;
++    }
+     const connection = connectionState.getConnection()!;
+     if (connectionState.isActive && connection) {
+       const cancel = connection
+@@ -127,10 +139,14 @@ export function useTable<TableDef extends UntypedTableDef>(
+         cancel.unsubscribe();
+       };
+     }
+-  }, [querySql, connectionState.isActive, connectionState]);
++  }, [querySql, connectionState.isActive, connectionState, enabled]);
+ 
+   const subscribe = useCallback(
+     (onStoreChange: () => void) => {
++      if (!enabled) {
++        return () => {};
++      }
++
+       const onInsert = (
+         ctx: EventContextInterface<UntypedRemoteModule>,
+         row: any
+@@ -205,14 +221,18 @@ export function useTable<TableDef extends UntypedTableDef>(
+         table.removeOnUpdate?.(onUpdate);
+       };
+     },
++    // TODO: investigating refactoring so that this is no longer necessary, as we have had genuine bugs with missed deps.
++    // See https://github.com/clockworklabs/SpacetimeDB/pull/4580.
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+     [
+       connectionState,
+       accessorName,
+       querySql,
++      computeSnapshot,
+       callbacks?.onDelete,
+       callbacks?.onInsert,
+       callbacks?.onUpdate,
++      enabled,
+     ]
+   );
+ 
+diff --git a/src/sdk/db_connection_builder.ts b/src/sdk/db_connection_builder.ts
+index 43bda10f68c47e9c1832c83deefcb00d418350ae..282cab02d375a3cd66a7c8cbc9bf7cce01b8cc59 100644
+--- a/src/sdk/db_connection_builder.ts
++++ b/src/sdk/db_connection_builder.ts
+@@ -8,6 +8,7 @@ import type {
+ } from '../';
+ import { ensureMinimumVersionOrThrow } from './version';
+ import { WebsocketDecompressAdapter } from './websocket_decompress_adapter';
++import type { WebSocketFactory } from './ws';
+ 
+ /**
+  * The database client connection to a SpacetimeDB server.
+@@ -23,10 +24,10 @@ export class DbConnectionBuilder<DbConnection extends DbConnectionImpl<any>> {
+   #identity?: Identity;
+   #token?: string;
+   #emitter: EventEmitter<ConnectionEvent> = new EventEmitter();
+-  #compression: 'gzip' | 'none' = 'gzip';
++  #compression: 'gzip' | 'brotli' | 'none' = 'gzip';
+   #lightMode: boolean = false;
+   #confirmedReads?: boolean;
+-  #createWSFn: typeof WebsocketDecompressAdapter.createWebSocketFn;
++  #createWSFn: WebSocketFactory;
+ 
+   /**
+    * Creates a new `DbConnectionBuilder` database client and set the initial parameters.
+@@ -42,7 +43,7 @@ export class DbConnectionBuilder<DbConnection extends DbConnectionImpl<any>> {
+       config: DbConnectionConfig<RemoteModuleOf<DbConnection>>
+     ) => DbConnection
+   ) {
+-    this.#createWSFn = WebsocketDecompressAdapter.createWebSocketFn;
++    this.#createWSFn = WebsocketDecompressAdapter.openWebSocket;
+   }
+ 
+   /**
+@@ -82,9 +83,7 @@ export class DbConnectionBuilder<DbConnection extends DbConnectionImpl<any>> {
+     return this;
+   }
+ 
+-  withWSFn(
+-    createWSFn: typeof WebsocketDecompressAdapter.createWebSocketFn
+-  ): this {
++  withWSFn(createWSFn: WebSocketFactory): this {
+     this.#createWSFn = createWSFn;
+     return this;
+   }
+@@ -94,7 +93,17 @@ export class DbConnectionBuilder<DbConnection extends DbConnectionImpl<any>> {
+    *
+    * @param compression The compression algorithm to use for the connection.
+    */
+-  withCompression(compression: 'gzip' | 'none'): this {
++  withCompression(compression: 'gzip' | 'brotli' | 'none'): this {
++    if (compression === 'brotli') {
++      try {
++        new DecompressionStream('brotli' as CompressionFormat);
++      } catch (e) {
++        throw new TypeError(
++          `Brotli compression is not supported by the runtime. Please choose a different compression method.`,
++          { cause: e }
++        );
++      }
++    }
+     this.#compression = compression;
+     return this;
+   }
+diff --git a/src/sdk/db_connection_impl.ts b/src/sdk/db_connection_impl.ts
+index 0af455c4d44959e1bcb7ebb3dc8235127d427512..1e604349f6650a2666655aa0c0f400465a6b5bd1 100644
+--- a/src/sdk/db_connection_impl.ts
++++ b/src/sdk/db_connection_impl.ts
+@@ -1,7 +1,7 @@
+ import { ConnectionId, ProductBuilder, ProductType } from '../';
+ import { AlgebraicType, type ComparablePrimitive } from '../';
+-import { BinaryReader } from '../';
+-import { BinaryWriter } from '../';
++import BinaryReader from '../lib/binary_reader.ts';
++import BinaryWriter from '../lib/binary_writer.ts';
+ import {
+   BsatnRowList,
+   ClientMessage,
+@@ -37,8 +37,6 @@ import {
+   type PendingCallback,
+   type TableUpdate as CacheTableUpdate,
+ } from './table_cache.ts';
+-import { WebsocketDecompressAdapter } from './websocket_decompress_adapter.ts';
+-import type { WebsocketTestAdapter } from './websocket_test_adapter.ts';
+ import {
+   SubscriptionBuilderImpl,
+   SubscriptionHandleImpl,
+@@ -58,6 +56,19 @@ import type { ProceduresView } from './procedures.ts';
+ import type { Values } from '../lib/type_util.ts';
+ import type { TransactionUpdate } from './client_api/types.ts';
+ import { InternalError, SenderError } from '../lib/errors.ts';
++import type { WebSocketAdapter, WebSocketFactory } from './ws.ts';
++import {
++  normalizeWsProtocol,
++  PREFERRED_WS_PROTOCOLS,
++  V2_WS_PROTOCOL,
++  V3_WS_PROTOCOL,
++  type NegotiatedWsProtocol,
++} from './websocket_protocols';
++import {
++  countClientMessagesForV3Frame,
++  encodeClientMessagesV3,
++  forEachServerMessageV3,
++} from './websocket_v3_frames.ts';
+ 
+ export {
+   DbConnectionBuilder,
+@@ -87,8 +98,8 @@ export type DbConnectionConfig<RemoteModule extends UntypedRemoteModule> = {
+   identity?: Identity;
+   token?: string;
+   emitter: EventEmitter<ConnectionEvent>;
+-  createWSFn: typeof WebsocketDecompressAdapter.createWebSocketFn;
+-  compression: 'gzip' | 'none';
++  createWSFn: WebSocketFactory;
++  compression: 'gzip' | 'brotli' | 'none';
+   lightMode: boolean;
+   confirmedReads?: boolean;
+   remoteModule: RemoteModule;
+@@ -96,6 +107,29 @@ export type DbConnectionConfig<RemoteModule extends UntypedRemoteModule> = {
+ 
+ type ProcedureCallback = (result: ProcedureResultMessage['result']) => void;
+ 
++const TEXT_ENCODER = new TextEncoder();
++
++function getClientMessageVariantTag(name: string): number {
++  if (ClientMessage.algebraicType.tag !== 'Sum') {
++    throw new TypeError('ClientMessage must be a sum type');
++  }
++  const tag = ClientMessage.algebraicType.value.variants.findIndex(
++    variant => variant.name === name
++  );
++  if (tag === -1) {
++    throw new RangeError(`Unknown ClientMessage variant: ${name}`);
++  }
++  return tag;
++}
++
++const CLIENT_MESSAGE_CALL_REDUCER_TAG =
++  getClientMessageVariantTag('CallReducer');
++const CLIENT_MESSAGE_CALL_PROCEDURE_TAG =
++  getClientMessageVariantTag('CallProcedure');
++// Keep individual v3 frames bounded so one burst does not monopolize the send
++// path or create very large websocket writes.
++const MAX_V3_OUTBOUND_FRAME_BYTES = 256 * 1024;
++
+ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+   implements DbContext<RemoteModule>
+ {
+@@ -139,14 +173,19 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+    * The `ConnectionId` of the connection to to the database.
+    */
+   connectionId: ConnectionId = ConnectionId.random();
++  #connectionIdHex = this.connectionId.toHexString();
+ 
+   // These fields are meant to be strictly private.
+   #queryId = 0;
+   #requestId = 0;
+   #eventId = 0;
+   #emitter: EventEmitter<ConnectionEvent>;
+-  #messageQueue = Promise.resolve();
+-  #outboundQueue: ClientMessage[] = [];
++  #inboundQueue: Uint8Array[] = [];
++  #inboundQueueOffset = 0;
++  #isDrainingInboundQueue = false;
++  #outboundQueue: Uint8Array<ArrayBuffer>[] = [];
++  #isOutboundFlushScheduled = false;
++  #negotiatedWsProtocol: NegotiatedWsProtocol = V2_WS_PROTOCOL;
+   #subscriptionManager = new SubscriptionManager<RemoteModule>();
+   #remoteModule: RemoteModule;
+   #reducerCallbacks = new Map<
+@@ -156,6 +195,10 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+   #reducerCallInfo = new Map<number, { name: string; args: object }>();
+   #procedureCallbacks = new Map<number, ProcedureCallback>();
+   #rowDeserializers: Record<string, Deserializer<any>>;
++  #rowIdMetadata: Record<
++    string,
++    { primaryKeyColName?: string; primaryKeyColType?: AlgebraicType }
++  >;
+   #reducerArgsSerializers: Record<
+     string,
+     { serialize: Serializer<any>; deserialize: Deserializer<any> }
+@@ -164,17 +207,22 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     string,
+     { serializeArgs: Serializer<any>; deserializeReturn: Deserializer<any> }
+   >;
++  #reducerNameBytes: Record<string, Uint8Array>;
++  #procedureNameBytes: Record<string, Uint8Array>;
+   #sourceNameToTableDef: Record<string, Values<RemoteModule['tables']>>;
++  #messageReader = new BinaryReader(new Uint8Array());
++  #rowListReader = new BinaryReader(new Uint8Array());
++  #clientFrameEncoder = new BinaryWriter(1024);
++  #boundSubscriptionBuilder!: () => SubscriptionBuilderImpl<RemoteModule>;
++  #boundDisconnect!: () => void;
+ 
+   // These fields are not part of the public API, but in a pinch you
+   // could use JavaScript to access them by bypassing TypeScript's
+   // private fields.
+   // We use them in testing.
+   private clientCache: ClientCache<RemoteModule>;
+-  private ws?: WebsocketDecompressAdapter | WebsocketTestAdapter;
+-  private wsPromise: Promise<
+-    WebsocketDecompressAdapter | WebsocketTestAdapter | undefined
+-  >;
++  private ws?: WebSocketAdapter;
++  private wsPromise: Promise<WebSocketAdapter | undefined>;
+ 
+   constructor({
+     uri,
+@@ -203,8 +251,11 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+ 
+     this.#remoteModule = remoteModule;
+     this.#emitter = emitter;
++    this.#boundSubscriptionBuilder = this.subscriptionBuilder.bind(this);
++    this.#boundDisconnect = this.disconnect.bind(this);
+ 
+     this.#rowDeserializers = Object.create(null);
++    this.#rowIdMetadata = Object.create(null);
+     this.#sourceNameToTableDef = Object.create(null);
+     for (const table of Object.values(remoteModule.tables)) {
+       this.#rowDeserializers[table.sourceName] = ProductType.makeDeserializer(
+@@ -213,17 +264,29 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+       this.#sourceNameToTableDef[table.sourceName] = table as Values<
+         RemoteModule['tables']
+       >;
++      const primaryKeyColumn = Object.entries(table.columns).find(
++        ([, column]) => column.columnMetadata.isPrimaryKey
++      );
++      this.#rowIdMetadata[table.sourceName] = primaryKeyColumn
++        ? {
++            primaryKeyColName: primaryKeyColumn[0],
++            primaryKeyColType: primaryKeyColumn[1].typeBuilder.algebraicType,
++          }
++        : {};
+     }
+ 
+     this.#reducerArgsSerializers = Object.create(null);
++    this.#reducerNameBytes = Object.create(null);
+     for (const reducer of remoteModule.reducers) {
+       this.#reducerArgsSerializers[reducer.name] = {
+         serialize: ProductType.makeSerializer(reducer.paramsType),
+         deserialize: ProductType.makeDeserializer(reducer.paramsType),
+       };
++      this.#reducerNameBytes[reducer.name] = TEXT_ENCODER.encode(reducer.name);
+     }
+ 
+     this.#procedureSerializers = Object.create(null);
++    this.#procedureNameBytes = Object.create(null);
+     for (const procedure of remoteModule.procedures) {
+       this.#procedureSerializers[procedure.name] = {
+         serializeArgs: ProductType.makeSerializer(
+@@ -233,10 +296,12 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+           procedure.returnType.algebraicType
+         ),
+       };
++      this.#procedureNameBytes[procedure.name] = TEXT_ENCODER.encode(
++        procedure.name
++      );
+     }
+ 
+-    const connectionId = this.connectionId.toHexString();
+-    url.searchParams.set('connection_id', connectionId);
++    url.searchParams.set('connection_id', this.#connectionIdHex);
+ 
+     this.clientCache = new ClientCache<RemoteModule>();
+     this.db = this.#makeDbView();
+@@ -246,7 +311,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     this.wsPromise = createWSFn({
+       url,
+       nameOrAddress,
+-      wsProtocol: 'v2.bsatn.spacetimedb',
++      wsProtocol: [...PREFERRED_WS_PROTOCOLS],
+       authToken: token,
+       compression: compression,
+       lightMode: lightMode,
+@@ -304,16 +369,23 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+ 
+     for (const reducer of def.reducers) {
+       const reducerName = reducer.name;
++      const encodedReducerName = this.#reducerNameBytes[reducerName];
+       const key = reducer.accessorName;
+ 
+       const { serialize: serializeArgs } =
+         this.#reducerArgsSerializers[reducerName];
+ 
+       (out as any)[key] = (params: InferTypeOfRow<typeof reducer.params>) => {
+-        const writer = new BinaryWriter(1024);
++        const writer = this.#reducerArgsEncoder;
++        writer.clear();
+         serializeArgs(writer, params);
+         const argsBuffer = writer.getBuffer();
+-        return this.callReducer(reducerName, argsBuffer, params);
++        return this.#callReducerWithEncodedName(
++          reducerName,
++          encodedReducerName,
++          argsBuffer,
++          params
++        );
+       };
+     }
+ 
+@@ -323,8 +395,11 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+   #makeProcedures(def: RemoteModule): ProceduresView<RemoteModule> {
+     const out: Record<string, unknown> = {};
+ 
++    const writer = new BinaryWriter(1024);
++
+     for (const procedure of def.procedures) {
+       const procedureName = procedure.name;
++      const encodedProcedureName = this.#procedureNameBytes[procedureName];
+       const key = procedure.accessorName;
+ 
+       const { serializeArgs, deserializeReturn } =
+@@ -333,10 +408,14 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+       (out as any)[key] = (
+         params: InferTypeOfRow<typeof procedure.params>
+       ): Promise<any> => {
+-        const writer = new BinaryWriter(1024);
++        writer.clear();
+         serializeArgs(writer, params);
+         const argsBuffer = writer.getBuffer();
+-        return this.callProcedure(procedureName, argsBuffer).then(returnBuf => {
++        return this.#callProcedureWithEncodedName(
++          procedureName,
++          encodedProcedureName,
++          argsBuffer
++        ).then(returnBuf => {
+           return deserializeReturn(new BinaryReader(returnBuf));
+         });
+       };
+@@ -353,13 +432,12 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+       >
+     >
+   ): EventContextInterface<RemoteModule> {
+-    // Bind methods to preserve `this` (#private fields safe)
+     return {
+       db: this.db,
+       reducers: this.reducers,
+       isActive: this.isActive,
+-      subscriptionBuilder: this.subscriptionBuilder.bind(this),
+-      disconnect: this.disconnect.bind(this),
++      subscriptionBuilder: this.#boundSubscriptionBuilder,
++      disconnect: this.#boundDisconnect,
+       event,
+     };
+   }
+@@ -420,24 +498,18 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     rowList: BsatnRowList
+   ): Operation[] {
+     const buffer = rowList.rowsData;
+-    const reader = new BinaryReader(buffer);
++    const reader = this.#rowListReader;
++    reader.reset(buffer);
+     const rows: Operation[] = [];
+ 
+     const deserializeRow = this.#rowDeserializers[tableName];
+-    const table = this.#sourceNameToTableDef[tableName];
+-    // TODO: performance
+-    const columnsArray = Object.entries(table.columns);
+-    const primaryKeyColumnEntry = columnsArray.find(
+-      col => col[1].columnMetadata.isPrimaryKey
+-    );
++    const { primaryKeyColName, primaryKeyColType } =
++      this.#rowIdMetadata[tableName];
+     let previousOffset = 0;
+     while (reader.remaining > 0) {
+       const row = deserializeRow(reader);
+       let rowId: ComparablePrimitive | undefined = undefined;
+-      if (primaryKeyColumnEntry !== undefined) {
+-        const primaryKeyColName = primaryKeyColumnEntry[0];
+-        const primaryKeyColType =
+-          primaryKeyColumnEntry[1].typeBuilder.algebraicType;
++      if (primaryKeyColName !== undefined && primaryKeyColType !== undefined) {
+         rowId = AlgebraicType.intoMapKey(
+           primaryKeyColType,
+           row[primaryKeyColName]
+@@ -537,52 +609,175 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     return this.#mergeTableUpdates(updates);
+   }
+ 
+-  #sendEncoded(
+-    wsResolved: WebsocketDecompressAdapter | WebsocketTestAdapter,
+-    message: ClientMessage
+-  ): void {
+-    stdbLogger(
+-      'trace',
+-      () => `Sending message to server: ${stringify(message)}`
++  #flushOutboundQueue(wsResolved: WebSocketAdapter): void {
++    if (this.#negotiatedWsProtocol === V3_WS_PROTOCOL) {
++      this.#flushOutboundQueueV3(wsResolved);
++      return;
++    }
++    this.#flushOutboundQueueV2(wsResolved);
++  }
++
++  #flushOutboundQueueV2(wsResolved: WebSocketAdapter): void {
++    const pending = this.#outboundQueue.splice(0);
++    for (const message of pending) {
++      wsResolved.send(message);
++    }
++  }
++
++  #flushOutboundQueueV3(wsResolved: WebSocketAdapter): void {
++    if (this.#outboundQueue.length === 0) {
++      return;
++    }
++
++    // Emit at most one bounded frame per flush. If more encoded v2 messages
++    // remain in the queue, they are sent by a later scheduled flush so inbound
++    // traffic and other tasks get a chance to run between websocket writes.
++    const batchSize = countClientMessagesForV3Frame(
++      this.#outboundQueue,
++      MAX_V3_OUTBOUND_FRAME_BYTES
+     );
+-    const writer = new BinaryWriter(1024);
+-    ClientMessage.serialize(writer, message);
+-    const encoded = writer.getBuffer();
+-    wsResolved.send(encoded);
++    wsResolved.send(
++      encodeClientMessagesV3(
++        this.#clientFrameEncoder,
++        this.#outboundQueue,
++        batchSize
++      )
++    );
++
++    if (batchSize === this.#outboundQueue.length) {
++      this.#outboundQueue.length = 0;
++      return;
++    }
++
++    this.#outboundQueue.copyWithin(0, batchSize);
++    this.#outboundQueue.length -= batchSize;
++    if (this.#outboundQueue.length > 0) {
++      this.#scheduleDeferredOutboundFlush();
++    }
+   }
+ 
+-  #flushOutboundQueue(
+-    wsResolved: WebsocketDecompressAdapter | WebsocketTestAdapter
+-  ): void {
+-    if (!this.isActive || this.#outboundQueue.length === 0) {
++  #scheduleOutboundFlush(): void {
++    this.#scheduleOutboundFlushWith('microtask');
++  }
++
++  #scheduleDeferredOutboundFlush(): void {
++    this.#scheduleOutboundFlushWith('next-task');
++  }
++
++  #scheduleOutboundFlushWith(schedule: 'microtask' | 'next-task'): void {
++    if (this.#isOutboundFlushScheduled) {
+       return;
+     }
+-    const pending = this.#outboundQueue.splice(0);
+-    for (const message of pending) {
+-      this.#sendEncoded(wsResolved, message);
++
++    this.#isOutboundFlushScheduled = true;
++    const flush = () => {
++      this.#isOutboundFlushScheduled = false;
++      if (this.ws && this.isActive) {
++        this.#flushOutboundQueue(this.ws);
++      }
++    };
++
++    // The first v3 flush stays on the current turn so same-tick sends coalesce.
++    // Follow-up flushes after a size-capped frame yield to the next task so we
++    // do not sit in a tight send loop while inbound websocket work is waiting.
++    if (schedule === 'next-task') {
++      setTimeout(flush, 0);
++    } else {
++      queueMicrotask(flush);
+     }
+   }
+ 
+-  #sendMessage(message: ClientMessage): void {
+-    this.wsPromise.then(wsResolved => {
+-      if (!wsResolved || !this.isActive) {
+-        this.#outboundQueue.push(message);
++  #reducerArgsEncoder = new BinaryWriter(1024);
++  #clientMessageEncoder = new BinaryWriter(1024);
++  #sendEncodedMessage(
++    encoded: Uint8Array<ArrayBuffer>,
++    describe: () => string
++  ): void {
++    stdbLogger('trace', describe);
++    if (this.ws && this.isActive) {
++      if (this.#negotiatedWsProtocol === V2_WS_PROTOCOL) {
++        if (this.#outboundQueue.length) this.#flushOutboundQueue(this.ws);
++        this.ws.send(encoded);
+         return;
+       }
+-      this.#flushOutboundQueue(wsResolved);
+-      this.#sendEncoded(wsResolved, message);
+-    });
++
++      this.#outboundQueue.push(encoded.slice());
++      this.#scheduleOutboundFlush();
++    } else {
++      // Use slice() to copy, in case the clientMessageEncoder's buffer gets reused
++      // before the connection opens or before a v3 microbatch flush runs.
++      this.#outboundQueue.push(encoded.slice());
++    }
++  }
++
++  #sendMessage(message: ClientMessage): void {
++    const writer = this.#clientMessageEncoder;
++    writer.clear();
++    ClientMessage.serialize(writer, message);
++    const encoded = writer.getBuffer();
++    const isLive = !!(this.ws && this.isActive);
++    this.#sendEncodedMessage(encoded, () =>
++      isLive
++        ? `Sending message to server: ${stringify(message)}`
++        : `Queuing message to server: ${stringify(message)}`
++    );
++  }
++
++  #sendCallReducerMessage(
++    requestId: number,
++    reducerNameBytes: Uint8Array,
++    argsBuffer: Uint8Array
++  ): void {
++    const writer = this.#clientMessageEncoder;
++    writer.clear();
++    writer.writeByte(CLIENT_MESSAGE_CALL_REDUCER_TAG);
++    writer.writeU32(requestId);
++    writer.writeU8(0);
++    writer.writeUInt8Array(reducerNameBytes);
++    writer.writeUInt8Array(argsBuffer);
++    const encoded = writer.getBuffer();
++    this.#sendEncodedMessage(
++      encoded,
++      () => `Sending reducer call message to server: requestId=${requestId}`
++    );
++  }
++
++  #sendCallProcedureMessage(
++    requestId: number,
++    procedureNameBytes: Uint8Array,
++    argsBuffer: Uint8Array
++  ): void {
++    const writer = this.#clientMessageEncoder;
++    writer.clear();
++    writer.writeByte(CLIENT_MESSAGE_CALL_PROCEDURE_TAG);
++    writer.writeU32(requestId);
++    writer.writeU8(0);
++    writer.writeUInt8Array(procedureNameBytes);
++    writer.writeUInt8Array(argsBuffer);
++    const encoded = writer.getBuffer();
++    this.#sendEncodedMessage(
++      encoded,
++      () => `Sending procedure call message to server: requestId=${requestId}`
++    );
++  }
++
++  #setConnectionId(connectionId: ConnectionId): void {
++    this.connectionId = connectionId;
++    this.#connectionIdHex = connectionId.toHexString();
+   }
+ 
+   #nextEventId(): string {
+     this.#eventId += 1;
+-    return `${this.connectionId.toHexString()}:${this.#eventId}`;
++    return `${this.#connectionIdHex}:${this.#eventId}`;
+   }
+ 
+   /**
+    * Handles WebSocket onOpen event.
+    */
+   #handleOnOpen(): void {
++    if (this.ws) {
++      this.#negotiatedWsProtocol = normalizeWsProtocol(this.ws.protocol);
++    }
+     this.isActive = true;
+     if (this.ws) {
+       this.#flushOutboundQueue(this.ws);
+@@ -630,8 +825,17 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     );
+   }
+ 
+-  async #processMessage(data: Uint8Array): Promise<void> {
+-    const serverMessage = ServerMessage.deserialize(new BinaryReader(data));
++  #dispatchPendingCallbacks(callbacks: readonly PendingCallback[]): void {
++    stdbLogger(
++      'trace',
++      () => `Calling ${callbacks.length} triggered row callbacks`
++    );
++    for (const callback of callbacks) {
++      callback.cb();
++    }
++  }
++
++  #processServerMessage(serverMessage: ServerMessage): void {
+     stdbLogger(
+       'trace',
+       () => `Processing server message: ${stringify(serverMessage)}`
+@@ -642,7 +846,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+         if (!this.token && serverMessage.value.token) {
+           this.token = serverMessage.value.token;
+         }
+-        this.connectionId = serverMessage.value.connectionId;
++        this.#setConnectionId(serverMessage.value.connectionId);
+         this.#emitter.emit('connect', this, this.identity, this.token);
+         break;
+       }
+@@ -669,13 +873,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+         const callbacks = this.#applyTableUpdates(tableUpdates, eventContext);
+         const { event: _, ...subscriptionEventContext } = eventContext;
+         subscription.emitter.emit('applied', subscriptionEventContext);
+-        stdbLogger(
+-          'trace',
+-          () => `Calling ${callbacks.length} triggered row callbacks`
+-        );
+-        for (const callback of callbacks) {
+-          callback.cb();
+-        }
++        this.#dispatchPendingCallbacks(callbacks);
+         break;
+       }
+       case 'UnsubscribeApplied': {
+@@ -701,13 +899,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+         const { event: _, ...subscriptionEventContext } = eventContext;
+         subscription.emitter.emit('end', subscriptionEventContext);
+         this.#subscriptionManager.subscriptions.delete(querySetId);
+-        stdbLogger(
+-          'trace',
+-          () => `Calling ${callbacks.length} triggered row callbacks`
+-        );
+-        for (const callback of callbacks) {
+-          callback.cb();
+-        }
++        this.#dispatchPendingCallbacks(callbacks);
+         break;
+       }
+       case 'SubscriptionError': {
+@@ -761,13 +953,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+           eventContext,
+           serverMessage.value
+         );
+-        stdbLogger(
+-          'trace',
+-          () => `Calling ${callbacks.length} triggered row callbacks`
+-        );
+-        for (const callback of callbacks) {
+-          callback.cb();
+-        }
++        this.#dispatchPendingCallbacks(callbacks);
+         break;
+       }
+       case 'ReducerResult': {
+@@ -799,13 +985,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+             eventContext,
+             result.value.transactionUpdate
+           );
+-          stdbLogger(
+-            'trace',
+-            () => `Calling ${callbacks.length} triggered row callbacks`
+-          );
+-          for (const callback of callbacks) {
+-            callback.cb();
+-          }
++          this.#dispatchPendingCallbacks(callbacks);
+         }
+         this.#reducerCallInfo.delete(requestId);
+         const cb = this.#reducerCallbacks.get(requestId);
+@@ -834,18 +1014,65 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     }
+   }
+ 
++  #processV2Message(data: Uint8Array): void {
++    const reader = this.#messageReader;
++    reader.reset(data);
++    this.#processServerMessage(ServerMessage.deserialize(reader));
++  }
++
++  #processMessage(data: Uint8Array): void {
++    if (this.#negotiatedWsProtocol !== V3_WS_PROTOCOL) {
++      this.#processV2Message(data);
++      return;
++    }
++
++    const messageCount = forEachServerMessageV3(
++      this.#messageReader,
++      data,
++      serverMessage => {
++        this.#processServerMessage(serverMessage);
++      }
++    );
++    stdbLogger(
++      'trace',
++      () => `Processing server v3 payload with ${messageCount} message(s)`
++    );
++  }
++
+   /**
+    * Handles WebSocket onMessage event.
+    * @param wsMessage MessageEvent object.
+    */
+   #handleOnMessage(wsMessage: { data: Uint8Array }): void {
+-    // Utilize promise chaining to ensure that we process messages in order
+-    // even though we are processing them asyncronously. This will not begin
+-    // processing the next message until we await the processing of the
+-    // current message.
+-    this.#messageQueue = this.#messageQueue.then(() => {
+-      return this.#processMessage(wsMessage.data);
+-    });
++    // Queue inbound messages so they are processed strictly in arrival order.
++    // We deliberately drain synchronously instead of promise-chaining each
++    // message, but this still guarantees that we do not begin processing the
++    // next message until the current message has been fully handled.
++    this.#inboundQueue.push(wsMessage.data);
++    if (this.#isDrainingInboundQueue) {
++      return;
++    }
++
++    this.#isDrainingInboundQueue = true;
++    try {
++      // TODO: If this loop starts monopolizing the event loop under sustained
++      // inbound traffic, switch to a chunked drain that periodically yields.
++      while (this.#inboundQueueOffset < this.#inboundQueue.length) {
++        const data = this.#inboundQueue[this.#inboundQueueOffset];
++        this.#inboundQueueOffset += 1;
++        if (data) {
++          this.#processMessage(data);
++        }
++      }
++    } finally {
++      if (this.#inboundQueueOffset >= this.#inboundQueue.length) {
++        this.#inboundQueue.length = 0;
++      } else if (this.#inboundQueueOffset > 0) {
++        this.#inboundQueue = this.#inboundQueue.slice(this.#inboundQueueOffset);
++      }
++      this.#inboundQueueOffset = 0;
++      this.#isDrainingInboundQueue = false;
++    }
+   }
+ 
+   /**
+@@ -858,6 +1085,59 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     reducerName: string,
+     argsBuffer: Uint8Array,
+     reducerArgs?: object
++  ): Promise<void> {
++    const encodedReducerName = this.#reducerNameBytes[reducerName];
++    if (encodedReducerName) {
++      return this.#callReducerWithEncodedName(
++        reducerName,
++        encodedReducerName,
++        argsBuffer,
++        reducerArgs
++      );
++    }
++    return this.#callReducerGeneric(reducerName, argsBuffer, reducerArgs);
++  }
++
++  #callReducerWithEncodedName(
++    reducerName: string,
++    encodedReducerName: Uint8Array,
++    argsBuffer: Uint8Array,
++    reducerArgs?: object
++  ): Promise<void> {
++    const { promise, resolve, reject } = Promise.withResolvers<void>();
++    const requestId = this.#getNextRequestId();
++    this.#sendCallReducerMessage(requestId, encodedReducerName, argsBuffer);
++    if (reducerArgs) {
++      this.#reducerCallInfo.set(requestId, {
++        name: reducerName,
++        args: reducerArgs,
++      });
++    }
++    this.#reducerCallbacks.set(requestId, result => {
++      if (result.tag === 'Ok' || result.tag === 'OkEmpty') {
++        resolve();
++      } else {
++        if (result.tag === 'Err') {
++          /// Interpret the user-returned error as a string.
++          const reader = new BinaryReader(result.value);
++          const errorString = reader.readString();
++          reject(new SenderError(errorString));
++        } else if (result.tag === 'InternalError') {
++          reject(new InternalError(result.value));
++        } else {
++          const unreachable: never = result;
++          reject(new Error('Unexpected reducer result'));
++          void unreachable;
++        }
++      }
++    });
++    return promise;
++  }
++
++  #callReducerGeneric(
++    reducerName: string,
++    argsBuffer: Uint8Array,
++    reducerArgs?: object
+   ): Promise<void> {
+     const { promise, resolve, reject } = Promise.withResolvers<void>();
+     const requestId = this.#getNextRequestId();
+@@ -907,7 +1187,8 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+     _paramsType: ProductType,
+     params: object
+   ): Promise<void> {
+-    const writer = new BinaryWriter(1024);
++    const writer = this.#reducerArgsEncoder;
++    writer.clear();
+     this.#reducerArgsSerializers[reducerName].serialize(writer, params);
+     const argsBuffer = writer.getBuffer();
+     return this.callReducer(reducerName, argsBuffer, params);
+@@ -922,6 +1203,39 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+   callProcedure(
+     procedureName: string,
+     argsBuffer: Uint8Array
++  ): Promise<Uint8Array> {
++    const encodedProcedureName = this.#procedureNameBytes[procedureName];
++    if (encodedProcedureName) {
++      return this.#callProcedureWithEncodedName(
++        procedureName,
++        encodedProcedureName,
++        argsBuffer
++      );
++    }
++    return this.#callProcedureGeneric(procedureName, argsBuffer);
++  }
++
++  #callProcedureWithEncodedName(
++    procedureName: string,
++    encodedProcedureName: Uint8Array,
++    argsBuffer: Uint8Array
++  ): Promise<Uint8Array> {
++    const { promise, resolve, reject } = Promise.withResolvers<Uint8Array>();
++    const requestId = this.#getNextRequestId();
++    this.#sendCallProcedureMessage(requestId, encodedProcedureName, argsBuffer);
++    this.#procedureCallbacks.set(requestId, result => {
++      if (result.tag === 'Ok') {
++        resolve(result.value);
++      } else {
++        reject(result.value);
++      }
++    });
++    return promise;
++  }
++
++  #callProcedureGeneric(
++    procedureName: string,
++    argsBuffer: Uint8Array
+   ): Promise<Uint8Array> {
+     const { promise, resolve, reject } = Promise.withResolvers<Uint8Array>();
+     const requestId = this.#getNextRequestId();
+@@ -978,11 +1292,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
+    * ```
+    */
+   disconnect(): void {
+-    this.wsPromise.then(wsResolved => {
+-      if (wsResolved) {
+-        wsResolved.close();
+-      }
+-    });
++    this.wsPromise.then(ws => ws?.close());
+   }
+ 
+   private on(
+diff --git a/src/sdk/decompress.ts b/src/sdk/decompress.ts
+index cdc49a2241aac48bcebc64348fd0312e7c76463d..8c35e0d90baf95687ffbe7e1d99f6133a6966028 100644
+--- a/src/sdk/decompress.ts
++++ b/src/sdk/decompress.ts
+@@ -1,12 +1,11 @@
+ export async function decompress(
+-  buffer: Uint8Array,
+-  // Leaving it here to expand to brotli when it lands in the browsers and NodeJS
+-  type: 'gzip',
++  buffer: Uint8Array<ArrayBuffer>,
++  type: CompressionFormat,
+   chunkSize: number = 128 * 1024 // 128KB
+ ): Promise<Uint8Array> {
+   // Create a single ReadableStream to handle chunks
+   let offset = 0;
+-  const readableStream = new ReadableStream({
++  const readableStream = new ReadableStream<BufferSource>({
+     pull(controller) {
+       if (offset < buffer.length) {
+         // Slice a chunk of the buffer and enqueue it
+@@ -29,24 +28,9 @@ export async function decompress(
+   const decompressedStream = readableStream.pipeThrough(decompressionStream);
+ 
+   // Collect the decompressed chunks efficiently
+-  const reader = decompressedStream.getReader();
+-  const chunks: Uint8Array[] = [];
+-  let totalLength = 0;
+-  let result: any;
+-
+-  while (!(result = await reader.read()).done) {
+-    chunks.push(result.value);
+-    totalLength += result.value.length;
++  const chunks = [];
++  for await (const chunk of decompressedStream) {
++    chunks.push(chunk);
+   }
+-
+-  // Allocate a single Uint8Array for the decompressed data
+-  const decompressedArray = new Uint8Array(totalLength);
+-  let chunkOffset = 0;
+-
+-  for (const chunk of chunks) {
+-    decompressedArray.set(chunk, chunkOffset);
+-    chunkOffset += chunk.length;
+-  }
+-
+-  return decompressedArray;
++  return new Blob(chunks).bytes();
+ }
+diff --git a/src/sdk/table_cache.ts b/src/sdk/table_cache.ts
+index 3b798b3772526d2b98714f78e3fef53f0412ce08..42645daaecf83274925da52b87d873df5e54334e 100644
+--- a/src/sdk/table_cache.ts
++++ b/src/sdk/table_cache.ts
+@@ -12,7 +12,6 @@ import type {
+   ReadonlyIndexes,
+   ReadonlyRangedIndex,
+   ReadonlyUniqueIndex,
+-  UntypedIndex,
+ } from '../lib/indexes.ts';
+ import type { Bound } from '../server/range.ts';
+ import type { Prettify } from '../lib/type_util.ts';
+@@ -67,6 +66,7 @@ export class TableCacheImpl<
+   TableName extends TableNamesOf<RemoteModule>,
+ > implements ClientTableCoreImplementable<RemoteModule, TableName>
+ {
++  private readonly hasPrimaryKey: boolean;
+   private rows: Map<
+     ComparablePrimitive,
+     [RowType<TableDefForTableName<RemoteModule, TableName>>, number]
+@@ -84,23 +84,30 @@ export class TableCacheImpl<
+     this.tableDef = tableDef;
+     this.rows = new Map();
+     this.emitter = new EventEmitter();
+-    // Build indexes
+-    const indexesDef = this.tableDef.indexes || [];
+-    for (const idx of indexesDef) {
+-      // TODO: don't do this. See comment in `tableToSchema` in `schema.ts`
+-      const idxDef = idx as UntypedIndex<
+-        keyof TableDefForTableName<RemoteModule, TableName>['columns'] & string
+-      >;
++    this.hasPrimaryKey = Object.values(this.tableDef.columns).some(
++      col => col.columnMetadata.isPrimaryKey === true
++    );
++    // Build index views from the resolved runtime index metadata.
++    //
++    // We intentionally use `resolvedIndexes` rather than `indexes`:
++    // - `indexes` is declarative table-level config (`IndexOpts`) used mainly for typing.
++    // - `resolvedIndexes` is the runtime shape (`UntypedIndex`) that includes both
++    //   field-level and explicit table-level indexes.
++    for (const idxDef of this.tableDef.resolvedIndexes) {
+       const index = this.#makeReadonlyIndex(this.tableDef, idxDef);
++      // IMPORTANT: for duplicate accessor names, client cache uses assignment
++      // semantics and later entries overwrite earlier ones. This matches prior
++      // behavior and is intentionally different from server runtime merge logic.
+       (this as any)[idxDef.name] = index;
+     }
+   }
+ 
+   // TODO: this just scans the whole table; we should build proper index structures
+   #makeReadonlyIndex<
+-    I extends UntypedIndex<
+-      keyof TableDefForTableName<RemoteModule, TableName>['columns'] & string
+-    >,
++    I extends TableDefForTableName<
++      RemoteModule,
++      TableName
++    >['resolvedIndexes'][number],
+   >(
+     tableDef: TableDefForTableName<RemoteModule, TableName>,
+     idx: I
+@@ -278,11 +285,7 @@ export class TableCacheImpl<
+       return pendingCallbacks;
+     }
+ 
+-    // TODO: performance
+-    const hasPrimaryKey = Object.values(this.tableDef.columns).some(
+-      col => col.columnMetadata.isPrimaryKey === true
+-    );
+-    if (hasPrimaryKey) {
++    if (this.hasPrimaryKey) {
+       const insertMap = new Map<
+         ComparablePrimitive,
+         [
+diff --git a/src/sdk/type_utils.ts b/src/sdk/type_utils.ts
+index 2c767c732594375a3c7b8bd56c6acb9f909f0214..dcfc3332be15fa63dcd8809dc1dd93a913243437 100644
+--- a/src/sdk/type_utils.ts
++++ b/src/sdk/type_utils.ts
+@@ -1,5 +1,6 @@
+-import type { InferTypeOfRow } from '.';
++import type { Infer, InferTypeOfRow } from '.';
+ import type { Prettify } from '../lib/type_util';
++import type { UntypedProcedureDef } from './procedures';
+ import type { UntypedReducerDef } from './reducers';
+ 
+ export type IsEmptyObject<T> = [keyof T] extends [never] ? true : false;
+@@ -8,3 +9,11 @@ export type MaybeParams<T> = IsEmptyObject<T> extends true ? [] : [params: T];
+ export type ParamsType<R extends UntypedReducerDef> = MaybeParams<
+   Prettify<InferTypeOfRow<R['params']>>
+ >;
++
++export type ProcedureParamsType<P extends UntypedProcedureDef> = MaybeParams<
++  Prettify<InferTypeOfRow<P['params']>>
++>;
++
++export type ProcedureReturnType<P extends UntypedProcedureDef> = Infer<
++  P['returnType']
++>;
+diff --git a/src/sdk/websocket_decompress_adapter.ts b/src/sdk/websocket_decompress_adapter.ts
+index 1edfdc6d0d612e701e566243d5ff39c7574b5871..884dba30f12ec1dab10c4ffada43a5c983ba59d2 100644
+--- a/src/sdk/websocket_decompress_adapter.ts
++++ b/src/sdk/websocket_decompress_adapter.ts
+@@ -1,48 +1,49 @@
+ import { decompress } from './decompress';
+-import { resolveWS } from './ws';
++import { openWebSocket, type WebSocketAdapter, type WebSocketArgs } from './ws';
+ 
+-export class WebsocketDecompressAdapter {
+-  onclose?: (...ev: any[]) => void;
+-  onopen?: (...ev: any[]) => void;
+-  onmessage?: (msg: { data: Uint8Array }) => void;
+-  onerror?: (msg: ErrorEvent) => void;
+-
+-  #ws: WebSocket;
+-
+-  async #handleOnMessage(msg: MessageEvent) {
+-    const buffer = new Uint8Array(msg.data);
+-    let decompressed: Uint8Array;
+-
+-    if (buffer[0] === 0) {
+-      decompressed = buffer.slice(1);
+-    } else if (buffer[0] === 1) {
+-      throw new Error(
+-        'Brotli Compression not supported. Please use gzip or none compression in withCompression method on DbConnection.'
+-      );
+-    } else if (buffer[0] === 2) {
+-      decompressed = await decompress(buffer.slice(1), 'gzip');
+-    } else {
+-      throw new Error(
+-        'Unexpected Compression Algorithm. Please use `gzip` or `none`'
+-      );
+-    }
+-
+-    this.onmessage?.({ data: decompressed });
++export class WebsocketDecompressAdapter implements WebSocketAdapter {
++  get protocol(): string {
++    return this.#ws.protocol;
+   }
+-
+-  #handleOnOpen(msg: any) {
+-    this.onopen?.(msg);
++  set onclose(handler: (ev: CloseEvent) => void) {
++    this.#ws.onclose = handler;
+   }
+-
+-  #handleOnError(msg: any) {
+-    this.onerror?.(msg);
++  set onopen(handler: () => void) {
++    this.#ws.onopen = handler;
++  }
++  set onmessage(handler: (msg: { data: Uint8Array }) => void) {
++    this.#ws.onmessage = async (msg: MessageEvent<ArrayBuffer>) => {
++      const data = await this.#decompress(new Uint8Array(msg.data));
++      handler({ data });
++    };
++  }
++  set onerror(handler: (msg: ErrorEvent) => void) {
++    this.#ws.onerror = handler as (msg: Event) => void;
+   }
+ 
+-  #handleOnClose(msg: any) {
+-    this.onclose?.(msg);
++  #ws: WebSocket;
++
++  async #decompress(buffer: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
++    const tag = buffer[0];
++    const data = buffer.subarray(1);
++    switch (tag) {
++      case 0:
++        return data;
++      case 1:
++        // Some runtimes support brotli, but it's not yet defined in `lib.dom.d.ts`.
++        // We assert runtime support in `DbConnectionBuilder.withCompression`, so
++        // this cast is safe.
++        return await decompress(data, 'brotli' as CompressionFormat);
++      case 2:
++        return await decompress(data, 'gzip');
++      default:
++        throw new Error(
++          'Unexpected Compression Algorithm. Please use `gzip` or `none`'
++        );
++    }
+   }
+ 
+-  send(msg: any): void {
++  send(msg: Uint8Array<ArrayBuffer>): void {
+     this.#ws.send(msg);
+   }
+ 
+@@ -51,78 +52,12 @@ export class WebsocketDecompressAdapter {
+   }
+ 
+   constructor(ws: WebSocket) {
+-    this.onmessage = undefined;
+-    this.onopen = undefined;
+-    this.onmessage = undefined;
+-    this.onerror = undefined;
+-
+-    ws.onmessage = this.#handleOnMessage.bind(this);
+-    ws.onerror = this.#handleOnError.bind(this);
+-    ws.onclose = this.#handleOnClose.bind(this);
+-    ws.onopen = this.#handleOnOpen.bind(this);
+-
+-    ws.binaryType = 'arraybuffer';
+-
+     this.#ws = ws;
+   }
+ 
+-  static async createWebSocketFn({
+-    url,
+-    nameOrAddress,
+-    wsProtocol,
+-    authToken,
+-    compression,
+-    lightMode,
+-    confirmedReads,
+-  }: {
+-    url: URL;
+-    wsProtocol: string;
+-    nameOrAddress: string;
+-    authToken?: string;
+-    compression: 'gzip' | 'none';
+-    lightMode: boolean;
+-    confirmedReads?: boolean;
+-  }): Promise<WebsocketDecompressAdapter> {
+-    const headers = new Headers();
+-
+-    const WS = await resolveWS();
+-
+-    // We swap our original token to a shorter-lived token
+-    // to avoid sending the original via query params.
+-    let temporaryAuthToken: string | undefined = undefined;
+-    if (authToken) {
+-      headers.set('Authorization', `Bearer ${authToken}`);
+-      const tokenUrl = new URL('v1/identity/websocket-token', url);
+-      tokenUrl.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+-
+-      const response = await fetch(tokenUrl, { method: 'POST', headers });
+-      if (response.ok) {
+-        const { token } = await response.json();
+-        temporaryAuthToken = token;
+-      } else {
+-        return Promise.reject(
+-          new Error(`Failed to verify token: ${response.statusText}`)
+-        );
+-      }
+-    }
+-
+-    const databaseUrl = new URL(`v1/database/${nameOrAddress}/subscribe`, url);
+-    if (temporaryAuthToken) {
+-      databaseUrl.searchParams.set('token', temporaryAuthToken);
+-    }
+-    databaseUrl.searchParams.set(
+-      'compression',
+-      compression === 'gzip' ? 'Gzip' : 'None'
+-    );
+-    if (lightMode) {
+-      databaseUrl.searchParams.set('light', 'true');
+-    }
+-    if (confirmedReads !== undefined) {
+-      databaseUrl.searchParams.set('confirmed', confirmedReads.toString());
+-    }
+-
+-    const ws = new WS(databaseUrl.toString(), wsProtocol);
+-
+-    return new WebsocketDecompressAdapter(ws);
++  static async openWebSocket(
++    args: WebSocketArgs
++  ): Promise<WebsocketDecompressAdapter> {
++    return new WebsocketDecompressAdapter(await openWebSocket(args));
+   }
+ }
+diff --git a/src/sdk/websocket_protocols.ts b/src/sdk/websocket_protocols.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d6598143e9d35e159e391feb65281b3a0097342
+--- /dev/null
++++ b/src/sdk/websocket_protocols.ts
+@@ -0,0 +1,25 @@
++import { stdbLogger } from './logger.ts';
++
++export const V2_WS_PROTOCOL = 'v2.bsatn.spacetimedb';
++export const V3_WS_PROTOCOL = 'v3.bsatn.spacetimedb';
++export const PREFERRED_WS_PROTOCOLS = [V3_WS_PROTOCOL, V2_WS_PROTOCOL] as const;
++
++export type NegotiatedWsProtocol =
++  | typeof V2_WS_PROTOCOL
++  | typeof V3_WS_PROTOCOL;
++
++export function normalizeWsProtocol(protocol: string): NegotiatedWsProtocol {
++  if (protocol === V3_WS_PROTOCOL) {
++    return V3_WS_PROTOCOL;
++  }
++  // We treat an empty negotiated subprotocol as legacy v2 for compatibility.
++  if (protocol === '' || protocol === V2_WS_PROTOCOL) {
++    return V2_WS_PROTOCOL;
++  }
++
++  stdbLogger(
++    'warn',
++    `Unexpected websocket subprotocol "${protocol}", falling back to ${V2_WS_PROTOCOL}.`
++  );
++  return V2_WS_PROTOCOL;
++}
+diff --git a/src/sdk/websocket_test_adapter.ts b/src/sdk/websocket_test_adapter.ts
+index f5aa35ba610eebb837afdb95ad2216f7d70745c4..b32e7744a00e3cb2ca6f11d647ac1d66b766beaf 100644
+--- a/src/sdk/websocket_test_adapter.ts
++++ b/src/sdk/websocket_test_adapter.ts
+@@ -1,63 +1,100 @@
+-import { BinaryReader, BinaryWriter } from '../';
++import BinaryReader from '../lib/binary_reader.ts';
++import BinaryWriter from '../lib/binary_writer.ts';
+ import { ClientMessage, ServerMessage } from './client_api/types';
++import type { WebSocketAdapter, WebSocketFactory } from './ws';
++import { PREFERRED_WS_PROTOCOLS, V3_WS_PROTOCOL } from './websocket_protocols';
++import {
++  decodeClientMessagesV3,
++  encodeServerMessagesV3,
++} from './websocket_v3_frames.ts';
+ 
+-class WebsocketTestAdapter {
+-  onclose: any;
+-  // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+-  onopen!: Function;
+-  onmessage: any;
+-  onerror: any;
++class WebsocketTestAdapter implements WebSocketAdapter {
++  protocol: string = '';
+ 
+-  messageQueue: any[];
++  messageQueue: Uint8Array<ArrayBuffer>[];
+   outgoingMessages: ClientMessage[];
+   closed: boolean;
++  supportedProtocols: string[];
++
++  #onclose: (ev: CloseEvent) => void = () => {};
++  #onopen: () => void = () => {};
++  #onmessage: (msg: { data: Uint8Array }) => void = () => {};
+ 
+   constructor() {
+     this.messageQueue = [];
+     this.outgoingMessages = [];
+     this.closed = false;
++    this.supportedProtocols = [...PREFERRED_WS_PROTOCOLS];
++  }
++
++  set onclose(handler: (ev: CloseEvent) => void) {
++    this.#onclose = handler;
++  }
++
++  set onopen(handler: () => void) {
++    this.#onopen = handler;
++  }
++
++  set onmessage(handler: (msg: { data: Uint8Array }) => void) {
++    this.#onmessage = handler;
+   }
+ 
+-  send(message: any): void {
+-    const parsedMessage = ClientMessage.deserialize(new BinaryReader(message));
+-    this.outgoingMessages.push(parsedMessage);
+-    // console.ClientMessageSerde.deserialize(message);
+-    this.messageQueue.push(message);
++  set onerror(_handler: (msg: ErrorEvent) => void) {}
++
++  send(message: Uint8Array<ArrayBuffer>): void {
++    const rawMessage = message.slice();
++    const outgoingMessages =
++      this.protocol === V3_WS_PROTOCOL
++        ? decodeClientMessagesV3(rawMessage)
++        : [rawMessage];
++
++    for (const outgoingMessage of outgoingMessages) {
++      this.outgoingMessages.push(
++        ClientMessage.deserialize(new BinaryReader(outgoingMessage))
++      );
++    }
++    this.messageQueue.push(rawMessage);
+   }
+ 
+   close(): void {
+     this.closed = true;
+-    this.onclose?.({ code: 1000, reason: 'normal closure', wasClean: true });
++    this.#onclose({
++      code: 1000,
++      reason: 'normal closure',
++      wasClean: true,
++    } as CloseEvent);
+   }
+ 
+   acceptConnection(): void {
+-    this.onopen();
++    this.#onopen();
+   }
+ 
+   sendToClient(message: ServerMessage): void {
+     const writer = new BinaryWriter(1024);
+     ServerMessage.serialize(writer, message);
+-    const rawBytes = writer.getBuffer();
++    const rawBytes = writer.getBuffer().slice();
+     // The brotli library's `compress` is somehow broken: it returns `null` for some inputs.
+     // See https://github.com/foliojs/brotli.js/issues/36, which is closed but not actually fixed.
+     // So we send the uncompressed data here, and in `spacetimedb.ts`,
+     // if compression fails, we treat the raw message as having been uncompressed all along.
+     // const data = compress(rawBytes);
+-    this.onmessage({ data: rawBytes });
+-  }
+-
+-  async createWebSocketFn(_args: {
+-    url: URL;
+-    wsProtocol: string;
+-    nameOrAddress: string;
+-    authToken?: string;
+-    compression: 'gzip' | 'none';
+-    lightMode: boolean;
+-    confirmedReads?: boolean;
+-  }): Promise<WebsocketTestAdapter> {
+-    return this;
++    const outboundData =
++      this.protocol === V3_WS_PROTOCOL
++        ? encodeServerMessagesV3(writer, [rawBytes]).slice()
++        : rawBytes;
++    this.#onmessage({ data: outboundData });
+   }
++
++  openWebSocket: WebSocketFactory = async ({ wsProtocol }) => {
++    const negotiatedProtocol = wsProtocol.find(protocol =>
++      this.supportedProtocols.includes(protocol)
++    );
++    if (!negotiatedProtocol) {
++      throw new Error('No compatible websocket protocol');
++    }
++    this.protocol = negotiatedProtocol;
++    return this;
++  };
+ }
+ 
+-export type { WebsocketTestAdapter };
+ export default WebsocketTestAdapter;
+diff --git a/src/sdk/websocket_v3_frames.ts b/src/sdk/websocket_v3_frames.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6613101cebe6380acc7db5c7e4b356cb757cd5f
+--- /dev/null
++++ b/src/sdk/websocket_v3_frames.ts
+@@ -0,0 +1,126 @@
++import BinaryReader from '../lib/binary_reader.ts';
++import BinaryWriter from '../lib/binary_writer.ts';
++import { ClientMessage, ServerMessage } from './client_api/types';
++
++// v3 is only a transport framing convention. The payload is one or more
++// already-encoded v2 websocket messages concatenated back-to-back, so these
++// helpers intentionally operate on raw bytes.
++const EMPTY_V3_PAYLOAD_ERR =
++  'v3 websocket payloads must contain at least one message';
++
++function ensureMessages(messages: readonly Uint8Array[]): void {
++  if (messages.length === 0) {
++    throw new RangeError(EMPTY_V3_PAYLOAD_ERR);
++  }
++}
++
++function ensureMessageCount(
++  messages: readonly Uint8Array[],
++  messageCount: number
++): void {
++  ensureMessages(messages);
++  if (messageCount < 1 || messageCount > messages.length) {
++    throw new RangeError(
++      `v3 websocket payload requested ${messageCount} messages from ${messages.length}`
++    );
++  }
++}
++
++function concatenateMessagesV3(
++  writer: BinaryWriter,
++  messages: readonly Uint8Array<ArrayBuffer>[],
++  messageCount: number = messages.length
++): Uint8Array<ArrayBuffer> {
++  ensureMessageCount(messages, messageCount);
++  writer.clear();
++  for (let i = 0; i < messageCount; i++) {
++    writer.writeBytes(messages[i]!);
++  }
++  return writer.getBuffer();
++}
++
++function splitMessagesV3(
++  reader: BinaryReader,
++  data: Uint8Array<ArrayBuffer>,
++  deserialize: (reader: BinaryReader) => unknown
++): Uint8Array<ArrayBuffer>[] {
++  reader.reset(data);
++  if (reader.remaining === 0) {
++    throw new RangeError(EMPTY_V3_PAYLOAD_ERR);
++  }
++
++  const messages: Uint8Array<ArrayBuffer>[] = [];
++  while (reader.remaining > 0) {
++    const startOffset = reader.offset;
++    deserialize(reader);
++    messages.push(data.subarray(startOffset, reader.offset));
++  }
++
++  return messages;
++}
++
++export function countClientMessagesForV3Frame(
++  messages: readonly Uint8Array<ArrayBuffer>[],
++  maxFrameBytes: number
++): number {
++  ensureMessages(messages);
++
++  const firstMessage = messages[0]!;
++  if (firstMessage.length > maxFrameBytes) {
++    return 1;
++  }
++
++  let count = 1;
++  let frameSize = firstMessage.length;
++  while (count < messages.length) {
++    const nextMessage = messages[count]!;
++    const nextFrameSize = frameSize + nextMessage.length;
++    if (nextFrameSize > maxFrameBytes) {
++      break;
++    }
++    frameSize = nextFrameSize;
++    count += 1;
++  }
++  return count;
++}
++
++export function encodeClientMessagesV3(
++  writer: BinaryWriter,
++  messages: readonly Uint8Array<ArrayBuffer>[],
++  messageCount: number = messages.length
++): Uint8Array<ArrayBuffer> {
++  return concatenateMessagesV3(writer, messages, messageCount);
++}
++
++export function decodeClientMessagesV3(
++  data: Uint8Array<ArrayBuffer>
++): Uint8Array<ArrayBuffer>[] {
++  return splitMessagesV3(new BinaryReader(data), data, reader =>
++    ClientMessage.deserialize(reader)
++  );
++}
++
++export function encodeServerMessagesV3(
++  writer: BinaryWriter,
++  messages: readonly Uint8Array<ArrayBuffer>[]
++): Uint8Array<ArrayBuffer> {
++  return concatenateMessagesV3(writer, messages);
++}
++
++export function forEachServerMessageV3(
++  reader: BinaryReader,
++  data: Uint8Array,
++  visit: (message: ServerMessage) => void
++): number {
++  reader.reset(data);
++  if (reader.remaining === 0) {
++    throw new RangeError(EMPTY_V3_PAYLOAD_ERR);
++  }
++
++  let count = 0;
++  while (reader.remaining > 0) {
++    visit(ServerMessage.deserialize(reader));
++    count += 1;
++  }
++  return count;
++}
+diff --git a/src/sdk/ws.ts b/src/sdk/ws.ts
+index fb7279d6e501cc12bc07cc4689c80606585ce9c8..1c3172ad924b02cd64dc32b06d881fffcd9cb5a9 100644
+--- a/src/sdk/ws.ts
++++ b/src/sdk/ws.ts
+@@ -1,9 +1,9 @@
+ import { stdbLogger } from './logger';
+ 
+-export async function resolveWS(): Promise<typeof WebSocket> {
++async function resolveWS(): Promise<typeof WebSocket> {
+   // Browser or Node >= 22 (or any env that exposes global WebSocket)
+-  if (typeof (globalThis as any).WebSocket !== 'undefined') {
+-    return (globalThis as any).WebSocket as typeof WebSocket;
++  if (typeof WebSocket !== 'undefined') {
++    return WebSocket;
+   }
+ 
+   // Node without a global WebSocket: lazily load undici's polyfill.
+@@ -25,3 +25,81 @@ export async function resolveWS(): Promise<typeof WebSocket> {
+     throw err;
+   }
+ }
++
++export interface WebSocketAdapter {
++  readonly protocol: string;
++  send(msg: Uint8Array<ArrayBuffer>): void;
++  close(): void;
++
++  set onclose(handler: (ev: CloseEvent) => void);
++  set onopen(handler: () => void);
++  set onmessage(handler: (msg: { data: Uint8Array }) => void);
++  set onerror(handler: (msg: ErrorEvent) => void);
++}
++
++export interface WebSocketArgs {
++  url: URL;
++  wsProtocol: string[];
++  nameOrAddress: string;
++  authToken?: string;
++  compression: 'gzip' | 'brotli' | 'none';
++  lightMode: boolean;
++  confirmedReads?: boolean;
++}
++export type WebSocketFactory = (
++  args: WebSocketArgs
++) => Promise<WebSocketAdapter>;
++
++/**
++ * Open a WebSocket to the database specified by the given `WebSocketArgs`.
++ * @returns a WebSocket with `binaryType` set to `arraybuffer`.
++ */
++export async function openWebSocket({
++  url,
++  nameOrAddress,
++  wsProtocol,
++  authToken,
++  compression,
++  lightMode,
++  confirmedReads,
++}: WebSocketArgs): Promise<WebSocket> {
++  const headers = new Headers();
++
++  const WS = await resolveWS();
++
++  // We swap our original token to a shorter-lived token
++  // to avoid sending the original via query params.
++  let temporaryAuthToken: string | undefined;
++  if (authToken) {
++    headers.set('Authorization', `Bearer ${authToken}`);
++    const tokenUrl = new URL('v1/identity/websocket-token', url);
++    tokenUrl.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
++
++    const response = await fetch(tokenUrl, { method: 'POST', headers });
++    if (response.ok) {
++      const { token } = await response.json();
++      temporaryAuthToken = token;
++    } else {
++      throw new Error(`Failed to verify token: ${response.statusText}`);
++    }
++  }
++
++  const databaseUrl = new URL(`v1/database/${nameOrAddress}/subscribe`, url);
++  if (temporaryAuthToken) {
++    databaseUrl.searchParams.set('token', temporaryAuthToken);
++  }
++  databaseUrl.searchParams.set(
++    'compression',
++    { gzip: 'Gzip', brotli: 'Brotli', none: 'None' }[compression] ?? 'None'
++  );
++  if (lightMode) {
++    databaseUrl.searchParams.set('light', 'true');
++  }
++  if (confirmedReads !== undefined) {
++    databaseUrl.searchParams.set('confirmed', confirmedReads.toString());
++  }
++
++  const ws = new WS(databaseUrl.toString(), wsProtocol);
++  ws.binaryType = 'arraybuffer';
++  return ws;
++}
+diff --git a/src/server/http_internal.ts b/src/server/http_internal.ts
+index 69cd3a982876931f6439d64acf2c913f69d6b01d..a58031e3a082077960fd386c3fc1f5b23e41149a 100644
+--- a/src/server/http_internal.ts
++++ b/src/server/http_internal.ts
+@@ -27,6 +27,15 @@ export interface ResponseInit {
+ const textEncoder = new TextEncoder();
+ const textDecoder = new TextDecoder('utf-8' /* { fatal: true } */);
+ 
++function deserializeHeaders(headers: HttpHeaders): Headers {
++  return new Headers(
++    headers.entries.map(({ name, value }): [string, string] => [
++      name,
++      textDecoder.decode(value),
++    ])
++  );
++}
++
+ const makeResponse = Symbol('makeResponse');
+ 
+ // based on deno's type of the same name
+@@ -187,7 +196,7 @@ function fetch(url: URL | string, init: RequestOptions = {}) {
+     url: uri,
+     status: response.code,
+     statusText: status(response.code),
+-    headers: new Headers(),
++    headers: deserializeHeaders(response.headers),
+     aborted: false,
+   });
+ }
+diff --git a/src/server/index.ts b/src/server/index.ts
+index ac4a492556fb06be275cecc453a42e53e7e36364..7954ca407e8b73279f3d0e8efa4fe98af3dfd1bf 100644
+--- a/src/server/index.ts
++++ b/src/server/index.ts
+@@ -8,7 +8,7 @@ export {
+ export { CaseConversionPolicy } from '../lib/autogen/types';
+ export { table } from '../lib/table';
+ export { SenderError, SpacetimeHostError, errors } from './errors';
+-export type { Reducer, ReducerCtx } from '../lib/reducers';
++export type { Reducer, ReducerCtx, JwtClaims, AuthCtx } from '../lib/reducers';
+ export type { ReducerExport } from './reducers';
+ export { type DbView } from './db_view';
+ export * from './query';
+@@ -21,5 +21,6 @@ export { toCamelCase } from '../lib/util';
+ export type { Uuid } from '../lib/uuid';
+ export type { Random } from './rng';
+ export type { ViewExport, ViewCtx, AnonymousViewCtx } from './views';
++export { Range, type Bound } from './range';
+ 
+ import './polyfills'; // Ensure polyfills are loaded
+diff --git a/src/server/procedures.ts b/src/server/procedures.ts
+index 5e0791c15c66fb4039a873f1affe559ec03b9b60..39e5f58542f80a90eaa8d8abfe1194505880bb95 100644
+--- a/src/server/procedures.ts
++++ b/src/server/procedures.ts
+@@ -75,6 +75,8 @@ export interface ProcedureOpts {
+ 
+ export interface ProcedureCtx<S extends UntypedSchemaDef> {
+   readonly sender: Identity;
++  readonly databaseIdentity: Identity;
++  /** @deprecated Use `databaseIdentity` instead. */
+   readonly identity: Identity;
+   readonly timestamp: Timestamp;
+   readonly connectionId: ConnectionId | null;
+@@ -195,10 +197,14 @@ const ProcedureCtxImpl = class ProcedureCtx<S extends UntypedSchemaDef>
+     this.#dbView = dbView;
+   }
+ 
+-  get identity() {
++  get databaseIdentity() {
+     return (this.#identity ??= new Identity(sys.identity()));
+   }
+ 
++  get identity() {
++    return this.databaseIdentity;
++  }
++
+   get random() {
+     return (this.#random ??= makeRandom(this.timestamp));
+   }
+diff --git a/src/server/runtime.ts b/src/server/runtime.ts
+--- a/src/server/runtime.ts
++++ b/src/server/runtime.ts
+@@ -220,8 +220,12 @@
+     me.#senderAuth = undefined;
+   }
+ 
++  get databaseIdentity() {
++    return (this.#identity ??= new Identity(sys.identity()));
++  }
++
+   get identity() {
+-    return (this.#identity ??= new Identity(sys.identity()));
++    return this.databaseIdentity;
+   }
+ 
+   get senderAuth() {
+@@ -508,6 +512,13 @@
+       );
+       return count > 0;
+     },
++    clear: () => {
++      let count = 0n;
++      for (const row of Array.from(iter())) {
++        if (tableMethods.delete(row)) count += 1n;
++      }
++      return count;
++    },
+   };
+ 
+   const tableView = Object.assign(
+@@ -516,6 +527,7 @@
+   ) as Table<any>;
+ 
+   for (const indexDef of table.indexes) {
++    const accessorName = indexDef.accessorName!;
+     const index_id = sys.index_id_from_name(indexDef.sourceName!);
+ 
+     let column_ids: number[];
+@@ -666,9 +678,37 @@
+       index = base as UniqueIndex<any, any>;
+     } else if (serializeSinglePoint) {
+       // numColumns == 1
++
++      const serializeSingleRange = !isHashIndex
++        ? (buffer: ResizableBuffer, range: Range<any>): IndexScanArgs => {
++            BINARY_WRITER.reset(buffer);
++            const writer = BINARY_WRITER;
++            const writeBound = (bound: Bound<any>) => {
++              const tags = { included: 0, excluded: 1, unbounded: 2 };
++              writer.writeU8(tags[bound.tag]);
++              if (bound.tag !== 'unbounded')
++                serializeSingleElement!(writer, bound.value);
++            };
++            writeBound(range.from);
++            const rstartLen = writer.offset;
++            writeBound(range.to);
++            const rendLen = writer.offset - rstartLen;
++            return [0, 0, rstartLen, rendLen];
++          }
++        : null;
++
+       const rawIndex = {
+         filter: (range: any): IteratorObject<RowType<any>> => {
+           const buf = LEAF_BUF;
++          if (serializeSingleRange && range instanceof Range) {
++            const args = serializeSingleRange(buf, range);
++            const iter_id = sys.datastore_index_scan_range_bsatn(
++              index_id,
++              buf.buffer,
++              ...args
++            );
++            return tableIterator(iter_id, deserializeRow);
++          }
+           const point_len = serializeSinglePoint(buf, range);
+           const iter_id = sys.datastore_index_scan_point_bsatn(
+             index_id,
+@@ -679,6 +719,14 @@
+         },
+         delete: (range: any): u32 => {
+           const buf = LEAF_BUF;
++          if (serializeSingleRange && range instanceof Range) {
++            const args = serializeSingleRange(buf, range);
++            return sys.datastore_delete_by_index_scan_range_bsatn(
++              index_id,
++              buf.buffer,
++              ...args
++            );
++          }
+           const point_len = serializeSinglePoint(buf, range);
+           return sys.datastore_delete_by_index_scan_point_bsatn(
+             index_id,
+@@ -795,10 +843,13 @@
+       } as RangedIndex<any, any>;
+     }
+ 
+-    if (Object.hasOwn(tableView, indexDef.accessorName!)) {
+-      freeze(Object.assign(tableView[indexDef.accessorName!], index));
++    // IMPORTANT: duplicate accessor handling.
++    // When multiple raw indexes share the same accessor name, we merge index
++    // methods onto a single accessor object instead of throwing.
++    if (Object.hasOwn(tableView, accessorName)) {
++      freeze(Object.assign((tableView as any)[accessorName], index));
+     } else {
+-      tableView[indexDef.accessorName!] = freeze(index) as any;
++      (tableView as any)[accessorName] = freeze(index);
+     }
+   }
+ 
+diff --git a/src/server/schema.test-d.ts b/src/server/schema.test-d.ts
+index 6c7cc492862aa57b811cd117f7127434aea7fc95..26f9018f24027b59ad039a1a6b4c45269080dd59 100644
+--- a/src/server/schema.test-d.ts
++++ b/src/server/schema.test-d.ts
+@@ -60,3 +60,40 @@ spacetimedb.init(ctx => {
+   // @ts-expect-error update() is NOT allowed on non-PK unique indexes
+   const _update = ctx.db.person.name2.update;
+ });
++
++/**
++ * Regression coverage for the declared-vs-resolved index split:
++ * - declared table-level indexes must still produce typed accessors
++ * - field-level indexes must still produce typed accessors
++ * - non-indexed fields must not accidentally become index accessors
++ */
++const account = table(
++  {
++    indexes: [
++      {
++        accessor: 'byEmailAndOrg',
++        algorithm: 'btree',
++        columns: ['email', 'orgId'] as const,
++      },
++    ] as const,
++  },
++  {
++    accountId: t.u32(),
++    email: t.string().index('hash'),
++    orgId: t.u32(),
++    nickname: t.string(),
++  }
++);
++
++const spacetimedbIndexSplit = schema({ account });
++
++spacetimedbIndexSplit.init(ctx => {
++  // Explicit table-level index accessor from `table({ indexes: [...] })`.
++  ctx.db.account.byEmailAndOrg.filter(['a@example.com', 1]);
++
++  // Field-level index accessor derived from column metadata.
++  ctx.db.account.email.filter('a@example.com');
++
++  // @ts-expect-error `nickname` is not indexed, so no index accessor should exist.
++  const _nickname = ctx.db.account.nickname;
++});
+diff --git a/src/server/view.test-d.ts b/src/server/view.test-d.ts
+index 6816b85141b17e07a7a85a7a68b814403c5f2209..1ce372f3190fb170401e2233c6c9d29a786c0b78 100644
+--- a/src/server/view.test-d.ts
++++ b/src/server/view.test-d.ts
+@@ -7,6 +7,7 @@ const person = table(
+     name: 'person',
+     indexes: [
+       {
++        accessor: 'name_id_idx',
+         name: 'name_id_idx',
+         algorithm: 'btree',
+         columns: ['name', 'id'] as const,
+@@ -48,6 +49,7 @@ const order = table(
+     name: 'order',
+     indexes: [
+       {
++        accessor: 'id_person_id',
+         name: 'id_person_id', // We are adding this to make sure `person_id` still isn't considered indexed.
+         algorithm: 'btree',
+         columns: ['id', 'person_id'] as const,
+@@ -159,6 +161,10 @@ spacetime.anonymousView({ name: 'v5', public: true }, arrayRetValue, ctx => {
+     .where(row => row.id.eq(5))
+     .leftSemijoin(ctx.from.order, (p, o) => p.name.eq(o.person_name))
+     .build();
++  const _mixedScopeAndInJoinPredicate = ctx.from.person
++    // @ts-expect-error semijoin on(...) only supports one table scope for and/or clauses.
++    .leftSemijoin(ctx.from.order, (p, o) => p.id.eq(o.id).and(o.id.eq(5)))
++    .build();
+   return ctx.from.person
+     .where(row => row.id.eq(5))
+     .leftSemijoin(ctx.from.order, (p, o) => p.id.eq(o.id))
+diff --git a/src/tanstack/SpacetimeDBQueryClient.ts b/src/tanstack/SpacetimeDBQueryClient.ts
+index ff337b2dc668ebc2b1c05124e2372d455365c9c9..4bce2812e52478d96cf0d0451816efeb78f1fcf2 100644
+--- a/src/tanstack/SpacetimeDBQueryClient.ts
++++ b/src/tanstack/SpacetimeDBQueryClient.ts
+@@ -96,6 +96,7 @@ export class SpacetimeDBQueryClient {
+   setConnection(connection: SpacetimeConnection): void {
+     this.connection = connection;
+     this.processPendingQueries();
++    this.hydrateSubscriptions();
+   }
+ 
+   connect(queryClient: QueryClient): void {
+@@ -289,6 +290,29 @@ export class SpacetimeDBQueryClient {
+     }
+   }
+ 
++  // subscribe to queries with SSR cached data but no active subscription
++  private hydrateSubscriptions(): void {
++    if (!this.connection || !this.queryClient) {
++      return;
++    }
++
++    for (const [querySql, { accessorName, whereExpr }] of queryRegistry) {
++      const queryKey = ['spacetimedb', accessorName, querySql] as const;
++      const keyStr = JSON.stringify(queryKey);
++
++      if (this.subscriptions.has(keyStr)) {
++        continue;
++      }
++      if (this.queryClient.getQueryData(queryKey) === undefined) {
++        continue;
++      }
++
++      this.setupSubscription(queryKey, accessorName, querySql, whereExpr).catch(
++        () => {}
++      );
++    }
++  }
++
+   // clean up all subscriptions and disconnect
+   disconnect(): void {
+     if (this.cacheUnsubscribe) {
+diff --git a/test-app/src/module_bindings/index.ts b/test-app/src/module_bindings/index.ts
+index a376f4f8caa0e39f7a8cca2700d2dbfa0d68aca5..852b010b300e9cb00d0e851f29f15f864af77ae3 100644
+--- a/test-app/src/module_bindings/index.ts
++++ b/test-app/src/module_bindings/index.ts
+@@ -50,7 +50,14 @@ const tablesSchema = __schema({
+   player: __table(
+     {
+       name: 'player',
+-      indexes: [{ name: 'id', algorithm: 'btree', columns: ['id'] }],
++      indexes: [
++        {
++          accessor: 'id',
++          name: 'player_id_idx_btree',
++          algorithm: 'btree',
++          columns: ['id'],
++        },
++      ],
+       constraints: [
+         { name: 'player_id_key', constraint: 'unique', columns: ['id'] },
+       ],
+@@ -60,7 +67,14 @@ const tablesSchema = __schema({
+   unindexed_player: __table(
+     {
+       name: 'unindexed_player',
+-      indexes: [{ name: 'id', algorithm: 'btree', columns: ['id'] }],
++      indexes: [
++        {
++          accessor: 'id',
++          name: 'unindexed_player_id_idx_btree',
++          algorithm: 'btree',
++          columns: ['id'],
++        },
++      ],
+       constraints: [
+         {
+           name: 'unindexed_player_id_key',
+@@ -75,7 +89,12 @@ const tablesSchema = __schema({
+     {
+       name: 'user',
+       indexes: [
+-        { name: 'identity', algorithm: 'btree', columns: ['identity'] },
++        {
++          accessor: 'identity',
++          name: 'user_identity_idx_btree',
++          algorithm: 'btree',
++          columns: ['identity'],
++        },
+       ],
+       constraints: [
+         {
+diff --git a/test-app/tsconfig.app.json b/test-app/tsconfig.app.json
+index 563997710d116ab8d46571d31d928076cb5d7571..85a14ac730270328ce0605958057dca20626cd4b 100644
+--- a/test-app/tsconfig.app.json
++++ b/test-app/tsconfig.app.json
+@@ -4,7 +4,7 @@
+     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+     "target": "ES2020",
+     "useDefineForClassFields": true,
+-    "lib": ["ESNext", "DOM", "DOM.Iterable"],
++    "lib": ["ESNext", "DOM", "DOM.Iterable", "DOM.AsyncIterable"],
+     "module": "ESNext",
+     "skipLibCheck": true,
+ 
+diff --git a/test-react-router-app/src/module_bindings/index.ts b/test-react-router-app/src/module_bindings/index.ts
+index 780ae5dfb341284599500f22864463f64eaed562..b9d553082d404d9451859cf74ca997a87fb9e540 100644
+--- a/test-react-router-app/src/module_bindings/index.ts
++++ b/test-react-router-app/src/module_bindings/index.ts
+@@ -51,7 +51,14 @@ const tablesSchema = __schema({
+   counter: __table(
+     {
+       name: 'counter',
+-      indexes: [{ name: 'id', algorithm: 'btree', columns: ['id'] }],
++      indexes: [
++        {
++          accessor: 'id',
++          name: 'counter_id_idx_btree',
++          algorithm: 'btree',
++          columns: ['id'],
++        },
++      ],
+       constraints: [
+         { name: 'counter_id_key', constraint: 'unique', columns: ['id'] },
+       ],
+@@ -62,7 +69,12 @@ const tablesSchema = __schema({
+     {
+       name: 'offline_user',
+       indexes: [
+-        { name: 'identity', algorithm: 'btree', columns: ['identity'] },
++        {
++          accessor: 'identity',
++          name: 'offline_user_identity_idx_btree',
++          algorithm: 'btree',
++          columns: ['identity'],
++        },
+       ],
+       constraints: [
+         {
+@@ -78,7 +90,12 @@ const tablesSchema = __schema({
+     {
+       name: 'user',
+       indexes: [
+-        { name: 'identity', algorithm: 'btree', columns: ['identity'] },
++        {
++          accessor: 'identity',
++          name: 'user_identity_idx_btree',
++          algorithm: 'btree',
++          columns: ['identity'],
++        },
+       ],
+       constraints: [
+         {
+diff --git a/tests/db_connection.test.ts b/tests/db_connection.test.ts
+index ec17430e41a3cafe57345fb47edc9cf6382b9b6e..0580518e280ff224ccbfe9c9e6f55abab622b96e 100644
+--- a/tests/db_connection.test.ts
++++ b/tests/db_connection.test.ts
+@@ -10,6 +10,8 @@ import {
+ } from '../src';
+ import { ServerMessage } from '../src/sdk/client_api/types';
+ import WebsocketTestAdapter from '../src/sdk/websocket_test_adapter';
++import { V2_WS_PROTOCOL, V3_WS_PROTOCOL } from '../src/sdk/websocket_protocols';
++import { decodeClientMessagesV3 } from '../src/sdk/websocket_v3_frames.ts';
+ import { DbConnection } from '../test-app/src/module_bindings';
+ import User from '../test-app/src/module_bindings/user_table';
+ import {
+@@ -172,7 +174,7 @@ describe('DbConnection', () => {
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .onConnect(() => {
+         called = true;
+         onConnectPromise.resolve();
+@@ -194,13 +196,70 @@ describe('DbConnection', () => {
+     expect(called).toBeTruthy();
+   });
+ 
++  test('batches same-tick reducer calls when v3 is negotiated', async () => {
++    const wsAdapter = new WebsocketTestAdapter();
++    const client = DbConnection.builder()
++      .withUri('ws://127.0.0.1:1234')
++      .withDatabaseName('db')
++      .withWSFn(wsAdapter.openWebSocket)
++      .build();
++
++    await client['wsPromise'];
++    wsAdapter.acceptConnection();
++
++    void client.reducers.createPlayer({
++      name: 'Player One',
++      location: { x: 1, y: 2 },
++    });
++    void client.reducers.createPlayer({
++      name: 'Player Two',
++      location: { x: 3, y: 4 },
++    });
++
++    await Promise.resolve();
++
++    expect(wsAdapter.protocol).toEqual(V3_WS_PROTOCOL);
++    expect(wsAdapter.messageQueue).toHaveLength(1);
++    expect(wsAdapter.outgoingMessages).toHaveLength(2);
++
++    expect(decodeClientMessagesV3(wsAdapter.messageQueue[0])).toHaveLength(2);
++  });
++
++  test('falls back to v2 and does not batch reducer calls when v3 is unavailable', async () => {
++    const wsAdapter = new WebsocketTestAdapter();
++    wsAdapter.supportedProtocols = [V2_WS_PROTOCOL];
++    const client = DbConnection.builder()
++      .withUri('ws://127.0.0.1:1234')
++      .withDatabaseName('db')
++      .withWSFn(wsAdapter.openWebSocket)
++      .build();
++
++    await client['wsPromise'];
++    wsAdapter.acceptConnection();
++
++    void client.reducers.createPlayer({
++      name: 'Player One',
++      location: { x: 1, y: 2 },
++    });
++    void client.reducers.createPlayer({
++      name: 'Player Two',
++      location: { x: 3, y: 4 },
++    });
++
++    await Promise.resolve();
++
++    expect(wsAdapter.protocol).toEqual(V2_WS_PROTOCOL);
++    expect(wsAdapter.messageQueue).toHaveLength(2);
++    expect(wsAdapter.outgoingMessages).toHaveLength(2);
++  });
++
+   test('disconnects when SubscriptionError has no requestId', async () => {
+     const onDisconnectPromise = new Deferred<void>();
+     const wsAdapter = new WebsocketTestAdapter();
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .onDisconnect(() => {
+         onDisconnectPromise.resolve();
+       })
+@@ -226,7 +285,7 @@ describe('DbConnection', () => {
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .build();
+ 
+     await client['wsPromise'];
+@@ -268,7 +327,7 @@ describe('DbConnection', () => {
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .onConnect(() => {
+         onConnectPromise.resolve();
+       })
+@@ -334,7 +393,7 @@ describe('DbConnection', () => {
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .onConnect(() => {
+         onConnectPromise.resolve();
+       })
+@@ -379,7 +438,7 @@ describe('DbConnection', () => {
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .onConnect(() => {
+         onConnectPromise.resolve();
+       })
+@@ -656,7 +715,7 @@ describe('DbConnection', () => {
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .onConnect(() => {})
+       .build();
+ 
+@@ -747,9 +806,10 @@ describe('DbConnection', () => {
+     const client = DbConnection.builder()
+       .withUri('ws://127.0.0.1:1234')
+       .withDatabaseName('db')
+-      .withWSFn(wsAdapter.createWebSocketFn.bind(wsAdapter) as any)
++      .withWSFn(wsAdapter.openWebSocket)
+       .build();
+     await client['wsPromise'];
++    wsAdapter.acceptConnection();
+     const user1 = { identity: bobIdentity, username: 'bob' };
+     const user2 = {
+       identity: sallyIdentity,
+diff --git a/tests/filter.test.ts b/tests/filter.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..90a3935e5d5aafbb18d820398761ae12c0f9dea1
+--- /dev/null
++++ b/tests/filter.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from 'vitest';
++import { eq, evaluate, toString } from '../src/lib/filter';
++import { ModuleContext, tablesToSchema } from '../src/lib/schema';
++import { table } from '../src/lib/table';
++import { Timestamp } from '../src/lib/timestamp';
++import { t } from '../src/lib/type_builders';
++
++const peopleTableDef = table(
++  { name: 'people' },
++  {
++    createdAt: t.timestamp(),
++    id: t.u32(),
++  }
++);
++
++const schemaDef = tablesToSchema(new ModuleContext(), {
++  people: peopleTableDef,
++});
++
++describe('filter.ts timestamp support', () => {
++  it('evaluates timestamp equality by microseconds', () => {
++    const ts = Timestamp.fromDate(new Date('2024-01-01T00:00:00.123Z'));
++
++    expect(evaluate(eq('createdAt', ts), { createdAt: ts })).toBe(true);
++    expect(
++      evaluate(eq('createdAt', ts), {
++        createdAt: new Timestamp(ts.microsSinceUnixEpoch + 1n),
++      })
++    ).toBe(false);
++  });
++
++  it('renders timestamp literals as ISO strings', () => {
++    const ts = Timestamp.fromDate(new Date('2024-01-01T00:00:00.123Z'));
++
++    expect(toString(schemaDef.tables.people, eq('createdAt', ts))).toBe(
++      `createdAt = '2024-01-01T00:00:00.123000Z'`
++    );
++  });
++});
+diff --git a/tests/http_headers.test.ts b/tests/http_headers.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0cba0d90b2ee888fe76845dcfe0cf1c42a35e165
+--- /dev/null
++++ b/tests/http_headers.test.ts
+@@ -0,0 +1,60 @@
++import { describe, expect, test } from 'vitest';
++import { BinaryReader, BinaryWriter } from '../src';
++import { HttpResponse } from '../src/lib/http_types';
++
++describe('HttpResponse header round-trip', () => {
++  test('headers survive BSATN serialize/deserialize', () => {
++    const textEncoder = new TextEncoder();
++    const textDecoder = new TextDecoder('utf-8');
++
++    const original: HttpResponse = {
++      headers: {
++        entries: [
++          {
++            name: 'content-type',
++            value: textEncoder.encode('text/event-stream'),
++          },
++          { name: 'x-request-id', value: textEncoder.encode('abc-123') },
++        ],
++      },
++      version: { tag: 'Http11' },
++      code: 200,
++    };
++
++    const writer = new BinaryWriter(256);
++    HttpResponse.serialize(writer, original);
++    const buf = writer.getBuffer();
++
++    const deserialized = HttpResponse.deserialize(new BinaryReader(buf));
++
++    expect(deserialized.code).toBe(200);
++    expect(deserialized.headers.entries).toHaveLength(2);
++
++    expect(deserialized.headers.entries[0].name).toBe('content-type');
++    expect(textDecoder.decode(deserialized.headers.entries[0].value)).toBe(
++      'text/event-stream'
++    );
++
++    expect(deserialized.headers.entries[1].name).toBe('x-request-id');
++    expect(textDecoder.decode(deserialized.headers.entries[1].value)).toBe(
++      'abc-123'
++    );
++  });
++
++  test('empty headers round-trip correctly', () => {
++    const original: HttpResponse = {
++      headers: { entries: [] },
++      version: { tag: 'Http11' },
++      code: 404,
++    };
++
++    const writer = new BinaryWriter(64);
++    HttpResponse.serialize(writer, original);
++    const deserialized = HttpResponse.deserialize(
++      new BinaryReader(writer.getBuffer())
++    );
++
++    expect(deserialized.code).toBe(404);
++    expect(deserialized.headers.entries).toHaveLength(0);
++  });
++});
+diff --git a/tests/query.test.ts b/tests/query.test.ts
+index f4e2421788f92b8092c77a5194085cc262012f5e..929506b28b13aef47d9c05939f1d7689cdc029e1 100644
+--- a/tests/query.test.ts
++++ b/tests/query.test.ts
+@@ -19,6 +19,7 @@ const personTable = table(
+ 
+     indexes: [
+       {
++        accessor: 'id_name_idx',
+         name: 'id_name_idx',
+         algorithm: 'btree',
+         columns: ['id', 'name'] as const,
+@@ -29,6 +30,8 @@ const personTable = table(
+     id: t.identity(),
+     name: t.string(),
+     age: t.u32(),
++    active: t.bool(),
++    createdAt: t.timestamp(),
+   }
+ );
+ 
+@@ -37,6 +40,7 @@ const ordersTable = table(
+     name: 'orders',
+     indexes: [
+       {
++        accessor: 'orders_person_id_idx',
+         name: 'orders_person_id_idx',
+         algorithm: 'btree',
+         columns: ['person_id'],
+@@ -51,9 +55,20 @@ const ordersTable = table(
+   }
+ );
+ 
++const renamedColumnsTable = table(
++  {
++    name: 'renamed_columns',
++  },
++  {
++    displayName: t.string().name('display_name'),
++    ageYears: t.u32().name('age_years'),
++  }
++);
++
+ const schemaDef = tablesToSchema(new ModuleContext(), {
+   person: personTable,
+   orders: ordersTable,
++  renamedColumns: renamedColumnsTable,
+ });
+ 
+ describe('Timestamp thing', () => {
+@@ -139,6 +154,13 @@ describe('TableScan.toSql', () => {
+     );
+   });
+ 
++  it('accepts boolean columns directly as where predicates', () => {
++    const qb = makeQueryBuilder(schemaDef);
++    const sql = toSql(qb.person.where(row => row.active).build());
++
++    expect(sql).toBe(`SELECT * FROM "person" WHERE "person"."active" = TRUE`);
++  });
++
+   it('renders Identity literals using their hex form', () => {
+     const qb = makeQueryBuilder(schemaDef);
+     const identity = new Identity(
+@@ -151,6 +173,26 @@ describe('TableScan.toSql', () => {
+     );
+   });
+ 
++  it('renders Timestamp literals as RFC3339 strings', () => {
++    const qb = makeQueryBuilder(schemaDef);
++    const timestamp = Timestamp.fromDate(new Date('2024-01-01T00:00:00.123Z'));
++    const sql = toSql(qb.person.where(row => row.createdAt.eq(timestamp)));
++
++    expect(sql).toBe(
++      `SELECT * FROM "person" WHERE "person"."createdAt" = '2024-01-01T00:00:00.123000Z'`
++    );
++  });
++
++  it('supports Timestamp comparisons in where predicates', () => {
++    const qb = makeQueryBuilder(schemaDef);
++    const timestamp = Timestamp.fromDate(new Date('2024-01-01T00:00:00.123Z'));
++    const sql = toSql(qb.person.where(row => row.createdAt.gt(timestamp)));
++
++    expect(sql).toBe(
++      `SELECT * FROM "person" WHERE "person"."createdAt" > '2024-01-01T00:00:00.123000Z'`
++    );
++  });
++
+   it('renders semijoin queries without additional filters', () => {
+     const qb = makeQueryBuilder(schemaDef);
+     const sql = toSql(
+@@ -337,4 +379,17 @@ describe('TableScan.toSql', () => {
+     const sql = toSql(qb.person);
+     expect(sql).toBe('SELECT * FROM "person"');
+   });
++
++  it('uses DB column names for accessors with explicit DB names', () => {
++    const qb = makeQueryBuilder(schemaDef);
++    const sql = toSql(
++      qb.renamedColumns
++        .where(row => row.displayName.eq('Alice').and(row.ageYears.gt(30)))
++        .build()
++    );
++
++    expect(sql).toBe(
++      `SELECT * FROM "renamed_columns" WHERE ("renamed_columns"."display_name" = 'Alice') AND ("renamed_columns"."age_years" > 30)`
++    );
++  });
+ });
+diff --git a/tests/query_error_message.test.ts b/tests/query_error_message.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f016c97cc28af11695ea4e2339c5bdca9503e788
+--- /dev/null
++++ b/tests/query_error_message.test.ts
+@@ -0,0 +1,89 @@
++import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import * as ts from 'typescript';
++import { describe, expect, it } from 'vitest';
++
++const bindingsRoot = path.resolve(
++  path.dirname(fileURLToPath(import.meta.url)),
++  '..'
++);
++
++function runTypecheck(semijoinPredicateExpr: string) {
++  const tmpDir = mkdtempSync(path.join(tmpdir(), 'stdb-query-diag-'));
++  const reproPath = path.join(tmpDir, 'repro.ts');
++
++  const imports = {
++    query: path.join(bindingsRoot, 'src/lib/query.ts'),
++    moduleBindings: path.join(
++      bindingsRoot,
++      'test-app/src/module_bindings/index.ts'
++    ),
++    sys: path.join(bindingsRoot, 'src/server/sys.d.ts'),
++  };
++
++  const source = `
++import { and } from ${JSON.stringify(imports.query)};
++import { tables } from ${JSON.stringify(imports.moduleBindings)};
++
++tables.player
++  .leftSemijoin(tables.unindexed_player, (l, r) => ${semijoinPredicateExpr})
++  .build();
++`;
++
++  writeFileSync(reproPath, source);
++
++  try {
++    const options: ts.CompilerOptions = {
++      target: ts.ScriptTarget.ESNext,
++      module: ts.ModuleKind.ESNext,
++      strict: true,
++      noEmit: true,
++      skipLibCheck: true,
++      forceConsistentCasingInFileNames: true,
++      allowImportingTsExtensions: true,
++      noImplicitAny: true,
++      moduleResolution: ts.ModuleResolutionKind.Bundler,
++      useDefineForClassFields: true,
++      verbatimModuleSyntax: true,
++      isolatedModules: true,
++    };
++
++    const host = ts.createCompilerHost(options);
++    const program = ts.createProgram([reproPath, imports.sys], options, host);
++    const diagnostics = ts.getPreEmitDiagnostics(program);
++    const output = diagnostics
++      .map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n'))
++      .join('\n');
++
++    return {
++      status: diagnostics.length === 0 ? 0 : 1,
++      output,
++    };
++  } finally {
++    rmSync(tmpDir, { recursive: true, force: true });
++  }
++}
++
++describe('query builder diagnostics', () => {
++  const messageStart =
++    'Cannot combine predicates from different table scopes with and/or.';
++  const messageHint = 'move extra predicates to .where(...)';
++
++  // This test invokes the TypeScript compiler directly, so it uses an explicit timeout for CI variability.
++  it('reports a clear message for free-floating and(...) in semijoin predicates', () => {
++    const { status, output } = runTypecheck('and(l.id.eq(r.id), r.id.eq(5))');
++    expect(status).not.toBe(0);
++    expect(output).toContain(messageStart);
++    expect(output).toContain(messageHint);
++  }, 15000);
++
++  // This test invokes the TypeScript compiler directly, so it uses an explicit timeout for CI variability.
++  it('reports a clear message for method-style .and(...) in semijoin predicates', () => {
++    const { status, output } = runTypecheck('l.id.eq(r.id).and(r.id.eq(5))');
++    expect(status).not.toBe(0);
++    expect(output).toContain(messageStart);
++    expect(output).toContain(messageHint);
++  }, 15000);
++});
+diff --git a/tests/schema_index_resolution.test.ts b/tests/schema_index_resolution.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..506e384f1ba9df689854c37ef0d44a95f29dfb02
+--- /dev/null
++++ b/tests/schema_index_resolution.test.ts
+@@ -0,0 +1,78 @@
++import { describe, expect, it } from 'vitest';
++import { ModuleContext, tablesToSchema } from '../src/lib/schema';
++import { table } from '../src/lib/table';
++import { t } from '../src/lib/type_builders';
++
++describe('schema index resolution', () => {
++  it('keeps declarative index options separate from resolved runtime indexes', () => {
++    /**
++     * Why this test exists:
++     * We intentionally model two different index representations:
++     * 1) `indexes`: declarative table-level options as authored by the user
++     * 2) `resolvedIndexes`: runtime-ready index metadata derived from RawTableDef
++     *
++     * The rewrite is correct only if:
++     * - `indexes` still preserves the original declaration shape for type inference.
++     * - `resolvedIndexes` includes every runtime index (field-level + table-level).
++     */
++    const player = table(
++      {
++        name: 'player',
++        indexes: [
++          {
++            accessor: 'byTeamAndLevel',
++            algorithm: 'btree',
++            columns: ['team', 'level'] as const,
++          },
++        ] as const,
++      },
++      {
++        // Field-level index declared on metadata.
++        displayName: t.string().index('hash'),
++        team: t.string(),
++        level: t.u32(),
++      }
++    );
++
++    const schemaDef = tablesToSchema(new ModuleContext(), { player });
++    const playerDef = schemaDef.tables.player;
++
++    /**
++     * `indexes` should remain the declarative shape from `table({ indexes: ... })`.
++     * This drives type-level behavior, so it must not be replaced with resolved
++     * runtime metadata.
++     */
++    expect(playerDef.indexes).toEqual([
++      {
++        accessor: 'byTeamAndLevel',
++        algorithm: 'btree',
++        columns: ['team', 'level'],
++      },
++    ]);
++
++    /**
++     * `resolvedIndexes` should contain:
++     * - the field-level index derived from `displayName.index('hash')`, and
++     * - the explicit table-level index `byTeamAndLevel`.
++     *
++     * Runtime consumers (e.g. TableCache) use this field because it is the
++     * normalized shape with resolved algorithms, names, and column lists.
++     */
++    expect(playerDef.resolvedIndexes).toEqual(
++      expect.arrayContaining([
++        {
++          name: 'displayName',
++          unique: false,
++          algorithm: 'hash',
++          columns: ['displayName'],
++        },
++        {
++          name: 'byTeamAndLevel',
++          unique: false,
++          algorithm: 'btree',
++          columns: ['team', 'level'],
++        },
++      ])
++    );
++  });
++});
+diff --git a/tests/table_cache_resolved_indexes.test.ts b/tests/table_cache_resolved_indexes.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e67cb418e5e9ef536c00b8c88183b79b5e908b7
+--- /dev/null
++++ b/tests/table_cache_resolved_indexes.test.ts
+@@ -0,0 +1,71 @@
++import { describe, expect, it } from 'vitest';
++import { ModuleContext, tablesToSchema } from '../src/lib/schema';
++import { table } from '../src/lib/table';
++import { TableCacheImpl } from '../src/sdk/table_cache';
++import { t } from '../src/lib/type_builders';
++
++describe('table cache resolved indexes', () => {
++  it('builds index accessors from resolvedIndexes (field-level + table-level)', () => {
++    /**
++     * Why this test exists:
++     * `TableCacheImpl` previously consumed `table.indexes` and re-cast it into a
++     * runtime shape. After the refactor, runtime index construction must come
++     * from `table.resolvedIndexes` instead.
++     *
++     * This test validates the observable contract:
++     * - field-level indexes still materialize as cache accessors
++     * - explicit table-level indexes still materialize as cache accessors
++     * - both accessors execute correctly against cached rows
++     */
++    const player = table(
++      {
++        name: 'player',
++        indexes: [
++          {
++            accessor: 'byTeamAndLevel',
++            algorithm: 'btree',
++            columns: ['team', 'level'] as const,
++          },
++        ] as const,
++      },
++      {
++        // Field-level index.
++        email: t.string().index('btree'),
++        team: t.string(),
++        level: t.u32(),
++      }
++    );
++
++    const schemaDef = tablesToSchema(new ModuleContext(), { player });
++    const playerDef = schemaDef.tables.player;
++    const tableCache = new TableCacheImpl<any, string>(playerDef as any);
++
++    const rows = [
++      { email: 'a@example.com', team: 'red', level: 1 },
++      { email: 'b@example.com', team: 'blue', level: 2 },
++      { email: 'c@example.com', team: 'red', level: 3 },
++    ];
++
++    const callbacks = tableCache.applyOperations(
++      rows.map(row => ({
++        type: 'insert' as const,
++        // This table has no primary key, so any stable row id is acceptable for this test.
++        rowId: row.email,
++        row,
++      })),
++      {}
++    );
++    callbacks.forEach(cb => cb.cb());
++
++    const emailIndex = (tableCache as any).email;
++    const byTeamAndLevel = (tableCache as any).byTeamAndLevel;
++
++    // The field-level accessor must exist and support point lookup semantics.
++    expect(typeof emailIndex?.filter).toBe('function');
++    expect(Array.from(emailIndex.filter('a@example.com'))).toEqual([rows[0]]);
++
++    // The explicit table-level accessor must exist and support tuple filtering.
++    expect(typeof byTeamAndLevel?.filter).toBe('function');
++    expect(Array.from(byTeamAndLevel.filter(['red', 1]))).toEqual([rows[0]]);
++  });
++});
+diff --git a/tests/table_index_accessor.test.ts b/tests/table_index_accessor.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3361deda465006e4285dda417c2352778a18dd42
+--- /dev/null
++++ b/tests/table_index_accessor.test.ts
+@@ -0,0 +1,146 @@
++import { describe, expect, it } from 'vitest';
++import { ModuleContext } from '../src/lib/schema';
++import { table } from '../src/lib/table';
++import { t } from '../src/lib/type_builders';
++
++describe('table index accessors', () => {
++  it('throws when an explicit index is missing accessor', () => {
++    expect(() =>
++      table(
++        {
++          name: 'person',
++          indexes: [
++            {
++              name: 'id_idx',
++              algorithm: 'btree',
++              columns: ['id'] as const,
++            } as any,
++          ] as const,
++        },
++        {
++          id: t.identity(),
++        }
++      )
++    ).toThrowError("must define a non-empty 'accessor'");
++  });
++
++  it('allows duplicate explicit index accessors in raw table definitions', () => {
++    /**
++     * table() does not reject duplicate explicit accessor names at definition
++     * time. Runtime table view construction handles duplicate accessors by
++     * merging methods onto a single accessor object.
++     */
++    const tableSchema = table(
++      {
++        name: 'person',
++        indexes: [
++          {
++            accessor: 'dup',
++            algorithm: 'btree',
++            columns: ['id'] as const,
++          },
++          {
++            accessor: 'dup',
++            algorithm: 'hash',
++            columns: ['email'] as const,
++          },
++        ] as const,
++      },
++      {
++        id: t.identity(),
++        email: t.string(),
++      }
++    );
++
++    const rawTableDef = tableSchema.tableDef(new ModuleContext(), 'person');
++    expect(rawTableDef.indexes).toHaveLength(2);
++    expect(rawTableDef.indexes.map(index => index.accessorName)).toEqual([
++      'dup',
++      'dup',
++    ]);
++  });
++
++  it('accepts an explicit accessor for table-level indexes', () => {
++    const tableSchema = table(
++      {
++        name: 'person',
++        indexes: [
++          {
++            accessor: 'byName',
++            algorithm: 'btree',
++            columns: ['name'] as const,
++          },
++        ] as const,
++      },
++      {
++        name: t.string(),
++      }
++    );
++
++    const rawTableDef = tableSchema.tableDef(new ModuleContext(), 'person');
++    expect(rawTableDef.indexes).toHaveLength(1);
++    expect(rawTableDef.indexes[0].accessorName).toBe('byName');
++  });
++
++  it('derives accessor from the field name for field-level indexes', () => {
++    const tableSchema = table(
++      {
++        name: 'person',
++      },
++      {
++        displayName: t.string().index('btree'),
++      }
++    );
++
++    const rawTableDef = tableSchema.tableDef(new ModuleContext(), 'person');
++    expect(rawTableDef.indexes).toHaveLength(1);
++    expect(rawTableDef.indexes[0].accessorName).toBe('displayName');
++  });
++
++  it('keeps both implicit and explicit index entries when accessors match', () => {
++    /**
++     * Generated client bindings can include an explicit table-level index entry
++     * for the same logical index that is already inferred from field metadata
++     * (e.g. primaryKey implies an implicit index). This should not fail as a
++     * duplicate accessor when the definitions are equivalent.
++     */
++    const tableSchema = table(
++      {
++        name: 'player',
++        indexes: [
++          {
++            accessor: 'id',
++            name: 'player_id_idx_btree',
++            algorithm: 'btree',
++            columns: ['id'] as const,
++          },
++        ] as const,
++      },
++      {
++        id: t.u32().primaryKey(),
++      }
++    );
++
++    const ctx = new ModuleContext();
++    const rawTableDef = tableSchema.tableDef(ctx, 'player');
++
++    // Raw schema keeps both entries; runtime accessor construction merges by
++    // accessor name.
++    expect(rawTableDef.indexes).toHaveLength(2);
++    expect(rawTableDef.indexes.map(index => index.accessorName)).toEqual([
++      'id',
++      'id',
++    ]);
++
++    // The explicit canonical name should still be preserved in explicit names.
++    expect(ctx.moduleDef.explicitNames.entries).toEqual([
++      {
++        tag: 'Index',
++        value: {
++          sourceName: 'player_id_idx_btree',
++          canonicalName: 'player_id_idx_btree',
++        },
++      },
++    ]);
++  });
++});
+diff --git a/tests/websocket_v3_frames.test.ts b/tests/websocket_v3_frames.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eefe7c0c640aed0f22da1029f31078784ff26dba
+--- /dev/null
++++ b/tests/websocket_v3_frames.test.ts
+@@ -0,0 +1,100 @@
++import { describe, expect, test } from 'vitest';
++import BinaryReader from '../src/lib/binary_reader.ts';
++import BinaryWriter from '../src/lib/binary_writer.ts';
++import { ClientMessage } from '../src/sdk/client_api/types';
++import {
++  countClientMessagesForV3Frame,
++  decodeClientMessagesV3,
++  encodeClientMessagesV3,
++} from '../src/sdk/websocket_v3_frames';
++
++function encodeClientMessage(message: ClientMessage): Uint8Array {
++  const writer = new BinaryWriter(128);
++  ClientMessage.serialize(writer, message);
++  return writer.getBuffer().slice();
++}
++
++describe('websocket_v3_frames', () => {
++  test('counts as many client messages as fit within the encoded frame limit', () => {
++    const messages = [
++      new Uint8Array(10),
++      new Uint8Array(20),
++      new Uint8Array(30),
++    ];
++
++    expect(countClientMessagesForV3Frame(messages, 10)).toBe(1);
++    expect(countClientMessagesForV3Frame(messages, 30)).toBe(2);
++    expect(countClientMessagesForV3Frame(messages, 60)).toBe(3);
++  });
++
++  test('still emits an oversized first message on its own', () => {
++    const messages = [new Uint8Array(300_000), new Uint8Array(10)];
++    expect(countClientMessagesForV3Frame(messages, 256 * 1024)).toBe(1);
++  });
++
++  test('encodes and decodes raw concatenated v2 messages', () => {
++    const encodedMessages = [
++      encodeClientMessage(
++        ClientMessage.CallReducer({
++          requestId: 7,
++          flags: 0,
++          reducer: 'first',
++          args: new Uint8Array([1, 2]),
++        })
++      ),
++      encodeClientMessage(
++        ClientMessage.CallProcedure({
++          requestId: 8,
++          flags: 0,
++          procedure: 'second',
++          args: new Uint8Array([3, 4, 5]),
++        })
++      ),
++    ];
++    const payload = encodeClientMessagesV3(
++      new BinaryWriter(128),
++      encodedMessages
++    );
++    const decodedMessages = decodeClientMessagesV3(payload);
++
++    expect(decodedMessages).toHaveLength(2);
++    expect(
++      ClientMessage.deserialize(new BinaryReader(decodedMessages[0])).tag
++    ).toBe('CallReducer');
++    expect(
++      ClientMessage.deserialize(new BinaryReader(decodedMessages[1])).tag
++    ).toBe('CallProcedure');
++  });
++
++  test('can encode only a prefix of queued client messages', () => {
++    const encodedMessages = [
++      encodeClientMessage(
++        ClientMessage.CallReducer({
++          requestId: 7,
++          flags: 0,
++          reducer: 'first',
++          args: new Uint8Array([1, 2]),
++        })
++      ),
++      encodeClientMessage(
++        ClientMessage.CallProcedure({
++          requestId: 8,
++          flags: 0,
++          procedure: 'second',
++          args: new Uint8Array([3, 4, 5]),
++        })
++      ),
++    ];
++    const payload = encodeClientMessagesV3(
++      new BinaryWriter(128),
++      encodedMessages,
++      1
++    );
++    const decodedMessages = decodeClientMessagesV3(payload);
++
++    expect(decodedMessages).toHaveLength(1);
++    expect(
++      ClientMessage.deserialize(new BinaryReader(decodedMessages[0])).tag
++    ).toBe('CallReducer');
++  });
++});

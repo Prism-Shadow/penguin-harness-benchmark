@@ -1,0 +1,509 @@
+diff --git a/app/controllers/pushes_controller.rb b/app/controllers/pushes_controller.rb
+index 06f85d89..4b95f175 100644
+--- a/app/controllers/pushes_controller.rb
++++ b/app/controllers/pushes_controller.rb
+@@ -242,6 +242,7 @@ class PushesController < BaseController
+   def preview
+     @secret_url = helpers.secret_url(@push)
+     @qr_code = helpers.qr_code(@secret_url)
++    @share_message = helpers.push_share_message_text(@push, secret_url: @secret_url)
+   end
+ 
+   def print_preview
+diff --git a/app/helpers/pushes_helper.rb b/app/helpers/pushes_helper.rb
+index da39bf4f..36a7b1c1 100644
+--- a/app/helpers/pushes_helper.rb
++++ b/app/helpers/pushes_helper.rb
+@@ -1,6 +1,8 @@
+ # frozen_string_literal: true
+ 
+ module PushesHelper
++  include ShareMessageHelper
++
+   PUSH_PAYLOAD_AUTO_REBLUR_SECONDS = 20
+ 
+   def push_payload_auto_reblur_seconds
+diff --git a/app/helpers/share_message_helper.rb b/app/helpers/share_message_helper.rb
+new file mode 100644
+index 00000000..759885ab
+--- /dev/null
++++ b/app/helpers/share_message_helper.rb
+@@ -0,0 +1,55 @@
++# frozen_string_literal: true
++
++module ShareMessageHelper
++  # Plain-text message for sharing a push link (preview page and manual copy).
++  #
++  # @param [Push] push
++  # @param [String] secret_url
++  # @param [Symbol, String, nil] locale - when nil, uses preview_share_message_locale
++  def push_share_message_text(push, secret_url:, locale: nil)
++    I18n.with_locale(share_message_locale(push, locale)) do
++      notes = [
++        share_message_expiration_note(push),
++        (passphrase_share_note if push.passphrase.present?),
++        I18n._("Once retrieved, the link and content will be deleted upon expiration.")
++      ].compact
++
++      [
++        I18n._("A secure link has been shared with you."),
++        "",
++        I18n._("Please find the secret link below to access the sensitive information."),
++        "",
++        "#{I18n._("Secret link")}: #{secret_url}",
++        "",
++        I18n._("IMPORTANT NOTES:"),
++        *notes.map { |note| "* #{note}" }
++      ].join("\n")
++    end
++  end
++
++  # Locale for share message on preview pages (follows secret link language selector).
++  def preview_share_message_locale(_push)
++    if params["push_locale"].present? && Settings.enabled_language_codes.include?(params["push_locale"])
++      params["push_locale"].to_sym
++    else
++      I18n.locale
++    end
++  end
++
++  private
++
++  def share_message_locale(push, locale)
++    locale.present? ? locale.to_sym : preview_share_message_locale(push)
++  end
++
++  def share_message_expiration_note(push)
++    days_label = "#{push.days_remaining} #{n_("day", "days", push.days_remaining)}"
++    views_label = "#{push.views_remaining} #{n_("view", "views", push.views_remaining)}"
++
++    I18n._("This link is valid for %{days}, or %{views}, whichever occurs first.") % {days: days_label, views: views_label}
++  end
++
++  def passphrase_share_note
++    I18n._("For added security, you may be prompted to enter a passphrase (provided separately) to access the content.")
++  end
++end
+diff --git a/app/javascript/controllers/copy_controller.js b/app/javascript/controllers/copy_controller.js
+index 880edf86..2d98da5b 100644
+--- a/app/javascript/controllers/copy_controller.js
++++ b/app/javascript/controllers/copy_controller.js
+@@ -3,6 +3,7 @@ import { Controller } from "@hotwired/stimulus"
+ export default class extends Controller {
+     static targets = [
+         "payloadDiv",
++        "icon",
+      ]
+ 
+     static values = {
+@@ -21,19 +22,22 @@ export default class extends Controller {
+             }
+         }
+ 
+-        let button = event.target
+-        if (button.tagName == 'BUTTON') {
+-            button = button.querySelector('em')
++        const button = event.currentTarget
++        this.clearStrayIconClasses(button)
++
++        const icon = this.iconElement(button)
++        if (!icon) return
++
++        if (this.feedbackTimeout) {
++            clearTimeout(this.feedbackTimeout)
+         }
+ 
+-        button.classList.remove('bi-clipboard-check')
+-        button.classList.add('bi-check-lg')
++        this.showCopySuccess(icon)
+ 
+-        setTimeout(function() {
+-            button.classList.remove('bi-check-lg')
+-            button.classList.add('bi-clipboard-check')
++        this.feedbackTimeout = setTimeout(() => {
++            this.resetCopyIcon(icon)
++            this.feedbackTimeout = null
+         }, 1000)
+-
+     }
+ 
+     copyToClipboard(event) {
+@@ -56,6 +60,38 @@ export default class extends Controller {
+ 
+     }
+ 
++    disconnect() {
++        if (this.feedbackTimeout) {
++            clearTimeout(this.feedbackTimeout)
++        }
++    }
++
++    iconElement(button) {
++        if (this.hasIconTarget && button.contains(this.iconTarget)) {
++            return this.iconTarget
++        }
++
++        return button.querySelector("em")
++    }
++
++    showCopySuccess(icon) {
++        icon.classList.remove("bi-clipboard-check")
++        icon.classList.add("bi-check-lg")
++    }
++
++    resetCopyIcon(icon) {
++        icon.classList.remove("bi-check-lg")
++        icon.classList.add("bi-clipboard-check")
++    }
++
++    clearStrayIconClasses(button) {
++        const iconClasses = ["bi", "bi-clipboard-check", "bi-check-lg"]
++
++        button.querySelectorAll("span").forEach((element) => {
++            iconClasses.forEach((iconClass) => element.classList.remove(iconClass))
++        })
++    }
++
+     fallbackCopyToClipboard(text) {
+         const textArea = document.createElement('textarea')
+         textArea.value = text
+diff --git a/app/views/application/_secret_url_bar.html.erb b/app/views/application/_secret_url_bar.html.erb
+index aedc11ff..15825042 100644
+--- a/app/views/application/_secret_url_bar.html.erb
++++ b/app/views/application/_secret_url_bar.html.erb
+@@ -1,4 +1,5 @@
+-<div class='input-group mb-5 w-75' data-controller="copy">
++<% wrapper_class = local_assigns.fetch(:wrapper_class, "input-group mb-5 w-75") %>
++<div class="<%= wrapper_class %>" data-controller="copy">
+     <input class='form-control' id='secret_url' value='<%= @secret_url %>' spellcheck='false' readonly='true' data-copy-target="payloadDiv">
+     <% if Settings.language_codes %>
+         <% if params.key?(:push_locale) %>
+diff --git a/app/views/pushes/preview.html.erb b/app/views/pushes/preview.html.erb
+index 7dfcc7ca..50c16806 100644
+--- a/app/views/pushes/preview.html.erb
++++ b/app/views/pushes/preview.html.erb
+@@ -1,120 +1,139 @@
+ <%= title(_('Push Preview')) %>
+ 
+-<div class="container h-75">
+-  <div class="d-flex flex-column justify-content-center align-items-center">
++<div class="container-xl py-4 py-lg-5">
+ 
+-    <h2 class="mt-5 fw-semibold"><em class="bi bi-check-circle text-success me-2"></em><%= _('Push Created') %></h2>
++    <%# Header %>
++    <div class="text-center mb-4">
++      <h2 class="fw-semibold mb-2">
++        <em class="bi bi-check-circle text-success me-2"></em><%= _('Push Created') %>
++      </h2>
++      <p class="text-muted mb-0"><%= _('Copy the link or message below to share this push securely.') %></p>
++    </div>
+ 
+-    <p class="mt-4 text-muted"><%= _('Use this secret link to share it:') %></p>
+-    <%= render partial: 'application/secret_url_bar' %>
+-    <%= @qr_code %>
++    <%# Secret link %>
++    <div class="card border-0 shadow-sm mb-4">
++      <div class="card-body">
++        <label for="secret_url" class="form-label fw-semibold mb-2"><%= _('Secret link') %></label>
++        <%= render partial: "application/secret_url_bar", locals: {wrapper_class: "input-group w-100"} %>
++      </div>
++    </div>
+ 
+-    <p class="d-inline-flex gap-1 mt-4 mb-2">
+-      <button class="btn btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#collapseExample" aria-expanded="false" aria-controls="collapseExample">
+-        <em class="bi bi-printer me-1"></em><%= _('Print & Share') %>
+-      </button>
+-    </p>
+-    <div class="collapse" id="collapseExample">
+-      <div class="card border-0 shadow-sm">
+-        <div class="card-header bg-transparent"><em class="bi bi-file-earmark-text me-1"></em><%= _('Generate a Printable Page for End Users') %></div>
+-        <div class="card-body">
+-          <%= form_tag(print_preview_push_path(@push), method: :get, target: '_blank') do %>
+-            <div class="row row-cols-lg-auto g-3 align-items-center">
+-              <div class="col w-100 mb-2">
+-                <label class="visually-hidden" for="inlineFormInputGroupUsername"><%= _('Optional Custom Message') %></label>
+-                <div class="input-group">
+-                  <%= text_field_tag(:message, nil, class: 'form-control w-100', placeholder: _("Optional Custom Message"), autocomplete: "on") %>
+-                </div>
+-              </div>
+-            </div>
++    <%# QR code + share message %>
++    <div class="row g-4 mb-4 align-items-stretch">
++      <div class="col-md-4 col-lg-4">
++        <div class="card border-0 shadow-sm h-100">
++          <div class="card-body d-flex flex-column align-items-center text-center">
++            <p class="form-label fw-semibold mb-3 w-100 text-start"><%= _('QR code') %></p>
++            <div class="mb-3"><%= @qr_code %></div>
++            <p class="text-muted small mb-3"><%= _('Scan to open the secret link on a mobile device.') %></p>
+ 
+-            <div class="row row-cols-lg-auto g-3 align-items-center">
+-              <div class="col-12">
+-                <div class="form-check">
+-                  <%= check_box_tag(:show_expiration, true, true, class: 'form-check-input') %>
+-                  <%= label_tag(:show_expiration, _('Show Expiration Details'), class: 'form-check-label') %>
++            <div class="w-100 mt-auto">
++              <button class="btn btn-outline-secondary btn-sm w-100" type="button" data-bs-toggle="collapse" data-bs-target="#printShareCollapse" aria-expanded="false" aria-controls="printShareCollapse">
++                <em class="bi bi-printer me-1"></em><%= _('Print & Share') %>
++              </button>
++              <div class="collapse mt-3 text-start" id="printShareCollapse">
++                <div class="border rounded-3 p-3 bg-body-tertiary">
++                  <p class="small fw-semibold mb-2"><%= _('Generate a printable page') %></p>
++                  <%= form_tag(print_preview_push_path(@push), method: :get, target: "_blank", class: "small") do %>
++                    <div class="mb-2">
++                      <%= text_field_tag(:message, nil, class: "form-control form-control-sm", placeholder: _("Optional custom message"), autocomplete: "on") %>
++                    </div>
++                    <div class="form-check mb-1">
++                      <%= check_box_tag(:show_expiration, true, true, class: "form-check-input") %>
++                      <%= label_tag(:show_expiration, _("Show expiration details"), class: "form-check-label") %>
++                    </div>
++                    <div class="form-check mb-2">
++                      <%= check_box_tag(:show_id, true, true, class: "form-check-input") %>
++                      <%= label_tag(:show_id, _("Include ID"), class: "form-check-label") %>
++                    </div>
++                    <button type="submit" class="btn btn-success btn-sm w-100">
++                      <em class="bi bi-file-earmark-pdf me-1"></em><%= _('Generate') %>
++                    </button>
++                  <% end %>
+                 </div>
+               </div>
++            </div>
++          </div>
++        </div>
++      </div>
+ 
+-              <div class="col-12">
+-                <div class="form-check">
+-                  <%= check_box_tag(:show_id, true, true, class: 'form-check-input') %>
+-                  <%= label_tag(:show_id, _('Include ID'), class: 'form-check-label') %>
+-                </div>
+-              </div>
++      <div class="col-md-8 col-lg-8">
++        <%= render partial: "shared/share_message", locals: {share_message: @share_message} %>
++      </div>
++    </div>
+ 
+-              <div class="col-12">
+-                <button type="submit" class="btn btn-success"><em class="bi bi-file-earmark-pdf me-1"></em><%= _('Generate') %></button>
+-              </div>
++    <%# Expiration & security details %>
++    <div class="card border-0 shadow-sm mb-4">
++      <div class="card-body">
++        <div class="row g-3 align-items-center">
++          <div class="col-lg-7">
++            <p class="fw-semibold mb-2">
++              <em class="bi bi-clock me-1"></em><%= _("Expires when the first limit is reached") %>
++            </p>
++            <div class="d-flex flex-wrap align-items-center gap-2">
++              <span class="badge bg-secondary fs-6"><%= @push.days_remaining %> <%= n_('day', 'days', @push.days_remaining) %></span>
++              <span class="text-muted"><%= _('or') %></span>
++              <span class="badge bg-secondary fs-6"><%= @push.views_remaining %> <%= n_('view', 'views', @push.views_remaining) %></span>
+             </div>
+-          <% end %>
++            <% unless @push.url? %>
++              <p class="mt-2 mb-0 small text-muted">
++                <% if @push.deletable_by_viewer %>
++                  <em class="bi bi-trash me-1"></em><%= _('Viewers can delete this push.') %>
++                <% else %>
++                  <em class="bi bi-lock me-1"></em><%= _('Viewers cannot delete this push.') %>
++                <% end %>
++              </p>
++            <% end %>
++            <% if @push.retrieval_step == true %>
++              <p class="mt-2 mb-0 small text-muted">
++                <em class="bi bi-shield-check me-1"></em><%= _('Includes a') %> <strong><%= _('1-click preliminary retrieval step') %></strong>.
++              </p>
++            <% end %>
++          </div>
++          <div class="col-lg-5">
++            <div class="d-flex flex-wrap gap-2 justify-content-lg-end">
++              <%= link_to @secret_url,
++                class: "btn btn-success",
++                "data-turbo-prefetch": false,
++                "data-turbolinks": false,
++                "data-turbo": false,
++                rel: "no-prefetch" do %>
++                <em class="bi bi-eye me-1"></em><%= _('View This Push') %>
++              <% end %>
++              <% if @push.url? %>
++                <%= link_to new_push_path(tab: "url"), class: "btn btn-primary" do %>
++                  <em class="bi bi-plus-lg me-1"></em><%= _('Push Another') %>
++                <% end %>
++              <% elsif @push.file? %>
++                <%= link_to new_push_path(tab: (Settings.disable_logins ? "text" : "files")), class: "btn btn-primary" do %>
++                  <em class="bi bi-plus-lg me-1"></em><%= _('Push Another') %>
++                <% end %>
++              <% else %>
++                <%= link_to new_push_path(tab: "text"), class: "btn btn-primary" do %>
++                  <em class="bi bi-plus-lg me-1"></em><%= _('Push Another') %>
++                <% end %>
++              <% end %>
++              <% if user_signed_in? %>
++                <%= link_to audit_push_path(@push), class: "btn btn-outline-secondary", rel: "nofollow" do %>
++                  <em class="bi bi-list-check me-1"></em><%= _('Audit Log') %>
++                <% end %>
++                <%= link_to edit_push_path(@push), class: "btn btn-outline-secondary", rel: "nofollow" do %>
++                  <em class="bi bi-pencil me-1"></em><%= _('Edit') %>
++                <% end %>
++              <% end %>
++            </div>
++          </div>
+         </div>
+       </div>
+     </div>
+ 
+-    <div class="my-4 p-3 bg-body-tertiary rounded-3 text-center">
+-      <p class="mb-2">
+-        <em class="bi bi-clock me-1"></em><%= _("This secret link and all content will be deleted in") %>
+-      </p>
+-      <p class="mb-0">
+-        <span class="badge bg-secondary fs-6"><%= @push.days_remaining %> <%= n_('day', 'days', @push.days_remaining) %></span>
+-        <span class="mx-1"><%= _('or') %></span>
+-        <span class="badge bg-secondary fs-6"><%= @push.views_remaining %> <%= n_('view', 'views', @push.views_remaining) %></span>
+-        <span class="text-muted small"><%= _('(whichever comes first)') %></span>
++    <%# Language tip %>
++    <div class="text-muted small text-center px-2">
++      <p class="mb-1">
++        <em class="bi bi-lightbulb me-1"></em>
++        <%= _('Tip: Change the secret link language using the dropdown to the right of the URL.') %>
+       </p>
+-      <% unless @push.url? %>
+-        <p class="mt-2 mb-0 small text-muted">
+-          <% if @push.deletable_by_viewer %>
+-            <em class="bi bi-trash me-1"></em><%= _('Viewers can delete this push.') %>
+-          <% else %>
+-            <em class="bi bi-lock me-1"></em><%= _('Viewers cannot delete this push.') %>
+-          <% end %>
+-        </p>
+-      <% end %>
++      <p class="mb-0"><%= _('Alternatively, auto-detection will select a language based on the recipient\'s browser settings.') %></p>
+     </div>
+ 
+-    <% if @push.retrieval_step == true %>
+-      <p class="mb-4 text-muted"><em class="bi bi-shield-check me-1"></em><%= _('Includes a') %> <strong><%= _('1-click preliminary retrieval step') %></strong>.</p>
+-    <% end %>
+-
+-    <div class="d-flex flex-wrap justify-content-center gap-2 mb-4">
+-      <%= link_to @secret_url,
+-        class: "btn btn-outline-primary",
+-        "data-turbo-prefetch": false,
+-        "data-turbolinks": false,
+-        "data-turbo": false,
+-        rel: "no-prefetch" do %>
+-        <em class="bi bi-eye me-1"></em><%= _('View This Push') %>
+-      <% end %>
+-      <% if @push.url? %>
+-        <%= link_to new_push_path(tab: "url"), class: "btn btn-primary" do %>
+-          <em class="bi bi-plus-lg me-1"></em><%= _('Push Another') %>
+-        <% end %>
+-      <% elsif @push.file? %>
+-        <%= link_to new_push_path(tab: (Settings.disable_logins ? "text" : "files")), class: "btn btn-primary" do %>
+-          <em class="bi bi-plus-lg me-1"></em><%= _('Push Another') %>
+-        <% end %>
+-      <% else %>
+-        <%= link_to new_push_path(tab: "text"), class: "btn btn-primary" do %>
+-          <em class="bi bi-plus-lg me-1"></em><%= _('Push Another') %>
+-        <% end %>
+-      <% end %>
+-    </div>
+-
+-    <% if user_signed_in? %>
+-      <div class="d-flex gap-2 mb-4">
+-        <%= link_to audit_push_path(@push), class: 'btn btn-outline-secondary btn-sm', rel: 'nofollow' do %>
+-          <em class="bi bi-list-check me-1"></em><%= _('Audit Log') %>
+-        <% end %>
+-        <%= link_to edit_push_path(@push), class: 'btn btn-outline-secondary btn-sm', rel: 'nofollow' do %>
+-          <em class="bi bi-pencil me-1"></em><%= _('Edit') %>
+-        <% end %>
+-      </div>
+-    <% end %>
+-
+-    <div class="text-muted small text-center">
+-      <p class="mb-1"><em class="bi bi-lightbulb me-1"></em><%= _('Tip: Pushing to an international user? Change the secret link language using the dropdown menu to the right of the URL.') %></p>
+-      <p class="mb-0"><%= _('Alternatively auto-detection will select a language based on end-user browser settings.') %></p>
+-    </div>
+-  </div>
+ </div>
+diff --git a/app/views/shared/_share_message.html.erb b/app/views/shared/_share_message.html.erb
+new file mode 100644
+index 00000000..1ee9596e
+--- /dev/null
++++ b/app/views/shared/_share_message.html.erb
+@@ -0,0 +1,23 @@
++<div class="card border-0 shadow-sm h-100">
++  <div class="card-body d-flex flex-column h-100" data-controller="copy">
++    <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
++      <div>
++        <label for="share-message-text" class="form-label fw-semibold mb-1"><%= _("Optional message to share") %></label>
++        <p class="text-muted small mb-0"><%= _("Copy and paste this into your email or chat. It includes the secret link and expiration details.") %></p>
++      </div>
++      <button type="button"
++              class="btn btn-outline-secondary btn-sm flex-shrink-0"
++              data-action="click->copy#miniCopyToClipboard"
++              title="<%= _('Copy to Clipboard') %>"
++              aria-label="<%= _('Copy message') %>">
++        <em class="bi bi-clipboard-check" data-copy-target="icon" aria-hidden="true"></em>
++        <span class="d-none d-sm-inline ms-1" style="pointer-events: none"><%= _("Copy message") %></span>
++      </button>
++    </div>
++    <textarea id="share-message-text"
++              class="form-control flex-grow-1"
++              rows="10"
++              spellcheck="false"
++              data-copy-target="payloadDiv"><%= share_message %></textarea>
++  </div>
++</div>
+diff --git a/test/helpers/share_message_helper_test.rb b/test/helpers/share_message_helper_test.rb
+new file mode 100644
+index 00000000..844ff395
+--- /dev/null
++++ b/test/helpers/share_message_helper_test.rb
+@@ -0,0 +1,36 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class ShareMessageHelperTest < ActionView::TestCase
++  include PushesHelper
++
++  setup do
++    @push = pushes(:test_push)
++    @secret_url = "https://example.com/p/testtoken123"
++  end
++
++  test "push_share_message_text includes secret url and expiration notes" do
++    message = push_share_message_text(@push, secret_url: @secret_url)
++
++    assert_includes message, @secret_url
++    assert_includes message, "Secret link:"
++    assert_includes message, "IMPORTANT NOTES:"
++    assert_includes message, @push.views_remaining.to_s
++    assert_includes message, @push.days_remaining.to_s
++  end
++
++  test "push_share_message_text includes passphrase note when passphrase set" do
++    @push.passphrase = "secret"
++    message = push_share_message_text(@push, secret_url: @secret_url)
++
++    assert_includes message, "passphrase"
++  end
++
++  test "push_share_message_text omits passphrase note when passphrase blank" do
++    @push.passphrase = ""
++    message = push_share_message_text(@push, secret_url: @secret_url)
++
++    assert_not_includes message.downcase, "passphrase"
++  end
++end
+diff --git a/test/integration/password/password_creation_test.rb b/test/integration/password/password_creation_test.rb
+index e2918f3e..5111cae9 100644
+--- a/test/integration/password/password_creation_test.rb
++++ b/test/integration/password/password_creation_test.rb
+@@ -34,6 +34,8 @@ class PasswordCreationTest < ActionDispatch::IntegrationTest
+     follow_redirect!
+     assert_response :success
+     assert_select "h2", "Push Created"
++    assert_match "Optional message to share", response.body
++    assert_select "textarea#share-message-text", minimum: 1
+ 
+     # Password page
+     get request.url.sub("/preview", "")

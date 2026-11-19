@@ -1,0 +1,290 @@
+diff --git a/src/apphosting/config.ts b/src/apphosting/config.ts
+index 661ca0e2..2d525918 100644
+--- a/src/apphosting/config.ts
++++ b/src/apphosting/config.ts
+@@ -12,21 +12,14 @@ export interface RunConfig {
+   maxInstances?: number;
+ }
+ 
+-interface HasSecret {
+-  secret: string;
+-  value: never;
+-}
+-interface HasValue {
+-  secret: never;
+-  value: string;
+-}
+-
+ /** Where an environment variable can be provided. */
+ export type Availability = "BUILD" | "RUNTIME";
+ 
+ /** Config for an environment variable. */
+-export type Env = (HasSecret | HasValue) & {
++export type Env = {
+   variable: string;
++  secret?: string;
++  value?: string;
+   availability?: Availability[];
+ };
+ 
+diff --git a/src/apphosting/secrets/dialogs.ts b/src/apphosting/secrets/dialogs.ts
+index 819c05e0..8e4c63d5 100644
+--- a/src/apphosting/secrets/dialogs.ts
++++ b/src/apphosting/secrets/dialogs.ts
+@@ -7,6 +7,9 @@ import * as prompt from "../../prompt";
+ import * as utils from "../../utils";
+ import { logger } from "../../logger";
+ 
++// TODO: Consider moving some of this into a common utility
++import * as env from "../../functions/env";
++
+ interface BackendMetadata {
+   location: string;
+   id: string;
+@@ -195,3 +198,36 @@ export async function selectBackendServiceAccounts(
+   }
+   return selectFromMetadata(metadata, chosen);
+ }
++
++function toUpperSnakeCase(key: string): string {
++  return key
++    .replace(/[.-]/g, "_")
++    .replace(/([a-z])([A-Z])/g, "$1_$2")
++    .toUpperCase();
++}
++
++export async function envVarForSecret(secret: string): Promise<string> {
++  const upper = toUpperSnakeCase(secret);
++  if (upper === secret) {
++    try {
++      env.validateKey(secret);
++      return secret;
++    } catch {
++      // fallthrough
++    }
++  }
++
++  do {
++    const test = await prompt.promptOnce({
++      message: "What environment variable name would you like to use?",
++      default: upper,
++    });
++
++    try {
++      env.validateKey(test);
++      return test;
++    } catch (err) {
++      utils.logLabeledError("apphosting", (err as env.KeyValidationError).message);
++    }
++  } while (true);
++}
+diff --git a/src/apphosting/secrets/index.ts b/src/apphosting/secrets/index.ts
+index ac349f6b..6ce7d2a8 100644
+--- a/src/apphosting/secrets/index.ts
++++ b/src/apphosting/secrets/index.ts
+@@ -61,7 +61,8 @@ export function serviceAccountsForBackend(
+  * Grants the corresponding service accounts the necessary access permissions to the provided secret.
+  */
+ export async function grantSecretAccess(
+-  secret: gcsm.Secret,
++  projectId: string,
++  secretName: string,
+   accounts: MultiServiceAccounts,
+ ): Promise<void> {
+   const newBindings: iam.Binding[] = [
+@@ -81,10 +82,10 @@ export async function grantSecretAccess(
+ 
+   let existingBindings;
+   try {
+-    existingBindings = (await gcsm.getIamPolicy(secret)).bindings;
++    existingBindings = (await gcsm.getIamPolicy({ projectId, name: secretName })).bindings || [];
+   } catch (err: any) {
+     throw new FirebaseError(
+-      `Failed to get IAM bindings on secret: ${secret.name}. Ensure you have the permissions to do so and try again.`,
++      `Failed to get IAM bindings on secret: ${secretName}. Ensure you have the permissions to do so and try again.`,
+       { original: err },
+     );
+   }
+@@ -92,15 +93,15 @@ export async function grantSecretAccess(
+   try {
+     // TODO: Merge with existing bindings with the same role
+     const updatedBindings = existingBindings.concat(newBindings);
+-    await gcsm.setIamPolicy(secret, updatedBindings);
++    await gcsm.setIamPolicy({ projectId, name: secretName }, updatedBindings);
+   } catch (err: any) {
+     throw new FirebaseError(
+-      `Failed to set IAM bindings ${JSON.stringify(newBindings)} on secret: ${secret.name}. Ensure you have the permissions to do so and try again.`,
++      `Failed to set IAM bindings ${JSON.stringify(newBindings)} on secret: ${secretName}. Ensure you have the permissions to do so and try again.`,
+       { original: err },
+     );
+   }
+ 
+-  utils.logSuccess(`Successfully set IAM bindings on secret ${secret.name}.\n`);
++  utils.logSuccess(`Successfully set IAM bindings on secret ${secretName}.\n`);
+ }
+ 
+ /**
+diff --git a/src/commands/apphosting-secrets-grantaccess.ts b/src/commands/apphosting-secrets-grantaccess.ts
+index f4cc6cd4..3b381ce9 100644
+--- a/src/commands/apphosting-secrets-grantaccess.ts
++++ b/src/commands/apphosting-secrets-grantaccess.ts
+@@ -43,21 +43,14 @@ export const command = new Command("apphosting:secrets:grantaccess <secretName>"
+ 
+     // TODO: consider showing dialog if both --location and --backend are missing
+ 
+-    let secret: secretManager.Secret;
+-    try {
+-      secret = await secretManager.getSecret(projectId, secretName);
+-    } catch (err: any) {
+-      if (err.status === 404) {
+-        throw new FirebaseError(`Cannot find secret ${secretName}`);
+-      }
+-      throw new FirebaseError(`Unexpected error loading secret ${secretName}`, {
+-        original: err as Error,
+-      });
++    const exists = await secretManager.secretExists(projectId, secretName);
++    if (!exists) {
++      throw new FirebaseError(`Cannot find secret ${secretName}`);
+     }
+ 
+     const backendId = options.backend as string;
+     const backend = await apphosting.getBackend(projectId, location, backendId);
+     const accounts = secrets.toMulti(secrets.serviceAccountsForBackend(projectNumber, backend));
+ 
+-    await secrets.grantSecretAccess(secret, accounts);
++    await secrets.grantSecretAccess(projectId, secretName, accounts);
+   });
+diff --git a/src/commands/apphosting-secrets-set.ts b/src/commands/apphosting-secrets-set.ts
+new file mode 100644
+index 00000000..fffb9db1
+--- /dev/null
++++ b/src/commands/apphosting-secrets-set.ts
+@@ -0,0 +1,116 @@
++import * as tty from "tty";
++import * as clc from "colorette";
++import { join } from "path";
++
++import { Command } from "../command";
++import { Options } from "../options";
++import { needProjectId, needProjectNumber } from "../projectUtils";
++import { requireAuth } from "../requireAuth";
++import * as fs from "fs";
++import * as gcsm from "../gcp/secretManager";
++import * as apphosting from "../gcp/apphosting";
++import { requirePermissions } from "../requirePermissions";
++import { confirm, promptOnce } from "../prompt";
++import * as secrets from "../apphosting/secrets";
++import * as dialogs from "../apphosting/secrets/dialogs";
++import * as config from "../apphosting/config";
++import { logSuccess, logWarning } from "../utils";
++
++export const command = new Command("apphosting:secrets:set <secretName>")
++  .description("grant service accounts permissions to the provided secret")
++  .option("-l, --location <location>", "optional location to retrict secret replication")
++  // TODO: What is the right --force behavior for granting access? Seems correct to grant permissions
++  // if there is only one set of accounts, but should maybe fail if there are more than one set of
++  // accounts for different backends?
++  .withForce("Automatically create a secret, grant permissions, and add to YAML.")
++  .before(requireAuth)
++  .before(gcsm.ensureApi)
++  .before(apphosting.ensureApiEnabled)
++  .before(requirePermissions, [
++    "secretmanager.secrets.create",
++    "secretmanager.secrets.get",
++    "secretmanager.secrets.update",
++    "secretmanager.versions.add",
++    "secretmanager.secrets.getIamPolicy",
++    "secretmanager.secrets.setIamPolicy",
++  ])
++  .option(
++    "--data-file <dataFile>",
++    'File path from which to read secret data. Set to "-" to read the secret data from stdin.',
++  )
++  .action(async (secretName: string, options: Options) => {
++    const howToAccess = `You can access the contents of the secret's latest value with ${clc.bold(`firebase apphosting:secrets:access ${secretName}`)}`;
++    const projectId = needProjectId(options);
++    const projectNumber = await needProjectNumber(options);
++
++    const created = secrets.upsertSecret(projectId, secretName, options.location as string);
++    if (created === null) {
++      return;
++    }
++
++    let secretValue;
++    if ((!options.dataFile || options.dataFile === "-") && tty.isatty(0)) {
++      secretValue = await promptOnce({
++        type: "password",
++        message: `Enter a value for ${secretName}`,
++      });
++    } else {
++      let dataFile: string | number = 0;
++      if (options.dataFile && options.dataFile !== "-") {
++        dataFile = options.dataFile as string;
++      }
++      secretValue = fs.readFileSync(dataFile, "utf-8");
++    }
++
++    if (!created) {
++      const version = await gcsm.addVersion(projectId, secretName, secretValue);
++      logSuccess(`Created new secret version ${gcsm.toSecretVersionResourceName(version)}`);
++      logSuccess(howToAccess);
++      return;
++    }
++
++    logSuccess(`Created new secret projects/${projectId}/secrets/${secretName}`);
++    logSuccess(howToAccess);
++
++    const accounts = await dialogs.selectBackendServiceAccounts(projectNumber, projectId, options);
++    // If we're not granting permissions, there's no point in adding to YAML either.
++    if (!accounts.buildServiceAccounts.length && !accounts.runServiceAccounts.length) {
++      logWarning(
++        `To use this secret your backend, you must grant access. You can do so in the future with ${clc.bold("firebase apphosting:secrets:grantAccess")}`,
++      );
++    } else {
++      await secrets.grantSecretAccess(projectId, secretName, accounts);
++    }
++
++    // Note: The API proposal suggested that we would check if the env exists. This is stupidly hard because the YAML may not exist yet.
++    let path = config.yamlPath(process.cwd());
++    let yaml: config.Config = {};
++    if (path) {
++      yaml = config.load(path);
++      if (yaml.env?.find((env) => env.variable === secretName)) {
++        return;
++      }
++    }
++    const addToYaml = await confirm({
++      message: "Would you like to add this secret to apphosting.yaml?",
++      default: true,
++    });
++    if (!addToYaml) {
++      return;
++    }
++    if (!path) {
++      path = await promptOnce({
++        message:
++          "It looks like you don't have an apphosting.yaml yet. Where would you like to store it?",
++        default: process.cwd(),
++      });
++      path = join(path, "apphosting.yaml");
++    }
++    const envName = await dialogs.envVarForSecret(secretName);
++    yaml.env = yaml.env || [];
++    yaml.env.push({
++      variable: envName,
++      secret: secretName,
++    });
++    config.store(path, yaml);
++  });
+diff --git a/src/commands/index.ts b/src/commands/index.ts
+index 9382878c..a8a87c6e 100644
+--- a/src/commands/index.ts
++++ b/src/commands/index.ts
+@@ -172,6 +172,7 @@ export function load(client: any): any {
+     client.apphosting.builds.get = loadCommand("apphosting-builds-get");
+     client.apphosting.builds.create = loadCommand("apphosting-builds-create");
+     client.apphosting.secrets = {};
++    client.apphosting.secrets.set = loadCommand("apphosting-secrets-set");
+     client.apphosting.secrets.grantaccess = loadCommand("apphosting-secrets-grantaccess");
+     client.apphosting.secrets.describe = loadCommand("apphosting-secrets-describe");
+     client.apphosting.rollouts = {};

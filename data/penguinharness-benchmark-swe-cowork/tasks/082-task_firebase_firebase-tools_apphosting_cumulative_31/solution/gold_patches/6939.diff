@@ -1,0 +1,367 @@
+diff --git a/src/apphosting/secrets/dialogs.ts b/src/apphosting/secrets/dialogs.ts
+new file mode 100644
+index 00000000..c8ef30af
+--- /dev/null
++++ b/src/apphosting/secrets/dialogs.ts
+@@ -0,0 +1,174 @@
++import * as clc from "colorette";
++const Table = require("cli-table");
++
++import * as apphosting from "../../gcp/apphosting";
++import * as prompt from "../../prompt";
++import * as gce from "../../gcp/computeEngine";
++import * as cloudbuild from "../../gcp/cloudbuild";
++import * as utils from "../../utils";
++import { logger } from "../../logger";
++
++interface BackendMetadata {
++  location: string;
++  id: string;
++  accounts: string[];
++}
++
++/**
++ * Finds the explicit service account used for a backend or, for legacy cases,
++ * the defaults for GCB and compute.
++ */
++export function serviceAccountsForBackend(
++  projectNumber: string,
++  backend: apphosting.Backend,
++): string[] {
++  if (backend.serviceAccount) {
++    return [backend.serviceAccount];
++  }
++  return [
++    cloudbuild.getDefaultServiceAccount(projectNumber),
++    gce.getDefaultServiceAccount(projectNumber),
++  ];
++}
++
++/**
++ * Creates sorted BackendMetadata for a list of Backends.
++ */
++export function toMetadata(
++  projectNumber: string,
++  backends: apphosting.Backend[],
++): BackendMetadata[] {
++  const metadata: BackendMetadata[] = [];
++  for (const backend of backends) {
++    // Splits format projects/<unused>/locations/<location>/backends/<id>
++    const [, , , location, , id] = backend.name.split("/");
++    metadata.push({ location, id, accounts: serviceAccountsForBackend(projectNumber, backend) });
++  }
++  return metadata.sort((left, right) => {
++    const cmplocation = left.location.localeCompare(right.location);
++    if (cmplocation) {
++      return cmplocation;
++    }
++    return left.id.localeCompare(right.id);
++  });
++}
++
++/**
++ * Given a list of BackendMetadata, creates the JSON necessary to power a cli table.
++ * @returns a tuple where the first element is column names and the second element is rows.
++ */
++export function tableForBackends(
++  metadata: BackendMetadata[],
++): [headers: string[], rows: string[][]] {
++  const headers = [
++    "location",
++    "backend",
++    metadata.findIndex((val) => val.accounts.length > 1) === -1
++      ? "service account"
++      : "service accounts",
++  ];
++  const rows = metadata.map((m) => [m.location, m.id, m.accounts.join(", ")]);
++  return [headers, rows];
++}
++
++/** Common warning log that there are no backends. Exported to make tests easier. */
++export const WARN_NO_BACKENDS =
++  "To use this secret, your backend's service account must have secret accessor permission. " +
++  "It does not look like you have a backend yet. After creating a backend, grant access with " +
++  clc.bold("firebase apphosting:secrets:grantAccess");
++
++/** Common warning log that the user will need to grant access manually. Exported to make tests easier. */
++export const GRANT_ACCESS_IN_FUTURE = `To grant access in the future, run ${clc.bold("firebase apphosting:secrets:grantaccess")}`;
++
++/**
++ * Create a dialog where customers can choose a series of service accounts to grant access.
++ * Can return an empty array of the user opts out of granting access.
++ */
++export async function selectBackendServiceAccounts(
++  projectNumber: string,
++  projectId: string,
++  options: any,
++): Promise<string[]> {
++  const listBackends = await apphosting.listBackends(projectId, "-");
++
++  if (listBackends.unreachable.length) {
++    utils.logLabeledWarning(
++      "apphosting",
++      `Could not reach location(s) ${listBackends.unreachable.join(", ")}. You may need to run ` +
++        `${clc.bold("firebase apphosting:secrets:grantAccess")} at a later time if you have backends in these locations`,
++    );
++  }
++
++  if (!listBackends.backends.length) {
++    utils.logLabeledWarning("apphosting", WARN_NO_BACKENDS);
++    return [];
++  }
++
++  if (listBackends.backends.length === 1) {
++    const grant = await prompt.confirm({
++      nonInteractive: options.nonInteractive,
++      default: true,
++      message:
++        "To use this secret, your backend's service account must have secret accessor permission. Would you like to grant it now?",
++    });
++    if (grant) {
++      return serviceAccountsForBackend(projectNumber, listBackends.backends[0]);
++    }
++    utils.logLabeledBullet("apphosting", GRANT_ACCESS_IN_FUTURE);
++    return [];
++  }
++
++  const metadata: BackendMetadata[] = toMetadata(projectNumber, listBackends.backends);
++
++  // Use JSON.stringify because deep comparison is annoying in JS. Because the order of the service account list should be deterinistic,
++  // this shouldn't need a sort command.
++  const firstServiceAccounts = JSON.stringify(metadata[0].accounts);
++  const allSharedAccounts = metadata.every(
++    (val) => JSON.stringify(val.accounts) === firstServiceAccounts,
++  );
++  if (allSharedAccounts) {
++    const grant = await prompt.confirm({
++      nonInteractive: options.nonInteractive,
++      default: true,
++      message:
++        "To use this secret, your backend's service account must have secret accessor permission. All of your backends use " +
++        (metadata[0].accounts.length === 1
++          ? `service account ${metadata[0].accounts[0]}`
++          : `service accounts ${metadata[0].accounts.join(", ")}`) +
++        ". Granting access to one backend will grant access to all backends. Would you like to grant it now?",
++    });
++    if (grant) {
++      return metadata[0].accounts;
++    }
++    utils.logLabeledBullet("apphosting", GRANT_ACCESS_IN_FUTURE);
++    return [];
++  }
++
++  utils.logLabeledBullet(
++    "apphosting",
++    "To use this secret, your backend's service account must have secret accessor permission. Your backends use the following service accounts:",
++  );
++  const tableData = tableForBackends(metadata);
++  const table = new Table({
++    head: tableData[0],
++    style: { head: ["green"] },
++    rows: tableData[1],
++  });
++  logger.info(table.toString());
++
++  const allAccounts = metadata.reduce((accum: Set<string>, row) => {
++    row.accounts.forEach((sa) => accum.add(sa));
++    return accum;
++  }, new Set<string>());
++  const chosen = await prompt.promptOnce({
++    type: "checkbox",
++    message:
++      "Which service accounts would you like to grant access? " +
++      "Press Space to select accounts, then Enter to confirm your choices.",
++    choices: [...allAccounts.values()].sort(),
++  });
++  if (!chosen.length) {
++    utils.logLabeledBullet("apphosting", GRANT_ACCESS_IN_FUTURE);
++  }
++  return chosen;
++}
+diff --git a/src/deploy/functions/checkIam.ts b/src/deploy/functions/checkIam.ts
+index dbf5a342..7d578a68 100644
+--- a/src/deploy/functions/checkIam.ts
++++ b/src/deploy/functions/checkIam.ts
+@@ -6,8 +6,8 @@ import { FirebaseError } from "../../error";
+ import { Options } from "../../options";
+ import { flattenArray } from "../../functional";
+ import * as iam from "../../gcp/iam";
++import * as gce from "../../gcp/computeEngine";
+ import * as args from "./args";
+-import * as gcb from "../../gcp/cloudbuild";
+ import * as backend from "./backend";
+ import { trackGA4 } from "../../track";
+ import * as utils from "../../utils";
+@@ -154,9 +154,7 @@ export function obtainPubSubServiceAgentBindings(projectNumber: string): iam.Bin
+  * @param existingPolicy the project level IAM policy
+  */
+ export function obtainDefaultComputeServiceAgentBindings(projectNumber: string): iam.Binding[] {
+-  const defaultComputeServiceAgent = `serviceAccount:${gcb.getDefaultComputeEngineServiceAgent(
+-    projectNumber,
+-  )}`;
++  const defaultComputeServiceAgent = `serviceAccount:${gce.getDefaultServiceAccount(projectNumber)}`;
+   const runInvokerBinding: iam.Binding = {
+     role: RUN_INVOKER_ROLE,
+     members: [defaultComputeServiceAgent],
+diff --git a/src/deploy/functions/release/fabricator.ts b/src/deploy/functions/release/fabricator.ts
+index 9a45ef10..d03be4ce 100644
+--- a/src/deploy/functions/release/fabricator.ts
++++ b/src/deploy/functions/release/fabricator.ts
+@@ -25,7 +25,7 @@ import * as scheduler from "../../../gcp/cloudscheduler";
+ import * as utils from "../../../utils";
+ import * as services from "../services";
+ import { AUTH_BLOCKING_EVENTS } from "../../../functions/events/v1";
+-import * as gcb from "../../../gcp/cloudbuild";
++import * as gce from "../../../gcp/computeEngine";
+ import { getHumanFriendlyPlatformName } from "../functionsDeployHelper";
+ 
+ // TODO: Tune this for better performance.
+@@ -436,7 +436,7 @@ export class Fabricator {
+     } else if (backend.isScheduleTriggered(endpoint)) {
+       const invoker = endpoint.serviceAccount
+         ? [endpoint.serviceAccount]
+-        : [gcb.getDefaultComputeEngineServiceAgent(this.projectNumber)];
++        : [gce.getDefaultServiceAccount(this.projectNumber)];
+       await this.executor
+         .run(() => run.setInvokerCreate(endpoint.project, serviceName, invoker))
+         .catch(rethrowAs(endpoint, "set invoker"));
+@@ -543,7 +543,7 @@ export class Fabricator {
+     } else if (backend.isScheduleTriggered(endpoint)) {
+       invoker = endpoint.serviceAccount
+         ? [endpoint.serviceAccount]
+-        : [gcb.getDefaultComputeEngineServiceAgent(this.projectNumber)];
++        : [gce.getDefaultServiceAccount(this.projectNumber)];
+     }
+ 
+     if (invoker) {
+diff --git a/src/gcp/apphosting.ts b/src/gcp/apphosting.ts
+index f62e4c3e..3fec2b77 100644
+--- a/src/gcp/apphosting.ts
++++ b/src/gcp/apphosting.ts
+@@ -40,7 +40,7 @@ export interface Backend {
+   createTime: string;
+   updateTime: string;
+   uri: string;
+-  computeServiceAccount?: string;
++  serviceAccount?: string;
+ }
+ 
+ export type BackendOutputOnlyFields = "name" | "createTime" | "updateTime" | "uri";
+diff --git a/src/gcp/cloudbuild.ts b/src/gcp/cloudbuild.ts
+index 0b3f0c99..0f17b556 100644
+--- a/src/gcp/cloudbuild.ts
++++ b/src/gcp/cloudbuild.ts
+@@ -218,18 +218,17 @@ export async function deleteRepository(
+ }
+ 
+ /**
+- * Returns email associated with the Cloud Build Service Agent.
++ * Returns the service account created by Cloud Build to use as a default in Cloud Build jobs.
++ * This service account is deprecated and future users should bring their own account.
+  */
+-export function serviceAgentEmail(projectNumber: string): string {
++export function getDefaultServiceAccount(projectNumber: string): string {
+   return `service-${projectNumber}@gcp-sa-cloudbuild.iam.gserviceaccount.com`;
+ }
+ 
+-/** Returns the default cloud build service agent */
+-export function getDefaultCloudBuildServiceAgent(projectNumber: string): string {
++/**
++ * Returns the default cloud build service agent.
++ * This is the account that Cloud Build itself uses when performing operations on the user's behalf.
++ */
++export function getDefaultServiceAgent(projectNumber: string): string {
+   return `${projectNumber}@cloudbuild.gserviceaccount.com`;
+ }
+-
+-/** Returns the default compute engine service agent */
+-export function getDefaultComputeEngineServiceAgent(projectNumber: string): string {
+-  return `${projectNumber}-compute@developer.gserviceaccount.com`;
+-}
+diff --git a/src/gcp/cloudscheduler.ts b/src/gcp/cloudscheduler.ts
+index 63fea1e4..e82d96bd 100644
+--- a/src/gcp/cloudscheduler.ts
++++ b/src/gcp/cloudscheduler.ts
+@@ -6,7 +6,7 @@ import { cloudschedulerOrigin } from "../api";
+ import { Client } from "../apiv2";
+ import * as backend from "../deploy/functions/backend";
+ import * as proto from "./proto";
+-import * as gcb from "../gcp/cloudbuild";
++import * as gce from "../gcp/computeEngine";
+ import { assertExhaustive, nullsafeVisitor } from "../functional";
+ 
+ const VERSION = "v1";
+@@ -245,8 +245,7 @@ export function jobFromEndpoint(
+       uri: endpoint.uri!,
+       httpMethod: "POST",
+       oidcToken: {
+-        serviceAccountEmail:
+-          endpoint.serviceAccount ?? gcb.getDefaultComputeEngineServiceAgent(projectNumber),
++        serviceAccountEmail: endpoint.serviceAccount ?? gce.getDefaultServiceAccount(projectNumber),
+       },
+     };
+   } else {
+diff --git a/src/gcp/computeEngine.ts b/src/gcp/computeEngine.ts
+new file mode 100644
+index 00000000..28a17469
+--- /dev/null
++++ b/src/gcp/computeEngine.ts
+@@ -0,0 +1,4 @@
++/** Returns the default compute engine service agent */
++export function getDefaultServiceAccount(projectNumber: string): string {
++  return `${projectNumber}-compute@developer.gserviceaccount.com`;
++}
+diff --git a/src/init/features/apphosting/index.ts b/src/init/features/apphosting/index.ts
+index dec2ef01..8596962c 100644
+--- a/src/init/features/apphosting/index.ts
++++ b/src/init/features/apphosting/index.ts
+@@ -187,11 +187,11 @@ export async function createBackend(
+       rootDirectory: "/",
+     },
+     labels: deploymentTool.labels(),
+-    computeServiceAccount: serviceAccount || defaultServiceAccount,
++    serviceAccount: serviceAccount || defaultServiceAccount,
+   };
+ 
+   // TODO: remove computeServiceAccount when the backend supports the field.
+-  delete backendReqBody.computeServiceAccount;
++  delete backendReqBody.serviceAccount;
+ 
+   async function createBackendAndPoll(): Promise<apphosting.Backend> {
+     const op = await apphosting.createBackend(projectId, location, backendReqBody, backendId);
+diff --git a/src/init/features/apphosting/repo.ts b/src/init/features/apphosting/repo.ts
+index b1b644bc..4af4946a 100644
+--- a/src/init/features/apphosting/repo.ts
++++ b/src/init/features/apphosting/repo.ts
+@@ -243,7 +243,7 @@ async function promptRepositoryUri(
+ 
+ async function ensureSecretManagerAdminGrant(projectId: string): Promise<void> {
+   const projectNumber = await getProjectNumber({ projectId });
+-  const cbsaEmail = gcb.serviceAgentEmail(projectNumber);
++  const cbsaEmail = gcb.getDefaultServiceAccount(projectNumber);
+ 
+   const alreadyGranted = await rm.serviceAccountHasRoles(
+     projectId,
+diff --git a/src/init/features/apphosting/secrets.ts b/src/init/features/apphosting/secrets.ts
+index 77d6040e..354cecc5 100644
+--- a/src/init/features/apphosting/secrets.ts
++++ b/src/init/features/apphosting/secrets.ts
+@@ -1,6 +1,7 @@
+ import { logSuccess } from "../../../utils";
+ import * as iam from "../../../gcp/iam";
+ import * as gcb from "../../../gcp/cloudbuild";
++import * as gce from "../../../gcp/computeEngine";
+ import * as secretManager from "../../../gcp/secretManager";
+ import { FirebaseError } from "../../../error";
+ 
+@@ -12,8 +13,8 @@ function fetchServiceAccounts(projectNumber: string): {
+   // the attached service account in a given backend/location then return that value instead.
+   // Sample Call: await apphosting.getBackend(projectId, location, backendId); & make this function async
+   return {
+-    buildServiceAccount: gcb.getDefaultCloudBuildServiceAgent(projectNumber),
+-    runServiceAccount: gcb.getDefaultComputeEngineServiceAgent(projectNumber),
++    buildServiceAccount: gcb.getDefaultServiceAccount(projectNumber),
++    runServiceAccount: gce.getDefaultServiceAccount(projectNumber),
+   };
+ }
+ 

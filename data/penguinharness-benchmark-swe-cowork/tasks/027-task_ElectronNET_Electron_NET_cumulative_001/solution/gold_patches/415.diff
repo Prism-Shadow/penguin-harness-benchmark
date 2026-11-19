@@ -1,0 +1,538 @@
+diff --git a/Changelog.md b/Changelog.md
+index 3983532bdaa5c93063a36ed76057a1a56f6c8cc0..e3bf56b7ee30a4d09268d82db8bef14a4dc5a5b9 100644
+--- a/Changelog.md
++++ b/Changelog.md
+@@ -1,15 +1,18 @@
+ # Not released
+ 
+-# 8.31.3
++# 9.31.1
+ 
+ ElectronNET.CLI:
+ 
+ * New Feature: Added config parameter (thanks [konstantingross](https://github.com/konstantingross)) [\#409](https://github.com/ElectronNET/Electron.NET/pull/409)
++* Fixed bug: Custom user path removed and replaced by the correct directory with VS macro (When ElectronNET.CLI is the Startup Project, press F5 (Debug) and the ElectronNET.WebApp starts correctly without error!) (thanks [konstantingross](https://github.com/konstantingross)) [\#409](https://github.com/ElectronNET/Electron.NET/pull/409)
+ 
+ ElectronNET.API:
+ 
++* New Feature: Native Electron 9 support, but not all new features (we search contributors)
+ * New Feature: PowerMonitor API Support (thanks [gustavo-lara-molina](https://github.com/gustavo-lara-molina)) [\#399](https://github.com/ElectronNET/Electron.NET/pull/399)
+ * New Feature: NativeTheme API Support (thanks [konstantingross](https://github.com/konstantingross)) [\#402](https://github.com/ElectronNET/Electron.NET/pull/402)
++* New Feature: Cookie API Support (thanks [freosc](https://github.com/freosc)) [\#413](https://github.com/ElectronNET/Electron.NET/pull/413)
+ * App-Api Enhancement: MenuItems with Submenus need an submenu type workaround [\#412](https://github.com/ElectronNET/Electron.NET/issues/412)
+ * App-Api Enhancement: Added UserAgentFallback (thanks [Mandrakia](https://github.com/Mandrakia)) [\#406](https://github.com/ElectronNET/Electron.NET/pull/406)
+ * Notification-Api Enhancement: Added missing properties in Notifications (thanks [konstantingross](https://github.com/konstantingross)) [\#410](https://github.com/ElectronNET/Electron.NET/pull/410)
+diff --git a/ElectronNET.API/App.cs b/ElectronNET.API/App.cs
+index b14ccb8d0837875616f989f34fba601d64e3e07f..f48976dbe3fdbd0c37973abdf6ae8dfbd884aeaf 100644
+--- a/ElectronNET.API/App.cs
++++ b/ElectronNET.API/App.cs
+@@ -6,6 +6,7 @@ using System;
+ using System.Runtime.InteropServices;
+ using System.Threading;
+ using System.Threading.Tasks;
++using Microsoft.Extensions.Hosting;
+ 
+ namespace ElectronNET.API
+ {
+@@ -352,6 +353,11 @@ namespace ElectronNET.API
+ 
+         private event Action<bool> _accessibilitySupportChanged;
+ 
++        /// <summary>
++        /// Application host fully started.
++        /// </summary>
++        public bool IsReady { get; internal set; }
++
+         /// <summary>
+         /// A property that indicates the current application's name, which is the
+         /// name in the application's `package.json` file.
+diff --git a/ElectronNET.API/LifetimeServiceHost.cs b/ElectronNET.API/LifetimeServiceHost.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb58eb1b30ceb1b1031175ad9ac2a6da6df784a7
+--- /dev/null
++++ b/ElectronNET.API/LifetimeServiceHost.cs
+@@ -0,0 +1,41 @@
++﻿using System;
++using System.Threading;
++using System.Threading.Tasks;
++using Microsoft.Extensions.Hosting;
++
++namespace ElectronNET.API
++{
++    /// <summary>
++    /// Base class that reports if ASP.NET Core has fully started.
++    /// </summary>
++    internal class LifetimeServiceHost : IHostedService
++    {
++        public LifetimeServiceHost(IHostApplicationLifetime lifetime)
++        {
++            lifetime.ApplicationStarted.Register(() =>
++            {
++                App.Instance.IsReady = true;
++
++                Console.WriteLine("ASP.NET Core host has fully started.");
++            });
++        }
++
++        /// <summary>
++        /// Triggered when the application host is ready to start the service.
++        /// </summary>
++        /// <param name="cancellationToken">Indicates that the start process has been aborted.</param>
++        public Task StartAsync(CancellationToken cancellationToken)
++        {
++            return Task.CompletedTask;
++        }
++
++        /// <summary>
++        /// Triggered when the application host is performing a graceful shutdown.
++        /// </summary>
++        /// <param name="cancellationToken">Indicates that the shutdown process should no longer be graceful.</param>
++        public Task StopAsync(CancellationToken cancellationToken)
++        {
++            return Task.CompletedTask;
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/ElectronNET.API/Shell.cs b/ElectronNET.API/Shell.cs
+index f29ec6697940a86d407c274d671270339e67a743..98cda34f208674dfbce488e84bf19668077f2ad3 100644
+--- a/ElectronNET.API/Shell.cs
++++ b/ElectronNET.API/Shell.cs
+@@ -63,18 +63,18 @@ namespace ElectronNET.API
+         /// </summary>
+         /// <param name="fullPath"></param>
+         /// <returns>Whether the item was successfully opened.</returns>
+-        public Task<bool> OpenItemAsync(string fullPath)
++        public Task<bool> OpenPathAsync(string fullPath)
+         {
+             var taskCompletionSource = new TaskCompletionSource<bool>();
+ 
+-            BridgeConnector.Socket.On("shell-openItemCompleted", (success) =>
++            BridgeConnector.Socket.On("shell-openPathCompleted", (success) =>
+             {
+-                BridgeConnector.Socket.Off("shell-openItemCompleted");
++                BridgeConnector.Socket.Off("shell-openPathCompleted");
+ 
+                 taskCompletionSource.SetResult((bool)success);
+             });
+ 
+-            BridgeConnector.Socket.Emit("shell-openItem", fullPath);
++            BridgeConnector.Socket.Emit("shell-openPath", fullPath);
+ 
+             return taskCompletionSource.Task;
+         }
+diff --git a/ElectronNET.API/WebHostBuilderExtensions.cs b/ElectronNET.API/WebHostBuilderExtensions.cs
+index 8680cf632a3eaf63235b3cac3886981fa356118b..af7cf9107cbc8cdafc7ec7a07e4244a88e1c2c7f 100644
+--- a/ElectronNET.API/WebHostBuilderExtensions.cs
++++ b/ElectronNET.API/WebHostBuilderExtensions.cs
+@@ -1,6 +1,7 @@
+ ﻿using Microsoft.AspNetCore.Hosting;
+ using System;
+ using System.IO;
++using Microsoft.Extensions.DependencyInjection;
+ 
+ namespace ElectronNET.API
+ {
+@@ -32,6 +33,11 @@ namespace ElectronNET.API
+ 
+             if (HybridSupport.IsElectronActive)
+             {
++                builder.ConfigureServices(services =>
++                {
++                    services.AddHostedService<LifetimeServiceHost>();
++                });
++
+                 // check for the content folder if its exists in base director otherwise no need to include
+                 // It was used before because we are publishing the project which copies everything to bin folder and contentroot wwwroot was folder there.
+                 // now we have implemented the live reload if app is run using /watch then we need to use the default project path.
+@@ -49,4 +55,4 @@ namespace ElectronNET.API
+             return builder;
+         }
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/ElectronNET.CLI/Commands/BuildCommand.cs b/ElectronNET.CLI/Commands/BuildCommand.cs
+index 4ca71202f770830777244a6e93b59b4fb061a7f6..50ed119351eb1def8e5f8dcd779f2a3abffd640b 100644
+--- a/ElectronNET.CLI/Commands/BuildCommand.cs
++++ b/ElectronNET.CLI/Commands/BuildCommand.cs
+@@ -187,7 +187,7 @@ namespace ElectronNET.CLI.Commands
+                 ProcessHelper.CmdExecute($"node build-helper.js " + manifestFileName, tempPath);
+ 
+                 Console.WriteLine($"Package Electron App for Platform {platformInfo.ElectronPackerPlatform}...");
+-                ProcessHelper.CmdExecute($"npx electron-builder . --config=./bin/electron-builder.json --{platformInfo.ElectronPackerPlatform} --{electronArch} -c.electronVersion=8.2.3 {electronParams}", tempPath);
++                ProcessHelper.CmdExecute($"npx electron-builder . --config=./bin/electron-builder.json --{platformInfo.ElectronPackerPlatform} --{electronArch} -c.electronVersion=9.0.0 {electronParams}", tempPath);
+ 
+                 Console.WriteLine("... done");
+ 
+diff --git a/ElectronNET.CLI/Properties/launchSettings.json b/ElectronNET.CLI/Properties/launchSettings.json
+index 934f42bd44e4308e03387ffee92f93a3a13a6b04..5adf9cdb59f49299c543b0cf999bf06e7053ca51 100644
+--- a/ElectronNET.CLI/Properties/launchSettings.json
++++ b/ElectronNET.CLI/Properties/launchSettings.json
+@@ -2,7 +2,7 @@
+   "profiles": {
+     "ElectronNET.CLI": {
+       "commandName": "Project",
+-      "commandLineArgs": "start /project-path \"$(SolutionDir)\\ElectronNET.WebApp\" /watch"
++      "commandLineArgs": "start /project-path \"$(SolutionDir)ElectronNET.WebApp\" /watch"
+     }
+   }
+ }
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/shell.js b/ElectronNET.Host/api/shell.js
+index 4b80f9c12a6a46543cbd73e7e6c6692d7a8a7630..fdb245c2eeb277543cedd36f85a3fb94392bb479 100644
+--- a/ElectronNET.Host/api/shell.js
++++ b/ElectronNET.Host/api/shell.js
+@@ -7,9 +7,9 @@ module.exports = (socket) => {
+         const success = electron_1.shell.showItemInFolder(fullPath);
+         electronSocket.emit('shell-showItemInFolderCompleted', success);
+     });
+-    socket.on('shell-openItem', (fullPath) => {
+-        const success = electron_1.shell.openItem(fullPath);
+-        electronSocket.emit('shell-openItemCompleted', success);
++    socket.on('shell-openPath', async (fullPath) => {
++        const success = await electron_1.shell.openPath(fullPath);
++        electronSocket.emit('shell-openPathCompleted', success);
+     });
+     socket.on('shell-openExternal', (url, options) => {
+         let success = true;
+diff --git a/ElectronNET.Host/api/shell.js.map b/ElectronNET.Host/api/shell.js.map
+index 614fee41233b014b52523991f18306eaa27e3fe6..0ebc9c789fa2fefef0cc8a15152ee9a355aae4b7 100644
+--- a/ElectronNET.Host/api/shell.js.map
++++ b/ElectronNET.Host/api/shell.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"shell.js","sourceRoot":"","sources":["shell.ts"],"names":[],"mappings":";AAAA,uCAAiC;AACjC,IAAI,cAAc,CAAC;AAEnB,iBAAS,CAAC,MAAuB,EAAE,EAAE;IACjC,cAAc,GAAG,MAAM,CAAC;IACxB,MAAM,CAAC,EAAE,CAAC,wBAAwB,EAAE,CAAC,QAAQ,EAAE,EAAE;QAC7C,MAAM,OAAO,GAAG,gBAAK,CAAC,gBAAgB,CAAC,QAAQ,CAAC,CAAC;QAEjD,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,OAAO,CAAC,CAAC;IACpE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gBAAgB,EAAE,CAAC,QAAQ,EAAE,EAAE;QACrC,MAAM,OAAO,GAAG,gBAAK,CAAC,QAAQ,CAAC,QAAQ,CAAC,CAAC;QAEzC,cAAc,CAAC,IAAI,CAAC,yBAAyB,EAAE,OAAO,CAAC,CAAC;IAC5D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oBAAoB,EAAE,CAAC,GAAG,EAAE,OAAO,EAAE,EAAE;QAC7C,IAAI,OAAO,GAAG,IAAI,CAAC;QAEnB,IAAI,OAAO,EAAE;YACT,gBAAK,CAAC,YAAY,CAAC,GAAG,EAAE,OAAO,CAAC,CAAC,KAAK,CAAC,CAAC,KAAK,EAAE,EAAE;gBAC7C,OAAO,GAAG,KAAK,CAAC;gBAChB,cAAc,CAAC,IAAI,CAAC,4BAA4B,EAAE,CAAC,GAAG,EAAE,KAAK,CAAC,CAAC,CAAC;YACpE,CAAC,CAAC,CAAC;SACN;aAAM;YACH,gBAAK,CAAC,YAAY,CAAC,GAAG,CAAC,CAAC,KAAK,CAAC,CAAC,KAAK,EAAE,EAAE;gBACpC,OAAO,GAAG,KAAK,CAAC;gBAChB,cAAc,CAAC,IAAI,CAAC,4BAA4B,EAAE,CAAC,GAAG,EAAE,KAAK,CAAC,CAAC,CAAC;YACpE,CAAC,CAAC,CAAC;SACN;QAED,cAAc,CAAC,IAAI,CAAC,6BAA6B,EAAE,OAAO,CAAC,CAAC;IAChE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,QAAQ,EAAE,EAAE;QAC5C,MAAM,OAAO,GAAG,gBAAK,CAAC,eAAe,CAAC,QAAQ,CAAC,CAAC;QAEhD,cAAc,CAAC,IAAI,CAAC,gCAAgC,EAAE,OAAO,CAAC,CAAC;IACnE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,YAAY,EAAE,GAAG,EAAE;QACzB,gBAAK,CAAC,IAAI,EAAE,CAAC;IACjB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,YAAY,EAAE,SAAS,EAAE,OAAO,EAAE,EAAE;QACtE,MAAM,OAAO,GAAG,gBAAK,CAAC,iBAAiB,CAAC,YAAY,EAAE,SAAS,EAAE,OAAO,CAAC,CAAC;QAE1E,cAAc,CAAC,IAAI,CAAC,kCAAkC,EAAE,OAAO,CAAC,CAAC;IACrE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,wBAAwB,EAAE,CAAC,YAAY,EAAE,EAAE;QACjD,MAAM,eAAe,GAAG,gBAAK,CAAC,gBAAgB,CAAC,YAAY,CAAC,CAAC;QAE7D,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,eAAe,CAAC,CAAC;IAC5E,CAAC,CAAC,CAAC;AACP,CAAC,CAAC"}
+\ No newline at end of file
++{"version":3,"file":"shell.js","sourceRoot":"","sources":["shell.ts"],"names":[],"mappings":";AAAA,uCAAiC;AACjC,IAAI,cAAc,CAAC;AAEnB,iBAAS,CAAC,MAAuB,EAAE,EAAE;IACjC,cAAc,GAAG,MAAM,CAAC;IACxB,MAAM,CAAC,EAAE,CAAC,wBAAwB,EAAE,CAAC,QAAQ,EAAE,EAAE;QAC7C,MAAM,OAAO,GAAG,gBAAK,CAAC,gBAAgB,CAAC,QAAQ,CAAC,CAAC;QAEjD,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,OAAO,CAAC,CAAC;IACpE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gBAAgB,EAAE,KAAK,EAAE,QAAQ,EAAE,EAAE;QAC3C,MAAM,OAAO,GAAG,MAAM,gBAAK,CAAC,QAAQ,CAAC,QAAQ,CAAC,CAAC;QAE/C,cAAc,CAAC,IAAI,CAAC,yBAAyB,EAAE,OAAO,CAAC,CAAC;IAC5D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oBAAoB,EAAE,CAAC,GAAG,EAAE,OAAO,EAAE,EAAE;QAC7C,IAAI,OAAO,GAAG,IAAI,CAAC;QAEnB,IAAI,OAAO,EAAE;YACT,gBAAK,CAAC,YAAY,CAAC,GAAG,EAAE,OAAO,CAAC,CAAC,KAAK,CAAC,CAAC,KAAK,EAAE,EAAE;gBAC7C,OAAO,GAAG,KAAK,CAAC;gBAChB,cAAc,CAAC,IAAI,CAAC,4BAA4B,EAAE,CAAC,GAAG,EAAE,KAAK,CAAC,CAAC,CAAC;YACpE,CAAC,CAAC,CAAC;SACN;aAAM;YACH,gBAAK,CAAC,YAAY,CAAC,GAAG,CAAC,CAAC,KAAK,CAAC,CAAC,KAAK,EAAE,EAAE;gBACpC,OAAO,GAAG,KAAK,CAAC;gBAChB,cAAc,CAAC,IAAI,CAAC,4BAA4B,EAAE,CAAC,GAAG,EAAE,KAAK,CAAC,CAAC,CAAC;YACpE,CAAC,CAAC,CAAC;SACN;QAED,cAAc,CAAC,IAAI,CAAC,6BAA6B,EAAE,OAAO,CAAC,CAAC;IAChE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,QAAQ,EAAE,EAAE;QAC5C,MAAM,OAAO,GAAG,gBAAK,CAAC,eAAe,CAAC,QAAQ,CAAC,CAAC;QAEhD,cAAc,CAAC,IAAI,CAAC,gCAAgC,EAAE,OAAO,CAAC,CAAC;IACnE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,YAAY,EAAE,GAAG,EAAE;QACzB,gBAAK,CAAC,IAAI,EAAE,CAAC;IACjB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,YAAY,EAAE,SAAS,EAAE,OAAO,EAAE,EAAE;QACtE,MAAM,OAAO,GAAG,gBAAK,CAAC,iBAAiB,CAAC,YAAY,EAAE,SAAS,EAAE,OAAO,CAAC,CAAC;QAE1E,cAAc,CAAC,IAAI,CAAC,kCAAkC,EAAE,OAAO,CAAC,CAAC;IACrE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,wBAAwB,EAAE,CAAC,YAAY,EAAE,EAAE;QACjD,MAAM,eAAe,GAAG,gBAAK,CAAC,gBAAgB,CAAC,YAAY,CAAC,CAAC;QAE7D,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,eAAe,CAAC,CAAC;IAC5E,CAAC,CAAC,CAAC;AACP,CAAC,CAAC"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/shell.ts b/ElectronNET.Host/api/shell.ts
+index 708c875779683d2a99cdddf458afbd0940571d18..a53ebf561cea6dce4dfc265df1a0abf9de1e8795 100644
+--- a/ElectronNET.Host/api/shell.ts
++++ b/ElectronNET.Host/api/shell.ts
+@@ -9,10 +9,10 @@ export = (socket: SocketIO.Socket) => {
+         electronSocket.emit('shell-showItemInFolderCompleted', success);
+     });
+ 
+-    socket.on('shell-openItem', (fullPath) => {
+-        const success = shell.openItem(fullPath);
++    socket.on('shell-openPath', async (fullPath) => {
++        const success = await shell.openPath(fullPath);
+ 
+-        electronSocket.emit('shell-openItemCompleted', success);
++        electronSocket.emit('shell-openPathCompleted', success);
+     });
+ 
+     socket.on('shell-openExternal', (url, options) => {
+diff --git a/ElectronNET.Host/package-lock.json b/ElectronNET.Host/package-lock.json
+index 715091773c5f781e5b98ebbec5fcbca3b90ce8e2..fd37698ae1e40d3c250b92957a289ff3d39f46f0 100644
+--- a/ElectronNET.Host/package-lock.json
++++ b/ElectronNET.Host/package-lock.json
+@@ -89,9 +89,9 @@
+             }
+         },
+         "@electron/get": {
+-            "version": "1.10.0",
+-            "resolved": "https://registry.npmjs.org/@electron/get/-/get-1.10.0.tgz",
+-            "integrity": "sha512-hlueNXU51c3CwQjBw/i5fwt+VfQgSQVUTdicpCHkhEjNZaa4CXJ5W1GaxSwtLE2dvRmAHjpIjUMHTqJ53uojfg==",
++            "version": "1.12.2",
++            "resolved": "https://registry.npmjs.org/@electron/get/-/get-1.12.2.tgz",
++            "integrity": "sha512-vAuHUbfvBQpYTJ5wB7uVIDq5c/Ry0fiTBMs7lnEYAo/qXXppIVcWdfBr57u6eRnKdVso7KSiH6p/LbQAG6Izrg==",
+             "dev": true,
+             "requires": {
+                 "debug": "^4.1.1",
+@@ -123,22 +123,14 @@
+         "@types/node": {
+             "version": "10.17.20",
+             "resolved": "https://registry.npmjs.org/@types/node/-/node-10.17.20.tgz",
+-            "integrity": "sha512-XgDgo6W10SeGEAM0k7FosJpvLCynOTYns4Xk3J5HGrA+UI/bKZ30PGMzOP5Lh2zs4259I71FSYLAtjnx3qhObw==",
+-            "dev": true
++            "integrity": "sha512-XgDgo6W10SeGEAM0k7FosJpvLCynOTYns4Xk3J5HGrA+UI/bKZ30PGMzOP5Lh2zs4259I71FSYLAtjnx3qhObw=="
+         },
+         "@types/semver": {
+-            "version": "7.1.0",
+-            "resolved": "https://registry.npmjs.org/@types/semver/-/semver-7.1.0.tgz",
+-            "integrity": "sha512-pOKLaubrAEMUItGNpgwl0HMFPrSAFic8oSVIvfu1UwcgGNmNyK9gyhBHKmBnUTwwVvpZfkzUC0GaMgnL6P86uA==",
++            "version": "7.2.0",
++            "resolved": "https://registry.npmjs.org/@types/semver/-/semver-7.2.0.tgz",
++            "integrity": "sha512-TbB0A8ACUWZt3Y6bQPstW9QNbhNeebdgLX4T/ZfkrswAfUzRiXrgd9seol+X379Wa589Pu4UEx9Uok0D4RjRCQ==",
+             "requires": {
+                 "@types/node": "*"
+-            },
+-            "dependencies": {
+-                "@types/node": {
+-                    "version": "13.13.0",
+-                    "resolved": "https://registry.npmjs.org/@types/node/-/node-13.13.0.tgz",
+-                    "integrity": "sha512-WE4IOAC6r/yBZss1oQGM5zs2D7RuKR6Q+w+X2SouPofnWn+LbCqClRyhO3ZE7Ix8nmFgo/oVuuE01cJT2XB13A=="
+-                }
+             }
+         },
+         "@types/socket.io": {
+@@ -190,6 +182,11 @@
+             "resolved": "https://registry.npmjs.org/async-limiter/-/async-limiter-1.0.1.tgz",
+             "integrity": "sha512-csOlWGAcRFJaI6m+F2WKdnMKr4HhdhFVBk0H/QbJFMCr+uO2kwohwXQPxw/9OCxp05r5ghVBFSyioixx3gfkNQ=="
+         },
++        "at-least-node": {
++            "version": "1.0.0",
++            "resolved": "https://registry.npmjs.org/at-least-node/-/at-least-node-1.0.0.tgz",
++            "integrity": "sha512-+q/t7Ekv1EDY2l6Gda6LLiX14rU9TV20Wa3ofeQmwPFZbOMo9DXrLbOjFaaclkXKWidIaopwAObQDqwWtGUjqg=="
++        },
+         "backo2": {
+             "version": "1.0.2",
+             "resolved": "https://registry.npmjs.org/backo2/-/backo2-1.0.2.tgz",
+@@ -254,9 +251,9 @@
+             "dev": true
+         },
+         "builder-util-runtime": {
+-            "version": "8.6.2",
+-            "resolved": "https://registry.npmjs.org/builder-util-runtime/-/builder-util-runtime-8.6.2.tgz",
+-            "integrity": "sha512-9QnIBISfhgQ2BxtRLidVqf/v5HD73vSKZDllpUmGd2L6VORGQk7cZAPmPtw4HQM3gPBelyVJ5yIjMNZ8xjmd1A==",
++            "version": "8.7.0",
++            "resolved": "https://registry.npmjs.org/builder-util-runtime/-/builder-util-runtime-8.7.0.tgz",
++            "integrity": "sha512-G1AqqVM2vYTrSFR982c1NNzwXKrGLQjVjaZaWQdn4O6Z3YKjdMDofw88aD9jpyK9ZXkrCxR0tI3Qe9wNbyTlXg==",
+             "requires": {
+                 "debug": "^4.1.1",
+                 "sax": "^1.2.4"
+@@ -440,9 +437,9 @@
+             "dev": true
+         },
+         "electron": {
+-            "version": "8.2.3",
+-            "resolved": "https://registry.npmjs.org/electron/-/electron-8.2.3.tgz",
+-            "integrity": "sha512-FJUp103c8yJBoAaj/QM/OBde57iJh95u1yGJBytMUXmLFSsx78LmNE03QN4XCODyzi76IEcasvUcK6scogRLbQ==",
++            "version": "9.0.0",
++            "resolved": "https://registry.npmjs.org/electron/-/electron-9.0.0.tgz",
++            "integrity": "sha512-JsaSQNPh+XDYkLj8APtVKTtvpb86KIG57W5OOss4TNrn8L3isC9LsCITwfnVmGIXHhvX6oY/weCtN5hAAytjVg==",
+             "dev": true,
+             "requires": {
+                 "@electron/get": "^1.0.1",
+@@ -451,26 +448,52 @@
+             },
+             "dependencies": {
+                 "@types/node": {
+-                    "version": "12.12.36",
+-                    "resolved": "https://registry.npmjs.org/@types/node/-/node-12.12.36.tgz",
+-                    "integrity": "sha512-hmmypvyO/uTLFYCYu6Hlb3ydeJ11vXRxg8/WJ0E3wvwmPO0y47VqnfmXFVuWlysO0Zyj+je1Y33rQeuYkZ51GQ==",
++                    "version": "12.12.42",
++                    "resolved": "https://registry.npmjs.org/@types/node/-/node-12.12.42.tgz",
++                    "integrity": "sha512-R/9QdYFLL9dE9l5cWWzWIZByVGFd7lk7JVOJ7KD+E1SJ4gni7XJRLz9QTjyYQiHIqEAgku9VgxdLjMlhhUaAFg==",
+                     "dev": true
+                 }
+             }
+         },
+         "electron-updater": {
+-            "version": "4.2.5",
+-            "resolved": "https://registry.npmjs.org/electron-updater/-/electron-updater-4.2.5.tgz",
+-            "integrity": "sha512-ir8SI3capF5pN4LTQY79bP7oqiBKjgtdDW378xVId5VcGUZ+Toei2j+fgx1mq3y4Qg19z4HqLxEZ9FqMD0T0RA==",
++            "version": "4.3.1",
++            "resolved": "https://registry.npmjs.org/electron-updater/-/electron-updater-4.3.1.tgz",
++            "integrity": "sha512-UDC5AHCgeiHJYDYWZG/rsl1vdAFKqI/Lm7whN57LKAk8EfhTewhcEHzheRcncLgikMcQL8gFo1KeX51tf5a5Wg==",
+             "requires": {
+                 "@types/semver": "^7.1.0",
+-                "builder-util-runtime": "8.6.2",
+-                "fs-extra": "^8.1.0",
++                "builder-util-runtime": "8.7.0",
++                "fs-extra": "^9.0.0",
+                 "js-yaml": "^3.13.1",
+                 "lazy-val": "^1.0.4",
+                 "lodash.isequal": "^4.5.0",
+-                "pako": "^1.0.11",
+                 "semver": "^7.1.3"
++            },
++            "dependencies": {
++                "fs-extra": {
++                    "version": "9.0.0",
++                    "resolved": "https://registry.npmjs.org/fs-extra/-/fs-extra-9.0.0.tgz",
++                    "integrity": "sha512-pmEYSk3vYsG/bF651KPUXZ+hvjpgWYw/Gc7W9NFUe3ZVLczKKWIij3IKpOrQcdw4TILtibFslZ0UmR8Vvzig4g==",
++                    "requires": {
++                        "at-least-node": "^1.0.0",
++                        "graceful-fs": "^4.2.0",
++                        "jsonfile": "^6.0.1",
++                        "universalify": "^1.0.0"
++                    }
++                },
++                "jsonfile": {
++                    "version": "6.0.1",
++                    "resolved": "https://registry.npmjs.org/jsonfile/-/jsonfile-6.0.1.tgz",
++                    "integrity": "sha512-jR2b5v7d2vIOust+w3wtFKZIfpC2pnRmFAhAC/BuweZFQR8qZzxH1OyrQ10HmdVYiXWkYUqPVsz91cG7EL2FBg==",
++                    "requires": {
++                        "graceful-fs": "^4.1.6",
++                        "universalify": "^1.0.0"
++                    }
++                },
++                "universalify": {
++                    "version": "1.0.0",
++                    "resolved": "https://registry.npmjs.org/universalify/-/universalify-1.0.0.tgz",
++                    "integrity": "sha512-rb6X1W158d7pRQBg5gkR8uPaSfiids68LTJQYOtEUhoJUWBdaQHsuT/EUduxXYxcrt4r5PJ4fuHW1MHT6p0qug=="
++                }
+             }
+         },
+         "encodeurl": {
+@@ -614,6 +637,7 @@
+             "version": "8.1.0",
+             "resolved": "https://registry.npmjs.org/fs-extra/-/fs-extra-8.1.0.tgz",
+             "integrity": "sha512-yhlQgA6mnOJUKOsRUFsgJdQCvkKhcz8tlZG5HBQfReYZy46OwLcY+Zia0mtdHsOo9y/hP+CxMN0TU9QxoOtG4g==",
++            "dev": true,
+             "requires": {
+                 "graceful-fs": "^4.2.0",
+                 "jsonfile": "^4.0.0",
+@@ -809,6 +833,7 @@
+             "version": "4.0.0",
+             "resolved": "https://registry.npmjs.org/jsonfile/-/jsonfile-4.0.0.tgz",
+             "integrity": "sha1-h3Gq4HmbZAdrdmQPygWPnBDjPss=",
++            "dev": true,
+             "requires": {
+                 "graceful-fs": "^4.1.6"
+             }
+@@ -955,11 +980,6 @@
+             "integrity": "sha512-s73XxOZ4zpt1edZYZzvhqFa6uvQc1vwUa0K0BdtIZgQMAJj9IbebH+JkgKZc9h+B05PKHLOTl4ajG1BmNrVZlw==",
+             "dev": true
+         },
+-        "pako": {
+-            "version": "1.0.11",
+-            "resolved": "https://registry.npmjs.org/pako/-/pako-1.0.11.tgz",
+-            "integrity": "sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw=="
+-        },
+         "parseqs": {
+             "version": "0.0.5",
+             "resolved": "https://registry.npmjs.org/parseqs/-/parseqs-0.0.5.tgz",
+@@ -1400,7 +1420,8 @@
+         "universalify": {
+             "version": "0.1.2",
+             "resolved": "https://registry.npmjs.org/universalify/-/universalify-0.1.2.tgz",
+-            "integrity": "sha512-rBJeI5CXAlmy1pV+617WB9J63U6XcazHHF2f2dbJix4XzpUF0RS3Zbj0FGIOCAva5P/d/GBOYaACQ1w+0azUkg=="
++            "integrity": "sha512-rBJeI5CXAlmy1pV+617WB9J63U6XcazHHF2f2dbJix4XzpUF0RS3Zbj0FGIOCAva5P/d/GBOYaACQ1w+0azUkg==",
++            "dev": true
+         },
+         "url-parse-lax": {
+             "version": "3.0.0",
+diff --git a/ElectronNET.Host/package.json b/ElectronNET.Host/package.json
+index a9f49c1264d620e62f03a4f51e0ae73cdc74c0e7..b6634da0d3e1fdab6d71524a5c2893dfb9fa078b 100644
+--- a/ElectronNET.Host/package.json
++++ b/ElectronNET.Host/package.json
+@@ -13,7 +13,7 @@
+     },
+     "dependencies": {
+         "dasherize": "^2.0.0",
+-        "electron-updater": "^4.2.5",
++        "electron-updater": "^4.3.1",
+         "image-size": "^0.7.4",
+         "portscanner": "^2.2.0",
+         "socket.io": "^2.3.0"
+@@ -21,7 +21,7 @@
+     "devDependencies": {
+         "@types/node": "^10.14.4",
+         "@types/socket.io": "^2.1.2",
+-        "electron": "^8.2.3",
++        "electron": "^9.0.0",
+         "tslint": "^6.1.1",
+         "typescript": "^3.8.3"
+     }
+diff --git a/ElectronNET.WebApp/Controllers/MenusController.cs b/ElectronNET.WebApp/Controllers/MenusController.cs
+index b961554f83868d24a1abc1004bc9b4027a29cebe..ebf6a9be593f841ff44bac335f027471e14528f5 100644
+--- a/ElectronNET.WebApp/Controllers/MenusController.cs
++++ b/ElectronNET.WebApp/Controllers/MenusController.cs
+@@ -2,27 +2,20 @@
+ using Microsoft.AspNetCore.Mvc;
+ using ElectronNET.API.Entities;
+ using ElectronNET.API;
+-using Microsoft.Extensions.Hosting;
+ 
+ namespace ElectronNET.WebApp.Controllers
+ {
+     public class MenusController : Controller
+     {
+-        public MenusController(IHostApplicationLifetime hostApplicationLifetime)
++        public IActionResult Index()
+         {
+-            hostApplicationLifetime.ApplicationStarted.Register(() =>
++            if (HybridSupport.IsElectronActive)
+             {
+-                if (HybridSupport.IsElectronActive)
++                if (Electron.App.IsReady)
+                 {
+                     CreateContextMenu();
+                 }
+-            });
+-        }
+ 
+-        public IActionResult Index()
+-        {
+-            if (HybridSupport.IsElectronActive)
+-            {
+                 var menu = new MenuItem[] {
+                 new MenuItem { Label = "Edit", Submenu = new MenuItem[] {
+                     new MenuItem { Label = "Undo", Accelerator = "CmdOrCtrl+Z", Role = MenuRole.undo },
+diff --git a/ElectronNET.WebApp/ElectronHostHook/connector.js b/ElectronNET.WebApp/ElectronHostHook/connector.js
+index 68734001c506a05045964ba760c5bbf468a8a525..5e5a0e8187ce7a70f2387b00dc33a7141fee2984 100644
+--- a/ElectronNET.WebApp/ElectronHostHook/connector.js
++++ b/ElectronNET.WebApp/ElectronHostHook/connector.js
+@@ -1,5 +1,6 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
++exports.Connector = void 0;
+ class Connector {
+     constructor(socket, 
+     // @ts-ignore
+diff --git a/ElectronNET.WebApp/ElectronHostHook/connector.js.map b/ElectronNET.WebApp/ElectronHostHook/connector.js.map
+index 06a767af16c0b545aaced0db08905e524491f6de..be84b69006b544dbc78a0813c7389449a40417db 100644
+--- a/ElectronNET.WebApp/ElectronHostHook/connector.js.map
++++ b/ElectronNET.WebApp/ElectronHostHook/connector.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"connector.js","sourceRoot":"","sources":["connector.ts"],"names":[],"mappings":";;AAAA,MAAa,SAAS;IAClB,YAAoB,MAAuB;IACvC,aAAa;IACN,GAAiB;QAFR,WAAM,GAAN,MAAM,CAAiB;QAEhC,QAAG,GAAH,GAAG,CAAc;IAAI,CAAC;IAEjC,EAAE,CAAC,GAAW,EAAE,cAAwB;QACpC,IAAI,CAAC,MAAM,CAAC,EAAE,CAAC,GAAG,EAAE,CAAC,GAAG,IAAW,EAAE,EAAE;YACnC,MAAM,EAAE,GAAW,IAAI,CAAC,GAAG,EAAE,CAAC;YAE9B,IAAI;gBACA,cAAc,CAAC,GAAG,IAAI,EAAE,CAAC,IAAI,EAAE,EAAE;oBAC7B,IAAI,IAAI,EAAE;wBACN,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,WAAW,EAAE,EAAE,EAAE,IAAI,CAAC,CAAC;qBACjD;gBACL,CAAC,CAAC,CAAC;aACN;YAAC,OAAO,KAAK,EAAE;gBACZ,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,QAAQ,EAAE,EAAE,EAAE,qBAAqB,EAAE,KAAK,CAAC,CAAC;aACtE;QACL,CAAC,CAAC,CAAC;IACP,CAAC;CACJ;AApBD,8BAoBC"}
+\ No newline at end of file
++{"version":3,"file":"connector.js","sourceRoot":"","sources":["connector.ts"],"names":[],"mappings":";;;AAAA,MAAa,SAAS;IAClB,YAAoB,MAAuB;IACvC,aAAa;IACN,GAAiB;QAFR,WAAM,GAAN,MAAM,CAAiB;QAEhC,QAAG,GAAH,GAAG,CAAc;IAAI,CAAC;IAEjC,EAAE,CAAC,GAAW,EAAE,cAAwB;QACpC,IAAI,CAAC,MAAM,CAAC,EAAE,CAAC,GAAG,EAAE,CAAC,GAAG,IAAW,EAAE,EAAE;YACnC,MAAM,EAAE,GAAW,IAAI,CAAC,GAAG,EAAE,CAAC;YAE9B,IAAI;gBACA,cAAc,CAAC,GAAG,IAAI,EAAE,CAAC,IAAI,EAAE,EAAE;oBAC7B,IAAI,IAAI,EAAE;wBACN,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,WAAW,EAAE,EAAE,EAAE,IAAI,CAAC,CAAC;qBACjD;gBACL,CAAC,CAAC,CAAC;aACN;YAAC,OAAO,KAAK,EAAE;gBACZ,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,GAAG,GAAG,QAAQ,EAAE,EAAE,EAAE,qBAAqB,EAAE,KAAK,CAAC,CAAC;aACtE;QACL,CAAC,CAAC,CAAC;IACP,CAAC;CACJ;AApBD,8BAoBC"}
+\ No newline at end of file
+diff --git a/ElectronNET.WebApp/ElectronHostHook/excelCreator.js b/ElectronNET.WebApp/ElectronHostHook/excelCreator.js
+index bab2f867d581e41fefc9652a762a81dec7ce33c7..cb0a22b6107a866c80fe4b70fc49bdaf7943b49e 100644
+--- a/ElectronNET.WebApp/ElectronHostHook/excelCreator.js
++++ b/ElectronNET.WebApp/ElectronHostHook/excelCreator.js
+@@ -9,6 +9,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
+     });
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
++exports.ExcelCreator = void 0;
+ const Excel = require("exceljs");
+ class ExcelCreator {
+     create(path) {
+diff --git a/ElectronNET.WebApp/ElectronHostHook/excelCreator.js.map b/ElectronNET.WebApp/ElectronHostHook/excelCreator.js.map
+index b75f85d4b1b477ee1d563117a4d717628d79bac9..813defbd587d38d7a46162b116686e6c0b2703f7 100644
+--- a/ElectronNET.WebApp/ElectronHostHook/excelCreator.js.map
++++ b/ElectronNET.WebApp/ElectronHostHook/excelCreator.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"excelCreator.js","sourceRoot":"","sources":["excelCreator.ts"],"names":[],"mappings":";;;;;;;;;;;AAAA,iCAAiC;AAGjC,MAAa,YAAY;IACf,MAAM,CAAC,IAAY;;YACrB,MAAM,QAAQ,GAAa,IAAI,KAAK,CAAC,QAAQ,EAAE,CAAC;YAChD,MAAM,SAAS,GAAc,QAAQ,CAAC,YAAY,CAAC,UAAU,CAAC,CAAC;YAC/D,SAAS,CAAC,OAAO,GAAG;gBAChB,EAAE,MAAM,EAAE,IAAI,EAAE,GAAG,EAAE,IAAI,EAAE,KAAK,EAAE,EAAE,EAAE;gBACtC,EAAE,MAAM,EAAE,MAAM,EAAE,GAAG,EAAE,MAAM,EAAE,KAAK,EAAE,EAAE,EAAE;gBAC1C,EAAE,MAAM,EAAE,UAAU,EAAE,GAAG,EAAE,UAAU,EAAE,KAAK,EAAE,EAAE,EAAE,YAAY,EAAE,CAAC,EAAE;aACtE,CAAC;YACF,SAAS,CAAC,MAAM,CAAC,EAAE,EAAE,EAAE,CAAC,EAAE,IAAI,EAAE,UAAU,EAAE,QAAQ,EAAE,IAAI,IAAI,CAAC,IAAI,EAAE,CAAC,EAAE,CAAC,CAAC,EAAE,CAAC,CAAC;YAC9E,SAAS,CAAC,MAAM,CAAC,EAAE,EAAE,EAAE,CAAC,EAAE,IAAI,EAAE,UAAU,EAAE,QAAQ,EAAE,IAAI,IAAI,CAAC,IAAI,EAAE,CAAC,EAAE,CAAC,CAAC,EAAE,CAAC,CAAC;YAE9E,MAAM,QAAQ,CAAC,IAAI,CAAC,SAAS,CAAC,IAAI,GAAG,eAAe,CAAC,CAAC;YAEtD,OAAO,qBAAqB,CAAC;QACjC,CAAC;KAAA;CACJ;AAhBD,oCAgBC"}
+\ No newline at end of file
++{"version":3,"file":"excelCreator.js","sourceRoot":"","sources":["excelCreator.ts"],"names":[],"mappings":";;;;;;;;;;;;AAAA,iCAAiC;AAGjC,MAAa,YAAY;IACf,MAAM,CAAC,IAAY;;YACrB,MAAM,QAAQ,GAAa,IAAI,KAAK,CAAC,QAAQ,EAAE,CAAC;YAChD,MAAM,SAAS,GAAc,QAAQ,CAAC,YAAY,CAAC,UAAU,CAAC,CAAC;YAC/D,SAAS,CAAC,OAAO,GAAG;gBAChB,EAAE,MAAM,EAAE,IAAI,EAAE,GAAG,EAAE,IAAI,EAAE,KAAK,EAAE,EAAE,EAAE;gBACtC,EAAE,MAAM,EAAE,MAAM,EAAE,GAAG,EAAE,MAAM,EAAE,KAAK,EAAE,EAAE,EAAE;gBAC1C,EAAE,MAAM,EAAE,UAAU,EAAE,GAAG,EAAE,UAAU,EAAE,KAAK,EAAE,EAAE,EAAE,YAAY,EAAE,CAAC,EAAE;aACtE,CAAC;YACF,SAAS,CAAC,MAAM,CAAC,EAAE,EAAE,EAAE,CAAC,EAAE,IAAI,EAAE,UAAU,EAAE,QAAQ,EAAE,IAAI,IAAI,CAAC,IAAI,EAAE,CAAC,EAAE,CAAC,CAAC,EAAE,CAAC,CAAC;YAC9E,SAAS,CAAC,MAAM,CAAC,EAAE,EAAE,EAAE,CAAC,EAAE,IAAI,EAAE,UAAU,EAAE,QAAQ,EAAE,IAAI,IAAI,CAAC,IAAI,EAAE,CAAC,EAAE,CAAC,CAAC,EAAE,CAAC,CAAC;YAE9E,MAAM,QAAQ,CAAC,IAAI,CAAC,SAAS,CAAC,IAAI,GAAG,eAAe,CAAC,CAAC;YAEtD,OAAO,qBAAqB,CAAC;QACjC,CAAC;KAAA;CACJ;AAhBD,oCAgBC"}
+\ No newline at end of file
+diff --git a/ElectronNET.WebApp/ElectronHostHook/index.js b/ElectronNET.WebApp/ElectronHostHook/index.js
+index b6ea7139d10bad3c4429b2e8aacf922b053933a0..5eca5dce570a56b573571c9ecfc136696efc0d4b 100644
+--- a/ElectronNET.WebApp/ElectronHostHook/index.js
++++ b/ElectronNET.WebApp/ElectronHostHook/index.js
+@@ -9,6 +9,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
+     });
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
++exports.HookService = void 0;
+ const connector_1 = require("./connector");
+ const excelCreator_1 = require("./excelCreator");
+ class HookService extends connector_1.Connector {
+diff --git a/ElectronNET.WebApp/ElectronHostHook/index.js.map b/ElectronNET.WebApp/ElectronHostHook/index.js.map
+index 258351d08fd68b99b49ae89fc4eb05d831cfecd7..734178588b47cb26b031c8c2ef79142223742de4 100644
+--- a/ElectronNET.WebApp/ElectronHostHook/index.js.map
++++ b/ElectronNET.WebApp/ElectronHostHook/index.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"index.js","sourceRoot":"","sources":["index.ts"],"names":[],"mappings":";;;;;;;;;;;AAEA,2CAAwC;AACxC,iDAA8C;AAE9C,MAAa,WAAY,SAAQ,qBAAS;IACtC,YAAY,MAAuB,EAAS,GAAiB;QACzD,KAAK,CAAC,MAAM,EAAE,GAAG,CAAC,CAAC;QADqB,QAAG,GAAH,GAAG,CAAc;IAE7D,CAAC;IAED,WAAW;QACP,8CAA8C;QAC9C,IAAI,CAAC,EAAE,CAAC,mBAAmB,EAAE,CAAO,IAAI,EAAE,IAAI,EAAE,EAAE;YAC9C,MAAM,YAAY,GAAiB,IAAI,2BAAY,EAAE,CAAC;YACtD,MAAM,MAAM,GAAW,MAAM,YAAY,CAAC,MAAM,CAAC,IAAI,CAAC,CAAC;YAEvD,IAAI,CAAC,MAAM,CAAC,CAAC;QACjB,CAAC,CAAA,CAAC,CAAC;IACP,CAAC;CACJ;AAdD,kCAcC"}
+\ No newline at end of file
++{"version":3,"file":"index.js","sourceRoot":"","sources":["index.ts"],"names":[],"mappings":";;;;;;;;;;;;AAEA,2CAAwC;AACxC,iDAA8C;AAE9C,MAAa,WAAY,SAAQ,qBAAS;IACtC,YAAY,MAAuB,EAAS,GAAiB;QACzD,KAAK,CAAC,MAAM,EAAE,GAAG,CAAC,CAAC;QADqB,QAAG,GAAH,GAAG,CAAc;IAE7D,CAAC;IAED,WAAW;QACP,8CAA8C;QAC9C,IAAI,CAAC,EAAE,CAAC,mBAAmB,EAAE,CAAO,IAAI,EAAE,IAAI,EAAE,EAAE;YAC9C,MAAM,YAAY,GAAiB,IAAI,2BAAY,EAAE,CAAC;YACtD,MAAM,MAAM,GAAW,MAAM,YAAY,CAAC,MAAM,CAAC,IAAI,CAAC,CAAC;YAEvD,IAAI,CAAC,MAAM,CAAC,CAAC;QACjB,CAAC,CAAA,CAAC,CAAC;IACP,CAAC;CACJ;AAdD,kCAcC"}
+\ No newline at end of file
+diff --git a/ElectronNET.WebApp/Startup.cs b/ElectronNET.WebApp/Startup.cs
+index 863b7b64462149b5dafd061992e12a6f75f2f962..f6131b3f6edcb44e2b8b53bd6cda39171817fdba 100644
+--- a/ElectronNET.WebApp/Startup.cs
++++ b/ElectronNET.WebApp/Startup.cs
+@@ -4,7 +4,6 @@ using Microsoft.AspNetCore.Builder;
+ using Microsoft.AspNetCore.Hosting;
+ using Microsoft.Extensions.Configuration;
+ using Microsoft.Extensions.DependencyInjection;
+-using Microsoft.Extensions.Logging;
+ using Microsoft.Extensions.Hosting;
+ 
+ namespace ElectronNET.WebApp

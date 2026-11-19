@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+project(installed_rmlui_client LANGUAGES CXX)
+find_package(RmlUi CONFIG REQUIRED PATHS "${SDK_ROOT}" NO_DEFAULT_PATH)
+add_executable(installed_client "${SDK_PROBE_SOURCE}")
+target_compile_features(installed_client PRIVATE cxx_std_17)
+target_link_libraries(installed_client PRIVATE RmlUi::Core RmlUi::Debugger)

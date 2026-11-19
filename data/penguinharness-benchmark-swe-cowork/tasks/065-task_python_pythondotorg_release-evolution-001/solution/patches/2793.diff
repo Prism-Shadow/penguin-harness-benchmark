@@ -1,0 +1,139 @@
+diff --git a/downloads/models.py b/downloads/models.py
+index 6a810c393ae0d4476833c63eac6b1cbb06922e38..aa929855dd0c8adb3aa4171889707548fbcab537 100644
+--- a/downloads/models.py
++++ b/downloads/models.py
+@@ -158,24 +158,29 @@ def update_supernav():
+     if not latest_python3:
+         return
+ 
++    try:
++        latest_pymanager = Release.objects.latest_pymanager()
++    except Release.DoesNotExist:
++        latest_pymanager = None
++
+     python_files = []
+     for o in OS.objects.all():
+         data = {
+             'os': o,
+             'python3': None,
++            'pymanager': None,
+         }
+ 
+-        release_file = latest_python3.download_file_for_os(o.slug)
+-        if not release_file:
+-            continue
+-        data['python3'] = release_file
++        data['python3'] = latest_python3.download_file_for_os(o.slug)
++        if latest_pymanager:
++            data['pymanager'] = latest_pymanager.download_file_for_os(o.slug)
+ 
+         python_files.append(data)
+ 
+     if not python_files:
+         return
+ 
+-    if not all(f['python3'] for f in python_files):
++    if not all(f['python3'] or f['pymanager'] for f in python_files):
+         # We have a latest Python release, different OSes, but don't have release
+         # files for the release, so return early.
+         return
+@@ -287,6 +292,7 @@ def purge_fastly_download_pages(sender, instance, **kwargs):
+         purge_url('/downloads/feed.rss')
+         purge_url('/downloads/latest/python2/')
+         purge_url('/downloads/latest/python3/')
++        purge_url('/downloads/latest/pymanager/')
+         purge_url('/downloads/macos/')
+         purge_url('/downloads/source/')
+         purge_url('/downloads/windows/')
+@@ -308,9 +314,7 @@ def update_download_supernav_and_boxes(sender, instance, **kwargs):
+         return
+ 
+     if instance.is_published:
+-        # Supernav only has download buttons for Python 3.
+-        if instance.version == instance.PYTHON3:
+-            update_supernav()
++        update_supernav()
+         update_download_landing_sources_box()
+         update_homepage_download_box()
+ 
+diff --git a/downloads/tests/test_models.py b/downloads/tests/test_models.py
+index e73858d3bbd02434b3bfcd47cf38cd5a8267b7fb..bd26c3b58a75741c5aa74bec73b9b4835cf2e551 100644
+--- a/downloads/tests/test_models.py
++++ b/downloads/tests/test_models.py
+@@ -1,4 +1,4 @@
+-from ..models import Release
++from ..models import Release, ReleaseFile
+ from .base import BaseDownloadTests
+ 
+ 
+@@ -95,3 +95,54 @@ class DownloadModelTests(BaseDownloadTests):
+         self.assertFalse(invalid_release.is_version_at_least_3_5)
+         self.assertFalse(invalid_release.is_version_at_least_3_9)
+         self.assertFalse(invalid_release.is_version_at_least_3_14)
++
++    def test_update_supernav(self):
++        from ..models import update_supernav
++        from boxes.models import Box
++
++        release = Release.objects.create(
++            name='Python install manager 25.0',
++            version=Release.PYMANAGER,
++            is_latest=True,
++            is_published=True,
++        )
++
++        for os, slug in [
++            (self.windows, 'python3.10-windows'),
++            (self.osx, 'python3.10-macos'),
++            (self.linux, 'python3.10-linux'),
++        ]:
++            ReleaseFile.objects.create(
++                os=os,
++                release=self.python_3,
++                slug=slug,
++                name='Python 3.10',
++                url='/ftp/python/{}.zip'.format(slug),
++                download_button=True,
++            )
++
++        update_supernav()
++
++        content = Box.objects.get(label='supernav-python-downloads').content.rendered
++        self.assertIn('class="download-os-windows"', content)
++        self.assertNotIn('pymanager-25.0.msix', content)
++        self.assertIn('python3.10-windows.zip', content)
++        self.assertIn('class="download-os-macos"', content)
++        self.assertIn('python3.10-macos.zip', content)
++        self.assertIn('class="download-os-linux"', content)
++        self.assertIn('python3.10-linux.zip', content)
++
++        ReleaseFile.objects.create(
++            os=self.windows,
++            release=release,
++            name='MSIX',
++            url='/ftp/python/pymanager/pymanager-25.0.msix',
++            download_button=True,
++        )
++
++        update_supernav()
++
++        content = Box.objects.get(label='supernav-python-downloads').content.rendered
++        self.assertIn('class="download-os-windows"', content)
++        self.assertIn('pymanager-25.0.msix', content)
++        self.assertIn('python3.10-windows.zip', content)
+diff --git a/templates/downloads/supernav.html b/templates/downloads/supernav.html
+index 12568eadbc279809ddf3d432d42a50475d228065..edd23dc82af3b610f6306b4ee4fd319bf05c644a 100644
+--- a/templates/downloads/supernav.html
++++ b/templates/downloads/supernav.html
+@@ -10,8 +10,10 @@
+ 
+         {% if data.pymanager %}
+         <p><a class="button" href="{{ data.pymanager.url }}">Python install manager</a></p>
++        {% if data.python3 %}
+         <p>Or get the standalone installer for <a class="button" href="{{ data.python3.url }}">{{ data.python3.release.name }}</a></p>
+-        {% else %}
++        {% endif %}
++        {% elif data.python3 %}
+         <p>
+             <a class="button" href="{{ data.python3.url }}">{{ data.python3.release.name }}</a>
+         </p>

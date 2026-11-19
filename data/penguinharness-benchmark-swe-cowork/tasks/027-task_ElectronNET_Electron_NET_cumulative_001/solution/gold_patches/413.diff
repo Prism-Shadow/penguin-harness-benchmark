@@ -1,0 +1,890 @@
+diff --git a/Changelog.md b/Changelog.md
+index 0528feddefe66199ca792642fda251097a328d93..3983532bdaa5c93063a36ed76057a1a56f6c8cc0 100644
+--- a/Changelog.md
++++ b/Changelog.md
+@@ -2,9 +2,19 @@
+ 
+ # 8.31.3
+ 
++ElectronNET.CLI:
++
++* New Feature: Added config parameter (thanks [konstantingross](https://github.com/konstantingross)) [\#409](https://github.com/ElectronNET/Electron.NET/pull/409)
++
+ ElectronNET.API:
+ 
+ * New Feature: PowerMonitor API Support (thanks [gustavo-lara-molina](https://github.com/gustavo-lara-molina)) [\#399](https://github.com/ElectronNET/Electron.NET/pull/399)
++* New Feature: NativeTheme API Support (thanks [konstantingross](https://github.com/konstantingross)) [\#402](https://github.com/ElectronNET/Electron.NET/pull/402)
++* App-Api Enhancement: MenuItems with Submenus need an submenu type workaround [\#412](https://github.com/ElectronNET/Electron.NET/issues/412)
++* App-Api Enhancement: Added UserAgentFallback (thanks [Mandrakia](https://github.com/Mandrakia)) [\#406](https://github.com/ElectronNET/Electron.NET/pull/406)
++* Notification-Api Enhancement: Added missing properties in Notifications (thanks [konstantingross](https://github.com/konstantingross)) [\#410](https://github.com/ElectronNET/Electron.NET/pull/410)
++* MacOS Enhancement: Application exit logic (thanks [dafergu2](https://github.com/dafergu2)) [\#405](https://github.com/ElectronNET/Electron.NET/pull/405)
++* Fixed bug: ElectronNET.API.Entities.WebPreferences.ContextIsolation [DefaultValue(true)] [\#411](https://github.com/ElectronNET/Electron.NET/issues/411)
+ 
+ # Released
+ 
+diff --git a/ElectronNET.API/Cookies.cs b/ElectronNET.API/Cookies.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..98be3d423a126d12ebc0505cfe749e50a6fcf526
+--- /dev/null
++++ b/ElectronNET.API/Cookies.cs
+@@ -0,0 +1,154 @@
++﻿using System;
++using System.Threading.Tasks;
++using ElectronNET.API.Entities;
++using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++using Newtonsoft.Json.Serialization;
++
++namespace ElectronNET.API
++{
++    /// <summary>
++    /// Query and modify a session's cookies.
++    /// </summary>
++    public class Cookies
++    {
++        /// <summary>
++        /// Gets the identifier.
++        /// </summary>
++        /// <value>
++        /// The identifier.
++        /// </value>
++        public int Id { get; private set; }
++
++        internal Cookies(int id)
++        {
++            Id = id;
++        }
++
++        /// <summary>
++        /// Emitted when a cookie is changed because it was added, edited, removed, or expired.
++        /// </summary>
++        public event Action<Cookie, CookieChangedCause, bool> OnChanged
++        {
++            add
++            {
++                if (_changed == null)
++                {
++                    BridgeConnector.Socket.On("webContents-session-cookies-changed" + Id, (args) =>
++                    {
++                        Cookie cookie = ((JArray)args)[0].ToObject<Cookie>();
++                        CookieChangedCause cause = ((JArray)args)[1].ToObject<CookieChangedCause>();
++                        bool removed = ((JArray)args)[2].ToObject<bool>();
++                        _changed(cookie, cause, removed);
++                    });
++
++                    BridgeConnector.Socket.Emit("register-webContents-session-cookies-changed", Id);
++                }
++                _changed += value;
++            }
++            remove
++            {
++                _changed -= value;
++
++                if (_changed == null)
++                    BridgeConnector.Socket.Off("webContents-session-cookies-changed" + Id);
++            }
++        }
++
++        private event Action<Cookie, CookieChangedCause, bool> _changed;
++
++        /// <summary>
++        /// Sends a request to get all cookies matching filter, and resolves a callack with the response.
++        /// </summary>
++        /// <param name="filter">
++        /// </param>
++        /// <returns>A task which resolves an array of cookie objects.</returns>
++        public Task<Cookie[]> GetAsync(CookieFilter filter)
++        {
++            var taskCompletionSource = new TaskCompletionSource<Cookie[]>();
++            string guid = Guid.NewGuid().ToString();
++
++            BridgeConnector.Socket.On("webContents-session-cookies-get-completed" + guid, (cookies) =>
++            {
++                Cookie[] result = ((JArray)cookies).ToObject<Cookie[]>();
++
++                BridgeConnector.Socket.Off("webContents-session-cookies-get-completed" + guid);
++                taskCompletionSource.SetResult(result);
++            });
++
++            BridgeConnector.Socket.Emit("webContents-session-cookies-get", Id, JObject.FromObject(filter, _jsonSerializer), guid);
++
++            return taskCompletionSource.Task;
++        }
++
++        /// <summary>
++        /// 
++        /// </summary>
++        /// <param name="details"></param>
++        /// <returns></returns>
++        public Task SetAsync(CookieDetails details)
++        {
++            var taskCompletionSource = new TaskCompletionSource<object>();
++            string guid = Guid.NewGuid().ToString();
++
++            BridgeConnector.Socket.On("webContents-session-cookies-set-completed" + guid, () =>
++            {
++                BridgeConnector.Socket.Off("webContents-session-cookies-set-completed" + guid);
++                taskCompletionSource.SetResult(null);
++            });
++
++            BridgeConnector.Socket.Emit("webContents-session-cookies-set", Id, JObject.FromObject(details, _jsonSerializer), guid);
++
++            return taskCompletionSource.Task;
++        }
++
++        /// <summary>
++        /// Removes the cookies matching url and name
++        /// </summary>
++        /// <param name="url">The URL associated with the cookie.</param>
++        /// <param name="name">The name of cookie to remove.</param>
++        /// <returns>A task which resolves when the cookie has been removed</returns>
++        public Task RemoveAsync(string url, string name)
++        {
++            var taskCompletionSource = new TaskCompletionSource<object>();
++            string guid = Guid.NewGuid().ToString();
++
++            BridgeConnector.Socket.On("webContents-session-cookies-remove-completed" + guid, () =>
++            {
++                BridgeConnector.Socket.Off("webContents-session-cookies-remove-completed" + guid);
++                taskCompletionSource.SetResult(null);
++            });
++
++            BridgeConnector.Socket.Emit("webContents-session-cookies-remove", Id, url, name, guid);
++
++            return taskCompletionSource.Task;
++        }
++
++        /// <summary>
++        /// Writes any unwritten cookies data to disk.
++        /// </summary>
++        /// <returns>A task which resolves when the cookie store has been flushed</returns>
++        public Task FlushStoreAsync()
++        {
++            var taskCompletionSource = new TaskCompletionSource<object>();
++            string guid = Guid.NewGuid().ToString();
++
++            BridgeConnector.Socket.On("webContents-session-cookies-flushStore-completed" + guid, () =>
++            {
++                BridgeConnector.Socket.Off("webContents-session-cookies-flushStore-completed" + guid);
++                taskCompletionSource.SetResult(null);
++            });
++
++            BridgeConnector.Socket.Emit("webContents-session-cookies-flushStore", Id, guid);
++
++            return taskCompletionSource.Task;
++        }
++
++        private JsonSerializer _jsonSerializer = new JsonSerializer()
++        {
++            ContractResolver = new CamelCasePropertyNamesContractResolver(),
++            NullValueHandling = NullValueHandling.Ignore,
++            DefaultValueHandling = DefaultValueHandling.Ignore
++        };
++    }
++}
+\ No newline at end of file
+diff --git a/ElectronNET.API/Entities/Cookie.cs b/ElectronNET.API/Entities/Cookie.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6b37fae5b64607b74e27711aae2c9f590f167a6
+--- /dev/null
++++ b/ElectronNET.API/Entities/Cookie.cs
+@@ -0,0 +1,51 @@
++﻿namespace ElectronNET.API.Entities {
++    /// <summary>
++    /// 
++    /// </summary>
++    public class Cookie {
++        /// <summary>
++        /// The name of the cookie.
++        /// </summary>
++        public string Name { get; set;}
++
++        /// <summary>
++        /// The value of the cookie.
++        /// </summary>
++        public string Value { get; set; }
++
++        /// <summary>
++        /// (optional) - The domain of the cookie; this will be normalized with a preceding dot so that it's also valid for subdomains.
++        /// </summary>
++        public string Domain { get; set; }
++
++        /// <summary>
++        /// (optional) - Whether the cookie is a host-only cookie; this will only be true if no domain was passed.
++        /// </summary>
++        public bool HostOnly { get; set; }
++
++        /// <summary>
++        /// (optional) - The path of the cookie.
++        /// </summary>
++        public string Path  { get; set; }
++
++        /// <summary>
++        /// (optional) - Whether the cookie is marked as secure.
++        /// </summary>
++        public bool Secure { get; set; }
++
++        /// <summary>
++        /// (optional) - Whether the cookie is marked as HTTP only.
++        /// </summary>
++        public bool HttpOnly  { get; set; }
++
++        /// <summary>
++        /// (optional) - Whether the cookie is a session cookie or a persistent cookie with an expiration date.
++        /// </summary>
++        public bool Session { get; set; }
++
++        /// <summary>
++        /// (optional) - The expiration date of the cookie as the number of seconds since the UNIX epoch. Not provided for session cookies.
++        /// </summary>
++        public long ExpirationDate { get; set; }
++    }
++}
+diff --git a/ElectronNET.API/Entities/CookieChangedCause.cs b/ElectronNET.API/Entities/CookieChangedCause.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42430daf352647e92829766b052955a776c248c
+--- /dev/null
++++ b/ElectronNET.API/Entities/CookieChangedCause.cs
+@@ -0,0 +1,38 @@
++﻿using Newtonsoft.Json;
++using Newtonsoft.Json.Converters;
++
++namespace ElectronNET.API.Entities {
++    /// <summary>
++    /// The cause of the change 
++    /// </summary>
++    [JsonConverter(typeof(StringEnumConverter))]
++    public enum CookieChangedCause 
++    {
++        /// <summary>
++        ///The cookie was changed directly by a consumer's action.
++        /// </summary>
++        [JsonProperty("explicit")]
++        @explicit,
++
++        /// <summary>
++        /// The cookie was automatically removed due to an insert operation that overwrote it.
++        /// </summary>
++        overwrite,
++
++        /// <summary>
++        ///  The cookie was automatically removed as it expired.
++        /// </summary>
++        expired,
++
++        /// <summary>
++        ///  The cookie was automatically evicted during garbage collection.
++        /// </summary>
++        evicted,
++
++        /// <summary>
++        ///   The cookie was overwritten with an already-expired expiration date.
++        /// </summary>
++        [JsonProperty("expired_overwrite")]
++        expiredOverwrite
++    }
++}
+\ No newline at end of file
+diff --git a/ElectronNET.API/Entities/CookieDetails.cs b/ElectronNET.API/Entities/CookieDetails.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a91d278bfcd6773cf6f7ceb7e1ce947a05c1dbe1
+--- /dev/null
++++ b/ElectronNET.API/Entities/CookieDetails.cs
+@@ -0,0 +1,56 @@
++﻿using System.ComponentModel;
++
++namespace ElectronNET.API.Entities {
++    /// <summary>
++    /// 
++    /// </summary>
++    public class CookieDetails {
++        /// <summary>
++        /// The URL to associate the cookie with. The callback will be rejected if the URL is invalid.
++        /// </summary>
++        public string Url { get; set; }
++
++        /// <summary>
++        /// (optional) - The name of the cookie. Empty by default if omitted.
++        /// </summary>
++        [DefaultValue("")]
++        public string Name { get; set; }
++
++        /// <summary>
++        /// (optional) - The value of the cookie. Empty by default if omitted.
++        /// </summary>
++        [DefaultValue("")] 
++        public string Value { get; set; }
++
++        /// <summary>
++        /// (optional) - The domain of the cookie; this will be normalized with a preceding dot so that it's also valid for subdomains. Empty by default if omitted.
++        /// </summary>
++        [DefaultValue("")]
++        public string Domain { get; set; }
++
++        /// <summary>
++        /// (optional) - The path of the cookie. Empty by default if omitted.
++        /// </summary>
++        [DefaultValue("")] 
++        public string Path { get; set; }
++
++        /// <summary>
++        /// (optional) - Whether the cookie is marked as secure. Defaults to false.
++        /// </summary>
++        [DefaultValue(false)] 
++        public bool Secure { get; set; }
++
++        /// <summary>
++        /// (optional) - Whether the cookie is marked as HTTP only. Defaults to false.
++        /// </summary>
++        [DefaultValue(false)]
++        public bool HttpOnly { get; set; }
++
++        /// <summary>
++        /// (optional) - The expiration date of the cookie as the number of seconds since the UNIX epoch. 
++        /// If omitted then the cookie becomes a session cookie and will not be retained between sessions.
++        /// </summary>
++        [DefaultValue(0)]
++        public long ExpirationDate { get; set; }
++    }
++}
+diff --git a/ElectronNET.API/Entities/CookieFilter.cs b/ElectronNET.API/Entities/CookieFilter.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..41d3f04b39add699b84780d49f05e4dc66fbaacf
+--- /dev/null
++++ b/ElectronNET.API/Entities/CookieFilter.cs
+@@ -0,0 +1,43 @@
++﻿using System;
++using System.Collections.Generic;
++using System.Text;
++
++namespace ElectronNET.API.Entities 
++{
++    /// <summary>
++    /// 
++    /// </summary>
++    public class CookieFilter 
++    {
++        /// <summary>
++        /// (optional) - Retrieves cookies which are associated with url.Empty implies retrieving cookies of all URLs.
++        /// </summary>
++        public string Url { get; set; }
++
++        /// <summary>
++        /// (optional) - Filters cookies by name.
++        /// </summary>
++        public string Name { get; set; }
++
++        /// <summary>
++        /// (optional) - Retrieves cookies whose domains match or are subdomains of domains.
++        /// </summary>
++        public string Domain { get; set; }
++
++        /// <summary>
++        /// (optional) - Retrieves cookies whose path matches path.
++        /// </summary>
++        public string Path { get; set; }
++
++        /// <summary>
++        /// (optional) - Filters cookies by their Secure property.
++        /// </summary>
++        public bool Secure { get; set; }
++
++        /// <summary>
++        /// (optional) - Filters out session or persistent cookies.
++        /// </summary>
++        public bool Session { get; set; }
++
++    }
++}
+diff --git a/ElectronNET.API/Entities/NotificationOptions.cs b/ElectronNET.API/Entities/NotificationOptions.cs
+index ce73b048bcf9e4ba9e2026251db796b9aef6499a..d191379880f5d613a2550563ddede84bd3520154 100644
+--- a/ElectronNET.API/Entities/NotificationOptions.cs
++++ b/ElectronNET.API/Entities/NotificationOptions.cs
+@@ -10,28 +10,28 @@ namespace ElectronNET.API.Entities
+     {
+         /// <summary>
+         /// A title for the notification, which will be shown at the top of the notification
+-        /// window when it is shown
++        /// window when it is shown.
+         /// </summary>
+         public string Title { get; set; }
+ 
+         /// <summary>
+-        /// The body text of the notification, which will be displayed below the title or
+-        /// subtitle
++        /// A subtitle for the notification, which will be displayed below the title.
+         /// </summary>
+-        public string Body { get; set; }
++        public string SubTitle { get; set; }
+ 
+         /// <summary>
+-        /// A subtitle for the notification, which will be displayed below the title.
++        /// The body text of the notification, which will be displayed below the title or
++        /// subtitle.
+         /// </summary>
+-        public string Subtitle { get; set; }
++        public string Body { get; set; }
+ 
+         /// <summary>
+-        /// Whether or not to emit an OS notification noise when showing the notification
++        /// Whether or not to emit an OS notification noise when showing the notification.
+         /// </summary>
+         public bool Silent { get; set; }
+ 
+         /// <summary>
+-        /// An icon to use in the notification
++        /// An icon to use in the notification.
+         /// </summary>
+         public string Icon { get; set; }
+ 
+@@ -40,6 +40,11 @@ namespace ElectronNET.API.Entities
+         /// </summary>
+         public bool HasReply { get; set; }
+ 
++        /// <summary>
++        /// The timeout duration of the notification. Can be 'default' or 'never'.
++        /// </summary>
++        public string TimeoutType { get; set; }
++
+         /// <summary>
+         /// The placeholder to write in the inline reply input field.
+         /// </summary>
+@@ -50,16 +55,27 @@ namespace ElectronNET.API.Entities
+         /// </summary>
+         public string Sound { get; set; }
+ 
++        /// <summary>
++        /// The urgency level of the notification. Can be 'normal', 'critical', or 'low'.
++        /// </summary>
++        public string Urgency { get; set; }
++
+         /// <summary>
+         /// Actions to add to the notification. Please read the available actions and
+-        /// limitations in the NotificationAction documentation
++        /// limitations in the NotificationAction documentation.
+         /// </summary>
+         public NotificationAction Actions { get; set; }
+ 
+         /// <summary>
+-        /// Emitted when the notification is shown to the user, 
+-        /// note this could be fired multiple times as a notification 
+-        /// can be shown multiple times through the Show() method.
++        /// A custom title for the close button of an alert. An empty string will cause the
++        /// default localized text to be used.
++        /// </summary>
++        public string CloseButtonText { get; set; }
++
++        /// <summary>
++        /// Emitted when the notification is shown to the user, note this could be fired
++        /// multiple times as a notification can be shown multiple times through the Show()
++        /// method.
+         /// </summary>
+         [JsonIgnore]
+         public Action OnShow { get; set; }
+@@ -148,4 +164,4 @@ namespace ElectronNET.API.Entities
+             Body = body;
+         }
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/ElectronNET.API/Entities/WebPreferences.cs b/ElectronNET.API/Entities/WebPreferences.cs
+index c77b8a2c14feeffd9d2986868decdee73ce102e0..031c78c3b3514c57dc022af5225de40393329779 100644
+--- a/ElectronNET.API/Entities/WebPreferences.cs
++++ b/ElectronNET.API/Entities/WebPreferences.cs
+@@ -173,7 +173,7 @@ namespace ElectronNET.API.Entities
+ 
+         /// <summary>
+         /// Whether to run Electron APIs and the specified preload script in a separate
+-        /// JavaScript context.Defaults to false. The context that the preload script runs
++        /// JavaScript context. Defaults to false. The context that the preload script runs
+         /// in will still have full access to the document and window globals but it will
+         /// use its own set of JavaScript builtins (Array, Object, JSON, etc.) and will be
+         /// isolated from any changes made to the global environment by the loaded page.The
+@@ -185,8 +185,8 @@ namespace ElectronNET.API.Entities
+         /// Context' entry in the combo box at the top of the Console tab. This option is
+         /// currently experimental and may change or be removed in future Electron releases.
+         /// </summary>
+-        [DefaultValue(true)]
+-        public bool ContextIsolation { get; set; } = true;
++        [DefaultValue(false)]
++        public bool ContextIsolation { get; set; }
+ 
+         /// <summary>
+         /// Whether to use native window.open(). Defaults to false. This option is currently experimental.
+diff --git a/ElectronNET.API/Extensions/MenuItemExtensions.cs b/ElectronNET.API/Extensions/MenuItemExtensions.cs
+index 6644bd1ef9012d3b98b6c8233711449ea36c702b..37a5b9cb0b5ba16698fb5951a06be5310db0e7ef 100644
+--- a/ElectronNET.API/Extensions/MenuItemExtensions.cs
++++ b/ElectronNET.API/Extensions/MenuItemExtensions.cs
+@@ -48,5 +48,24 @@ namespace ElectronNET.API.Extensions
+ 
+             return result;
+         }
++
++        public static MenuItem[] AddSubmenuTypes(this MenuItem[] menuItems)
++        {
++            for (int index = 0; index < menuItems.Length; index++)
++            {
++                var menuItem = menuItems[index];
++                if (menuItem?.Submenu?.Length > 0)
++                {
++                    if(menuItem.Type == MenuType.normal)
++                    {
++                        menuItem.Type = MenuType.submenu;
++                    }
++
++                    AddSubmenuTypes(menuItem.Submenu);
++                }
++            }
++
++            return menuItems;
++        }
+     }
+ }
+diff --git a/ElectronNET.API/Menu.cs b/ElectronNET.API/Menu.cs
+index 00d7fb5d8b12a7128e1a63edadbec8f5fedd2a19..8397a10d9b03b1b8d11786efd7d26d7bb69f7791 100644
+--- a/ElectronNET.API/Menu.cs
++++ b/ElectronNET.API/Menu.cs
+@@ -56,6 +56,8 @@ namespace ElectronNET.API
+             _menuItems.Clear();
+ 
+             menuItems.AddMenuItemsId();
++            menuItems.AddSubmenuTypes();
++
+             BridgeConnector.Socket.Emit("menu-setApplicationMenu", JArray.FromObject(menuItems, _jsonSerializer));
+             _menuItems.AddRange(menuItems);
+ 
+@@ -83,6 +85,8 @@ namespace ElectronNET.API
+         public void SetContextMenu(BrowserWindow browserWindow, MenuItem[] menuItems)
+         {
+             menuItems.AddMenuItemsId();
++            menuItems.AddSubmenuTypes();
++
+             BridgeConnector.Socket.Emit("menu-setContextMenu", browserWindow.Id, JArray.FromObject(menuItems, _jsonSerializer));
+ 
+             if (!_contextMenuItems.ContainsKey(browserWindow.Id))
+diff --git a/ElectronNET.API/NativeTheme.cs b/ElectronNET.API/NativeTheme.cs
+index 81770e9cb0406bf45a773f022f1aca09121a7763..037a97a6c64596ba89925c51ae3e02e15829173c 100644
+--- a/ElectronNET.API/NativeTheme.cs
++++ b/ElectronNET.API/NativeTheme.cs
+@@ -89,7 +89,7 @@ namespace ElectronNET.API
+         /// </list>
+         /// Your application should then always use <see cref="ShouldUseDarkColorsAsync"/> to determine what CSS to apply.
+         /// </summary>
+-        /// <param name="themeSource">The new ThemeSource.</param>
++        /// <param name="themeSourceMode">The new ThemeSource.</param>
+         public void SetThemeSource(ThemeSourceMode themeSourceMode)
+         {
+             var themeSource = themeSourceMode.GetDescription();
+diff --git a/ElectronNET.API/Session.cs b/ElectronNET.API/Session.cs
+index 38b5f0f6c36a79962087d642105e99a8338a9f31..053467e1726f4acc8a727d3101b1fce8d3461f2f 100644
+--- a/ElectronNET.API/Session.cs
++++ b/ElectronNET.API/Session.cs
+@@ -20,9 +20,15 @@ namespace ElectronNET.API
+         /// </value>
+         public int Id { get; private set; }
+ 
++        /// <summary>
++        /// Query and modify a session's cookies.
++        /// </summary>
++        public Cookies Cookies { get; }
++
+         internal Session(int id)
+         {
+             Id = id;
++            Cookies = new Cookies(id);
+         }
+ 
+         /// <summary>
+diff --git a/ElectronNET.CLI/Commands/StartElectronCommand.cs b/ElectronNET.CLI/Commands/StartElectronCommand.cs
+index b72d7bda917ca393ca00804d5409234593a5a8a2..64c0f8ba35770532f1cbcf14f4c006e0a47bd39d 100644
+--- a/ElectronNET.CLI/Commands/StartElectronCommand.cs
++++ b/ElectronNET.CLI/Commands/StartElectronCommand.cs
+@@ -27,6 +27,7 @@ namespace ElectronNET.CLI.Commands
+         private string _manifest = "manifest";
+         private string _clearCache = "clear-cache";
+         private string _paramPublishReadyToRun = "PublishReadyToRun";
++        private string _paramDotNetConfig = "dotnet-configuration";
+ 
+         public Task<bool> ExecuteAsync()
+         {
+@@ -73,9 +74,15 @@ namespace ElectronNET.CLI.Commands
+                     publishReadyToRun += "true";
+                 }
+ 
++                string configuration = "Release";
++                if (parser.Arguments.ContainsKey(_paramDotNetConfig))
++                {
++                    configuration = parser.Arguments[_paramDotNetConfig][0];
++                }
++
+                 if (parser != null && !parser.Arguments.ContainsKey("watch"))
+                 {
+-                    resultCode = ProcessHelper.CmdExecute($"dotnet publish -r {platformInfo.NetCorePublishRid} --output \"{tempBinPath}\" {publishReadyToRun} --no-self-contained", aspCoreProjectPath);
++                    resultCode = ProcessHelper.CmdExecute($"dotnet publish -r {platformInfo.NetCorePublishRid} -c {configuration} --output \"{tempBinPath}\" {publishReadyToRun} --no-self-contained", aspCoreProjectPath);
+                 }
+ 
+                 if (resultCode != 0)
+diff --git a/ElectronNET.CLI/Properties/launchSettings.json b/ElectronNET.CLI/Properties/launchSettings.json
+index 819d7fec250c81b69176141991136bae0da768d1..934f42bd44e4308e03387ffee92f93a3a13a6b04 100644
+--- a/ElectronNET.CLI/Properties/launchSettings.json
++++ b/ElectronNET.CLI/Properties/launchSettings.json
+@@ -2,7 +2,7 @@
+   "profiles": {
+     "ElectronNET.CLI": {
+       "commandName": "Project",
+-      "commandLineArgs": "start /project-path \"C:\\Users\\Rizvi\\source\\repos\\Electron.NET\\ElectronNET.WebApp\" /watch"
++      "commandLineArgs": "start /project-path \"$(SolutionDir)\\ElectronNET.WebApp\" /watch"
+     }
+   }
+ }
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/app.js.map b/ElectronNET.Host/api/app.js.map
+index 6b7dc023fa4340cd778c7975504a3f4cfa4221b0..19aa555810acf34fb62bc2566d3c1736a5c66d15 100644
+--- a/ElectronNET.Host/api/app.js.map
++++ b/ElectronNET.Host/api/app.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"app.js","sourceRoot":"","sources":["app.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
++{"version":3,"file":"app.js","sourceRoot":"","sources":["app.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/webContents.js b/ElectronNET.Host/api/webContents.js
+index fe0d09f78b75d97bdde0939291d378df1c0a0729..859196aaac4aaf3cac3fc91033b99a44398c2ce7 100644
+--- a/ElectronNET.Host/api/webContents.js
++++ b/ElectronNET.Host/api/webContents.js
+@@ -136,6 +136,33 @@ module.exports = (socket) => {
+         const browserWindow = getWindowById(id);
+         browserWindow.webContents.session.setUserAgent(userAgent, acceptLanguages);
+     });
++    socket.on('register-webContents-session-cookies-changed', (id) => {
++        const browserWindow = getWindowById(id);
++        browserWindow.webContents.session.cookies.removeAllListeners('changed');
++        browserWindow.webContents.session.cookies.on('changed', (event, cookie, cause, removed) => {
++            electronSocket.emit('webContents-session-cookies-changed' + id, [cookie, cause, removed]);
++        });
++    });
++    socket.on('webContents-session-cookies-get', async (id, filter, guid) => {
++        const browserWindow = getWindowById(id);
++        const cookies = await browserWindow.webContents.session.cookies.get(filter);
++        electronSocket.emit('webContents-session-cookies-get-completed' + guid, cookies);
++    });
++    socket.on('webContents-session-cookies-set', async (id, details, guid) => {
++        const browserWindow = getWindowById(id);
++        await browserWindow.webContents.session.cookies.set(details);
++        electronSocket.emit('webContents-session-cookies-set-completed' + guid);
++    });
++    socket.on('webContents-session-cookies-remove', async (id, url, name, guid) => {
++        const browserWindow = getWindowById(id);
++        await browserWindow.webContents.session.cookies.remove(url, name);
++        electronSocket.emit('webContents-session-cookies-remove-completed' + guid);
++    });
++    socket.on('webContents-session-cookies-flushStore', async (id, guid) => {
++        const browserWindow = getWindowById(id);
++        await browserWindow.webContents.session.cookies.flushStore();
++        electronSocket.emit('webContents-session-cookies-flushStore-completed' + guid);
++    });
+     socket.on('webContents-loadURL', (id, url, options) => {
+         const browserWindow = getWindowById(id);
+         browserWindow.webContents.loadURL(url, options).then(() => {
+diff --git a/ElectronNET.Host/api/webContents.js.map b/ElectronNET.Host/api/webContents.js.map
+index 52aae2bef6a612e46ee9fa7c52a6737f3873eb1d..4d12120945fb48938315593ca3761bd7c9ba4484 100644
+--- a/ElectronNET.Host/api/webContents.js.map
++++ b/ElectronNET.Host/api/webContents.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"webContents.js","sourceRoot":"","sources":["webContents.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
++{"version":3,"file":"webContents.js","sourceRoot":"","sources":["webContents.ts"],"names":[],"mappings":";AAAA,uCAAsD;AACtD,MAAM,EAAE,GAAG,OAAO,CAAC,IAAI,CAAC,CAAC;AACzB,IAAI,cAAc,CAAC;AAEnB,iBAAS,CAAC,MAAuB,EAAE,EAAE;IACjC,cAAc,GAAG,MAAM,CAAC;IACxB,MAAM,CAAC,EAAE,CAAC,8BAA8B,EAAE,CAAC,EAAE,EAAE,EAAE;QAC7C,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QAExC,aAAa,CAAC,WAAW,CAAC,kBAAkB,CAAC,SAAS,CAAC,CAAC;QACxD,aAAa,CAAC,WAAW,CAAC,EAAE,CAAC,SAAS,EAAE,CAAC,KAAK,EAAE,MAAM,EAAE,EAAE;YACtD,cAAc,CAAC,IAAI,CAAC,qBAAqB,GAAG,EAAE,EAAE,MAAM,CAAC,CAAC;QAC5D,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oCAAoC,EAAE,CAAC,EAAE,EAAE,EAAE;QACnD,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QAExC,aAAa,CAAC,WAAW,CAAC,kBAAkB,CAAC,iBAAiB,CAAC,CAAC;QAChE,aAAa,CAAC,WAAW,CAAC,EAAE,CAAC,iBAAiB,EAAE,GAAG,EAAE;YACjD,cAAc,CAAC,IAAI,CAAC,2BAA2B,GAAG,EAAE,CAAC,CAAC;QAC1D,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,EAAE,EAAE,OAAO,EAAE,EAAE;QACjD,IAAI,OAAO,EAAE;YACT,aAAa,CAAC,EAAE,CAAC,CAAC,WAAW,CAAC,YAAY,CAAC,OAAO,CAAC,CAAC;SACvD;aAAM;YACH,aAAa,CAAC,EAAE,CAAC,CAAC,WAAW,CAAC,YAAY,EAAE,CAAC;SAChD;IACL,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,KAAK,EAAE,EAAE,EAAE,EAAE;QAC9C,MAAM,QAAQ,GAAG,MAAM,aAAa,CAAC,EAAE,CAAC,CAAC,WAAW,CAAC,WAAW,EAAE,CAAC;QACnE,cAAc,CAAC,IAAI,CAAC,mCAAmC,EAAE,QAAQ,CAAC,CAAC;IACvE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,mBAAmB,EAAE,KAAK,EAAE,EAAE,EAAE,OAAO,GAAG,EAAE,EAAE,EAAE;QACtD,MAAM,aAAa,CAAC,EAAE,CAAC,CAAC,WAAW,CAAC,KAAK,CAAC,OAAO,CAAC,CAAC;QACnD,cAAc,CAAC,IAAI,CAAC,6BAA6B,EAAE,IAAI,CAAC,CAAC;IAC7D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,wBAAwB,EAAE,KAAK,EAAE,EAAE,EAAE,OAAO,GAAG,EAAE,EAAE,IAAI,EAAE,EAAE;QACjE,MAAM,MAAM,GAAG,MAAM,aAAa,CAAC,EAAE,CAAC,CAAC,WAAW,CAAC,UAAU,CAAC,OAAO,CAAC,CAAC;QAEvE,EAAE,CAAC,SAAS,CAAC,IAAI,EAAE,MAAM,EAAE,CAAC,KAAK,EAAE,EAAE;YACjC,IAAI,KAAK,EAAE;gBACP,cAAc,CAAC,IAAI,CAAC,kCAAkC,EAAE,KAAK,CAAC,CAAC;aAClE;iBAAM;gBACH,cAAc,CAAC,IAAI,CAAC,kCAAkC,EAAE,IAAI,CAAC,CAAC;aACjE;QACL,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oBAAoB,EAAE,UAAU,EAAE;QACxC,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,cAAc,CAAC,IAAI,CAAC,oBAAoB,GAAG,EAAE,EAAE,aAAa,CAAC,WAAW,CAAC,MAAM,EAAE,CAAC,CAAC;IACvF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oDAAoD,EAAE,CAAC,EAAE,EAAE,OAAO,EAAE,EAAE;QAC5E,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,8BAA8B,CAAC,OAAO,CAAC,CAAC;IAC9E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oCAAoC,EAAE,KAAK,EAAE,EAAE,EAAE,OAAO,EAAE,IAAI,EAAE,EAAE;QACxE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,cAAc,CAAC,OAAO,CAAC,CAAC;QAEhE,cAAc,CAAC,IAAI,CAAC,8CAA8C,GAAG,IAAI,CAAC,CAAC;IAC/E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gCAAgC,EAAE,KAAK,EAAE,EAAE,EAAE,IAAI,EAAE,EAAE;QAC3D,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,UAAU,EAAE,CAAC;QAErD,cAAc,CAAC,IAAI,CAAC,0CAA0C,GAAG,IAAI,CAAC,CAAC;IAC3E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,4CAA4C,EAAE,KAAK,EAAE,EAAE,EAAE,IAAI,EAAE,EAAE;QACvE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,sBAAsB,EAAE,CAAC;QAEjE,cAAc,CAAC,IAAI,CAAC,sDAAsD,GAAG,IAAI,CAAC,CAAC;IACvF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,sCAAsC,EAAE,KAAK,EAAE,EAAE,EAAE,IAAI,EAAE,EAAE;QACjE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,gBAAgB,CAAC,EAAE,CAAC,CAAC;QAE7D,cAAc,CAAC,IAAI,CAAC,gDAAgD,GAAG,IAAI,CAAC,CAAC;IACjF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,8CAA8C,EAAE,KAAK,EAAE,EAAE,EAAE,OAAO,EAAE,IAAI,EAAE,EAAE;QAClF,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,gBAAgB,CAAC,OAAO,CAAC,CAAC;QAElE,cAAc,CAAC,IAAI,CAAC,wDAAwD,GAAG,IAAI,CAAC,CAAC;IACzF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,+CAA+C,EAAE,CAAC,EAAE,EAAE,OAAO,EAAE,EAAE;QACvE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,yBAAyB,CAAC,OAAO,CAAC,CAAC;IACzE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,6CAA6C,EAAE,CAAC,EAAE,EAAE,EAAE;QAC5D,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,uBAAuB,EAAE,CAAC;IAChE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,4CAA4C,EAAE,CAAC,EAAE,EAAE,OAAO,EAAE,EAAE;QACpE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,sBAAsB,CAAC,OAAO,CAAC,CAAC;IACtE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,sCAAsC,EAAE,CAAC,EAAE,EAAE,EAAE;QACrD,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,gBAAgB,EAAE,CAAC;IACzD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,iCAAiC,EAAE,KAAK,EAAE,EAAE,EAAE,UAAU,EAAE,IAAI,EAAE,EAAE;QACxE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,MAAM,GAAG,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,WAAW,CAAC,UAAU,CAAC,CAAC;QAE/E,cAAc,CAAC,IAAI,CAAC,2CAA2C,GAAG,IAAI,EAAE,MAAM,CAAC,MAAM,CAAC,CAAC;IAC3F,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kCAAkC,EAAE,KAAK,EAAE,EAAE,EAAE,IAAI,EAAE,EAAE;QAC7D,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,IAAI,GAAG,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,YAAY,EAAE,CAAC;QAEpE,cAAc,CAAC,IAAI,CAAC,4CAA4C,GAAG,IAAI,EAAE,IAAI,CAAC,CAAC;IACnF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,iCAAiC,EAAE,CAAC,EAAE,EAAE,IAAI,EAAE,EAAE;QACtD,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,QAAQ,GAAG,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,WAAW,EAAE,CAAC;QAEjE,cAAc,CAAC,IAAI,CAAC,2CAA2C,GAAG,IAAI,EAAE,QAAQ,CAAC,CAAC;IACtF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kCAAkC,EAAE,CAAC,EAAE,EAAE,IAAI,EAAE,EAAE;QACvD,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,SAAS,GAAG,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,YAAY,EAAE,CAAC;QAEnE,cAAc,CAAC,IAAI,CAAC,4CAA4C,GAAG,IAAI,EAAE,SAAS,CAAC,CAAC;IACxF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kCAAkC,EAAE,KAAK,EAAE,EAAE,EAAE,GAAG,EAAE,IAAI,EAAE,EAAE;QAClE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,KAAK,GAAG,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,YAAY,CAAC,GAAG,CAAC,CAAC;QAExE,cAAc,CAAC,IAAI,CAAC,4CAA4C,GAAG,IAAI,EAAE,KAAK,CAAC,CAAC;IACpF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,qCAAqC,EAAE,CAAC,EAAE,EAAE,IAAI,EAAE,EAAE;QAC1D,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,eAAe,CAAC,IAAI,CAAC,CAAC;IAC5D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,iCAAiC,EAAE,CAAC,EAAE,EAAE,QAAQ,EAAE,EAAE;QAC1D,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,WAAW,CAAC,QAAQ,CAAC,CAAC;IAC5D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,8BAA8B,EAAE,KAAK,EAAE,EAAE,EAAE,aAAa,EAAE,IAAI,EAAE,EAAE;QACxE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,QAAQ,CAAC,aAAa,CAAC,CAAC;QAEhE,cAAc,CAAC,IAAI,CAAC,wCAAwC,GAAG,IAAI,CAAC,CAAC;IACzE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kCAAkC,EAAE,CAAC,EAAE,EAAE,SAAS,EAAE,eAAe,EAAE,EAAE;QAC7E,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,YAAY,CAAC,SAAS,EAAE,eAAe,CAAC,CAAC;IAC/E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,8CAA8C,EAAE,CAAC,EAAE,EAAE,EAAE;QAC7D,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QAExC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,OAAO,CAAC,kBAAkB,CAAC,SAAS,CAAC,CAAC;QACxE,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,OAAO,CAAC,EAAE,CAAC,SAAS,EAAE,CAAC,KAAK,EAAE,MAAM,EAAE,KAAK,EAAE,OAAO,EAAE,EAAE;YACtF,cAAc,CAAC,IAAI,CAAC,qCAAqC,GAAG,EAAE,EAAE,CAAC,MAAM,EAAE,KAAK,EAAE,OAAO,CAAC,CAAC,CAAC;QAC9F,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,iCAAiC,EAAE,KAAK,EAAE,EAAE,EAAE,MAAM,EAAE,IAAI,EAAE,EAAE;QACpE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,OAAO,GAAG,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,OAAO,CAAC,GAAG,CAAC,MAAM,CAAC,CAAC;QAE5E,cAAc,CAAC,IAAI,CAAC,2CAA2C,GAAG,IAAI,EAAE,OAAO,CAAC,CAAC;IACrF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,iCAAiC,EAAE,KAAK,EAAE,EAAE,EAAE,OAAO,EAAE,IAAI,EAAE,EAAE;QACrE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,OAAO,CAAC,GAAG,CAAC,OAAO,CAAC,CAAC;QAE7D,cAAc,CAAC,IAAI,CAAC,2CAA2C,GAAG,IAAI,CAAC,CAAC;IAC5E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oCAAoC,EAAE,KAAK,EAAE,EAAE,EAAE,GAAG,EAAE,IAAI,EAAE,IAAI,EAAE,EAAE;QAC1E,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,OAAO,CAAC,MAAM,CAAC,GAAG,EAAE,IAAI,CAAC,CAAC;QAElE,cAAc,CAAC,IAAI,CAAC,8CAA8C,GAAG,IAAI,CAAC,CAAC;IAC/E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,wCAAwC,EAAE,KAAK,EAAE,EAAE,EAAE,IAAI,EAAE,EAAE;QACnE,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,MAAM,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,OAAO,CAAC,UAAU,EAAE,CAAC;QAE7D,cAAc,CAAC,IAAI,CAAC,kDAAkD,GAAG,IAAI,CAAC,CAAC;IACnF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,qBAAqB,EAAE,CAAC,EAAE,EAAE,GAAG,EAAE,OAAO,EAAE,EAAE;QAClD,MAAM,aAAa,GAAG,aAAa,CAAC,EAAE,CAAC,CAAC;QACxC,aAAa,CAAC,WAAW,CAAC,OAAO,CAAC,GAAG,EAAE,OAAO,CAAC,CAAC,IAAI,CAAC,GAAG,EAAE;YACtD,cAAc,CAAC,IAAI,CAAC,8BAA8B,GAAG,EAAE,CAAC,CAAC;QAC7D,CAAC,CAAC,CAAC,KAAK,CAAC,CAAC,KAAK,EAAE,EAAE;YACf,OAAO,CAAC,KAAK,CAAC,KAAK,CAAC,CAAC;YACrB,cAAc,CAAC,IAAI,CAAC,2BAA2B,GAAG,EAAE,EAAE,KAAK,CAAC,CAAC;QACjE,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,SAAS,aAAa,CAAC,EAAU;QAE7B,IAAI,EAAE,IAAI,IAAI,EAAE;YACZ,OAAO,sBAAW,CAAC,MAAM,CAAC,EAAE,GAAG,IAAI,CAAC,CAAC;SACxC;QAED,OAAO,wBAAa,CAAC,MAAM,CAAC,EAAE,CAAC,CAAC;IACpC,CAAC;AACL,CAAC,CAAC"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/webContents.ts b/ElectronNET.Host/api/webContents.ts
+index ea39dc7f6aa11a479303d3ef23ef83fd1ca1788c..b01c7310eb1c7349dbf9977649cbd638031f7f7b 100644
+--- a/ElectronNET.Host/api/webContents.ts
++++ b/ElectronNET.Host/api/webContents.ts
+@@ -174,6 +174,43 @@ export = (socket: SocketIO.Socket) => {
+         browserWindow.webContents.session.setUserAgent(userAgent, acceptLanguages);
+     });
+ 
++    socket.on('register-webContents-session-cookies-changed', (id) => {
++        const browserWindow = getWindowById(id);
++
++        browserWindow.webContents.session.cookies.removeAllListeners('changed');
++        browserWindow.webContents.session.cookies.on('changed', (event, cookie, cause, removed) => {
++            electronSocket.emit('webContents-session-cookies-changed' + id, [cookie, cause, removed]);
++        });
++    });
++
++    socket.on('webContents-session-cookies-get', async (id, filter, guid) => {
++        const browserWindow = getWindowById(id);
++        const cookies = await browserWindow.webContents.session.cookies.get(filter);
++
++        electronSocket.emit('webContents-session-cookies-get-completed' + guid, cookies);
++    });
++
++    socket.on('webContents-session-cookies-set', async (id, details, guid) => {
++        const browserWindow = getWindowById(id);
++        await browserWindow.webContents.session.cookies.set(details);
++
++        electronSocket.emit('webContents-session-cookies-set-completed' + guid);
++    });
++
++    socket.on('webContents-session-cookies-remove', async (id, url, name, guid) => {
++        const browserWindow = getWindowById(id);
++        await browserWindow.webContents.session.cookies.remove(url, name);
++
++        electronSocket.emit('webContents-session-cookies-remove-completed' + guid);
++    });
++
++    socket.on('webContents-session-cookies-flushStore', async (id, guid) => {
++        const browserWindow = getWindowById(id);
++        await browserWindow.webContents.session.cookies.flushStore();
++
++        electronSocket.emit('webContents-session-cookies-flushStore-completed' + guid);
++    });
++
+     socket.on('webContents-loadURL', (id, url, options) => {
+         const browserWindow = getWindowById(id);
+         browserWindow.webContents.loadURL(url, options).then(() => {
+diff --git a/ElectronNET.Host/package-lock.json b/ElectronNET.Host/package-lock.json
+index 8fbff344746a99ed99296a9123c237a6ab0fb74e..715091773c5f781e5b98ebbec5fcbca3b90ce8e2 100644
+--- a/ElectronNET.Host/package-lock.json
++++ b/ElectronNET.Host/package-lock.json
+@@ -503,11 +503,11 @@
+             }
+         },
+         "engine.io-client": {
+-            "version": "3.4.1",
+-            "resolved": "https://registry.npmjs.org/engine.io-client/-/engine.io-client-3.4.1.tgz",
+-            "integrity": "sha512-RJNmA+A9Js+8Aoq815xpGAsgWH1VoSYM//2VgIiu9lNOaHFfLpTjH4tOzktBpjIs5lvOfiNY1dwf+NuU6D38Mw==",
++            "version": "3.4.2",
++            "resolved": "https://registry.npmjs.org/engine.io-client/-/engine.io-client-3.4.2.tgz",
++            "integrity": "sha512-AWjc1Xg06a6UPFOBAzJf48W1UR/qKYmv/ubgSCumo9GXgvL/xGIvo05dXoBL+2NTLMipDI7in8xK61C17L25xg==",
+             "requires": {
+-                "component-emitter": "1.2.1",
++                "component-emitter": "~1.3.0",
+                 "component-inherit": "0.0.3",
+                 "debug": "~4.1.0",
+                 "engine.io-parser": "~2.2.0",
+@@ -520,6 +520,11 @@
+                 "yeast": "0.1.2"
+             },
+             "dependencies": {
++                "component-emitter": {
++                    "version": "1.3.0",
++                    "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.3.0.tgz",
++                    "integrity": "sha512-Rd3se6QB+sO1TwqZjscQrurpEPIfO0/yYnSin6Q/rD3mOutHvUrCAhJub3r90uNb+SESBuE0QYoB90YdfatsRg=="
++                },
+                 "ws": {
+                     "version": "6.1.4",
+                     "resolved": "https://registry.npmjs.org/ws/-/ws-6.1.4.tgz",
+@@ -854,16 +859,16 @@
+             }
+         },
+         "mime-db": {
+-            "version": "1.43.0",
+-            "resolved": "https://registry.npmjs.org/mime-db/-/mime-db-1.43.0.tgz",
+-            "integrity": "sha512-+5dsGEEovYbT8UY9yD7eE4XTc4UwJ1jBYlgaQQF38ENsKR3wj/8q8RFZrF9WIZpB2V1ArTVFUva8sAul1NzRzQ=="
++            "version": "1.44.0",
++            "resolved": "https://registry.npmjs.org/mime-db/-/mime-db-1.44.0.tgz",
++            "integrity": "sha512-/NOTfLrsPBVeH7YtFPgsVWveuL+4SjjYxaQ1xtM1KMFj7HdxlBlxeyNLzhyJVx7r4rZGJAZ/6lkKCitSc/Nmpg=="
+         },
+         "mime-types": {
+-            "version": "2.1.26",
+-            "resolved": "https://registry.npmjs.org/mime-types/-/mime-types-2.1.26.tgz",
+-            "integrity": "sha512-01paPWYgLrkqAyrlDorC1uDwl2p3qZT7yl806vW7DvDoxwXi46jsjFbg+WdwotBIk6/MbEhO/dh5aZ5sNj/dWQ==",
++            "version": "2.1.27",
++            "resolved": "https://registry.npmjs.org/mime-types/-/mime-types-2.1.27.tgz",
++            "integrity": "sha512-JIhqnCasI9yD+SsmkquHBxTSEuZdQX5BuQnS2Vc7puQQQ+8yiP5AY5uWhpdv4YL4VM5c6iliiYWPgJ/nJQLp7w==",
+             "requires": {
+-                "mime-db": "1.43.0"
++                "mime-db": "1.44.0"
+             }
+         },
+         "mimic-response": {
+@@ -1214,9 +1219,9 @@
+             }
+         },
+         "socket.io-parser": {
+-            "version": "3.4.0",
+-            "resolved": "https://registry.npmjs.org/socket.io-parser/-/socket.io-parser-3.4.0.tgz",
+-            "integrity": "sha512-/G/VOI+3DBp0+DJKW4KesGnQkQPFmUCbA/oO2QGT6CWxU7hLGWqU3tyuzeSK/dqcyeHsQg1vTe9jiZI8GU9SCQ==",
++            "version": "3.4.1",
++            "resolved": "https://registry.npmjs.org/socket.io-parser/-/socket.io-parser-3.4.1.tgz",
++            "integrity": "sha512-11hMgzL+WCLWf1uFtHSNvliI++tcRUWdoeYuwIl+Axvwy9z2gQM+7nJyN3STj1tLj5JyIUH8/gpDGxzAlDdi0A==",
+             "requires": {
+                 "component-emitter": "1.2.1",
+                 "debug": "~4.1.0",
+@@ -1425,9 +1430,9 @@
+             "dev": true
+         },
+         "ws": {
+-            "version": "7.2.3",
+-            "resolved": "https://registry.npmjs.org/ws/-/ws-7.2.3.tgz",
+-            "integrity": "sha512-HTDl9G9hbkNDk98naoR/cHDws7+EyYMOdL1BmjsZXRUjf7d+MficC4B7HLUPlSiho0vg+CWKrGIt/VJBd1xunQ=="
++            "version": "7.3.0",
++            "resolved": "https://registry.npmjs.org/ws/-/ws-7.3.0.tgz",
++            "integrity": "sha512-iFtXzngZVXPGgpTlP1rBqsUK82p9tKqsWRPg5L56egiljujJT3vGAYnHANvFxBieXrTFavhzhxW52jnaWV+w2w=="
+         },
+         "xmlhttprequest-ssl": {
+             "version": "1.5.5",
+diff --git a/ElectronNET.Host/package.json b/ElectronNET.Host/package.json
+index afb0e8059c93a36cd0c38ce32faa44df4ad28076..a9f49c1264d620e62f03a4f51e0ae73cdc74c0e7 100644
+--- a/ElectronNET.Host/package.json
++++ b/ElectronNET.Host/package.json
+@@ -16,7 +16,7 @@
+         "electron-updater": "^4.2.5",
+         "image-size": "^0.7.4",
+         "portscanner": "^2.2.0",
+-        "socket.io": "^2.2.0"
++        "socket.io": "^2.3.0"
+     },
+     "devDependencies": {
+         "@types/node": "^10.14.4",
+diff --git a/ElectronNET.WebApp/Controllers/MenusController.cs b/ElectronNET.WebApp/Controllers/MenusController.cs
+index 09f0b895a1d23e9a5f31ee27e8c5a9ae240176c7..b961554f83868d24a1abc1004bc9b4027a29cebe 100644
+--- a/ElectronNET.WebApp/Controllers/MenusController.cs
++++ b/ElectronNET.WebApp/Controllers/MenusController.cs
+@@ -2,11 +2,23 @@
+ using Microsoft.AspNetCore.Mvc;
+ using ElectronNET.API.Entities;
+ using ElectronNET.API;
++using Microsoft.Extensions.Hosting;
+ 
+ namespace ElectronNET.WebApp.Controllers
+ {
+     public class MenusController : Controller
+     {
++        public MenusController(IHostApplicationLifetime hostApplicationLifetime)
++        {
++            hostApplicationLifetime.ApplicationStarted.Register(() =>
++            {
++                if (HybridSupport.IsElectronActive)
++                {
++                    CreateContextMenu();
++                }
++            });
++        }
++
+         public IActionResult Index()
+         {
+             if (HybridSupport.IsElectronActive)
+@@ -93,7 +105,6 @@ namespace ElectronNET.WebApp.Controllers
+ 
+                 Electron.Menu.SetApplicationMenu(menu);
+ 
+-                CreateContextMenu();
+             }
+ 
+             return View();
+@@ -113,12 +124,11 @@ namespace ElectronNET.WebApp.Controllers
+             };
+ 
+             var mainWindow = Electron.WindowManager.BrowserWindows.FirstOrDefault();
+-            if (mainWindow == null) return;
+-
+             Electron.Menu.SetContextMenu(mainWindow, menu);
+ 
+             Electron.IpcMain.On("show-context-menu", (args) =>
+             {
++                var mainWindow = Electron.WindowManager.BrowserWindows.FirstOrDefault();
+                 Electron.Menu.ContextMenuPopup(mainWindow);
+             });
+         }

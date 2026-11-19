@@ -1,0 +1,3348 @@
+diff --git a/__tests__/test-walk.js b/__tests__/test-walk.js
+index 7f4b57d..981b992 100644
+--- a/__tests__/test-walk.js
++++ b/__tests__/test-walk.js
+@@ -1,5 +1,7 @@
+ // @ts-nocheck
+ /* eslint-env node, browser, jasmine */
++import { createHash } from 'crypto'
++
+ import { walk, WORKDIR, TREE, STAGE, setConfig } from 'isomorphic-git'
+ 
+ import { makeFixture } from './__helpers__/FixtureFS.js'
+@@ -43,6 +45,12 @@ describe('walk', () => {
+     const isBrowserFS = !!fs._original_unwrapped_fs.getRootFS
+     const FILEMODE = isBrowserFS ? 0o100755 : 0o100644
+     const SYMLINKMODE = isBrowserFS ? 0o100755 : 0o120000
++    const LINKCONTENT = isBrowserFS
++      ? ''
++      : (await fs.readlink(`${dir}/folder/3.txt`)).toString()
++    const LINKOID = createHash('sha1')
++      .update(`blob ${Buffer.byteLength(LINKCONTENT)}\0${LINKCONTENT}`)
++      .digest('hex')
+ 
+     // Test
+     const matrix = await walk({
+@@ -249,8 +257,8 @@ describe('walk', () => {
+         {
+           type: 'blob',
+           mode: SYMLINKMODE,
+-          content: '',
+-          oid: 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391',
++          content: LINKCONTENT,
++          oid: LINKOID,
+           hasStat: true,
+         },
+         null,
+@@ -274,6 +282,12 @@ describe('walk', () => {
+     const isBrowserFS = !!fs._original_unwrapped_fs.getRootFS
+     const FILEMODE = isBrowserFS ? 0o100755 : 0o100644
+     const SYMLINKMODE = isBrowserFS ? 0o100755 : 0o120000
++    const LINKCONTENT = isBrowserFS
++      ? ''
++      : (await fs.readlink(`${dir}/folder/3.txt`)).toString()
++    const LINKOID = createHash('sha1')
++      .update(`blob ${Buffer.byteLength(LINKCONTENT)}\0${LINKCONTENT}`)
++      .digest('hex')
+     const toWalkerResult = async walker => {
+       return {
+         type: await walker.type(),
+@@ -468,8 +482,8 @@ describe('walk', () => {
+         {
+           type: 'blob',
+           mode: SYMLINKMODE,
+-          content: '',
+-          oid: 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391',
++          content: LINKCONTENT,
++          oid: LINKOID,
+           hasStat: true,
+         },
+         null,
+diff --git a/src/api/add.js b/src/api/add.js
+index 8dc4560..d8a5d61 100644
+--- a/src/api/add.js
++++ b/src/api/add.js
+@@ -73,6 +73,18 @@ export async function add({
+   }
+ }
+ 
++// True for a path the index already holds, and for a folder holding one. The
++// exact lookup is a Map hit; the prefix scan only runs for folders, since a
++// tracked file always answers on the first check.
++function isTracked(index, filepath) {
++  if (index.has({ filepath })) return true
++  const prefix = `${filepath}/`
++  for (const entry of index.entriesMap.keys()) {
++    if (entry.startsWith(prefix)) return true
++  }
++  return false
++}
++
+ async function addToIndex({
+   dir,
+   gitdir,
+@@ -83,10 +95,13 @@ async function addToIndex({
+   parallel,
+   autocrlf,
+ }) {
+-  // TODO: Should ignore UNLESS it's already in the index.
+   filepath = Array.isArray(filepath) ? filepath : [filepath]
+   const promises = filepath.map(async currentFilepath => {
+-    if (!force) {
++    // .gitignore governs untracked paths. Once a path is in the index, adding a
++    // matching rule does not stop canonical git from staging further changes,
++    // and an ignored folder is still walked for the sake of what it tracks:
++    // the recursion below re-checks every child, so only tracked ones get in.
++    if (!force && !isTracked(index, currentFilepath)) {
+       const ignored = await GitIgnoreManager.isIgnored({
+         fs,
+         dir,
+diff --git a/src/api/checkout.js b/src/api/checkout.js
+index cd38624..13ec543 100644
+--- a/src/api/checkout.js
++++ b/src/api/checkout.js
+@@ -19,7 +19,7 @@ import { join } from '../utils/join.js'
+  * @param {string} args.dir - The [working tree](dir-vs-gitdir.md) directory path
+  * @param {string} [args.gitdir=join(dir,'.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+  * @param {string} [args.ref = 'HEAD'] - Source to checkout files from
+- * @param {string[]} [args.filepaths] - Limit the checkout to the given files and directories
++ * @param {string[]} [args.filepaths] - Limit the checkout to the given files and directories. If `ref` is not provided, restore them from the index.
+  * @param {string} [args.remote = 'origin'] - Which remote repository to use
+  * @param {boolean} [args.noCheckout = false] - If true, will update HEAD but won't update the working directory
+  * @param {boolean} [args.noUpdateHead] - If true, will update the working directory but won't update HEAD. Defaults to `false` when `ref` is provided, and `true` if `ref` is not provided.
+@@ -42,7 +42,7 @@ import { join } from '../utils/join.js'
+  * console.log('done')
+  *
+  * @example
+- * // restore the 'docs' and 'src/docs' folders to the way they were, overwriting any changes
++ * // restore the 'docs' and 'src/docs' folders from the index, overwriting any unstaged changes
+  * await git.checkout({
+  *   fs,
+  *   dir: '/tutorial',
+@@ -87,6 +87,8 @@ export async function checkout({
+     assertParameter('gitdir', gitdir)
+ 
+     const ref = _ref || 'HEAD'
++    const restoreFromIndex =
++      _ref === undefined && filepaths != null && filepaths.length > 0
+     const fsp = new FileSystem(fs)
+     const updatedGitdir = await discoverGitdir({ fsp, dotgit: gitdir })
+     return await _checkout({
+@@ -104,6 +106,7 @@ export async function checkout({
+       dryRun,
+       force,
+       track,
++      restoreFromIndex,
+       nonBlocking,
+       batchSize,
+     })
+diff --git a/src/api/cherryPick.js b/src/api/cherryPick.js
+new file mode 100644
+index 0000000..3080117
+--- /dev/null
++++ b/src/api/cherryPick.js
+@@ -0,0 +1,116 @@
++// @ts-check
++import '../typedefs.js'
++
++import { _cherryPick } from '../commands/cherryPick.js'
++import { _readCommit } from '../commands/readCommit.js'
++import { MissingNameError } from '../errors/MissingNameError.js'
++import { FileSystem } from '../models/FileSystem.js'
++import { assertParameter } from '../utils/assertParameter.js'
++import { discoverGitdir } from '../utils/discoverGitdir.js'
++import { join } from '../utils/join.js'
++import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
++
++/**
++ * Cherry-pick a commit onto the current branch
++ *
++ * @param {object} args
++ * @param {FsClient} args.fs - a file system implementation
++ * @param {string} [args.dir] - The [working tree](dir-vs-gitdir.md) directory path
++ * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
++ * @param {string} args.oid - The commit to cherry-pick
++ * @param {object} [args.cache] - a [cache](cache.md) object
++ * @param {object} [args.committer] - The details about the commit committer. If not specified, uses user.name and user.email config with current timestamp.
++ * @param {string} [args.committer.name] - Default is `user.name` config.
++ * @param {string} [args.committer.email] - Default is `user.email` config.
++ * @param {number} [args.committer.timestamp=Math.floor(Date.now()/1000)] - Set the committer timestamp field. This is the integer number of seconds since the Unix epoch (1970-01-01 00:00:00).
++ * @param {number} [args.committer.timezoneOffset] - Set the committer timezone offset field. This is the difference, in minutes, from the current timezone to UTC. Default is `(new Date()).getTimezoneOffset()`.
++ * @param {boolean} [args.dryRun=false] - If true, simulates cherry-picking so you can test whether it would succeed. Implies `noUpdateBranch`.
++ * @param {boolean} [args.noUpdateBranch=false] - If true, does not update the branch pointer after creating the commit.
++ * @param {boolean} [args.abortOnConflict=true] - If true, merges with conflicts will throw a `MergeConflictError`. If false, merge conflicts will leave conflict markers in the working directory and index.
++ * @param {MergeDriverCallback} [args.mergeDriver] - A custom merge driver for handling conflicts.
++ *
++ * @returns {Promise<string>} Resolves successfully with the SHA-1 object id of the newly created commit
++ *
++ * @example
++ * let oid = await git.cherryPick({
++ *   fs,
++ *   dir: '/tutorial',
++ *   oid: 'e10ebb90d03eaacca84de1af0a59b444232da99e'
++ * })
++ * console.log(oid)
++ *
++ */
++export async function cherryPick({
++  fs: _fs,
++  dir,
++  gitdir = join(dir, '.git'),
++  oid,
++  cache = {},
++  committer,
++  dryRun = false,
++  noUpdateBranch = false,
++  abortOnConflict = true,
++  mergeDriver,
++}) {
++  try {
++    assertParameter('fs', _fs)
++    assertParameter('dir', dir)
++    assertParameter('gitdir', gitdir)
++    assertParameter('oid', oid)
++
++    const fs = new FileSystem(_fs)
++    const updatedGitdir = await discoverGitdir({ fsp: fs, dotgit: gitdir })
++
++    // Read the commit to be cherry-picked
++    const { commit: cherryCommit } = await _readCommit({
++      fs,
++      cache,
++      gitdir: updatedGitdir,
++      oid,
++    })
++
++    // If the target is a merge commit, let the command layer handle rejecting it
++    // (so tests expecting a CherryPickMergeCommitError still work). Only enforce
++    // a committer when we are actually going to create a commit.
++    if (cherryCommit.parent && cherryCommit.parent.length > 1) {
++      return await _cherryPick({
++        fs,
++        cache,
++        dir,
++        gitdir: updatedGitdir,
++        oid,
++        dryRun,
++        noUpdateBranch,
++        abortOnConflict,
++        committer: undefined,
++        mergeDriver,
++      })
++    }
++
++    // Use provided committer, not the original commit's committer
++    const normalizedCommitter = await normalizeCommitterObject({
++      fs,
++      gitdir: updatedGitdir,
++      committer,
++    })
++    if (!normalizedCommitter) {
++      throw new MissingNameError('committer')
++    }
++
++    return await _cherryPick({
++      fs,
++      cache,
++      dir,
++      gitdir: updatedGitdir,
++      oid,
++      dryRun,
++      noUpdateBranch,
++      abortOnConflict,
++      committer: normalizedCommitter,
++      mergeDriver,
++    })
++  } catch (err) {
++    err.caller = 'git.cherryPick'
++    throw err
++  }
++}
+diff --git a/src/api/commit.js b/src/api/commit.js
+index 2b07032..c44be62 100644
+--- a/src/api/commit.js
++++ b/src/api/commit.js
+@@ -29,6 +29,7 @@ import { join } from '../utils/join.js'
+  * @param {boolean} [args.amend = false] - If true, replaces the last commit pointed to by `ref` with a new commit.
+  * @param {boolean} [args.dryRun = false] - If true, simulates making a commit so you can test whether it would succeed. Implies `noUpdateBranch`.
+  * @param {boolean} [args.noUpdateBranch = false] - If true, does not update the branch pointer after creating the commit.
++ * @param {boolean} [args.disallowEmpty = false] - If true, throws an error instead of creating a commit with no staged changes.
+  * @param {string} [args.ref] - The fully expanded name of the branch to commit to. Default is the current branch pointed to by HEAD. (TODO: fix it so it can expand branch names without throwing if the branch doesn't exist yet.)
+  * @param {string[]} [args.parent] - The SHA-1 object ids of the commits to use as parents. If not specified, the commit pointed to by `ref` is used.
+  * @param {string} [args.tree] - The SHA-1 object id of the tree to use. If not specified, a new tree object is created from the current git index.
+@@ -61,6 +62,7 @@ export async function commit({
+   amend = false,
+   dryRun = false,
+   noUpdateBranch = false,
++  disallowEmpty = false,
+   ref,
+   parent,
+   tree,
+@@ -89,6 +91,7 @@ export async function commit({
+       amend,
+       dryRun,
+       noUpdateBranch,
++      disallowEmpty,
+       ref,
+       parent,
+       tree,
+diff --git a/src/api/log.js b/src/api/log.js
+index 3aaf3a4..30dc97c 100644
+--- a/src/api/log.js
++++ b/src/api/log.js
+@@ -20,6 +20,7 @@ import { join } from '../utils/join.js'
+  * @param {Date} [args.since] - Return history newer than the given date. Can be combined with `depth` to get whichever is shorter.
+  * @param {boolean=} [args.force=false] do not throw error if filepath is not exist (works only for a single file). defaults to false
+  * @param {boolean=} [args.follow=false] Continue listing the history of a file beyond renames (works only for a single file). defaults to false
++ * @param {boolean=} [args.includeChanges=false] Include changed file object ids for each commit. Each tuple is `[newOid, oldOid, filepath]`; an added or removed file has a null old or new oid, respectively.
+  * @param {object} [args.cache] - a [cache](cache.md) object
+  *
+  * @returns {Promise<Array<ReadCommitResult>>} Resolves to an array of ReadCommitResult objects
+@@ -46,6 +47,7 @@ export async function log({
+   since, // Date
+   force,
+   follow,
++  includeChanges = false,
+   cache = {},
+ }) {
+   try {
+@@ -65,6 +67,7 @@ export async function log({
+       since,
+       force,
+       follow,
++      includeChanges,
+     })
+   } catch (err) {
+     err.caller = 'git.log'
+diff --git a/src/api/status.js b/src/api/status.js
+index 0b20bd2..35f6c34 100644
+--- a/src/api/status.js
++++ b/src/api/status.js
+@@ -2,6 +2,7 @@
+ import { _readTree } from '../commands/readTree.js'
+ import { NotFoundError } from '../errors/NotFoundError.js'
+ import { ObjectTypeError } from '../errors/ObjectTypeError.js'
++import { GitConfigManager } from '../managers/GitConfigManager.js'
+ import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
+ import { GitIndexManager } from '../managers/GitIndexManager.js'
+ import { GitRefManager } from '../managers/GitRefManager.js'
+@@ -41,6 +42,11 @@ import { join } from '../utils/join.js'
+  * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
+  * @param {string} args.filepath - The path to the file to query
+  * @param {object} [args.cache] - a [cache](cache.md) object
++ * @param {boolean} [args.refresh = true] - when false, do not refresh the
++ *   `.git/index` stat cache when the working-tree file's contents still match
++ *   the staged blob. The call becomes read-only with respect to the index, at
++ *   the cost of recomputing the SHA1 on subsequent calls for files whose
++ *   stat info has drifted.
+  *
+  * @returns {Promise<'ignored'|'unmodified'|'*modified'|'*deleted'|'*added'|'absent'|'modified'|'deleted'|'added'|'*unmodified'|'*absent'|'*undeleted'|'*undeletemodified'>} Resolves successfully with the file's git status
+  *
+@@ -55,6 +61,7 @@ export async function status({
+   gitdir = join(dir, '.git'),
+   filepath,
+   cache = {},
++  refresh = true,
+ }) {
+   try {
+     assertParameter('fs', _fs)
+@@ -63,15 +70,6 @@ export async function status({
+ 
+     const fs = new FileSystem(_fs)
+     const updatedGitdir = await discoverGitdir({ fsp: fs, dotgit: gitdir })
+-    const ignored = await GitIgnoreManager.isIgnored({
+-      fs,
+-      gitdir: updatedGitdir,
+-      dir,
+-      filepath,
+-    })
+-    if (ignored) {
+-      return 'ignored'
+-    }
+     const headTree = await getHeadTree({ fs, cache, gitdir: updatedGitdir })
+     const treeOid = await getOidAtPath({
+       fs,
+@@ -89,6 +87,20 @@ export async function status({
+         return null
+       }
+     )
++    // .gitignore governs untracked files. A file in HEAD or in the index is
++    // tracked, so canonical git keeps reporting its real state, and
++    // `git check-ignore` does not match it. statusMatrix already does this.
++    if (treeOid === null && indexEntry === null) {
++      const ignored = await GitIgnoreManager.isIgnored({
++        fs,
++        gitdir: updatedGitdir,
++        dir,
++        filepath,
++      })
++      if (ignored) {
++        return 'ignored'
++      }
++    }
+     const stats = await fs.lstat(join(dir, filepath))
+ 
+     const H = treeOid !== null // head
+@@ -99,14 +111,19 @@ export async function status({
+       if (I && !compareStats(indexEntry, stats)) {
+         return indexEntry.oid
+       } else {
+-        const object = await fs.read(join(dir, filepath))
++        // Read through the same core.autocrlf normalisation GitWalkerFs uses,
++        // so the working copy hashes to the blob that was stored. Without it a
++        // CRLF checkout of an LF blob reads as modified.
++        const config = await GitConfigManager.get({ fs, gitdir: updatedGitdir })
++        const autocrlf = await config.get('core.autocrlf')
++        const object = await fs.read(join(dir, filepath), { autocrlf })
+         const workdirOid = await hashObject({
+           gitdir: updatedGitdir,
+           type: 'blob',
+           object,
+         })
+         // If the oid in the index === working dir oid but stats differed update cache
+-        if (I && indexEntry.oid === workdirOid) {
++        if (refresh && I && indexEntry.oid === workdirOid) {
+           // and as long as our fs.stats aren't bad.
+           // size of -1 happens over a BrowserFS HTTP Backend that doesn't serve Content-Length headers
+           // (like the Karma webserver) because BrowserFS HTTP Backend uses HTTP HEAD requests to do fs.stat
+diff --git a/src/api/statusMatrix.js b/src/api/statusMatrix.js
+index 8786d52..a11d788 100644
+--- a/src/api/statusMatrix.js
++++ b/src/api/statusMatrix.js
+@@ -151,6 +151,11 @@ import { worthWalking } from '../utils/worthWalking.js'
+  * @param {function(string): boolean} [args.filter] - Filter the results to only those whose filepath matches a function.
+  * @param {object} [args.cache] - a [cache](cache.md) object
+  * @param {boolean} [args.ignored = false] - include ignored files in the result
++ * @param {boolean} [args.refresh = true] - when false, do not refresh the
++ *   `.git/index` stat cache for files whose contents still match the staged
++ *   blob. The call becomes read-only with respect to the index, at the cost
++ *   of recomputing the SHA1 on subsequent calls for files whose stat info
++ *   has drifted.
+  *
+  * @returns {Promise<Array<StatusRow>>} Resolves with a status matrix, described below.
+  * @see StatusRow
+@@ -164,6 +169,7 @@ export async function statusMatrix({
+   filter,
+   cache = {},
+   ignored: shouldIgnore = false,
++  refresh = true,
+ }) {
+   try {
+     assertParameter('fs', _fs)
+@@ -177,7 +183,7 @@ export async function statusMatrix({
+       cache,
+       dir,
+       gitdir: updatedGitdir,
+-      trees: [TREE({ ref }), WORKDIR(), STAGE()],
++      trees: [TREE({ ref }), WORKDIR({ refresh }), STAGE()],
+       map: async function (filepath, [head, workdir, stage]) {
+         // Ignore ignored files, but only if they are not already tracked.
+         if (!head && !stage && workdir) {
+diff --git a/src/commands/WORKDIR.js b/src/commands/WORKDIR.js
+index 3cfae9c..04e9642 100644
+--- a/src/commands/WORKDIR.js
++++ b/src/commands/WORKDIR.js
+@@ -5,13 +5,17 @@ import { GitWalkerFs } from '../models/GitWalkerFs.js'
+ import { GitWalkSymbol } from '../utils/symbols.js'
+ 
+ /**
++ * @param {object} [opts]
++ * @param {boolean} [opts.refresh=true] - When false, suppress the stat-cache
++ *   refresh that would rewrite `.git/index` when a working-tree file's stat
++ *   info has drifted but its content still matches the staged blob.
+  * @returns {Walker}
+  */
+-export function WORKDIR() {
++export function WORKDIR({ refresh = true } = {}) {
+   const o = Object.create(null)
+   Object.defineProperty(o, GitWalkSymbol, {
+     value: function ({ fs, dir, gitdir, cache }) {
+-      return new GitWalkerFs({ fs, dir, gitdir, cache })
++      return new GitWalkerFs({ fs, dir, gitdir, cache, refresh })
+     },
+   })
+   Object.freeze(o)
+diff --git a/src/commands/checkout.js b/src/commands/checkout.js
+index 3daecf1..8cb65fd 100644
+--- a/src/commands/checkout.js
++++ b/src/commands/checkout.js
+@@ -8,11 +8,13 @@ import { _walk } from '../commands/walk.js'
+ import { CheckoutConflictError } from '../errors/CheckoutConflictError.js'
+ import { CommitNotFetchedError } from '../errors/CommitNotFetchedError.js'
+ import { InternalError } from '../errors/InternalError.js'
++import { MultipleGitError } from '../errors/MultipleGitError.js'
+ import { NotFoundError } from '../errors/NotFoundError.js'
+ import { GitConfigManager } from '../managers/GitConfigManager.js'
+ import { GitIndexManager } from '../managers/GitIndexManager.js'
+ import { GitRefManager } from '../managers/GitRefManager.js'
+ import { _readObject as readObject } from '../storage/readObject.js'
++import { assertNoSymlinkInLeadingPath } from '../utils/assertNoSymlinkInLeadingPath.js'
+ import { flat } from '../utils/flat.js'
+ import { worthWalking } from '../utils/worthWalking.js'
+ 
+@@ -32,6 +34,7 @@ import { worthWalking } from '../utils/worthWalking.js'
+  * @param {boolean} [args.dryRun]
+  * @param {boolean} [args.force]
+  * @param {boolean} [args.track]
++ * @param {boolean} [args.restoreFromIndex]
+  * @param {boolean} [args.nonBlocking]
+  * @param {number} [args.batchSize]
+  *
+@@ -53,6 +56,7 @@ export async function _checkout({
+   dryRun,
+   force,
+   track = true,
++  restoreFromIndex = false,
+   nonBlocking = false,
+   batchSize = 100,
+ }) {
+@@ -112,6 +116,7 @@ export async function _checkout({
+         ref,
+         force,
+         filepaths,
++        restoreFromIndex,
+       })
+     } catch (err) {
+       // Throw a more helpful error message for this common mistake.
+@@ -222,6 +227,7 @@ export async function _checkout({
+         .filter(([method]) => method === 'mkdir' || method === 'mkdir-index')
+         .map(async function ([_, fullpath]) {
+           const filepath = `${dir}/${fullpath}`
++          await assertNoSymlinkInLeadingPath(fs, dir, fullpath)
+           await fs.mkdir(filepath)
+           if (onProgress) {
+             await onProgress({
+@@ -279,7 +285,7 @@ export async function _checkout({
+       await GitIndexManager.acquire(
+         { fs, gitdir, cache, allowUnmerged: true },
+         async function (index) {
+-          await Promise.all(
++          const settled = await Promise.allSettled(
+             ops
+               .filter(
+                 ([method]) =>
+@@ -290,66 +296,80 @@ export async function _checkout({
+               )
+               .map(async function ([method, fullpath, oid, mode, chmod]) {
+                 const filepath = `${dir}/${fullpath}`
+-                try {
+-                  if (method !== 'create-index' && method !== 'mkdir-index') {
+-                    const { object } = await readObject({
+-                      fs,
+-                      cache,
+-                      gitdir,
+-                      oid,
+-                    })
+-                    if (chmod) {
+-                      // Note: the mode option of fs.write only works when creating files,
+-                      // not updating them. Since the `fs` plugin doesn't expose `chmod` this
+-                      // is our only option.
+-                      await fs.rm(filepath)
+-                    }
+-                    if (mode === 0o100644) {
+-                      // regular file
+-                      await fs.write(filepath, object)
+-                    } else if (mode === 0o100755) {
+-                      // executable file
+-                      await fs.write(filepath, object, { mode: 0o777 })
+-                    } else if (mode === 0o120000) {
+-                      // symlink
+-                      await fs.writelink(filepath, object)
+-                    } else {
+-                      throw new InternalError(
+-                        `Invalid mode 0o${mode.toString(
+-                          8
+-                        )} detected in blob ${oid}`
+-                      )
+-                    }
+-                  }
+-
+-                  const stats = await fs.lstat(filepath)
+-                  // We can't trust the executable bit returned by lstat on Windows,
+-                  // so we need to preserve this value from the TREE.
+-                  // TODO: Figure out how git handles this internally.
+-                  if (mode === 0o100755) {
+-                    stats.mode = 0o755
+-                  }
+-                  // Submodules are present in the git index but use a unique mode different from trees
+-                  if (method === 'mkdir-index') {
+-                    stats.mode = 0o160000
+-                  }
+-                  index.insert({
+-                    filepath: fullpath,
+-                    stats,
++                if (method !== 'create-index' && method !== 'mkdir-index') {
++                  // Don't write through a symlinked leading path: a parent component that
++                  // is a symlink could otherwise redirect the write outside the working
++                  // tree. git applies the same check (it does not follow symlinks here).
++                  await assertNoSymlinkInLeadingPath(fs, dir, fullpath)
++                  const { object } = await readObject({
++                    fs,
++                    cache,
++                    gitdir,
+                     oid,
+                   })
+-                  if (onProgress) {
+-                    await onProgress({
+-                      phase: 'Updating workdir',
+-                      loaded: ++count,
+-                      total,
+-                    })
++                  if (chmod) {
++                    // Note: the mode option of fs.write only works when creating files,
++                    // not updating them. Since the `fs` plugin doesn't expose `chmod` this
++                    // is our only option.
++                    await fs.rm(filepath)
++                  }
++                  if (mode === 0o100644) {
++                    // regular file
++                    await fs.write(filepath, object)
++                  } else if (mode === 0o100755) {
++                    // executable file
++                    await fs.write(filepath, object, { mode: 0o777 })
++                  } else if (mode === 0o120000) {
++                    // symlink
++                    await fs.writelink(filepath, object)
++                  } else {
++                    throw new InternalError(
++                      `Invalid mode 0o${mode.toString(
++                        8
++                      )} detected in blob ${oid}`
++                    )
+                   }
+-                } catch (e) {
+-                  console.log(e)
++                }
++
++                const stats = await fs.lstat(filepath)
++                // We can't trust the executable bit returned by lstat on Windows,
++                // so we need to preserve this value from the TREE.
++                // TODO: Figure out how git handles this internally.
++                if (mode === 0o100755) {
++                  stats.mode = 0o755
++                }
++                // Submodules are present in the git index but use a unique mode different from trees
++                if (method === 'mkdir-index') {
++                  stats.mode = 0o160000
++                }
++                index.insert({
++                  filepath: fullpath,
++                  stats,
++                  oid,
++                })
++                if (onProgress) {
++                  await onProgress({
++                    phase: 'Updating workdir',
++                    loaded: ++count,
++                    total,
++                  })
+                 }
+               })
+           )
++          const rejections = []
++          for (const result of settled) {
++            if (result.status === 'rejected') {
++              rejections.push(result.reason)
++              // eslint-disable-next-line no-console
++              console.error(
++                '[isomorphic-git checkout] task rejected:',
++                result.reason?.stack ?? result.reason
++              )
++            }
++          }
++          if (rejections.length > 0) {
++            throw new MultipleGitError(rejections)
++          }
+         }
+       )
+     }
+@@ -389,6 +409,7 @@ async function analyze({
+   ref,
+   force,
+   filepaths,
++  restoreFromIndex,
+ }) {
+   let count = 0
+   return _walk({
+@@ -396,7 +417,7 @@ async function analyze({
+     cache,
+     dir,
+     gitdir,
+-    trees: [TREE({ ref }), WORKDIR(), STAGE()],
++    trees: [restoreFromIndex ? STAGE() : TREE({ ref }), WORKDIR(), STAGE()],
+     map: async function (fullpath, [commit, workdir, stage]) {
+       if (fullpath === '.') return
+       // match against base paths
+@@ -421,7 +442,12 @@ async function analyze({
+         // Ignore workdir files that are not tracked and not part of the new commit.
+         case '001':
+           // OK, make an exception for explicitly named files.
+-          if (force && filepaths && filepaths.includes(fullpath)) {
++          if (
++            !restoreFromIndex &&
++            force &&
++            filepaths &&
++            filepaths.includes(fullpath)
++          ) {
+             return ['delete', fullpath]
+           }
+           return
+@@ -687,6 +713,7 @@ async function updateWorkingDir(
+ ) {
+   const filepath = `${dir}/${fullpath}`
+   if (method !== 'create-index' && method !== 'mkdir-index') {
++    await assertNoSymlinkInLeadingPath(fs, dir, fullpath)
+     const { object } = await readObject({ fs, cache, gitdir, oid })
+     if (chmod) {
+       await fs.rm(filepath)
+@@ -718,26 +745,33 @@ async function updateWorkingDir(
+ 
+ async function batchAllSettled(operationName, tasks, onProgress, batchSize) {
+   const results = []
+-  try {
+-    for (let i = 0; i < tasks.length; i += batchSize) {
+-      const batch = tasks.slice(i, i + batchSize).map(task => task())
+-      const batchResults = await Promise.allSettled(batch)
+-      batchResults.forEach(result => {
+-        if (result.status === 'fulfilled') results.push(result.value)
+-      })
+-      if (onProgress) {
+-        await onProgress({
+-          phase: 'Updating workdir',
+-          loaded: i + batch.length,
+-          total: tasks.length,
+-        })
++  const rejections = []
++  for (let i = 0; i < tasks.length; i += batchSize) {
++    const batch = tasks.slice(i, i + batchSize).map(task => task())
++    const batchResults = await Promise.allSettled(batch)
++    batchResults.forEach(result => {
++      if (result.status === 'fulfilled') {
++        results.push(result.value)
++      } else {
++        rejections.push(result.reason)
++        // eslint-disable-next-line no-console
++        console.error(
++          `[isomorphic-git ${operationName}] task rejected:`,
++          result.reason?.stack ?? result.reason
++        )
+       }
++    })
++    if (onProgress) {
++      await onProgress({
++        phase: 'Updating workdir',
++        loaded: i + batch.length,
++        total: tasks.length,
++      })
+     }
+-
+-    return results
+-  } catch (error) {
+-    console.error(`Error during ${operationName}: ${error}`)
+   }
+ 
++  if (rejections.length > 0) {
++    throw new MultipleGitError(rejections)
++  }
+   return results
+ }
+diff --git a/src/commands/cherryPick.js b/src/commands/cherryPick.js
+new file mode 100644
+index 0000000..4eba03a
+--- /dev/null
++++ b/src/commands/cherryPick.js
+@@ -0,0 +1,143 @@
++// @ts-check
++import '../typedefs.js'
++
++import { _commit } from '../commands/commit.js'
++import { _readCommit } from '../commands/readCommit.js'
++import { CherryPickMergeCommitError } from '../errors/CherryPickMergeCommitError.js'
++import { CherryPickRootCommitError } from '../errors/CherryPickRootCommitError.js'
++import { MergeConflictError } from '../errors/MergeConflictError.js'
++import { GitIndexManager } from '../managers/GitIndexManager.js'
++import { GitRefManager } from '../managers/GitRefManager.js'
++import { mergeTree } from '../utils/mergeTree.js'
++import { applyTreeChanges } from '../utils/walkerToTreeEntryMap.js'
++
++/**
++ * @param {object} args
++ * @param {import('../models/FileSystem.js').FileSystem} args.fs
++ * @param {object} args.cache
++ * @param {string} args.dir
++ * @param {string} args.gitdir
++ * @param {string} args.oid - The commit to cherry-pick
++ * @param {boolean} args.dryRun
++ * @param {boolean} args.noUpdateBranch
++ * @param {boolean} args.abortOnConflict
++ * @param {Object} [args.committer]
++ * @param {string} [args.committer.name]
++ * @param {string} [args.committer.email]
++ * @param {number} [args.committer.timestamp]
++ * @param {number} [args.committer.timezoneOffset]
++ * @param {MergeDriverCallback} [args.mergeDriver]
++ *
++ * @returns {Promise<string>} - The OID of the newly created commit
++ */
++export async function _cherryPick({
++  fs,
++  cache,
++  dir,
++  gitdir,
++  oid,
++  dryRun = false,
++  noUpdateBranch = false,
++  abortOnConflict = true,
++  committer,
++  mergeDriver,
++}) {
++  // Commit to cherry-pick
++  const { commit: cherryCommit, oid: cherryOid } = await _readCommit({
++    fs,
++    cache,
++    gitdir,
++    oid,
++  })
++
++  // Validate it's not a merge commit (>1 parent)
++  if (cherryCommit.parent.length > 1) {
++    throw new CherryPickMergeCommitError(cherryOid, cherryCommit.parent.length)
++  }
++
++  // Validate it's not an initial commit (0 parents)
++  if (cherryCommit.parent.length === 0) {
++    throw new CherryPickRootCommitError(cherryOid)
++  }
++
++  // Get current HEAD
++  const currentOid = await GitRefManager.resolve({
++    fs,
++    gitdir,
++    ref: 'HEAD',
++  })
++
++  const { commit: currentCommit } = await _readCommit({
++    fs,
++    cache,
++    gitdir,
++    oid: currentOid,
++  })
++
++  // Get parent of cherry-picked commit (the "base" for three-way merge)
++  const cherryParentOid = cherryCommit.parent[0]
++  const { commit: cherryParent } = await _readCommit({
++    fs,
++    cache,
++    gitdir,
++    oid: cherryParentOid,
++  })
++
++  // Three-way merge
++  // - ourOid: current HEAD tree
++  // - baseOid: parent of commit being cherry-picked
++  // - theirOid: the commit being cherry-picked
++  const mergedTreeOid = await GitIndexManager.acquire(
++    { fs, gitdir, cache, allowUnmerged: false },
++    async index => {
++      return mergeTree({
++        fs,
++        cache,
++        dir: dryRun || noUpdateBranch ? undefined : dir,
++        gitdir,
++        index,
++        ourOid: currentCommit.tree,
++        baseOid: cherryParent.tree,
++        theirOid: cherryCommit.tree,
++        ourName: 'HEAD',
++        baseName: `parent of ${cherryOid.slice(0, 7)}`,
++        theirName: cherryOid.slice(0, 7),
++        dryRun,
++        abortOnConflict,
++        mergeDriver,
++      })
++    }
++  )
++
++  if (mergedTreeOid instanceof MergeConflictError) {
++    throw mergedTreeOid
++  }
++
++  // Materialize before advancing HEAD so a refused destination or failed write
++  // cannot report a successful cherry-pick or advance the branch prematurely.
++  if (dir && !dryRun && !noUpdateBranch) {
++    await applyTreeChanges({
++      fs,
++      dir,
++      gitdir,
++      stashCommit: mergedTreeOid,
++      parentCommit: currentOid,
++      wasStaged: true,
++    })
++  }
++
++  const newOid = await _commit({
++    fs,
++    cache,
++    gitdir,
++    message: cherryCommit.message,
++    tree: mergedTreeOid,
++    parent: [currentOid],
++    author: cherryCommit.author,
++    committer,
++    dryRun,
++    noUpdateBranch,
++  })
++
++  return newOid
++}
+diff --git a/src/commands/commit.js b/src/commands/commit.js
+index a26036a..94d2ba0 100644
+--- a/src/commands/commit.js
++++ b/src/commands/commit.js
+@@ -1,6 +1,7 @@
+ // @ts-check
+ import '../typedefs.js'
+ 
++import { EmptyCommitError } from '../errors/EmptyCommitError.js'
+ import { MissingNameError } from '../errors/MissingNameError.js'
+ import { MissingParameterError } from '../errors/MissingParameterError.js'
+ import { NoCommitError } from '../errors/NoCommitError.js'
+@@ -15,6 +16,8 @@ import { normalizeCommitterObject } from '../utils/normalizeCommitterObject.js'
+ 
+ import { _readCommit as readCommit } from './readCommit.js'
+ 
++const EMPTY_TREE_OID = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
++
+ /**
+  *
+  * @param {Object} args
+@@ -37,6 +40,7 @@ import { _readCommit as readCommit } from './readCommit.js'
+  * @param {boolean} [args.amend = false]
+  * @param {boolean} [args.dryRun = false]
+  * @param {boolean} [args.noUpdateBranch = false]
++ * @param {boolean} [args.disallowEmpty = false]
+  * @param {string} [args.ref]
+  * @param {string[]} [args.parent]
+  * @param {string} [args.tree]
+@@ -55,13 +59,17 @@ export async function _commit({
+   amend = false,
+   dryRun = false,
+   noUpdateBranch = false,
++  disallowEmpty = false,
+   ref,
+   parent,
+   tree,
+ }) {
+   // Determine ref and the commit pointed to by ref, and if it is the initial commit
+   let initialCommit = false
++  let detachedHead = false
+   if (!ref) {
++    const headContent = await fs.read(`${gitdir}/HEAD`, { encoding: 'utf8' })
++    detachedHead = !headContent.startsWith('ref:')
+     ref = await GitRefManager.resolve({
+       fs,
+       gitdir,
+@@ -139,6 +147,15 @@ export async function _commit({
+         )
+       }
+ 
++      if (
++        disallowEmpty &&
++        !amend &&
++        ((initialCommit && tree === EMPTY_TREE_OID) ||
++          (!initialCommit && tree === refCommit.commit.tree))
++      ) {
++        throw new EmptyCommitError()
++      }
++
+       // Determine message of this commit
+       if (!message) {
+         if (!amend) {
+@@ -167,11 +184,11 @@ export async function _commit({
+         dryRun,
+       })
+       if (!noUpdateBranch && !dryRun) {
+-        // Update branch pointer
++        // Update branch pointer (or HEAD directly if detached)
+         await GitRefManager.writeRef({
+           fs,
+           gitdir,
+-          ref,
++          ref: detachedHead ? 'HEAD' : ref,
+           value: oid,
+         })
+       }
+diff --git a/src/commands/fetch.js b/src/commands/fetch.js
+index 9c8cffe..75cc381 100644
+--- a/src/commands/fetch.js
++++ b/src/commands/fetch.js
+@@ -13,6 +13,7 @@ import { GitPackIndex } from '../models/GitPackIndex.js'
+ import { hasObject } from '../storage/hasObject.js'
+ import { _readObject as readObject } from '../storage/readObject.js'
+ import { abbreviateRef } from '../utils/abbreviateRef.js'
++import { addCredentialUsername } from '../utils/addCredentialUsername.js'
+ import { collect } from '../utils/collect.js'
+ import { emptyPackfile } from '../utils/emptyPackfile.js'
+ import { filterCapabilities } from '../utils/filterCapabilities.js'
+@@ -112,9 +113,9 @@ export async function _fetch({
+   const GitRemoteHTTP = GitRemoteManager.getRemoteHelperFor({ url })
+   const remoteHTTP = await GitRemoteHTTP.discover({
+     http,
+-    onAuth,
++    onAuth: addCredentialUsername({ config, onAuth }),
+     onAuthSuccess,
+-    onAuthFailure,
++    onAuthFailure: addCredentialUsername({ config, onAuth: onAuthFailure }),
+     corsProxy,
+     service: 'git-upload-pack',
+     url,
+diff --git a/src/commands/findMergeBase.js b/src/commands/findMergeBase.js
+index 007ead3..01149aa 100644
+--- a/src/commands/findMergeBase.js
++++ b/src/commands/findMergeBase.js
+@@ -1,4 +1,6 @@
+ // @ts-check
++import { ObjectTypeError } from '../errors/ObjectTypeError.js'
++import { GitShallowManager } from '../managers/GitShallowManager.js'
+ import { GitCommit } from '../models/GitCommit.js'
+ import { _readObject as readObject } from '../storage/readObject.js'
+ 
+@@ -17,42 +19,68 @@ export async function _findMergeBase({ fs, cache, gitdir, oids }) {
+   // and computing virtual merge bases is just too much for me to fathom right now.
+ 
+   // If we start N independent walkers, one at each of the given `oids`, and walk backwards
+-  // through ancestors, eventually we'll discover a commit where each one of these N walkers
+-  // has passed through. So we just need to keep track of which walkers have visited each commit
+-  // until we find a commit that N distinct walkers has visited.
++  // through ancestors, eventually we'll discover commits where each one of these N walkers
++  // has passed through. We cannot stop at the first common commit because a better common
++  // ancestor may still be present in another branch of the graph.
+   const visits = {}
+   const passes = oids.length
++  const common = new Set()
++  const parents = new Map()
++  const shallows = await GitShallowManager.read({ fs, gitdir })
++  const readParents = async oid => {
++    if (parents.has(oid)) return parents.get(oid)
++    const { object, type } = await readObject({ fs, cache, gitdir, oid })
++    if (type !== 'commit') {
++      throw new ObjectTypeError(oid, type, 'commit')
++    }
++    const commit = GitCommit.from(object)
++    const { parent } = commit.parseHeaders()
++    const result = shallows.has(oid) ? [] : parent
++    parents.set(oid, result)
++    return result
++  }
+   let heads = oids.map((oid, index) => ({ index, oid }))
+   while (heads.length) {
+     // Count how many times we've passed each commit
+-    const result = new Set()
+     for (const { oid, index } of heads) {
++      await readParents(oid)
+       if (!visits[oid]) visits[oid] = new Set()
+       visits[oid].add(index)
+       if (visits[oid].size === passes) {
+-        result.add(oid)
++        common.add(oid)
+       }
+     }
+-    if (result.size > 0) {
+-      return [...result]
+-    }
+-    // We haven't found a common ancestor yet
+     const newheads = new Map()
+     for (const { oid, index } of heads) {
+-      try {
+-        const { object } = await readObject({ fs, cache, gitdir, oid })
+-        const commit = GitCommit.from(object)
+-        const { parent } = commit.parseHeaders()
+-        for (const oid of parent) {
+-          if (!visits[oid] || !visits[oid].has(index)) {
+-            newheads.set(oid + ':' + index, { oid, index })
+-          }
++      // Parents of a common commit cannot be better merge bases.
++      if (common.has(oid)) continue
++      for (const parent of await readParents(oid)) {
++        if (!visits[parent] || !visits[parent].has(index)) {
++          newheads.set(parent + ':' + index, { oid: parent, index })
+         }
+-      } catch (err) {
+-        // do nothing
+       }
+     }
+     heads = Array.from(newheads.values())
+   }
+-  return []
++
++  if (common.size < 2) return [...common]
++
++  // A merge base is only "best" when it is not an ancestor of another
++  // common ancestor. This also keeps independent criss-cross bases.
++  const redundant = new Set()
++  for (const oid of common) {
++    const ancestors = [...(await readParents(oid))]
++    const seen = new Set()
++    while (ancestors.length) {
++      const ancestor = ancestors.pop()
++      if (seen.has(ancestor)) continue
++      seen.add(ancestor)
++      if (common.has(ancestor)) {
++        redundant.add(ancestor)
++      } else {
++        ancestors.push(...(await readParents(ancestor)))
++      }
++    }
++  }
++  return [...common].filter(oid => !redundant.has(oid))
+ }
+diff --git a/src/commands/log.js b/src/commands/log.js
+index 4483234..c0b54e8 100644
+--- a/src/commands/log.js
++++ b/src/commands/log.js
+@@ -1,13 +1,15 @@
+ // @ts-check
+ import '../typedefs.js'
+ 
++import { TREE } from '../commands/TREE.js'
+ import { _readCommit } from '../commands/readCommit.js'
++import { _walk } from '../commands/walk.js'
+ import { NotFoundError } from '../errors/NotFoundError.js'
+ import { GitRefManager } from '../managers/GitRefManager.js'
+ import { GitShallowManager } from '../managers/GitShallowManager.js'
+ import { compareAge } from '../utils/compareAge.js'
+ import { resolveFileIdInTree } from '../utils/resolveFileIdInTree.js'
+-import { resolveFilepath } from '../utils/resolveFilepath.js'
++import { resolveFilepathEntry } from '../utils/resolveFilepath.js'
+ 
+ /**
+  * Get commit descriptions from the git history
+@@ -21,7 +23,7 @@ import { resolveFilepath } from '../utils/resolveFilepath.js'
+  * @param {number|void} args.depth
+  * @param {boolean=} [args.force=false] do not throw error if filepath is not exist (works only for a single file). defaults to false
+  * @param {boolean=} [args.follow=false] Continue listing the history of a file beyond renames (works only for a single file). defaults to false
+- * @param {boolean=} args.follow Continue listing the history of a file beyond renames (works only for a single file). defaults to false
++ * @param {boolean=} [args.includeChanges=false] Include changed file object ids for each commit.
+  *
+  * @returns {Promise<Array<ReadCommitResult>>} Resolves to an array of ReadCommitResult objects
+  * @see ReadCommitResult
+@@ -42,6 +44,7 @@ export async function _log({
+   since,
+   force,
+   follow,
++  includeChanges,
+ }) {
+   const sinceTimestamp =
+     typeof since === 'undefined'
+@@ -54,6 +57,7 @@ export async function _log({
+   const oid = await GitRefManager.resolve({ fs, gitdir, ref })
+   const tips = [await _readCommit({ fs, cache, gitdir, oid })]
+   let lastFileOid
++  let lastFileMode
+   let lastCommit
+   let isOk
+ 
+@@ -73,19 +77,23 @@ export async function _log({
+     }
+ 
+     if (filepath) {
+-      let vFileOid
++      let vFileEntry
+       try {
+-        vFileOid = await resolveFilepath({
++        vFileEntry = await resolveFilepathEntry({
+           fs,
+           cache,
+           gitdir,
+           oid: commit.commit.tree,
+           filepath,
+         })
+-        if (lastCommit && lastFileOid !== vFileOid) {
++        if (
++          lastCommit &&
++          (lastFileOid !== vFileEntry.oid || lastFileMode !== vFileEntry.mode)
++        ) {
+           commits.push(lastCommit)
+         }
+-        lastFileOid = vFileOid
++        lastFileOid = vFileEntry.oid
++        lastFileMode = vFileEntry.mode
+         lastCommit = commit
+         isOk = true
+       } catch (e) {
+@@ -169,5 +177,53 @@ export async function _log({
+     // Process tips in order by age
+     tips.sort((a, b) => compareAge(a.commit, b.commit))
+   }
++  if (includeChanges) {
++    for (const commit of commits) {
++      commit.commit.changes = await getChanges({
++        fs,
++        cache,
++        gitdir,
++        commit,
++        shallow: shallowCommits.has(commit.oid),
++      })
++    }
++  }
+   return commits
+ }
++
++async function getChanges({ fs, cache, gitdir, commit, shallow }) {
++  const parent =
++    shallow || !commit.commit.parent[0]
++      ? '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
++      : commit.commit.parent[0]
++  return _walk({
++    fs,
++    cache,
++    gitdir,
++    trees: [TREE({ ref: commit.oid }), TREE({ ref: parent })],
++    map: async (filepath, [current, previous]) => {
++      const [currentType, previousType] = await Promise.all([
++        current && current.type(),
++        previous && previous.type(),
++      ])
++      if (currentType === 'tree') {
++        if (previousType && previousType !== 'tree') {
++          return [null, await previous.oid(), filepath]
++        }
++        return
++      }
++      if (previousType === 'tree') {
++        if (currentType) {
++          return [await current.oid(), null, filepath]
++        }
++        return
++      }
++      const [newOid, oldOid] = await Promise.all([
++        current ? current.oid() : null,
++        previous ? previous.oid() : null,
++      ])
++      if (newOid === oldOid) return
++      return [newOid, oldOid, filepath]
++    },
++  })
++}
+diff --git a/src/commands/push.js b/src/commands/push.js
+index 3c8b2ff..2298fb8 100644
+--- a/src/commands/push.js
++++ b/src/commands/push.js
+@@ -16,6 +16,7 @@ import { GitConfigManager } from '../managers/GitConfigManager.js'
+ import { GitRefManager } from '../managers/GitRefManager.js'
+ import { GitRemoteManager } from '../managers/GitRemoteManager.js'
+ import { GitSideBand } from '../models/GitSideBand.js'
++import { addCredentialUsername } from '../utils/addCredentialUsername.js'
+ import { filterCapabilities } from '../utils/filterCapabilities.js'
+ import { forAwait } from '../utils/forAwait.js'
+ import { pkg } from '../utils/pkg.js'
+@@ -105,9 +106,9 @@ export async function _push({
+   const GitRemoteHTTP = GitRemoteManager.getRemoteHelperFor({ url })
+   const httpRemote = await GitRemoteHTTP.discover({
+     http,
+-    onAuth,
++    onAuth: addCredentialUsername({ config, onAuth }),
+     onAuthSuccess,
+-    onAuthFailure,
++    onAuthFailure: addCredentialUsername({ config, onAuth: onAuthFailure }),
+     corsProxy,
+     service: 'git-receive-pack',
+     url,
+diff --git a/src/commands/stash.js b/src/commands/stash.js
+index b1ff190..2089ff6 100644
+--- a/src/commands/stash.js
++++ b/src/commands/stash.js
+@@ -101,78 +101,88 @@ async function _createStashCommit({ fs, dir, gitdir, message = '' }) {
+ }
+ 
+ export async function _stashPush({ fs, dir, gitdir, message = '' }) {
+-  const { stashCommit, stashMsg, branch, stashMgr } = await _createStashCommit({
+-    fs,
+-    dir,
+-    gitdir,
+-    message,
+-  })
++  return acquireLock(gitdir, async () => {
++    const { stashCommit, stashMsg, branch, stashMgr } =
++      await _createStashCommit({
++        fs,
++        dir,
++        gitdir,
++        message,
++      })
+ 
+-  // next, write this commit into .git/refs/stash:
+-  await stashMgr.writeStashRef(stashCommit)
++    // next, write this commit into .git/refs/stash:
++    await stashMgr.writeStashRef(stashCommit)
+ 
+-  // write the stash commit to the logs
+-  await stashMgr.writeStashReflogEntry({
+-    stashCommit,
+-    message: stashMsg,
+-  })
++    // write the stash commit to the logs
++    await stashMgr.writeStashReflogEntry({
++      stashCommit,
++      message: stashMsg,
++    })
+ 
+-  // finally, go back to a clean working directory
+-  await checkout({
+-    fs,
+-    dir,
+-    gitdir,
+-    ref: branch,
+-    track: false,
+-    force: true, // force checkout to discard changes
+-  })
++    // finally, go back to a clean working directory
++    await checkout({
++      fs,
++      dir,
++      gitdir,
++      ref: branch,
++      track: false,
++      force: true, // force checkout to discard changes
++    })
+ 
+-  return stashCommit
++    return stashCommit
++  })
+ }
+ 
+ export async function _stashCreate({ fs, dir, gitdir, message = '' }) {
+-  const { stashCommit } = await _createStashCommit({
+-    fs,
+-    dir,
+-    gitdir,
+-    message,
+-  })
++  return acquireLock(gitdir, async () => {
++    const { stashCommit } = await _createStashCommit({
++      fs,
++      dir,
++      gitdir,
++      message,
++    })
+ 
+-  // Return the stash commit hash without modifying refs or working directory
+-  return stashCommit
++    // Return the stash commit hash without modifying refs or working directory
++    return stashCommit
++  })
+ }
+ 
+ export async function _stashApply({ fs, dir, gitdir, refIdx = 0 }) {
+-  const stashMgr = new GitStashManager({ fs, dir, gitdir })
+-
+-  // get the stash commit object
+-  const stashCommit = await stashMgr.readStashCommit(refIdx)
+-  const { parent: stashParents = null } = stashCommit.commit
+-    ? stashCommit.commit
+-    : {}
+-  if (!stashParents || !Array.isArray(stashParents)) {
+-    return // no stash found
+-  }
+-
+-  // compare the stash commit tree with its parent commit
+-  for (let i = 0; i < stashParents.length - 1; i++) {
+-    const applyingCommit = await _readCommit({
+-      fs,
+-      cache: {},
+-      gitdir,
+-      oid: stashParents[i + 1],
+-    })
+-    const wasStaged = applyingCommit.commit.message.startsWith('stash-Index')
++  return acquireLock(gitdir, async () => {
++    const stashMgr = new GitStashManager({ fs, dir, gitdir })
++
++    // get the stash commit object
++    const stashCommit = await stashMgr.readStashCommit(refIdx)
++    const { parent: stashParents = null } = stashCommit.commit
++      ? stashCommit.commit
++      : {}
++    if (!stashParents || !Array.isArray(stashParents)) {
++      return // no stash found
++    }
+ 
+-    await applyTreeChanges({
+-      fs,
+-      dir,
+-      gitdir,
+-      stashCommit: stashParents[i + 1],
+-      parentCommit: stashParents[i],
+-      wasStaged,
+-    })
+-  }
++    // Compare and materialize every parent tree under the same process-wide
++    // lock. A stash may contain both an index tree and a worktree tree; locking
++    // each tree separately would let another apply interleave between them.
++    for (let i = 0; i < stashParents.length - 1; i++) {
++      const applyingCommit = await _readCommit({
++        fs,
++        cache: {},
++        gitdir,
++        oid: stashParents[i + 1],
++      })
++      const wasStaged = applyingCommit.commit.message.startsWith('stash-Index')
++
++      await applyTreeChanges({
++        fs,
++        dir,
++        gitdir,
++        stashCommit: stashParents[i + 1],
++        parentCommit: stashParents[i],
++        wasStaged,
++        lock: false,
++      })
++    }
++  })
+ }
+ 
+ export async function _stashDrop({ fs, dir, gitdir, refIdx = 0 }) {
+@@ -199,7 +209,7 @@ export async function _stashDrop({ fs, dir, gitdir, refIdx = 0 }) {
+   reflogEntries.splice(refIdx, 1)
+ 
+   const stashReflogPath = stashMgr.refLogsStashPath
+-  await acquireLock({ reflogEntries, stashReflogPath, stashMgr }, async () => {
++  await acquireLock(stashReflogPath, async () => {
+     if (reflogEntries.length) {
+       await fs.write(
+         stashReflogPath,
+diff --git a/src/errors/CherryPickMergeCommitError.js b/src/errors/CherryPickMergeCommitError.js
+new file mode 100644
+index 0000000..633e587
+--- /dev/null
++++ b/src/errors/CherryPickMergeCommitError.js
+@@ -0,0 +1,18 @@
++import { BaseError } from './BaseError.js'
++
++export class CherryPickMergeCommitError extends BaseError {
++  /**
++   * @param {string} oid
++   * @param {number} parentCount
++   */
++  constructor(oid, parentCount) {
++    super(
++      `Cannot cherry-pick merge commit ${oid}. ` +
++        `Merge commits have ${parentCount} parents and require specifying which parent to use as the base.`
++    )
++    this.code = this.name = CherryPickMergeCommitError.code
++    this.data = { oid, parentCount }
++  }
++}
++/** @type {'CherryPickMergeCommitError'} */
++CherryPickMergeCommitError.code = 'CherryPickMergeCommitError'
+diff --git a/src/errors/CherryPickRootCommitError.js b/src/errors/CherryPickRootCommitError.js
+new file mode 100644
+index 0000000..964a655
+--- /dev/null
++++ b/src/errors/CherryPickRootCommitError.js
+@@ -0,0 +1,16 @@
++import { BaseError } from './BaseError.js'
++
++export class CherryPickRootCommitError extends BaseError {
++  /**
++   * @param {string} oid
++   */
++  constructor(oid) {
++    super(
++      `Cannot cherry-pick root commit ${oid}. Root commits have no parents.`
++    )
++    this.code = this.name = CherryPickRootCommitError.code
++    this.data = { oid }
++  }
++}
++/** @type {'CherryPickRootCommitError'} */
++CherryPickRootCommitError.code = 'CherryPickRootCommitError'
+diff --git a/src/errors/EmptyCommitError.js b/src/errors/EmptyCommitError.js
+new file mode 100644
+index 0000000..86bbfd8
+--- /dev/null
++++ b/src/errors/EmptyCommitError.js
+@@ -0,0 +1,11 @@
++import { BaseError } from './BaseError.js'
++
++export class EmptyCommitError extends BaseError {
++  constructor() {
++    super('Cannot create an empty commit when disallowEmpty is true.')
++    this.code = this.name = EmptyCommitError.code
++    this.data = {}
++  }
++}
++/** @type {'EmptyCommitError'} */
++EmptyCommitError.code = 'EmptyCommitError'
+diff --git a/src/errors/InternalError.js b/src/errors/InternalError.js
+index 2b3777f..f026ff3 100644
+--- a/src/errors/InternalError.js
++++ b/src/errors/InternalError.js
+@@ -6,7 +6,7 @@ export class InternalError extends BaseError {
+    */
+   constructor(message) {
+     super(
+-      `An internal error caused this command to fail.\n\nIf you're not a developer, report the bug to the developers of the application you're using. If this is a bug in isomorphic-git then you should create a proper bug yourselves. The bug should include a minimal reproduction and details about the version and environment.\n\nPlease file a bug report at https://github.com/isomorphic-git/isomorphic-git/issues with this error message: ${message}`
++      `An internal error caused this command to fail.\n\nIf you're using an application that depends on isomorphic-git, please report this error to that application's developers.\n\nIf you're a developer and you believe this is a bug in isomorphic-git, please file an issue at https://github.com/isomorphic-git/isomorphic-git/issues with a minimal reproduction, version and environment details, and this error message: ${message}`
+     )
+     this.code = this.name = InternalError.code
+     this.data = { message }
+diff --git a/src/errors/index.js b/src/errors/index.js
+index f09e9b9..3170a79 100644
+--- a/src/errors/index.js
++++ b/src/errors/index.js
+@@ -2,7 +2,10 @@ export * from './AlreadyExistsError.js'
+ export * from './AmbiguousError.js'
+ // BaseError.js
+ export * from './CheckoutConflictError.js'
++export * from './CherryPickMergeCommitError.js'
++export * from './CherryPickRootCommitError.js'
+ export * from './CommitNotFetchedError.js'
++export * from './EmptyCommitError.js'
+ export * from './EmptyServerResponseError.js'
+ export * from './FastForwardError.js'
+ export * from './GitPushError.js'
+diff --git a/src/http/node/index.js b/src/http/node/index.js
+index 17004b5..1faed0e 100644
+--- a/src/http/node/index.js
++++ b/src/http/node/index.js
+@@ -17,10 +17,12 @@ export async function request({
+   method = 'GET',
+   headers = {},
+   agent,
++  fetchOptions = {},
+   body,
+ }) {
+   // If we can, we should send it as a single buffer so it sets a Content-Length header.
+   if (body && Array.isArray(body)) {
++    // @ts-expect-error
+     body = Buffer.from(await collect(body))
+   } else if (body) {
+     body = asyncIteratorToStream(body)
+@@ -28,6 +30,7 @@ export async function request({
+   return new Promise((resolve, reject) => {
+     get(
+       {
++        ...fetchOptions,
+         url,
+         method,
+         headers,
+diff --git a/src/http/web/index.js b/src/http/web/index.js
+index 2186d80..0d75a11 100644
+--- a/src/http/web/index.js
++++ b/src/http/web/index.js
+@@ -14,24 +14,29 @@ export async function request({
+   url,
+   method = 'GET',
+   headers = {},
++  fetchOptions = {},
+   body,
+ }) {
+   // streaming uploads aren't possible yet in the browser
+   if (body) {
++    // @ts-expect-error
+     body = await collect(body)
+   }
+-  const res = await fetch(url, { method, headers, body })
++  const res = await fetch(url, { ...fetchOptions, method, headers, body })
+   const iter =
++    // @ts-expect-error
+     res.body && res.body.getReader
+       ? fromStream(res.body)
+       : [new Uint8Array(await res.arrayBuffer())]
+   // convert Header object to ordinary JSON
+   headers = {}
++  // @ts-expect-error
+   for (const [key, value] of res.headers.entries()) {
+     headers[key] = value
+   }
+   return {
+     url: res.url,
++    // @ts-expect-error
+     method: res.method,
+     statusCode: res.status,
+     statusMessage: res.statusText,
+diff --git a/src/index.js b/src/index.js
+index 8135040..3d48642 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -10,6 +10,7 @@ import { addRemote } from './api/addRemote.js'
+ import { annotatedTag } from './api/annotatedTag.js'
+ import { branch } from './api/branch.js'
+ import { checkout } from './api/checkout.js'
++import { cherryPick } from './api/cherryPick.js'
+ import { clone } from './api/clone.js'
+ import { commit } from './api/commit.js'
+ import { currentBranch } from './api/currentBranch.js'
+@@ -83,6 +84,7 @@ export {
+   addRemote,
+   annotatedTag,
+   branch,
++  cherryPick,
+   checkout,
+   clone,
+   commit,
+@@ -157,6 +159,7 @@ export default {
+   addRemote,
+   annotatedTag,
+   branch,
++  cherryPick,
+   checkout,
+   clone,
+   commit,
+diff --git a/src/internal-apis.js b/src/internal-apis.js
+index b1a6fc1..b52c282 100644
+--- a/src/internal-apis.js
++++ b/src/internal-apis.js
+@@ -31,12 +31,17 @@ export * from './storage/readObject.js'
+ export * from './storage/writeObject.js'
+ export * from './storage/readObjectPacked.js'
+ 
++export * from './utils/applyDelta.js'
+ export * from './utils/calculateBasicAuthHeader.js'
+ export * from './utils/collect.js'
+ export * from './utils/comparePath.js'
++export * from './utils/discoverGitdir.js'
++export * from './utils/extractAuthFromUrl.js'
+ export * from './utils/flatFileListToDirectoryStructure.js'
++export * from './utils/formatInfoRefs.js'
+ export * from './utils/isBinary.js'
+ export * from './utils/join.js'
++export * from './utils/lock.js'
+ export * from './utils/mergeFile.js'
+ export * from './utils/mergeTree.js'
+ export * from './utils/modified.js'
+@@ -46,6 +51,7 @@ export * from './utils/padHex.js'
+ export * from './utils/pkg.js'
+ export * from './utils/resolveTree.js'
+ export * from './utils/shasum.js'
++export * from './utils/splitLines.js'
+ export * from './utils/sleep.js'
+ export * from './utils/symbols.js'
+ 
+diff --git a/src/managers/GitIndexManager.js b/src/managers/GitIndexManager.js
+index 0820943..9517c55 100644
+--- a/src/managers/GitIndexManager.js
++++ b/src/managers/GitIndexManager.js
+@@ -1,16 +1,9 @@
+ import '../typedefs.js'
+ 
+-// import LockManager from 'travix-lock-manager'
+-import AsyncLock from 'async-lock'
+-
+ import { UnmergedPathsError } from '../errors/UnmergedPathsError.js'
+ import { GitIndex } from '../models/GitIndex.js'
+ import { compareStats } from '../utils/compareStats.js'
+-
+-// import Lock from '../utils.js'
+-
+-// const lm = new LockManager()
+-let lock = null
++import { acquireLock } from '../utils/lock.js'
+ 
+ const IndexCache = Symbol('IndexCache')
+ 
+@@ -55,10 +48,10 @@ async function updateCachedIndexFile(fs, filepath, cache) {
+ async function isIndexStale(fs, filepath, cache) {
+   const savedStats = cache.stats.get(filepath)
+   if (savedStats === undefined) return true
+-  if (savedStats === null) return false
+-
+   const currStats = await fs.lstat(filepath)
+-  if (currStats === null) return false
++  if (savedStats === null || currStats === null) {
++    return currStats !== savedStats
++  }
+   return compareStats(savedStats, currStats)
+ }
+ 
+@@ -81,10 +74,9 @@ export class GitIndexManager {
+     }
+ 
+     const filepath = `${gitdir}/index`
+-    if (lock === null) lock = new AsyncLock({ maxPending: Infinity })
+     let result
+     let unmergedPaths = []
+-    await lock.acquire(filepath, async () => {
++    await acquireLock(filepath, async () => {
+       // Acquire a file lock while we're reading the index
+       // to make sure other processes aren't writing to it
+       // simultaneously, which could result in a corrupted index.
+@@ -99,15 +91,23 @@ export class GitIndexManager {
+       if (unmergedPaths.length && !allowUnmerged)
+         throw new UnmergedPathsError(unmergedPaths)
+ 
+-      result = await closure(index)
+-      if (index._dirty) {
+-        // Acquire a file lock while we're writing the index file
+-        // let fileLock = await Lock(filepath)
+-        const buffer = await index.toObject()
+-        await fs.write(filepath, buffer)
+-        // Update cached stat value
+-        theIndexCache.stats.set(filepath, await fs.lstat(filepath))
+-        index._dirty = false
++      try {
++        result = await closure(index)
++        if (index._dirty) {
++          // Acquire a file lock while we're writing the index file
++          // let fileLock = await Lock(filepath)
++          const buffer = await index.toObject()
++          await fs.write(filepath, buffer)
++          // Update cached stat value
++          theIndexCache.stats.set(filepath, await fs.lstat(filepath))
++          index._dirty = false
++        }
++      } catch (error) {
++        // Neither a rejected callback nor a failed write may leave uncommitted
++        // entries in a caller cache for a later read to accidentally persist.
++        theIndexCache.map.delete(filepath)
++        theIndexCache.stats.delete(filepath)
++        throw error
+       }
+     })
+ 
+diff --git a/src/managers/GitRefManager.js b/src/managers/GitRefManager.js
+index 5bedf3e..70cdca8 100644
+--- a/src/managers/GitRefManager.js
++++ b/src/managers/GitRefManager.js
+@@ -1,15 +1,16 @@
+ import '../typedefs.js'
+ 
+ // This is a convenience wrapper for reading and writing files in the 'refs' directory.
+-import AsyncLock from 'async-lock'
+-
++import { InternalError } from '../errors/InternalError.js'
+ import { InvalidOidError } from '../errors/InvalidOidError.js'
++import { InvalidRefNameError } from '../errors/InvalidRefNameError.js'
+ import { NoRefspecError } from '../errors/NoRefspecError.js'
+ import { NotFoundError } from '../errors/NotFoundError.js'
+ import { GitPackedRefs } from '../models/GitPackedRefs.js'
+ import { GitRefSpecSet } from '../models/GitRefSpecSet.js'
+ import { compareRefNames } from '../utils/compareRefNames.js'
+ import { join } from '../utils/join.js'
++import { acquireLock } from '../utils/lock.js'
+ 
+ import { GitConfigManager } from './GitConfigManager.js'
+ 
+@@ -26,11 +27,14 @@ const refpaths = ref => [
+ // @see https://git-scm.com/docs/gitrepository-layout
+ const GIT_FILES = ['config', 'description', 'index', 'shallow', 'commondir']
+ 
+-let lock
+-
+-async function acquireLock(ref, callback) {
+-  if (lock === undefined) lock = new AsyncLock()
+-  return lock.acquire(ref, callback)
++// These names are legal one-level ref names, so nothing upstream of here
++// rejects them, and writing to one lands on the repository file itself.
++// Canonical git refuses too: `git update-ref index <oid>` fails with
++// "cannot lock ref 'index': reference broken" and leaves the file alone.
++function assertWritableRef(ref) {
++  if (GIT_FILES.includes(ref)) {
++    throw new InvalidRefNameError(ref, `refs/heads/${ref}`)
++  }
+ }
+ 
+ /**
+@@ -80,6 +84,31 @@ export class GitRefManager {
+     }
+     const refspec = GitRefSpecSet.from(refspecs)
+     const actualRefsToWrite = new Map()
++    // Work out every destination this call will write, before touching the
++    // repository. Translating is pure, so it can happen up here; the writes
++    // themselves stay at the end of the function.
++    const refTranslations = refspec.translate([...refs.keys()])
++    const symrefTranslations = []
++    for (const [serverRef, translatedRef] of refspec.translate([
++      ...symrefs.keys(),
++    ])) {
++      const symtarget = refspec.translateOne(symrefs.get(serverRef))
++      if (symtarget) {
++        symrefTranslations.push([translatedRef, `ref: ${symtarget}`])
++      }
++    }
++    // The local side of a refspec is whatever `remote.<name>.fetch` says, so a
++    // config like `+refs/heads/main:index` lands a write on `.git/index`.
++    // Refuse it here rather than at the write loop: `pruneTags` and `prune`
++    // delete refs in between, so a later throw leaves the repository pruned
++    // and not updated. The tags added below are always `refs/tags/...`, which
++    // is never a system file, so nothing is missed by checking this early.
++    for (const [, translatedRef] of refTranslations) {
++      assertWritableRef(translatedRef)
++    }
++    for (const [translatedRef] of symrefTranslations) {
++      assertWritableRef(translatedRef)
++    }
+     // Delete all current tags if the pruneTags argument is true.
+     if (pruneTags) {
+       const tags = await GitRefManager.listRefs({
+@@ -107,18 +136,12 @@ export class GitRefManager {
+       }
+     }
+     // Combine refs and symrefs giving symrefs priority
+-    const refTranslations = refspec.translate([...refs.keys()])
+     for (const [serverRef, translatedRef] of refTranslations) {
+       const value = refs.get(serverRef)
+       actualRefsToWrite.set(translatedRef, value)
+     }
+-    const symrefTranslations = refspec.translate([...symrefs.keys()])
+-    for (const [serverRef, translatedRef] of symrefTranslations) {
+-      const value = symrefs.get(serverRef)
+-      const symtarget = refspec.translateOne(value)
+-      if (symtarget) {
+-        actualRefsToWrite.set(translatedRef, `ref: ${symtarget}`)
+-      }
++    for (const [translatedRef, value] of symrefTranslations) {
++      actualRefsToWrite.set(translatedRef, value)
+     }
+     // If `prune` argument is true, clear out the existing local refspec roots
+     const pruned = []
+@@ -177,6 +200,7 @@ export class GitRefManager {
+   // TODO: make this less crude?
+   static async writeRef({ fs, gitdir, ref, value }) {
+     // Validate input
++    assertWritableRef(ref)
+     if (!value.match(/[0-9a-f]{40}/)) {
+       throw new InvalidOidError(value)
+     }
+@@ -196,6 +220,7 @@ export class GitRefManager {
+    * @returns {Promise<void>}
+    */
+   static async writeSymbolicRef({ fs, gitdir, ref, value }) {
++    assertWritableRef(ref)
+     await acquireLock(ref, async () =>
+       fs.write(join(gitdir, ref), 'ref: ' + `${value.trim()}\n`, 'utf8')
+     )
+@@ -224,6 +249,8 @@ export class GitRefManager {
+    * @returns {Promise<void>}
+    */
+   static async deleteRefs({ fs, gitdir, refs }) {
++    // Validate input
++    refs.forEach(assertWritableRef)
+     // Delete regular ref
+     await Promise.all(refs.map(ref => fs.rm(join(gitdir, ref))))
+     // Delete any packed ref
+@@ -255,7 +282,13 @@ export class GitRefManager {
+    * @param {number} [args.depth = undefined] - The maximum depth to resolve symbolic refs.
+    * @returns {Promise<string>} - The resolved object ID.
+    */
+-  static async resolve({ fs, gitdir, ref, depth = undefined }) {
++  static async resolve({
++    fs,
++    gitdir,
++    ref,
++    depth = undefined,
++    visited = new Set(),
++  }) {
+     if (depth !== undefined) {
+       depth--
+       if (depth === -1) {
+@@ -266,7 +299,7 @@ export class GitRefManager {
+     // Is it a ref pointer?
+     if (ref.startsWith('ref: ')) {
+       ref = ref.slice('ref: '.length)
+-      return GitRefManager.resolve({ fs, gitdir, ref, depth })
++      return GitRefManager.resolve({ fs, gitdir, ref, depth, visited })
+     }
+     // Is it a complete and valid SHA?
+     if (ref.length === 40 && /[0-9a-f]{40}/.test(ref)) {
+@@ -285,13 +318,59 @@ export class GitRefManager {
+           packedMap.get(ref)
+       )
+       if (sha) {
+-        return GitRefManager.resolve({ fs, gitdir, ref: sha.trim(), depth })
++        // Guard against circular symbolic references (e.g. a -> b -> a). Without
++        // tracking visited refs this recursion would not terminate.
++        if (visited.has(ref)) {
++          throw new InternalError(
++            `Circular reference detected while resolving ref "${ref}"`
++          )
++        }
++        visited.add(ref)
++        return GitRefManager.resolve({
++          fs,
++          gitdir,
++          ref: sha.trim(),
++          depth,
++          visited,
++        })
+       }
+     }
+     // Do we give up?
+     throw new NotFoundError(ref)
+   }
+ 
++  /**
++   * Checks whether a ref names the branch HEAD points at in a repository where
++   * that branch has no commits yet.
++   *
++   * A repository created by `git init` has a HEAD pointing at a branch that
++   * does not exist on disk. Resolving that branch fails the same way resolving
++   * a misspelled ref does, so callers that want to treat the two differently
++   * need this to tell them apart.
++   *
++   * @param {Object} args
++   * @param {FSClient} args.fs - A file system implementation.
++   * @param {string} [args.gitdir=join(dir, '.git')] - [required] The [git directory](dir-vs-gitdir.md) path
++   * @param {string} args.ref - The ref to check.
++   * @returns {Promise<boolean>} - True if the ref names an unborn branch.
++   */
++  static async isUnbornBranch({ fs, gitdir, ref }) {
++    let target
++    try {
++      // depth 2 stops at the symbolic target instead of following it to an oid.
++      target = await GitRefManager.resolve({
++        fs,
++        gitdir,
++        ref: 'HEAD',
++        depth: 2,
++      })
++    } catch (_) {
++      return false
++    }
++    if (!target.startsWith('refs/heads/')) return false
++    return ref === 'HEAD' || refpaths(ref).includes(target)
++  }
++
+   /**
+    * Checks if a ref exists.
+    *
+@@ -327,7 +406,7 @@ export class GitRefManager {
+     // We need to alternate between the file system and the packed-refs
+     const packedMap = await GitRefManager.packedRefs({ fs, gitdir })
+     // Look in all the proper paths, in this order
+-    const allpaths = refpaths(ref)
++    const allpaths = refpaths(ref).filter(p => !GIT_FILES.includes(p)) // exclude git system files (#709)
+     for (const ref of allpaths) {
+       const refExists = await acquireLock(ref, async () =>
+         fs.exists(`${gitdir}/${ref}`)
+diff --git a/src/managers/GitRemoteManager.js b/src/managers/GitRemoteManager.js
+index 96dd6a6..f264ead 100644
+--- a/src/managers/GitRemoteManager.js
++++ b/src/managers/GitRemoteManager.js
+@@ -27,8 +27,10 @@ export class GitRemoteManager {
+     if (!parts) {
+       throw new UrlParseError(url)
+     }
+-    if (remoteHelpers.has(parts.transport)) {
+-      return remoteHelpers.get(parts.transport)
++    // Normalize only the lookup key; the HTTP request retains its original URL.
++    const transport = parts.transport.toLowerCase()
++    if (remoteHelpers.has(transport)) {
++      return remoteHelpers.get(transport)
+     }
+     throw new UnknownTransportError(
+       url,
+@@ -45,9 +47,15 @@ export class GitRemoteManager {
+  * @param {string} args.url - The URL of the remote repository.
+  * @returns {Object|undefined} - An object containing the transport and address, or undefined if parsing fails.
+  */
++// git-clone(1) calls this the "shorter scp-like syntax": [user@]host:path. The
++// user is part of the syntax, not part of the word `git`, and a self-hosted
++// forge is as likely to hand out `gitolite@`, `forgejo@` or `ubuntu@`. The host
++// and the user cannot hold a slash, an at sign or a colon, so `https://x` and a
++// `scheme:address` override are left to the expression below.
++const scpLike = /^[^/@:]+@[^/@:]+:/
++
+ function parseRemoteUrl({ url }) {
+-  // the stupid "shorter scp-like syntax"
+-  if (url.startsWith('git@')) {
++  if (scpLike.test(url)) {
+     return {
+       transport: 'ssh',
+       address: url,
+diff --git a/src/managers/GitShallowManager.js b/src/managers/GitShallowManager.js
+index 94f7cb3..aa5d28f 100644
+--- a/src/managers/GitShallowManager.js
++++ b/src/managers/GitShallowManager.js
+@@ -1,9 +1,6 @@
+ import '../typedefs.js'
+-import AsyncLock from 'async-lock'
+-
+ import { join } from '../utils/join.js'
+-
+-let lock = null
++import { acquireLock } from '../utils/lock.js'
+ 
+ export class GitShallowManager {
+   /**
+@@ -15,10 +12,9 @@ export class GitShallowManager {
+    * @returns {Promise<Set<string>>} - A set of shallow object IDs.
+    */
+   static async read({ fs, gitdir }) {
+-    if (lock === null) lock = new AsyncLock()
+     const filepath = join(gitdir, 'shallow')
+     const oids = new Set()
+-    await lock.acquire(filepath, async function () {
++    await acquireLock(filepath, async function () {
+       const text = await fs.read(filepath, { encoding: 'utf8' })
+       if (text === null) return oids // no file
+       if (text.trim() === '') return oids // empty file
+@@ -41,18 +37,17 @@ export class GitShallowManager {
+    * @returns {Promise<void>}
+    */
+   static async write({ fs, gitdir, oids }) {
+-    if (lock === null) lock = new AsyncLock()
+     const filepath = join(gitdir, 'shallow')
+     if (oids.size > 0) {
+       const text = [...oids].join('\n') + '\n'
+-      await lock.acquire(filepath, async function () {
++      await acquireLock(filepath, async function () {
+         await fs.write(filepath, text, {
+           encoding: 'utf8',
+         })
+       })
+     } else {
+       // No shallows
+-      await lock.acquire(filepath, async function () {
++      await acquireLock(filepath, async function () {
+         await fs.rm(filepath)
+       })
+     }
+diff --git a/src/managers/GitStashManager.js b/src/managers/GitStashManager.js
+index 0b47d02..93e30f2 100644
+--- a/src/managers/GitStashManager.js
++++ b/src/managers/GitStashManager.js
+@@ -188,7 +188,7 @@ export class GitStashManager {
+     )
+     const filepath = this.refLogsStashPath
+ 
+-    await acquireLock({ filepath, entry }, async () => {
++    await acquireLock(filepath, async () => {
+       const appendTo = (await this.fs.exists(filepath))
+         ? await this.fs.read(filepath, 'utf8')
+         : ''
+diff --git a/src/models/FileSystem.js b/src/models/FileSystem.js
+index a294dff..6c82903 100644
+--- a/src/models/FileSystem.js
++++ b/src/models/FileSystem.js
+@@ -2,6 +2,7 @@ import pify from 'pify'
+ 
+ import { compareStrings } from '../utils/compareStrings.js'
+ import { dirname } from '../utils/dirname.js'
++import { mkdirp } from '../utils/mkdirp.js'
+ import { rmRecursive } from '../utils/rmRecursive.js'
+ import { isPromiseLike } from '../utils/types.js'
+ 
+@@ -158,29 +159,17 @@ export class FileSystem {
+    * Make a directory (or series of nested directories) without throwing an error if it already exists.
+    *
+    * @param {string} filepath - The path to the directory.
+-   * @param {boolean} [_selfCall=false] - Internal flag to prevent infinite recursion.
+    * @returns {Promise<void>}
+    */
+-  async mkdir(filepath, _selfCall = false) {
+-    try {
+-      await this._mkdir(filepath)
+-    } catch (err) {
+-      // If err is null then operation succeeded!
+-      if (err === null) return
+-      // If the directory already exists, that's OK!
+-      if (err.code === 'EEXIST') return
+-      // Avoid infinite loops of failure
+-      if (_selfCall) throw err
+-      // If we got a "no such file or directory error" backup and try again.
+-      if (err.code === 'ENOENT') {
+-        const parent = dirname(filepath)
+-        // Check to see if we've gone too far
+-        if (parent === '.' || parent === '/' || parent === filepath) throw err
+-        // Infinite recursion, what could go wrong?
+-        await this.mkdir(parent)
+-        await this.mkdir(filepath, true)
+-      }
+-    }
++  async mkdir(filepath) {
++    // Recursively create the directory, using only single-level `_mkdir` so we
++    // don't depend on `{ recursive: true }` (which isn't part of the required
++    // `fs` contract — see docs/fs.md — and is unimplemented by some backends
++    // e.g. lightning-fs). The helper tolerates EEXIST and the transient ENOENT
++    // that eventually-consistent backends throw when a freshly created parent
++    // isn't visible yet, which is what made concurrent reflog writes into
++    // `.git/logs/refs/*` fail intermittently.
++    await mkdirp(this._mkdir, filepath)
+   }
+ 
+   /**
+diff --git a/src/models/GitPackIndex.js b/src/models/GitPackIndex.js
+index 64c55fe..b4fb218 100644
+--- a/src/models/GitPackIndex.js
++++ b/src/models/GitPackIndex.js
+@@ -289,12 +289,13 @@ export class GitPackIndex {
+       0b1100000: 'ofs_delta',
+       0b1110000: 'ref_delta',
+     }
+-    if (!this.pack) {
++    const pack = await this.pack
++    if (!pack) {
+       throw new InternalError(
+-        'Tried to read from a GitPackIndex with no packfile loaded into memory'
++        'Could not read packfile data. The packfile may be missing, corrupted, or too large to read into memory.'
+       )
+     }
+-    const raw = (await this.pack).slice(start)
++    const raw = pack.slice(start)
+     const reader = new BufferCursor(raw)
+     const byte = reader.readUInt8()
+     // Object type is encoded in bits 654
+diff --git a/src/models/GitTree.js b/src/models/GitTree.js
+index 34ee129..efa0734 100644
+--- a/src/models/GitTree.js
++++ b/src/models/GitTree.js
+@@ -45,8 +45,31 @@ function parseBuffer(buffer) {
+     const type = mode2type(mode)
+     const path = buffer.slice(space + 1, nullchar).toString('utf8')
+ 
+-    // Prevent malicious git repos from writing to "..\foo" on clone etc
+-    if (path.includes('\\') || path.includes('/')) {
++    // Reject reserved entry names, matching git's verify_path(): path separators,
++    // "." and ".." (which resolve outside the working directory), and ".git" (which git
++    // disallows as a path component). Checks mirror git's is_ntfs_dotgit() and
++    // is_hfs_dotgit(): case-insensitive, trailing dots/spaces stripped (NTFS),
++    // NTFS 8.3 short name aliases (git~1..git~9), NTFS Alternate Data Streams, and
++    // HFS+ ignorable Unicode characters stripped (zero-width joiners, directional
++    // marks, BOM, etc.).
++    const hfsClean = path.replace(
++      /[\u200C-\u200F\u202A-\u202E\u206A-\u206F\uFEFF]/g,
++      ''
++    )
++    // NTFS Alternate Data Streams are referenced as `<name>:<stream>:<type>`, and a
++    // directory's default stream lets `.git::$INDEX_ALLOCATION` resolve to the `.git`
++    // directory itself. git forbids *any* ADS, so only the portion before the first
++    // colon names the actual entry we normalize and check.
++    const ntfsClean = hfsClean.split(':')[0]
++    const normalized = ntfsClean.toLowerCase().replace(/[. ]+$/, '')
++    if (
++      path.includes('\\') ||
++      path.includes('/') ||
++      hfsClean === '.' ||
++      hfsClean === '..' ||
++      normalized === '.git' ||
++      /^\.?git~[1-9]$/.test(normalized)
++    ) {
+       throw new UnsafeFilepathError(path)
+     }
+ 
+diff --git a/src/models/GitWalkerFs.js b/src/models/GitWalkerFs.js
+index b9575c1..2ac4003 100644
+--- a/src/models/GitWalkerFs.js
++++ b/src/models/GitWalkerFs.js
+@@ -8,11 +8,12 @@ import { shasum } from '../utils/shasum.js'
+ import { GitObject } from './GitObject.js'
+ 
+ export class GitWalkerFs {
+-  constructor({ fs, dir, gitdir, cache }) {
++  constructor({ fs, dir, gitdir, cache, refresh = true }) {
+     this.fs = fs
+     this.cache = cache
+     this.dir = dir
+     this.gitdir = gitdir
++    this.refresh = refresh
+ 
+     this.config = null
+     const walker = this
+@@ -49,6 +50,7 @@ export class GitWalkerFs {
+   }
+ 
+   async readdir(entry) {
++    if ((await entry.type()) !== 'tree') return null
+     const filepath = entry._fullpath
+     const { fs, dir } = this
+     const names = await fs.readdir(join(dir, filepath))
+@@ -101,9 +103,14 @@ export class GitWalkerFs {
+       if ((await entry.type()) === 'tree') {
+         entry._content = undefined
+       } else {
+-        const config = await this._getGitConfig(fs, gitdir)
+-        const autocrlf = await config.get('core.autocrlf')
+-        const content = await fs.read(`${dir}/${entry._fullpath}`, { autocrlf })
++        let content
++        if ((await entry.mode()) >> 12 === 0b1010) {
++          content = await fs.readlink(`${dir}/${entry._fullpath}`)
++        } else {
++          const config = await this._getGitConfig(fs, gitdir)
++          const autocrlf = await config.get('core.autocrlf')
++          content = await fs.read(`${dir}/${entry._fullpath}`, { autocrlf })
++        }
+         // workaround for a BrowserFS edge case
+         entry._actualSize = content.length
+         if (entry._stat && entry._stat.size === -1) {
+@@ -143,7 +150,9 @@ export class GitWalkerFs {
+               // Update the stats in the index so we will get a "cache hit" next time
+               // 1) if we can (because the oid and mode are the same)
+               // 2) and only if we need to (because other stats differ)
++              // 3) and only if the caller opted in to refreshing the index
+               if (
++                self.refresh &&
+                 stage &&
+                 oid === stage.oid &&
+                 (!filemode || stats.mode === stage.mode) &&
+diff --git a/src/models/GitWalkerRepo.js b/src/models/GitWalkerRepo.js
+index 7b139de..f7c291d 100644
+--- a/src/models/GitWalkerRepo.js
++++ b/src/models/GitWalkerRepo.js
+@@ -18,9 +18,16 @@ export class GitWalkerRepo {
+       try {
+         oid = await GitRefManager.resolve({ fs, gitdir, ref })
+       } catch (e) {
+-        if (e instanceof NotFoundError) {
+-          // Handle fresh branches with no commits
++        // Only a branch that has no commits yet gets the empty tree. Anything
++        // else that fails to resolve is a ref the caller got wrong, and
++        // swallowing it here would walk an empty tree instead of saying so.
++        if (
++          e instanceof NotFoundError &&
++          (await GitRefManager.isUnbornBranch({ fs, gitdir, ref }))
++        ) {
+           oid = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
++        } else {
++          throw e
+         }
+       }
+       const tree = await resolveTree({ fs, cache: this.cache, gitdir, oid })
+diff --git a/src/storage/readObject.js b/src/storage/readObject.js
+index b3e7a82..071f06e 100644
+--- a/src/storage/readObject.js
++++ b/src/storage/readObject.js
+@@ -21,6 +21,10 @@ export async function _readObject({
+   oid,
+   format = 'content',
+ }) {
++  if (!['deflated', 'wrapped', 'content'].includes(format)) {
++    throw new InternalError(`invalid requested format "${format}"`)
++  }
++
+   // Curry the current read method so that the packfile un-deltification
+   // process can acquire external ref-deltas.
+   const getExternalRefDelta = oid => _readObject({ fs, cache, gitdir, oid })
+@@ -80,9 +84,5 @@ export async function _readObject({
+   result.object = object
+   result.format = 'content'
+ 
+-  if (format === 'content') {
+-    return result
+-  }
+-
+-  throw new InternalError(`invalid requested format "${format}"`)
++  return result
+ }
+diff --git a/src/storage/readObjectPacked.js b/src/storage/readObjectPacked.js
+index 4d53103..bbb37b5 100644
+--- a/src/storage/readObjectPacked.js
++++ b/src/storage/readObjectPacked.js
+@@ -1,6 +1,7 @@
+ import { InternalError } from '../errors/InternalError.js'
+ import { readPackIndex } from '../storage/readPackIndex.js'
+ import { join } from '../utils/join.js'
++import { shasumRange } from '../utils/shasumRange.js'
+ 
+ export async function readObjectPacked({
+   fs,
+@@ -25,11 +26,52 @@ export async function readObjectPacked({
+     if (p.error) throw new InternalError(p.error)
+     // If the packfile DOES have the oid we're looking for...
+     if (p.offsets.has(oid)) {
+-      // Get the resolved git object from the packfile
++      // Derive the .pack path from the .idx path
++      const packFile = indexFile.replace(/idx$/, 'pack')
+       if (!p.pack) {
+-        const packFile = indexFile.replace(/idx$/, 'pack')
+         p.pack = fs.read(packFile)
+       }
++      const pack = await p.pack
++      if (!pack) {
++        p.pack = null
++        throw new InternalError(
++          `Could not read packfile at ${packFile}. The file may be missing, corrupted, or too large to read into memory.`
++        )
++      }
++
++      // === Packfile Integrity Verification ===
++      // Performance optimization: use _checksumVerified flag to verify only once per packfile
++      if (!p._checksumVerified) {
++        const expectedShaFromIndex = p.packfileSha
++
++        // 1. Fast Check: Verify packfile trailer matches index record
++        // Use subarray instead of slice to avoid memory copy (zero-copy for large packfiles)
++        const packTrailer = pack.subarray(-20)
++        const packTrailerSha = Array.from(packTrailer)
++          .map(b => b.toString(16).padStart(2, '0'))
++          .join('')
++        if (packTrailerSha !== expectedShaFromIndex) {
++          throw new InternalError(
++            `Packfile trailer mismatch: expected ${expectedShaFromIndex}, got ${packTrailerSha}. The packfile may be corrupted.`
++          )
++        }
++
++        // 2. Deep Integrity Check: Calculate actual SHA-1 of packfile payload.
++        // Hash exactly the payload; the trailing digest is excluded.
++        const actualPayloadSha = await shasumRange(pack, {
++          start: 0,
++          end: pack.length - 20,
++        })
++        if (actualPayloadSha !== expectedShaFromIndex) {
++          throw new InternalError(
++            `Packfile trailer mismatch: payload checksum ${actualPayloadSha} does not match ${expectedShaFromIndex}. The packfile may be corrupted.`
++          )
++        }
++
++        // Mark as verified to prevent performance regression on subsequent reads
++        p._checksumVerified = true
++      }
++
+       const result = await p.read({ oid, getExternalRefDelta })
+       result.format = 'content'
+       result.source = `objects/pack/${filename.replace(/idx$/, 'pack')}`
+diff --git a/src/typedefs-http.js b/src/typedefs-http.js
+index eb9c031..95ce0b3 100644
+--- a/src/typedefs-http.js
++++ b/src/typedefs-http.js
+@@ -20,6 +20,7 @@
+  * @property {AsyncIterableIterator<Uint8Array>} [body] - An async iterator of Uint8Arrays that make up the body of POST requests
+  * @property {ProgressCallback} [onProgress] - Reserved for future use (emitting `GitProgressEvent`s)
+  * @property {object} [signal] - Reserved for future use (canceling a request)
++ * @property {Object} [fetchOptions={}] - Additional options to pass to fetch (Web) or simple-get (Node)
+  */
+ 
+ /**
+diff --git a/src/typedefs.js b/src/typedefs.js
+index cc3b8c6..4b4d1f3 100644
+--- a/src/typedefs.js
++++ b/src/typedefs.js
+@@ -7,6 +7,7 @@ import './typedefs-http.js'
+  * @property {string} message Commit message
+  * @property {string} tree SHA-1 object id of corresponding file tree
+  * @property {string[]} parent an array of zero or more SHA-1 object ids
++ * @property {Array.<Array.<string|null>>} [changes] Changed files as `[newOid, oldOid, filepath]`; present when `log` is called with `includeChanges: true`.
+  * @property {Object} author
+  * @property {string} author.name The author's name
+  * @property {string} author.email The author's email
+diff --git a/src/utils/addCredentialUsername.js b/src/utils/addCredentialUsername.js
+new file mode 100644
+index 0000000..7247153
+--- /dev/null
++++ b/src/utils/addCredentialUsername.js
+@@ -0,0 +1,9 @@
++export function addCredentialUsername({ config, onAuth }) {
++  if (!onAuth) return onAuth
++
++  return async (url, auth) => {
++    const username =
++      auth.username || (await config.get(`credential.${url}.username`))
++    return onAuth(url, username ? { ...auth, username } : auth)
++  }
++}
+diff --git a/src/utils/applyDelta.js b/src/utils/applyDelta.js
+index 09be863..d5a463c 100644
+--- a/src/utils/applyDelta.js
++++ b/src/utils/applyDelta.js
+@@ -18,26 +18,31 @@ export function applyDelta(delta, source) {
+   const targetSize = readVarIntLE(reader)
+   let target
+ 
+-  const firstOp = readOp(reader, source)
++  const firstOp = reader.eof() ? Buffer.alloc(0) : readOp(reader, source)
+   // Speed optimization - return raw buffer if it's just single simple copy
+-  if (firstOp.byteLength === targetSize) {
++  if (firstOp.byteLength === targetSize && reader.eof()) {
+     target = firstOp
+   } else {
+-    // Otherwise, allocate a fresh buffer and slices
+-    target = Buffer.alloc(targetSize)
+-    const writer = new BufferCursor(target)
+-    writer.copy(firstOp)
++    // Build the result from the delta ops instead of pre-allocating `targetSize`.
++    // `targetSize` comes from the delta header and may not match the actual op output,
++    // so allocating it up front can reserve far more memory than the ops produce.
++    // Building from the ops bounds memory to the real output size; the size check below
++    // still validates the total before concatenating.
++    const chunks = [firstOp]
++    let tell = firstOp.byteLength
+ 
+     while (!reader.eof()) {
+-      writer.copy(readOp(reader, source))
++      const op = readOp(reader, source)
++      chunks.push(op)
++      tell += op.byteLength
+     }
+ 
+-    const tell = writer.tell()
+     if (targetSize !== tell) {
+       throw new InternalError(
+         `applyDelta expected target buffer to be ${targetSize} bytes but the resulting buffer was ${tell} bytes`
+       )
+     }
++    target = Buffer.concat(chunks, targetSize)
+   }
+   return target
+ }
+@@ -47,8 +52,13 @@ function readVarIntLE(reader) {
+   let shift = 0
+   let byte = null
+   do {
+-    byte = reader.readUInt8()
+-    result |= (byte & 0b01111111) << shift
++    byte = readByte(reader)
++    result += (byte & 0b01111111) * 2 ** shift
++    if (!Number.isSafeInteger(result)) {
++      throw new InternalError(
++        'applyDelta size exceeds the supported integer range'
++      )
++    }
+     shift += 7
+   } while (byte & 0b10000000)
+   return result
+@@ -59,7 +69,7 @@ function readCompactLE(reader, flags, size) {
+   let shift = 0
+   while (size--) {
+     if (flags & 0b00000001) {
+-      result |= reader.readUInt8() << shift
++      result += readByte(reader) * 2 ** shift
+     }
+     flags >>= 1
+     shift += 8
+@@ -67,9 +77,14 @@ function readCompactLE(reader, flags, size) {
+   return result
+ }
+ 
++function readByte(reader) {
++  if (reader.eof()) throw new InternalError('applyDelta truncated instruction')
++  return reader.readUInt8()
++}
++
+ function readOp(reader, source) {
+   /** @type {number} */
+-  const byte = reader.readUInt8()
++  const byte = readByte(reader)
+   const COPY = 0b10000000
+   const OFFS = 0b00001111
+   const SIZE = 0b01110000
+@@ -79,9 +94,15 @@ function readOp(reader, source) {
+     let size = readCompactLE(reader, (byte & SIZE) >> 4, 3)
+     // Yup. They really did this optimization.
+     if (size === 0) size = 0x10000
++    if (offset + size > source.length) {
++      throw new InternalError('applyDelta copy exceeds the source buffer')
++    }
+     return source.slice(offset, offset + size)
+   } else {
+-    // insert
++    // Opcode zero is reserved; a literal must include all its declared bytes.
++    if (byte === 0 || reader.tell() + byte > reader.buffer.length) {
++      throw new InternalError('applyDelta invalid literal instruction')
++    }
+     return reader.slice(byte)
+   }
+ }
+diff --git a/src/utils/assertNoSymlinkInLeadingPath.js b/src/utils/assertNoSymlinkInLeadingPath.js
+new file mode 100644
+index 0000000..7c6d1af
+--- /dev/null
++++ b/src/utils/assertNoSymlinkInLeadingPath.js
+@@ -0,0 +1,29 @@
++import { UnsafeFilepathError } from '../errors/UnsafeFilepathError.js'
++
++/**
++ * Refuse to materialize a working-tree entry whose parent path traverses a
++ * symbolic link. A leading component that is a symlink could otherwise redirect
++ * a write or mkdir outside the working tree. git applies the same check: it does
++ * not follow symlinks in the leading path when writing working-tree files.
++ *
++ * @param {import('../models/FileSystem.js').FileSystem} fs
++ * @param {string} dir
++ * @param {string} fullpath
++ */
++export async function assertNoSymlinkInLeadingPath(fs, dir, fullpath) {
++  const parts = fullpath.split('/')
++  parts.pop() // the final segment is the entry being written, not a leading dir
++  let current = dir
++  for (const part of parts) {
++    if (part === '' || part === '.') continue
++    current = `${current}/${part}`
++    const stats = await fs.lstat(current)
++    // lstat returns null when the path doesn't exist yet (nothing to traverse).
++    if (stats && stats.isSymbolicLink()) {
++      throw new UnsafeFilepathError(fullpath)
++    }
++    // A missing or ordinary-file prefix has no descendants to inspect yet.
++    // Materialization may legitimately replace a tracked file by a directory.
++    if (!stats || !stats.isDirectory()) return
++  }
++}
+diff --git a/src/utils/asyncIteratorToStream.js b/src/utils/asyncIteratorToStream.js
+index 1e790d5..062e799 100644
+--- a/src/utils/asyncIteratorToStream.js
++++ b/src/utils/asyncIteratorToStream.js
+@@ -1,6 +1,7 @@
+ import { forAwait } from './forAwait.js'
+ 
+ export function asyncIteratorToStream(iter) {
++  // @ts-expect-error: readable-stream has PassThrough at runtime, types mismatch
+   const { PassThrough } = require('readable-stream')
+   const stream = new PassThrough()
+   setTimeout(async () => {
+diff --git a/src/utils/discoverGitdir.js b/src/utils/discoverGitdir.js
+index a291510..b5cfbef 100644
+--- a/src/utils/discoverGitdir.js
++++ b/src/utils/discoverGitdir.js
+@@ -1,7 +1,7 @@
+ /**
+  * discoverGitdir
+  *
+- * When processing git commands on a submodule determine
++ * When processing git commands on a submodule or worktree, determine
+  * the actual git directory based on the contents of the .git file.
+  *
+  * Otherwise (if sent a directory) return that directory as-is.
+@@ -24,6 +24,11 @@ import { assertParameter } from './assertParameter.js'
+ import { dirname } from './dirname.js'
+ import { join } from './join.js'
+ 
++// Check if a path is absolute (Unix / or Windows drive letter like C:\ or C:/)
++function isAbsolute(filepath) {
++  return filepath.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(filepath)
++}
++
+ export async function discoverGitdir({ fsp, dotgit }) {
+   assertParameter('fsp', fsp)
+   assertParameter('dotgit', dotgit)
+@@ -38,6 +43,10 @@ export async function discoverGitdir({ fsp, dotgit }) {
+       ._readFile(dotgit, 'utf8')
+       .then(contents => contents.trimRight().substr(8))
+       .then(submoduleGitdir => {
++        // Worktrees use absolute gitdir paths; submodules use relative ones.
++        if (isAbsolute(submoduleGitdir)) {
++          return submoduleGitdir
++        }
+         const gitdir = join(dirname(dotgit), submoduleGitdir)
+         return gitdir
+       })
+diff --git a/src/utils/extractAuthFromUrl.js b/src/utils/extractAuthFromUrl.js
+index 2aa8fae..6eb957b 100644
+--- a/src/utils/extractAuthFromUrl.js
++++ b/src/utils/extractAuthFromUrl.js
+@@ -1,16 +1,71 @@
++// The `@` that ends the credentials is the last one in the authority, and the
++// scheme is matched case-insensitively: `HTTPS://user:pass@host/x` is a URL
++// like any other, and leaving the credentials in it is what `fetch` rejects.
++// The authority ends at the first `/`, `?` or `#`, so an `@` that lives in a
++// query or a fragment is left where it is.
++const CREDENTIALS = /^(https?:\/\/)([^/?#]+)@/i
++
+ export function extractAuthFromUrl(url) {
+   // For whatever reason, the `fetch` API does not convert credentials embedded in the URL
+   // into Basic Authentication headers automatically. Instead it throws an error!
+   // So we must manually parse the URL, rip out the user:password portion if it is present
+   // and compute the Authorization header.
+-  // Note: I tried using new URL(url) but that throws a security exception in Edge. :rolleyes:
+-  let userpass = url.match(/^https?:\/\/([^/]+)@/)
++  const credentials = url.match(CREDENTIALS)
+   // No credentials, return the url unmodified and an empty auth object
+-  if (userpass == null) return { url, auth: {} }
+-  userpass = userpass[1]
+-  const [username, password] = userpass.split(':')
+-  // Remove credentials from URL
+-  url = url.replace(`${userpass}@`, '')
+-  // Has credentials, return the fetch-safe URL and the parsed credentials
+-  return { url, auth: { username, password } }
++  if (credentials == null) return { url, auth: {} }
++  // Has credentials, return the fetch-safe URL and the parsed credentials.
++  // The credentials are cut out of the original string rather than read back
++  // off the parsed URL: serializing that one would also drop an explicit
++  // `:443` and append a slash to a URL that has no path, and this return value
++  // is what the request goes out against.
++  return {
++    url: url.replace(CREDENTIALS, '$1'),
++    auth: parseUserinfo(url, credentials[2]),
++  }
++}
++
++function parseUserinfo(url, userpass) {
++  // `URL` splits the two halves the way the platform does, so the first colon
++  // separates them and any later one stays in the password. Only the split is
++  // taken from it, for the reason above.
++  const parsed = parseUrl(url)
++  // A password is absent, not empty, when no colon was written at all. `URL`
++  // reports `''` for both, and the difference is worth keeping.
++  const hasPassword = userpass.indexOf(':') !== -1
++
++  if (parsed !== null) {
++    return {
++      username: decodeUserinfo(parsed.username),
++      password: hasPassword ? decodeUserinfo(parsed.password) : undefined,
++    }
++  }
++
++  // No `URL` to parse with, or it rejected a string the expression above
++  // accepted. Split on the first colon by hand, without the percent-decoding.
++  const separatorIndex = userpass.indexOf(':')
++  return {
++    username: hasPassword ? userpass.slice(0, separatorIndex) : userpass,
++    password: hasPassword ? userpass.slice(separatorIndex + 1) : undefined,
++  }
++}
++
++function parseUrl(url) {
++  if (typeof URL !== 'function') return null
++  try {
++    return new URL(url)
++  } catch (_) {
++    return null
++  }
++}
++
++// `URL` hands back the userinfo still percent-encoded, so `p:ss` arrives as
++// `p%3Ass` and has to be decoded before it reaches the Authorization header. A
++// lone `%` is not something the parser encodes, and it makes the decode throw,
++// so the raw value stands in whenever the decode fails.
++function decodeUserinfo(value) {
++  try {
++    return decodeURIComponent(value)
++  } catch (_) {
++    return value
++  }
+ }
+diff --git a/src/utils/formatInfoRefs.js b/src/utils/formatInfoRefs.js
+index 42f4f8d..f415870 100644
+--- a/src/utils/formatInfoRefs.js
++++ b/src/utils/formatInfoRefs.js
+@@ -18,11 +18,13 @@ export function formatInfoRefs(remote, prefix, symrefs, peelTags) {
+         const _key = key.replace('^{}', '')
+         // Peeled tags are almost always listed immediately after the original tag
+         const last = refs[refs.length - 1]
+-        const r = last.ref === _key ? last : refs.find(x => x.ref === _key)
+-        if (r === undefined) {
+-          throw new Error('I did not expect this to happen')
++        const r = last?.ref === _key ? last : refs.find(x => x.ref === _key)
++        // The tag itself can be absent when `prefix` filtered it out: the
++        // peeled name is longer, so it can match a prefix the tag does not.
++        // There is nothing to attach the peeled oid to, so drop it.
++        if (r !== undefined) {
++          r.peeled = value
+         }
+-        r.peeled = value
+       }
+       continue
+     }
+diff --git a/src/utils/join.js b/src/utils/join.js
+index e673708..1f23724 100644
+--- a/src/utils/join.js
++++ b/src/utils/join.js
+@@ -2,6 +2,18 @@
+  * This code for `path.join` is directly copied from @zenfs/core/path for bundle size improvements.
+  * SPDX-License-Identifier: LGPL-3.0-or-later
+  * Copyright (c) James Prevett and other ZenFS contributors.
++ *
++ * Windows support added:
++ *   - Backslashes are normalised to forward slashes before processing.
++ *   - Drive-letter prefixes (e.g. "C:") are detected and preserved through
++ *     normalisation, so absolute Windows paths are handled correctly.
++ *   - An absolute argument passed to join() resets the accumulated path,
++ *     matching Node behaviour and handling worktree gitdir paths properly.
++ *
++ * Limitation: UNC paths (e.g. \\server\share) are not supported. The leading
++ *   backslashes are normalised to forward slashes and then collapsed by
++ *   normalizeString, losing the UNC root. Git on Windows works with
++ *   drive-letter paths, so this is not expected to be a practical issue.
+  */
+ 
+ function normalizeString(path, aar) {
+@@ -65,29 +77,67 @@ function normalizeString(path, aar) {
+   return res
+ }
+ 
++// Returns the Windows drive prefix ("C:") if present, otherwise null.
++function getWindowsDrivePrefix(path) {
++  if (path.length >= 2 && /^[a-zA-Z]:/.test(path)) {
++    return path.slice(0, 2) // e.g. "C:"
++  }
++  return null
++}
++
+ function normalize(path) {
+   if (!path.length) return '.'
+ 
+-  const isAbsolute = path[0] === '/'
++  // Normalise backslashes to forward slashes before any other processing.
++  path = path.replace(/\\/g, '/')
++
++  const drivePrefix = getWindowsDrivePrefix(path)
++  // isAbsolute: Unix root ('/foo') OR Windows drive+slash ('C:/foo').
++  const isAbsolute =
++    path[0] === '/' || (drivePrefix !== null && path[2] === '/')
+   const trailingSeparator = path.at(-1) === '/'
+ 
+-  path = normalizeString(path, !isAbsolute)
++  // Strip the drive prefix before feeding into normalizeString so that the
++  // core algorithm only ever sees a plain POSIX-style string.
++  const pathBody = drivePrefix ? path.slice(2) : path
+ 
+-  if (!path.length) {
+-    if (isAbsolute) return '/'
+-    return trailingSeparator ? './' : '.'
++  let normalized = normalizeString(pathBody, !isAbsolute)
++
++  if (!normalized.length) {
++    const root = drivePrefix
++      ? isAbsolute
++        ? drivePrefix + '/'
++        : drivePrefix
++      : isAbsolute
++        ? '/'
++        : '.'
++    return trailingSeparator && !isAbsolute ? root + '/' : root
+   }
+-  if (trailingSeparator) path += '/'
++  if (trailingSeparator) normalized += '/'
+ 
+-  return isAbsolute ? `/${path}` : path
++  if (drivePrefix) {
++    return isAbsolute
++      ? `${drivePrefix}/${normalized}`
++      : `${drivePrefix}${normalized}`
++  }
++  return isAbsolute ? `/${normalized}` : normalized
+ }
+ 
+ export function join(...args) {
+   if (args.length === 0) return '.'
+   let joined
+   for (let i = 0; i < args.length; ++i) {
+-    const arg = args[i]
+-    if (arg.length > 0) {
++    // Normalise separators before processing.
++    const arg = args[i].replace(/\\/g, '/')
++    if (arg.length === 0) continue
++
++    // A Windows drive-letter path (e.g. "C:/worktrees/foo") cannot be
++    // meaningfully appended to any base, so it resets the accumulator.
++    // Unix absolute paths (leading '/') are NOT reset here — that would be
++    // path.resolve() semantics; path.join('foo', '/bar') must yield 'foo/bar'.
++    if (/^[a-zA-Z]:\//.test(arg)) {
++      joined = arg
++    } else {
+       if (joined === undefined) joined = arg
+       else joined += '/' + arg
+     }
+diff --git a/src/utils/lock.js b/src/utils/lock.js
+new file mode 100644
+index 0000000..99011a4
+--- /dev/null
++++ b/src/utils/lock.js
+@@ -0,0 +1,39 @@
++import AsyncLock from 'async-lock'
++
++// A single process-wide lock shared by everything that serializes file
++// operations (the index, refs, the shallow file, blob writes). It is keyed by
++// path, so unrelated resources never contend. Centralizing it here also means
++// there is exactly one place to reset it (see `_resetLock`).
++//
++// Created lazily (not at module load) so this module has no top-level side
++// effect and stays tree-shakeable.
++let lock
++
++function getLock() {
++  if (lock === undefined) lock = new AsyncLock({ maxPending: Infinity })
++  return lock
++}
++
++/**
++ * Run `callback` while holding the shared lock for `key`, then release it.
++ *
++ * @template T
++ * @param {string | string[]} key - Resource key(s) to lock (usually a filepath).
++ * @param {() => (Promise<T> | T)} callback
++ * @returns {Promise<T>}
++ */
++export function acquireLock(key, callback) {
++  return getLock().acquire(key, callback)
++}
++
++/**
++ * Discard the shared lock so the next `acquireLock` starts a fresh one. Intended
++ * for test harnesses that run many independent scenarios inside one long-lived
++ * module instance: if a scenario leaves an operation stalled (e.g. a filesystem
++ * that hangs), its still-held lock would otherwise block every later scenario
++ * that touches the same path. Resetting abandons that stalled queue so the next
++ * scenario starts clean. It is a no-op for normal library use.
++ */
++export function _resetLock() {
++  lock = undefined
++}
+diff --git a/src/utils/mergeTree.js b/src/utils/mergeTree.js
+index 5329424..bfa77ae 100644
+--- a/src/utils/mergeTree.js
++++ b/src/utils/mergeTree.js
+@@ -12,6 +12,7 @@ import { basename } from './basename.js'
+ import { join } from './join.js'
+ import { mergeFile } from './mergeFile.js'
+ import { modified } from './modified.js'
++import { applyTreeChanges } from './walkerToTreeEntryMap.js'
+ 
+ /**
+  * Create a merged tree
+@@ -295,22 +296,18 @@ export async function mergeTree({
+   })
+ 
+   if (unmergedFiles.length !== 0) {
+-    if (dir && !abortOnConflict) {
+-      await _walk({
++    if (dir && !abortOnConflict && !dryRun) {
++      // Use the same safe, mode-aware materialization as a clean cherry-pick.
++      // The caller already owns the index lock, so do not acquire a gitdir
++      // lock in reverse order. Conflict stages are maintained by the caller.
++      await applyTreeChanges({
+         fs,
+-        cache,
+         dir,
+         gitdir,
+-        trees: [TREE({ ref: results.oid })],
+-        map: async function (filepath, [entry]) {
+-          const path = `${dir}/${filepath}`
+-          if ((await entry.type()) === 'blob') {
+-            const mode = await entry.mode()
+-            const content = new TextDecoder().decode(await entry.content())
+-            await fs.write(path, content, { mode })
+-          }
+-          return true
+-        },
++        stashCommit: results.oid,
++        parentCommit: ourOid,
++        wasStaged: false,
++        lock: false,
+       })
+     }
+     return new MergeConflictError(
+diff --git a/src/utils/mkdirp.js b/src/utils/mkdirp.js
+new file mode 100644
+index 0000000..c5c99a5
+--- /dev/null
++++ b/src/utils/mkdirp.js
+@@ -0,0 +1,62 @@
++import { dirname } from './dirname.js'
++
++/**
++ * Recursively creates the directory at `filepath`, creating any missing parent
++ * directories along the way. This is a portable replacement for
++ * `fs.mkdir(path, { recursive: true })`: recursive `mkdir` is NOT part of
++ * isomorphic-git's required `fs` contract (see docs/fs.md — `mkdir` is only
++ * `mkdir(path[, mode])`) and is unimplemented by some backends such as
++ * lightning-fs, so we build it here on top of a single-level `mkdir(path)`
++ * primitive only — mirroring how `rmRecursive` provides `rm({ recursive: true })`.
++ *
++ * It takes the raw single-level `mkdir` *function* (typically `fs._mkdir`)
++ * rather than the FileSystem wrapper, to stay decoupled from that type.
++ *
++ * `EEXIST` is treated as success, so two callers concurrently creating the same
++ * directory (e.g. several reflog writes into `.git/logs/refs/*` during a stash)
++ * don't fail each other. On backends whose layers are only eventually
++ * consistent — e.g. an async copy-on-write overlay — a just-created parent may
++ * not yet be visible when its child is created, so `mkdir` can throw a
++ * transient `ENOENT`; those are retried a bounded number of times rather than
++ * surfaced as a spurious failure.
++ *
++ * @param {(filepath: string) => Promise<unknown>} mkdir - Creates a single directory (non-recursive).
++ * @param {string} filepath - The directory to create.
++ * @param {number} [retries=10] - Max transient-ENOENT retries after the parent exists.
++ * @returns {Promise<void>}
++ */
++export async function mkdirp(mkdir, filepath, retries = 10) {
++  try {
++    await mkdir(filepath)
++  } catch (err) {
++    // Some fs implementations signal success by yielding a null error.
++    if (err === null) return
++    // The directory already exists — that's fine.
++    if (err.code === 'EEXIST') return
++    // Anything other than a missing parent is a real error.
++    if (err.code !== 'ENOENT') throw err
++    const parent = dirname(filepath)
++    // Stop if we've walked past the filesystem root.
++    if (parent === '.' || parent === '/' || parent === filepath) throw err
++    // Create the missing parent(s) first, honoring the same retry budget.
++    await mkdirp(mkdir, parent, retries)
++    // Then (re)create this directory. On an eventually-consistent backend the
++    // parent may not be visible immediately after its mkdir resolves, so a
++    // repeated ENOENT here is transient — retry a bounded number of times,
++    // yielding between attempts so the pending write can settle.
++    for (let attempt = 0; ; attempt++) {
++      try {
++        await mkdir(filepath)
++        return
++      } catch (err2) {
++        if (err2 === null || err2.code === 'EEXIST') return
++        if (err2.code === 'ENOENT' && attempt < retries) {
++          // Give the backend a turn of the event loop to become consistent.
++          await new Promise(resolve => setTimeout(resolve, 0))
++          continue
++        }
++        throw err2
++      }
++    }
++  }
++}
+diff --git a/src/utils/resolveFilepath.js b/src/utils/resolveFilepath.js
+index 6567f68..e3dc1f5 100644
+--- a/src/utils/resolveFilepath.js
++++ b/src/utils/resolveFilepath.js
+@@ -7,6 +7,23 @@ import { _readObject as readObject } from '../storage/readObject.js'
+ import { resolveTree } from '../utils/resolveTree.js'
+ 
+ export async function resolveFilepath({ fs, cache, gitdir, oid, filepath }) {
++  const entry = await resolveFilepathEntry({
++    fs,
++    cache,
++    gitdir,
++    oid,
++    filepath,
++  })
++  return entry.oid
++}
++
++export async function resolveFilepathEntry({
++  fs,
++  cache,
++  gitdir,
++  oid,
++  filepath,
++}) {
+   // Ensure there are no leading or trailing directory separators.
+   // I was going to do this automatically, but then found that the Git Terminal for Windows
+   // auto-expands --filepath=/src/utils to --filepath=C:/Users/Will/AppData/Local/Programs/Git/src/utils
+@@ -20,10 +37,10 @@ export async function resolveFilepath({ fs, cache, gitdir, oid, filepath }) {
+   const result = await resolveTree({ fs, cache, gitdir, oid })
+   const tree = result.tree
+   if (filepath === '') {
+-    oid = result.oid
++    return { mode: '040000', oid: result.oid, path: '', type: 'tree' }
+   } else {
+     const pathArray = filepath.split('/')
+-    oid = await _resolveFilepath({
++    return _resolveFilepath({
+       fs,
+       cache,
+       gitdir,
+@@ -33,7 +50,6 @@ export async function resolveFilepath({ fs, cache, gitdir, oid, filepath }) {
+       filepath,
+     })
+   }
+-  return oid
+ }
+ 
+ async function _resolveFilepath({
+@@ -49,7 +65,7 @@ async function _resolveFilepath({
+   for (const entry of tree) {
+     if (entry.path === name) {
+       if (pathArray.length === 0) {
+-        return entry.oid
++        return entry
+       } else {
+         const { type, object } = await readObject({
+           fs,
+diff --git a/src/utils/shasumRange.js b/src/utils/shasumRange.js
+new file mode 100644
+index 0000000..6d1d852
+--- /dev/null
++++ b/src/utils/shasumRange.js
+@@ -0,0 +1,8 @@
++import { shasum } from './shasum.js'
++
++export async function shasumRange(
++  buffer,
++  { start = 0, end = buffer.length } = {}
++) {
++  return shasum(buffer.subarray(start, end))
++}
+diff --git a/src/utils/shasumRange.node.js b/src/utils/shasumRange.node.js
+new file mode 100644
+index 0000000..96c0867
+--- /dev/null
++++ b/src/utils/shasumRange.node.js
+@@ -0,0 +1,14 @@
++import { createHash } from 'crypto'
++
++const SHA1_CHUNK_SIZE = 8 * 1024 * 1024
++
++export async function shasumRange(
++  buffer,
++  { start = 0, end = buffer.length } = {}
++) {
++  const hash = createHash('sha1')
++  for (let i = start; i < end; i += SHA1_CHUNK_SIZE) {
++    hash.update(buffer.subarray(i, Math.min(i + SHA1_CHUNK_SIZE, end)))
++  }
++  return hash.digest('hex')
++}
+diff --git a/src/utils/splitLines.js b/src/utils/splitLines.js
+index b28272b..e86dee6 100644
+--- a/src/utils/splitLines.js
++++ b/src/utils/splitLines.js
+@@ -25,6 +25,11 @@ export function splitLines(input) {
+       while (true) {
+         const i = findSplit(tmp)
+         if (i === -1) break
++        // A '\r' at the very end may be the first half of a '\r\n' whose '\n'
++        // arrives in the next chunk. Hold it back until there is a character
++        // after it to look at, otherwise the same bytes split into two lines
++        // or one depending only on where the socket boundary fell.
++        if (i === tmp.length && tmp[i - 1] === '\r') break
+         output.write(tmp.slice(0, i))
+         tmp = tmp.slice(i)
+       }
+diff --git a/src/utils/translateSSHtoHTTP.js b/src/utils/translateSSHtoHTTP.js
+index 39a7806..56801aa 100644
+--- a/src/utils/translateSSHtoHTTP.js
++++ b/src/utils/translateSSHtoHTTP.js
+@@ -1,6 +1,5 @@
+ export function translateSSHtoHTTP(url) {
+-  // handle "shorter scp-like syntax"
+-  url = url.replace(/^git@([^:]+):/, 'https://$1/')
++  url = url.replace(/^([^/@:]+)@([^/@:]+):/, 'https://$1@$2/')
+   // handle proper SSH URLs
+   url = url.replace(/^ssh:\/\//, 'https://')
+   return url
+diff --git a/src/utils/walkerToTreeEntryMap.js b/src/utils/walkerToTreeEntryMap.js
+index 1c95a24..2e76b46 100644
+--- a/src/utils/walkerToTreeEntryMap.js
++++ b/src/utils/walkerToTreeEntryMap.js
+@@ -1,5 +1,3 @@
+-import AsyncLock from 'async-lock'
+-
+ import { STAGE } from '../commands/STAGE.js'
+ import { TREE } from '../commands/TREE.js'
+ import { WORKDIR } from '../commands/WORKDIR.js'
+@@ -10,25 +8,33 @@ import { NotFoundError } from '../errors/NotFoundError.js'
+ import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
+ import { GitIndexManager } from '../managers/GitIndexManager.js'
+ import { _readObject } from '../storage/readObject.js'
+-import { readObjectLoose } from '../storage/readObjectLoose.js'
+ import { _writeObject } from '../storage/writeObject.js'
+ 
++import { assertNoSymlinkInLeadingPath } from './assertNoSymlinkInLeadingPath.js'
+ import { join } from './join.js'
++// Re-exported so existing importers (e.g. commands/stash.js) keep working.
++import { acquireLock } from './lock.js'
+ import { posixifyPathBuffer } from './posixifyPathBuffer.js'
+ 
++export { acquireLock }
++
+ const _TreeMap = {
+   stage: STAGE,
+   workdir: WORKDIR,
+ }
+ 
+-let lock
+-export async function acquireLock(ref, callback) {
+-  if (lock === undefined) lock = new AsyncLock()
+-  return lock.acquire(ref, callback)
+-}
+-
+ // make sure filepath, blob type and blob object (from loose objects) plus oid are in sync and valid
+ async function checkAndWriteBlob(fs, gitdir, dir, filepath, oid = null) {
++  // An index/tree object remains usable even when the working file was
++  // deleted. Consult the object database before touching the working path.
++  if (oid) {
++    try {
++      await _readObject({ fs, cache: {}, gitdir, oid })
++      return oid
++    } catch (error) {
++      if (error.code !== 'NotFoundError') throw error
++    }
++  }
+   const currentFilepath = join(dir, filepath)
+   const stats = await fs.lstat(currentFilepath)
+   if (!stats) throw new NotFoundError(currentFilepath)
+@@ -36,23 +42,14 @@ async function checkAndWriteBlob(fs, gitdir, dir, filepath, oid = null) {
+     throw new InternalError(
+       `${currentFilepath}: file expected, but found directory`
+     )
+-
+-  // Look for it in the loose object directory.
+-  const objContent = oid
+-    ? await readObjectLoose({ fs, gitdir, oid })
+-    : undefined
+-  let retOid = objContent ? oid : undefined
+-  if (!objContent) {
+-    await acquireLock({ fs, gitdir, currentFilepath }, async () => {
+-      const object = stats.isSymbolicLink()
+-        ? await fs.readlink(currentFilepath).then(posixifyPathBuffer)
+-        : await fs.read(currentFilepath)
+-
+-      if (object === null) throw new NotFoundError(currentFilepath)
+-
+-      retOid = await _writeObject({ fs, gitdir, type: 'blob', object })
+-    })
+-  }
++  let retOid
++  await acquireLock(currentFilepath, async () => {
++    const object = stats.isSymbolicLink()
++      ? await fs.readlink(currentFilepath).then(posixifyPathBuffer)
++      : await fs.read(currentFilepath)
++    if (object === null) throw new NotFoundError(currentFilepath)
++    retOid = await _writeObject({ fs, gitdir, type: 'blob', object })
++  })
+ 
+   return retOid
+ }
+@@ -80,7 +77,7 @@ async function processTreeEntries({ fs, dir, gitdir, entries }) {
+         entry.path,
+         entry.oid
+       )
+-      entry.mode = 0o100644 // file
++      // Preserve the walker's executable/symlink mode.
+     }
+ 
+     // remove path from entry.path
+@@ -105,7 +102,9 @@ export async function writeTreeChanges({
+   const map = async (filepath, [head, stage]) => {
+     if (
+       filepath === '.' ||
+-      (await GitIgnoreManager.isIgnored({ fs, dir, gitdir, filepath }))
++      (!head &&
++        !isStage &&
++        (await GitIgnoreManager.isIgnored({ fs, dir, gitdir, filepath })))
+     ) {
+       return
+     }
+@@ -113,7 +112,8 @@ export async function writeTreeChanges({
+     if (stage) {
+       if (
+         !head ||
+-        ((await head.oid()) !== (await stage.oid()) &&
++        (((await head.oid()) !== (await stage.oid()) ||
++          (await head.mode()) !== (await stage.mode())) &&
+           (await stage.oid()) !== undefined)
+       ) {
+         changedEntries.push([head, stage])
+@@ -144,14 +144,9 @@ export async function writeTreeChanges({
+     for (const child of children) {
+       const [head, stage] = child
+       if (isStage) {
+-        if (stage) {
+-          // for deleted file in work dir, it also needs to be added on stage
+-          if (await fs.exists(`${dir}/${stage.toString()}`)) {
+-            filtered.push(child)
+-          } else {
+-            changedEntries.push([null, stage]) // record the change (deletion) while stop the iteration
+-          }
+-        }
++        // The index, not worktree existence, defines staged additions/deletions.
++        if (stage) filtered.push(child)
++        else if (head) changedEntries.push([head, null])
+       } else if (head) {
+         // for deleted file in workdir, "stage" (workdir in our case) will be undefined
+         if (!stage) {
+@@ -175,7 +170,7 @@ export async function writeTreeChanges({
+     iterate,
+   })
+ 
+-  if (changedEntries.length === 0 || entries.length === 0) {
++  if (changedEntries.length === 0) {
+     return null // no changes found to stash
+   }
+ 
+@@ -183,7 +178,7 @@ export async function writeTreeChanges({
+     fs,
+     dir,
+     gitdir,
+-    entries,
++    entries: entries || [],
+   })
+ 
+   const treeEntries = processedEntries.filter(Boolean).map(entry => ({
+@@ -203,102 +198,91 @@ export async function applyTreeChanges({
+   stashCommit,
+   parentCommit,
+   wasStaged,
++  lock = true,
+ }) {
+-  const dirRemoved = []
+-  const stageUpdated = []
+-
+-  // analyze the changes
+   const ops = await _walk({
+     fs,
+     cache: {},
+     dir,
+     gitdir,
+     trees: [TREE({ ref: parentCommit }), TREE({ ref: stashCommit })],
+-    map: async (filepath, [parent, stash]) => {
+-      if (
+-        filepath === '.' ||
+-        (await GitIgnoreManager.isIgnored({ fs, dir, gitdir, filepath }))
+-      ) {
+-        return
+-      }
+-      const type = stash ? await stash.type() : await parent.type()
+-      if (type !== 'tree' && type !== 'blob') {
++    map: async (filepath, [parent, next]) => {
++      if (filepath === '.') return
++      const beforeType = parent && (await parent.type())
++      const type = next && (await next.type())
++      if (!next)
++        return { method: beforeType === 'tree' ? 'rmdir' : 'rm', filepath }
++      if (type === 'tree') {
++        if (beforeType !== 'tree') return { method: 'mkdir', filepath }
+         return
+       }
+-
+-      // deleted tree or blob
+-      if (!stash && parent) {
+-        const method = type === 'tree' ? 'rmdir' : 'rm'
+-        if (type === 'tree') dirRemoved.push(filepath)
+-        if (type === 'blob' && wasStaged)
+-          stageUpdated.push({ filepath, oid: await parent.oid() }) // stats is undefined, will stage the deletion with index.insert
+-        return { method, filepath }
+-      }
+-
+-      const oid = await stash.oid()
+-      if (!parent || (await parent.oid()) !== oid) {
+-        // only apply changes if changed from the parent commit or doesn't exist in the parent commit
+-        if (type === 'tree') {
+-          return { method: 'mkdir', filepath }
+-        } else {
+-          if (wasStaged)
+-            stageUpdated.push({
+-              filepath,
+-              oid,
+-              stats: await fs.lstat(join(dir, filepath)),
+-            })
+-          return {
+-            method: 'write',
+-            filepath,
+-            oid,
+-          }
+-        }
++      if (type !== 'blob') return
++      const oid = await next.oid()
++      const mode = await next.mode()
++      if (
++        !parent ||
++        beforeType !== 'blob' ||
++        (await parent.oid()) !== oid ||
++        (await parent.mode()) !== mode
++      ) {
++        return { method: 'write', filepath, oid, mode }
+       }
+     },
+   })
+ 
+-  // apply the changes to work dir
+-  await acquireLock({ fs, gitdir, dirRemoved, ops }, async () => {
+-    for (const op of ops) {
++  const apply = async () => {
++    // Check the complete destination set before making any worktree changes.
++    for (const op of ops)
++      await assertNoSymlinkInLeadingPath(fs, dir, op.filepath)
++    const stageUpdated = []
++    const removals = ops
++      .filter(op => op.method === 'rm' || op.method === 'rmdir')
++      .sort((a, b) => b.filepath.length - a.filepath.length)
++    const writes = ops.filter(op => op.method !== 'rm' && op.method !== 'rmdir')
++    for (const op of [...removals, ...writes]) {
+       const currentFilepath = join(dir, op.filepath)
+-      switch (op.method) {
+-        case 'rmdir':
+-          await fs.rmdir(currentFilepath)
+-          break
+-        case 'mkdir':
+-          await fs.mkdir(currentFilepath)
+-          break
+-        case 'rm':
+-          await fs.rm(currentFilepath)
+-          break
+-        case 'write':
+-          // only writes if file is not in the removedDirs
+-          if (
+-            !dirRemoved.some(removedDir =>
+-              currentFilepath.startsWith(removedDir)
+-            )
+-          ) {
+-            const { object } = await _readObject({
+-              fs,
+-              cache: {},
+-              gitdir,
+-              oid: op.oid,
+-            })
+-            // just like checkout, since mode only applicable to create, not update, delete first
+-            if (await fs.exists(currentFilepath)) {
+-              await fs.rm(currentFilepath)
+-            }
+-            await fs.write(currentFilepath, object) // only handles regular files for now
+-          }
+-          break
++      if (op.method === 'rmdir') {
++        await fs.rmdir(currentFilepath)
++      } else if (op.method === 'rm') {
++        await fs.rm(currentFilepath)
++        if (wasStaged)
++          stageUpdated.push({ filepath: op.filepath, remove: true })
++      } else if (op.method === 'mkdir') {
++        const previous = await fs.lstat(currentFilepath)
++        if (previous && !previous.isDirectory()) await fs.rm(currentFilepath)
++        await fs.mkdir(currentFilepath)
++        if (wasStaged)
++          stageUpdated.push({ filepath: op.filepath, remove: true })
++      } else {
++        const { object } = await _readObject({
++          fs,
++          cache: {},
++          gitdir,
++          oid: op.oid,
++        })
++        // lstat also observes dangling symlinks. Unlink the final component
++        // before writing so its target can never be followed.
++        const previous = await fs.lstat(currentFilepath)
++        if (previous && !previous.isDirectory()) await fs.rm(currentFilepath)
++        else if (previous) await fs.rmdir(currentFilepath)
++        if (op.mode === 0o120000) await fs.writelink(currentFilepath, object)
++        else await fs.write(currentFilepath, object, { mode: op.mode })
++        if (wasStaged)
++          stageUpdated.push({
++            filepath: op.filepath,
++            oid: op.oid,
++            stats: await fs.lstat(currentFilepath),
++          })
+       }
+     }
+-  })
+-
+-  // update the stage
+-  await GitIndexManager.acquire({ fs, gitdir, cache: {} }, async index => {
+-    stageUpdated.forEach(({ filepath, stats, oid }) => {
+-      index.insert({ filepath, stats, oid })
+-    })
+-  })
++    if (wasStaged)
++      await GitIndexManager.acquire({ fs, gitdir, cache: {} }, async index => {
++        for (const update of stageUpdated) {
++          if (update.remove) index.delete({ filepath: update.filepath })
++          else index.insert(update)
++        }
++      })
++  }
++  if (lock) await acquireLock(gitdir, apply)
++  else await apply()
+ }
+diff --git a/src/utils/worthWalking.js b/src/utils/worthWalking.js
+index 94f776c..1eb03ff 100644
+--- a/src/utils/worthWalking.js
++++ b/src/utils/worthWalking.js
+@@ -2,9 +2,15 @@ export const worthWalking = (filepath, root) => {
+   if (filepath === '.' || root == null || root.length === 0 || root === '.') {
+     return true
+   }
+-  if (root.length >= filepath.length) {
+-    return root.startsWith(filepath)
+-  } else {
+-    return filepath.startsWith(root)
++  // A shared prefix only counts when it lands on a path component boundary,
++  // otherwise the root 'src' would also pull in 'src2/a.js' and 'srcfoo.txt'.
++  const base = root.endsWith('/') ? root.slice(0, -1) : root
++  if (base === '.') {
++    return true
++  }
++  if (base.length >= filepath.length) {
++    // Keep walking while filepath is still an ancestor of the wanted root.
++    return base === filepath || base.startsWith(`${filepath}/`)
+   }
++  return filepath.startsWith(`${base}/`)
+ }

@@ -1,0 +1,2218 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 8321fdaca27bd84336933cc9d878cb561a6202b6..f0e27f0ac3d5d689f0d695a41b4b89ccaba716e3 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -252,6 +252,7 @@ extend-safe-fixes = [
+     "SLF001",  # private member access
+ ]
+ "src/icalendar/prop/**" = [
++    "A003",    # class attribute shadowing builtin (vBinary.bytes, see #1289)
+     "DTZ001",  # datetime() called without tzinfo
+     "DTZ007",  # naive datetime from strptime
+     "E501",    # line too long (docstrings with code examples)
+diff --git a/src/icalendar/__init__.py b/src/icalendar/__init__.py
+index 31d75b3fd39520396db8281c15a55cd319ec9ae8..80f76d15044cfab52ddeafd8a4fcb48c14917a7e 100644
+--- a/src/icalendar/__init__.py
++++ b/src/icalendar/__init__.py
+@@ -37,6 +37,7 @@ from icalendar.error import (
+     ComponentEndMissing,
+     ComponentStartMissing,
+     FeatureWillBeRemovedInFutureVersion,
++    ICalParsingError,
+     IncompleteAlarmInformation,
+     IncompleteComponent,
+     InvalidCalendar,
+@@ -126,6 +127,7 @@ __all__ = [
+     "Event",
+     "FeatureWillBeRemovedInFutureVersion",
+     "FreeBusy",
++    "ICalParsingError",
+     "Image",
+     "IncompleteAlarmInformation",
+     "IncompleteComponent",
+diff --git a/src/icalendar/alarms.py b/src/icalendar/alarms.py
+index 1571d8078c29c54dbe83ef851ef92aaf8a0c4ac8..5535db0afc915116b93c2c9a8d3a8d09aedcd76f 100644
+--- a/src/icalendar/alarms.py
++++ b/src/icalendar/alarms.py
+@@ -13,6 +13,8 @@ This takes different calendar software into account and the RFC 9074 (Alarm Exte
+ 
+ from __future__ import annotations
+ 
++import icalendar.config as config
++
+ from datetime import date, timedelta, tzinfo
+ from typing import TYPE_CHECKING
+ 
+@@ -87,6 +89,14 @@ class AlarmTime:
+         """The alarm component."""
+         return self._alarm
+ 
++    @property
++    def action(self) -> str:
++        """The action invoked when this alarm triggers.
++
++        This delegates to :attr:`Alarm.ACTION <icalendar.cal.alarm.Alarm.ACTION>`.
++        """
++        return self.alarm.ACTION
++
+     @property
+     def parent(self) -> Parent | None:
+         """The component that contains the alarm.
+@@ -190,7 +200,7 @@ class Alarms:
+         if component is not None:
+             self.add_component(component)
+ 
+-    def add_component(self, component: Alarm | Parent):
++    def add_component(self, component: Alarm | Parent) -> None:
+         """Add a component.
+ 
+         If this is an alarm, it is added.
+@@ -310,7 +320,7 @@ class Alarms:
+     def _repeat(self, first: datetime, alarm: Alarm) -> Generator[datetime]:
+         """The times when the alarm is triggered relative to start."""
+         yield first  # we trigger at the start
+-        repeat = alarm.REPEAT
++        repeat = config._clamp_repeat(alarm.REPEAT)
+         duration = alarm.DURATION
+         if repeat and duration:
+             for i in range(1, repeat + 1):
+diff --git a/src/icalendar/attr.py b/src/icalendar/attr.py
+index f02413bbeea70c6255240f2a8daf5134f82994df..f4ad59eb9daa252fbb26a745d4a2ccfc20f8e8ec 100644
+--- a/src/icalendar/attr.py
++++ b/src/icalendar/attr.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import itertools
++from collections.abc import Sequence
+ from datetime import date, datetime, timedelta
+ from typing import TYPE_CHECKING, Literal, TypeAlias
+ 
+@@ -17,6 +18,7 @@ from icalendar.prop import (
+     vRecur,
+     vText,
+     vUid,
++    vUnknown,
+     vUri,
+     vXmlReference,
+ )
+@@ -26,7 +28,7 @@ from icalendar.timezone import tzp
+ from icalendar.tools import is_date
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Callable, Sequence
++    from collections.abc import Callable
+ 
+     from icalendar.cal import Component
+ 
+@@ -103,8 +105,8 @@ def _get_rdates(
+ 
+     .. note::
+ 
+-        You cannot modify the RDATE value by modifying the result.
+-        Use :func:`icalendar.cal.Component.add` to add values.
++        Modifying the returned list does not change the RDATE value. Assign to
++        :attr:`rdates` or use :func:`icalendar.cal.Component.add` instead.
+ 
+         If you want to compute recurrences, have a look at
+         `Related Projects <https://github.com/collective/icalendar/blob/main/README.rst#related-projects>`_.
+@@ -127,7 +129,24 @@ def _get_rdates(
+     return result
+ 
+ 
+-rdates_property = property(_get_rdates)
++def _set_rdates(self: Component, value) -> None:
++    """Set the RDATE values, replacing any existing ones.
++
++    ``value`` is a list as returned by :attr:`rdates` (each item a date, a
++    datetime, or a ``(start, end)`` period tuple). Setting an empty list or
++    :obj:`None` removes the RDATE property.
++    """
++    _del_rdates(self)
++    if value:
++        self.add("RDATE", value)
++
++
++def _del_rdates(self: Component) -> None:
++    """Delete all RDATE values."""
++    self.pop("RDATE", None)
++
++
++rdates_property = property(_get_rdates, _set_rdates, _del_rdates)
+ 
+ 
+ def _get_exdates(self: Component) -> list[date | datetime]:
+@@ -193,8 +212,8 @@ def _get_exdates(self: Component) -> list[date | datetime]:
+ 
+     .. note::
+ 
+-        You cannot modify the EXDATE value by modifying the result.
+-        Use :func:`icalendar.cal.Component.add` to add values.
++        Modifying the returned list does not change the EXDATE value. Assign to
++        :attr:`exdates` or use :func:`icalendar.cal.Component.add` instead.
+ 
+         If you want to compute recurrences, have a look at
+         `Related Projects <https://github.com/collective/icalendar/blob/main/README.rst#related-projects>`_.
+@@ -210,7 +229,23 @@ def _get_exdates(self: Component) -> list[date | datetime]:
+     return result
+ 
+ 
+-exdates_property = property(_get_exdates)
++def _set_exdates(self: Component, value) -> None:
++    """Set the EXDATE values, replacing any existing ones.
++
++    ``value`` is a list as returned by :attr:`exdates` (each item a date or a
++    datetime). Setting an empty list or :obj:`None` removes the EXDATE property.
++    """
++    _del_exdates(self)
++    if value:
++        self.add("EXDATE", value)
++
++
++def _del_exdates(self: Component) -> None:
++    """Delete all EXDATE values."""
++    self.pop("EXDATE", None)
++
++
++exdates_property = property(_get_exdates, _set_exdates, _del_exdates)
+ 
+ 
+ def _get_rrules(self: Component) -> list[vRecur]:
+@@ -369,7 +404,9 @@ def multi_language_text_property(
+     return property(fget, fset, fdel, doc)
+ 
+ 
+-def single_int_property(prop: str, default: int, doc: str) -> property:
++def single_int_property(
++    prop: str, default: int, doc: str, *, min_value: int | None = None
++) -> property:
+     """Create a property for an int value that exists only once.
+ 
+     Parameters:
+@@ -387,6 +424,11 @@ def single_int_property(prop: str, default: int, doc: str) -> property:
+ 
+     def fset(self: Component, value: int | None):
+         """Set the property."""
++        if value is not None:
++            if not isinstance(value, int) or isinstance(value, bool):
++                raise TypeError(f"{prop} must be an int, got {value!r}")
++            if min_value is not None and value < min_value:
++                raise InvalidCalendar(f"{prop} must be >= {min_value}, got {value}")
+         fdel(self)
+         if value is not None:
+             self.add(prop, value)
+@@ -418,7 +460,7 @@ def single_utc_property(name: str, docs: str) -> property:
+         if name not in self:
+             return None
+         dt = self.get(name)
+-        if isinstance(dt, vText):
++        if isinstance(dt, (vText, vUnknown)):
+             # we might be in an attribute that is not typed
+             value = vDDDTypes.from_ical(dt)
+         else:
+@@ -445,15 +487,25 @@ def single_utc_property(name: str, docs: str) -> property:
+ 
+ 
+ def single_string_property(
+-    name: str, docs: str, other_name: str | None = None, default: str = ""
++    name: str, docs: str, other_name: str | list[str] | None = None, default: str = ""
+ ) -> property:
+     """Create a property to access a single string value."""
++    other_names = (
++        []
++        if other_name is None
++        else [other_name]
++        if isinstance(other_name, str)
++        else list(other_name)
++    )
+ 
+     def fget(self: Component) -> str:
+         """Get the value."""
+-        result = self.get(
+-            name, None if other_name is None else self.get(other_name, None)
+-        )
++        result = self.get(name, None)
++        if result is None:
++            for alias in other_names:
++                result = self.get(alias, None)
++                if result is not None:
++                    break
+         if result is None or result == []:
+             return default
+         if isinstance(result, list):
+@@ -472,8 +524,8 @@ def single_string_property(
+     def fdel(self: Component):
+         """Delete the property."""
+         self.pop(name, None)
+-        if other_name is not None:
+-            self.pop(other_name, None)
++        for alias in other_names:
++            self.pop(alias, None)
+ 
+     return property(fget, fset, fdel, doc=docs)
+ 
+@@ -575,6 +627,7 @@ Examples:
+         >>> event.sequence
+         10
+     """,  # noqa: E501
++    min_value=0,
+ )
+ 
+ 
+@@ -672,13 +725,22 @@ def _get_attendees(self: Component) -> list[vCalAddress]:
+     return value
+ 
+ 
+-def _set_attendees(self: Component, value: list[vCalAddress] | vCalAddress | None):
++ATTENDEE_TYPE_SETTER: TypeAlias = Sequence[vCalAddress | str] | vCalAddress | str | None
++
++
++def _set_attendees(self: Component, value: ATTENDEE_TYPE_SETTER):
+     """Set attendees."""
+     _del_attendees(self)
+     if value is None:
+         return
+-    if not isinstance(value, list):
++    if isinstance(value, (vCalAddress, str)):
+         value = [value]
++    elif not isinstance(value, list):
++        value = list(value) if isinstance(value, Sequence) else [value]
++    for index, attendee in enumerate(value):
++        # vCalAddress subclasses str, so exclude it before normalizing strings
++        if not isinstance(attendee, vCalAddress) and isinstance(attendee, str):
++            value[index] = vCalAddress.new(attendee)
+     self["ATTENDEE"] = value
+ 
+ 
+@@ -713,31 +775,43 @@ Description:
+     type of iCalendar alarm.
+ 
+ Examples:
+-    Add a new attendee to an existing event.
++    Assign one or more attendee email addresses directly. Strings are
++    converted to :class:`~icalendar.prop.cal_address.vCalAddress` objects
++    and receive a ``mailto:`` prefix when needed.
+ 
+     .. code-block:: pycon
+ 
+-        >>> from icalendar import Event, vCalAddress
++        >>> from icalendar import Event
+         >>> event = Event()
+-        >>> event.attendees.append(vCalAddress("mailto:me@my-domain.com"))
++        >>> event.attendees = [
++        ...     "me@my-domain.com",
++        ...     "mailto:you@my-domain.com",
++        ... ]
++        >>> event.attendees[0]
++        vCalAddress('mailto:me@my-domain.com')
++        >>> event.attendees[1]
++        vCalAddress('mailto:you@my-domain.com')
+         >>> print(event.to_ical())
+         BEGIN:VEVENT
+         ATTENDEE:mailto:me@my-domain.com
++        ATTENDEE:mailto:you@my-domain.com
+         END:VEVENT
+ 
+-    Create an email alarm with several attendees:
++    Use :meth:`vCalAddress.new
++    <icalendar.prop.cal_address.vCalAddress.new>` when an attendee needs
++    parameters such as ``CN``, ``ROLE``, or ``RSVP``.
+ 
+-        >>> from icalendar import Alarm, vCalAddress
+-        >>> alarm = Alarm.new(attendees = [
+-        ...     vCalAddress("mailto:me@my-domain.com"),
+-        ...     vCalAddress("mailto:you@my-domain.com"),
+-        ... ], summary = "Email alarm")
+-        >>> print(alarm.to_ical())
+-        BEGIN:VALARM
+-        ATTENDEE:mailto:me@my-domain.com
+-        ATTENDEE:mailto:you@my-domain.com
+-        SUMMARY:Email alarm
+-        END:VALARM
++    .. code-block:: pycon
++
++        >>> from icalendar import vCalAddress
++        >>> event.attendees = [
++        ...     vCalAddress.new(
++        ...         "chair@example.com",
++        ...         cn="Meeting Chair",
++        ...         role="CHAIR",
++        ...         rsvp=True,
++        ...     )
++        ... ]
+ """,
+ )
+ 
+@@ -1230,6 +1304,21 @@ Description:
+ """,
+ )
+ 
++
++def _make_repeat_property() -> property:
++    """Expose the capped repeat count used by alarm trigger expansion."""
++    from icalendar.config import _clamp_repeat
++
++    base = single_int_property("REPEAT", 0, "The number of repeated triggers.", min_value=0)
++
++    def fget(self: Component) -> int:
++        return _clamp_repeat(base.fget(self))
++
++    return property(fget, base.fset, base.fdel, base.__doc__)
++
++
++repeat_property = _make_repeat_property()
++
+ priority_property = single_int_property(
+     "PRIORITY",
+     0,
+@@ -1269,6 +1358,7 @@ Description:
+     priority for the to-do.  This property is useful in prioritizing
+     multiple action items for a given time period.
+ """,
++    min_value=0,
+ )
+ 
+ class_property = single_string_enum_property(
+@@ -2450,6 +2540,7 @@ Examples:
+ 
+ 
+ __all__ = [
++    "ATTENDEE_TYPE_SETTER",
+     "CONCEPTS_TYPE_SETTER",
+     "LINKS_TYPE_SETTER",
+     "RECURRENCE_ID",
+@@ -2490,6 +2581,7 @@ __all__ = [
+     "rfc_7953_dtstart_property",
+     "rfc_7953_duration_property",
+     "rfc_7953_end_property",
++    "repeat_property",
+     "rrules_property",
+     "sequence_property",
+     "set_duration_with_locking",
+diff --git a/src/icalendar/cal/alarm.py b/src/icalendar/cal/alarm.py
+index a60e8a56074bef5a3040b527a6b25df3813711f0..1542e76a52f2cb9b245155eb54ee824255ad60e9 100644
+--- a/src/icalendar/cal/alarm.py
++++ b/src/icalendar/cal/alarm.py
+@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
+ from typing import TYPE_CHECKING, NamedTuple
+ 
+ from icalendar.attr import (
++    ATTENDEE_TYPE_SETTER,
+     CONCEPTS_TYPE_SETTER,
+     LINKS_TYPE_SETTER,
+     RELATED_TO_TYPE_SETTER,
+@@ -15,6 +16,7 @@ from icalendar.attr import (
+     property_del_duration,
+     property_get_duration,
+     property_set_duration,
++    repeat_property,
+     single_int_property,
+     single_string_property,
+     single_utc_property,
+@@ -23,11 +25,14 @@ from icalendar.attr import (
+ )
+ from icalendar.cal.component import Component
+ from icalendar.cal.examples import get_example
++from icalendar.error import InvalidCalendar
++from icalendar.prop.binary import vBinary
+ 
+ if TYPE_CHECKING:
+     import uuid
++    from collections.abc import Sequence
+ 
+-    from icalendar.prop import vCalAddress
++    from icalendar.compatibility import Self
+ 
+ 
+ class Alarm(Component):
+@@ -63,7 +68,6 @@ class Alarm(Component):
+         "TRIGGER",
+     )
+     singletons = (
+-        "ATTACH",
+         "ACTION",
+         "DESCRIPTION",
+         "SUMMARY",
+@@ -99,49 +103,73 @@ class Alarm(Component):
+         repetitions that the alarm will be triggered.  This repetition
+         count is in addition to the initial triggering of the alarm.
+         """,
++        min_value=0,
+     )
+ 
+     DURATION = property(
+         property_get_duration,
+         property_set_duration,
+         property_del_duration,
+-        """The DURATION property of an alarm component.
+-
+-    The alarm can be defined such that it triggers repeatedly.  A
+-    definition of an alarm with a repeating trigger MUST include both
+-    the "DURATION" and "REPEAT" properties.  The "DURATION" property
+-    specifies the delay period, after which the alarm will repeat.
+-    """,
++        """The delay between repeated triggers of a repeating alarm.
++
++        Returns a :class:`datetime.timedelta` or ``None`` when the alarm
++        has no :attr:`DURATION` set. Setting this attribute accepts a
++        :class:`~datetime.timedelta`; deleting it removes the property
++        from the component.
++
++        :attr:`DURATION` is meaningful only for repeating alarms and must
++        be paired with :attr:`REPEAT`. The two together produce
++        :attr:`REPEAT` additional triggers, each spaced by :attr:`DURATION` after
++        the initial trigger.
++
++        Conforming with :rfc:`5545#section-3.8.2.5`, the :attr:`DURATION` property
++        can appear once in an :class:`~icalendar.cal.alarm.Alarm` component.
++
++        Example:
++            Pair :attr:`DURATION` with :attr:`REPEAT` to produce three
++            triggers spaced ten minutes apart.
++
++            .. code-block:: pycon
++
++                >>> from datetime import timedelta
++                >>> from icalendar import Alarm
++                >>> alarm = Alarm()
++                >>> alarm.TRIGGER = timedelta(minutes=-30)
++                >>> alarm.DURATION = timedelta(minutes=10)
++                >>> alarm.REPEAT = 2
++                >>> alarm.DURATION
++                datetime.timedelta(seconds=600)
++        """,
+     )
+ 
+     ACKNOWLEDGED = single_utc_property(
+         "ACKNOWLEDGED",
+-        """This is defined in RFC 9074:
+-
+-    Purpose: This property specifies the UTC date and time at which the
+-    corresponding alarm was last sent or acknowledged.
+-
+-    This property is used to specify when an alarm was last sent or acknowledged.
+-    This allows clients to determine when a pending alarm has been acknowledged
+-    by a calendar user so that any alerts can be dismissed across multiple devices.
+-    It also allows clients to track repeating alarms or alarms on recurring events or
+-    to-dos to ensure that the right number of missed alarms can be tracked.
+-
+-    Clients SHOULD set this property to the current date-time value in UTC
+-    when a calendar user acknowledges a pending alarm. Certain kinds of alarms,
+-    such as email-based alerts, might not provide feedback as to when the calendar user
+-    sees them. For those kinds of alarms, the client SHOULD set this property
+-    when the alarm is triggered and the action is successfully carried out.
+-
+-    When an alarm is triggered on a client, clients can check to see if an "ACKNOWLEDGED"
+-    property is present. If it is, and the value of that property is greater than or
+-    equal to the computed trigger time for the alarm, then the client SHOULD NOT trigger
+-    the alarm. Similarly, if an alarm has been triggered and
+-    an "alert" has been presented to a calendar user, clients can monitor
+-    the iCalendar data to determine whether an "ACKNOWLEDGED" property is added or
+-    changed in the alarm component. If the value of any "ACKNOWLEDGED" property
+-    in the alarm changes and is greater than or equal to the trigger time of the alarm,
+-    then clients SHOULD dismiss or cancel any "alert" presented to the calendar user.
++        """This property is the UTC datetime at which this alarm was last sent or acknowledged as defined in :rfc:`9074`.
++
++    Setting this property allows calendar clients to
++    dismiss or suppress an alarm across multiple devices. Once set to a value
++    greater than or equal to the alarm's computed trigger time, conforming clients
++    will not refire the alarm.
++
++    Returns ``None`` when no acknowledgment has been recorded.
++
++    Example:
++        Mark an alarm as acknowledged. Note that the example uses an arbitrary time
++        for the purpose of passing doctests. In actual practice, clients should
++        use the current time in UTC, such as ``datetime.now(UTC)``.
++
++        .. code-block:: pycon
++
++            >>> from datetime import timezone, datetime
++            >>> from icalendar import Alarm
++            >>> UTC = timezone.utc
++            >>> alarm = Alarm()
++            >>> alarm.ACKNOWLEDGED = datetime(2024, 1, 15, 10, 0, tzinfo=UTC)
++            >>> alarm.ACKNOWLEDGED
++            datetime.datetime(2024, 1, 15, 10, 0, tzinfo=ZoneInfo(key='UTC'))
++
++    See also:
++        :attr:`TRIGGER`, the time at which the alarm fires.
+     """,
+     )
+ 
+@@ -150,17 +178,46 @@ class Alarm(Component):
+         "dt",
+         (datetime, timedelta),
+         timedelta | datetime | None,
+-        """Purpose:  This property specifies when an alarm will trigger.
++        """The time at which this alarm fires, per :rfc:`5545#section-3.8.6.3`.
++
++    The value is either a :class:`~datetime.timedelta` (relative trigger) or a
++    UTC :class:`~datetime.datetime` (absolute trigger).
++
++    A negative :class:`~datetime.timedelta` fires *before* the related
++    component boundary (start or end); a positive one fires *after* it.
++    Use :attr:`TRIGGER_RELATED` to choose whether the offset is measured from
++    the start or the end of the parent event or to-do.
++    An absolute trigger fires at an exact UTC point in time regardless of the
++    parent component's dates.
+ 
+-    Value Type:  The default value type is DURATION.  The value type can
+-    be set to a DATE-TIME value type, in which case the value MUST
+-    specify a UTC-formatted DATE-TIME value.
++    Examples:
++        Set an alarm to fire 15 minutes before the start of an event.
+ 
+-    Either a positive or negative duration may be specified for the
+-    "TRIGGER" property.  An alarm with a positive duration is
+-    triggered after the associated start or end of the event or to-do.
+-    An alarm with a negative duration is triggered before the
+-    associated start or end of the event or to-do.""",
++        .. code-block:: pycon
++
++            >>> from datetime import datetime, timedelta, timezone
++            >>> from icalendar import Alarm, Event
++            >>> UTC = timezone.utc
++            >>> event = Event()
++            >>> event.start = datetime(2024, 1, 15, 10, 0, tzinfo=UTC)
++            >>> alarm = Alarm()
++            >>> alarm.TRIGGER = timedelta(minutes=-15)
++            >>> event.add_component(alarm)
++            >>> event.alarms.times[0].trigger
++            datetime.datetime(2024, 1, 15, 9, 45, tzinfo=datetime.timezone.utc)
++
++        Set an absolute trigger to fire at a specific UTC time.
++
++        .. code-block:: pycon
++
++            >>> absolute_alarm = Alarm()
++            >>> absolute_alarm.TRIGGER = datetime(2024, 1, 15, 9, 45, tzinfo=UTC)
++            >>> absolute_alarm.TRIGGER
++            datetime.datetime(2024, 1, 15, 9, 45, tzinfo=datetime.timezone.utc)
++
++    See also:
++        :attr:`TRIGGER_RELATED`, :attr:`DURATION`, :attr:`REPEAT`
++    """,
+     )
+ 
+     @property
+@@ -174,7 +231,7 @@ class Alarm(Component):
+         the alarm to trigger off the end of the associated event or to-do.
+ 
+         In this example, we create an alarm that triggers two hours after the
+-        end of its parent component:
++        end of its parent component.
+ 
+         >>> from icalendar import Alarm
+         >>> from datetime import timedelta
+@@ -218,7 +275,7 @@ class Alarm(Component):
+         This takes the TRIGGER, DURATION and REPEAT properties into account.
+ 
+         Here, we create an alarm that triggers 3 times before the start of the
+-        parent component:
++        parent component.
+ 
+         >>> from icalendar import Alarm
+         >>> from datetime import timedelta
+@@ -249,16 +306,27 @@ class Alarm(Component):
+                 add = end
+             duration = self.DURATION
+             if duration is not None:
+-                for _ in range(self.REPEAT):
++                for _ in range(self.repeat):
+                     add.append(add[-1] + duration)
+         return self.Triggers(
+             start=tuple(start), end=tuple(end), absolute=tuple(absolute)
+         )
+ 
++    repeat = repeat_property
++
++    ACTION = single_string_property(
++        "ACTION",
++        """The action invoked when the alarm triggers.
++
++        Typical values defined by :rfc:`5545#section-3.8.6.1` are
++        ``AUDIO``, ``DISPLAY``, and ``EMAIL``. The empty string is
++        returned when no ``ACTION`` property is present.
++        """,
++    )
+     uid = single_string_property(
+         "UID",
+         uid_property.__doc__,
+-        "X-ALARMUID",
++        ["X-ALARMUID", "X-EVOLUTION-ALARM-UID"],
+     )
+     summary = summary_property
+     description = description_property
+@@ -268,7 +336,7 @@ class Alarm(Component):
+     def new(
+         cls,
+         /,
+-        attendees: list[vCalAddress] | None = None,
++        attendees: ATTENDEE_TYPE_SETTER = None,
+         concepts: CONCEPTS_TYPE_SETTER = None,
+         description: str | None = None,
+         links: LINKS_TYPE_SETTER = None,
+@@ -276,18 +344,18 @@ class Alarm(Component):
+         related_to: RELATED_TO_TYPE_SETTER = None,
+         summary: str | None = None,
+         uid: str | uuid.UUID | None = None,
+-    ):
++    ) -> Self:
+         """Create a new alarm with all required properties.
+ 
+         This creates a new Alarm in accordance with :rfc:`5545`.
+ 
+         Parameters:
+             attendees: The :attr:`attendees` of the alarm.
+-            concepts: The :attr:`~icalendar.Component.concepts` of the alarm.
++            concepts: The :attr:`~icalendar.cal.component.Component.concepts` of the alarm.
+             description: The :attr:`description` of the alarm.
+-            links: The :attr:`~icalendar.Component.links` of the alarm.
+-            refids: :attr:`~icalendar.Component.refids` of the alarm.
+-            related_to: :attr:`~icalendar.Component.related_to` of the alarm.
++            links: The :attr:`~icalendar.cal.component.Component.links` of the alarm.
++            refids: :attr:`~icalendar.cal.component.Component.refids` of the alarm.
++            related_to: :attr:`~icalendar.cal.component.Component.related_to` of the alarm.
+             summary: The :attr:`summary` of the alarm.
+             uid: The :attr:`uid` of the alarm.
+ 
+@@ -300,7 +368,7 @@ class Alarm(Component):
+ 
+         .. warning:: As time progresses, we will be stricter with the validation.
+         """
+-        alarm: Alarm = super().new(
++        alarm: Self = super().new(
+             links=links,
+             related_to=related_to,
+             refids=refids,
+@@ -312,6 +380,310 @@ class Alarm(Component):
+         alarm.attendees = attendees
+         return alarm
+ 
++    def _apply_duration_repeat(
++        self,
++        duration: timedelta | None,
++        repeat: int | None,
++    ) -> None:
++        if duration is not None or repeat is not None:
++            if duration is None or repeat is None:
++                raise InvalidCalendar(
++                    "DURATION and REPEAT must be set together or not at all"
++                )
++            self.DURATION = duration
++            self.REPEAT = repeat
++
++    @classmethod
++    def new_display(
++        cls,
++        description: str,
++        trigger: timedelta | datetime,
++        duration: timedelta | None = None,
++        repeat: int | None = None,
++        uid: str | uuid.UUID | None = None,
++        links: LINKS_TYPE_SETTER = None,
++        related_to: RELATED_TO_TYPE_SETTER = None,
++        refids: list[str] | str | None = None,
++        concepts: CONCEPTS_TYPE_SETTER = None,
++    ) -> Alarm:
++        """Create a new DISPLAY alarm that shows a text reminder.
++
++        A DISPLAY alarm pops up a text notification at the trigger time.
++        This is the most common alarm type used by calendar clients.
++
++        Conforms to :rfc:`5545#section-3.6.6`.
++
++        Parameters:
++            description: Required. The text to display when the alarm fires.
++                Corresponds to the :attr:`description` property.
++            trigger: Required. When the alarm fires, as a :class:`~datetime.timedelta`
++                relative to the event start (negative means before) or as an
++                absolute :class:`~datetime.datetime` (recommend UTC-aware).
++            concepts: The :attr:`~icalendar.cal.component.Component.concepts` of the alarm.
++            duration: Gap between repeated triggers. Must be paired with
++                ``repeat``. Corresponds to the :attr:`DURATION` property.
++            links: The :attr:`~icalendar.cal.component.Component.links` of the alarm.
++            refids: The :attr:`~icalendar.cal.component.Component.refids` of the alarm.
++            related_to: The :attr:`~icalendar.cal.component.Component.related_to` of the alarm.
++            repeat: Number of *additional* times to fire after the initial
++                trigger. Must be paired with ``duration``.
++                Corresponds to the :attr:`REPEAT` property.
++            uid: Unique identifier for the alarm or ``None``.
++
++        Returns:
++            :class:`Alarm` with ``ACTION:DISPLAY`` set.
++
++        Raises:
++            ~icalendar.error.InvalidCalendar: If required fields are missing
++                or ``duration`` and ``repeat`` are not both provided together.
++
++        Example:
++            Create a display alarm that fires 15 minutes before the event:
++
++            .. code-block:: pycon
++
++                >>> from datetime import timedelta
++                >>> from icalendar import Alarm
++                >>> alarm = Alarm.new_display(
++                ...     description="Team meeting in 15 minutes",
++                ...     trigger=timedelta(minutes=-15),
++                ... )
++                >>> print(alarm.to_ical().decode())
++                BEGIN:VALARM
++                ACTION:DISPLAY
++                DESCRIPTION:Team meeting in 15 minutes
++                TRIGGER:-PT15M
++                END:VALARM
++
++            Attach the alarm to an event:
++
++            .. code-block:: python
++
++                from datetime import datetime, timedelta, timezone
++                from icalendar import Alarm, Event
++
++                event = Event.new(
++                    summary="Team meeting",
++                    start=datetime(2025, 6, 1, 10, 0, tzinfo=timezone.utc),
++                    end=datetime(2025, 6, 1, 11, 0, tzinfo=timezone.utc),
++                )
++                event.add_component(Alarm.new_display(
++                    description="Team meeting in 15 minutes",
++                    trigger=timedelta(minutes=-15),
++                ))
++        """
++        if not description:
++            raise InvalidCalendar("DISPLAY alarm requires a description")
++        if trigger is None:
++            raise InvalidCalendar("DISPLAY alarm requires a trigger")
++        alarm: Alarm = cls.new(
++            description=description,
++            uid=uid,
++            links=links,
++            related_to=related_to,
++            refids=refids,
++            concepts=concepts,
++        )
++        alarm.add("ACTION", "DISPLAY")
++        alarm.TRIGGER = trigger
++        alarm._apply_duration_repeat(duration, repeat)
++        return alarm
++
++    @classmethod
++    def new_audio(
++        cls,
++        trigger: timedelta | datetime,
++        attach: str | bytes | None = None,
++        duration: timedelta | None = None,
++        repeat: int | None = None,
++        uid: str | uuid.UUID | None = None,
++        links: LINKS_TYPE_SETTER = None,
++        related_to: RELATED_TO_TYPE_SETTER = None,
++        refids: list[str] | str | None = None,
++        concepts: CONCEPTS_TYPE_SETTER = None,
++    ) -> Alarm:
++        """Create a new AUDIO alarm that plays a sound.
++
++        An AUDIO alarm plays a sound at the trigger time. An optional
++        ``attach`` URI points to the audio file to play; when omitted,
++        the client uses its default alert sound.
++
++        Conforms to :rfc:`5545#section-3.6.6`.
++
++        Parameters:
++            trigger: Required. When the alarm fires, as a :class:`~datetime.timedelta`
++                relative to the event start (negative means before) or as an
++                absolute :class:`~datetime.datetime` (recommend UTC-aware).
++            attach: Optional audio attachment. Pass a URI string such as
++                ``"ftp://example.com/pub/sounds/bell.aud"`` for a linked
++                sound file, or :class:`bytes` for inline binary audio data
++                (stored as ``VALUE=BINARY``). When ``None`` the client uses
++                its default sound.
++            concepts: The :attr:`~icalendar.cal.component.Component.concepts` of the alarm.
++            duration: Gap between repeated triggers. Must be paired with
++                ``repeat``. Corresponds to the :attr:`DURATION` property.
++            links: The :attr:`~icalendar.cal.component.Component.links` of the alarm.
++            refids: The :attr:`~icalendar.cal.component.Component.refids` of the alarm.
++            related_to: The :attr:`~icalendar.cal.component.Component.related_to` of the alarm.
++            repeat: Number of *additional* times to fire after the initial
++                trigger. Must be paired with ``duration``.
++                Corresponds to the :attr:`REPEAT` property.
++            uid: Unique identifier for the alarm or ``None``.
++
++        Returns:
++            :class:`Alarm` with ``ACTION:AUDIO`` set.
++
++        Raises:
++            ~icalendar.error.InvalidCalendar: If required fields are missing
++                or ``duration`` and ``repeat`` are not both provided together.
++
++        Example:
++            Create an audio alarm using a custom sound file:
++
++            .. code-block:: pycon
++
++                >>> from datetime import timedelta
++                >>> from icalendar import Alarm
++                >>> alarm = Alarm.new_audio(
++                ...     trigger=timedelta(minutes=-5),
++                ...     attach="ftp://example.com/pub/sounds/bell-01.aud",
++                ... )
++                >>> print(alarm.to_ical().decode())
++                BEGIN:VALARM
++                ACTION:AUDIO
++                ATTACH:ftp://example.com/pub/sounds/bell-01.aud
++                TRIGGER:-PT5M
++                END:VALARM
++        """
++        if trigger is None:
++            raise InvalidCalendar("AUDIO alarm requires a trigger")
++        alarm: Alarm = cls.new(
++            uid=uid,
++            links=links,
++            related_to=related_to,
++            refids=refids,
++            concepts=concepts,
++        )
++        alarm.add("ACTION", "AUDIO")
++        alarm.TRIGGER = trigger
++        if attach is not None:
++            alarm.add(
++                "ATTACH", vBinary(attach) if isinstance(attach, bytes) else attach
++            )
++        alarm._apply_duration_repeat(duration, repeat)
++        return alarm
++
++    @classmethod
++    def new_email(
++        cls,
++        summary: str,
++        description: str,
++        trigger: timedelta | datetime,
++        attendees: ATTENDEE_TYPE_SETTER,
++        attachments: Sequence[str] | str | None = None,
++        duration: timedelta | None = None,
++        repeat: int | None = None,
++        uid: str | uuid.UUID | None = None,
++        links: LINKS_TYPE_SETTER = None,
++        related_to: RELATED_TO_TYPE_SETTER = None,
++        refids: list[str] | str | None = None,
++        concepts: CONCEPTS_TYPE_SETTER = None,
++    ) -> Alarm:
++        """Create a new EMAIL alarm that sends an email notification.
++
++        An EMAIL alarm sends an email to each address in ``attendees`` when
++        the alarm fires.
++
++        Conforms to :rfc:`5545#section-3.6.6`.
++
++        Parameters:
++            attendees: Required. One or more recipient addresses as email strings or
++                :class:`~icalendar.prop.cal_address.vCalAddress` instances. A
++                single address or a sequence of addresses. At least one is
++                required.
++            description: Required. Body of the email.
++                Corresponds to the :attr:`description` property.
++            summary: Required. Subject line of the email.
++                Corresponds to the :attr:`summary` property.
++            trigger: Required. When the alarm fires, as a :class:`~datetime.timedelta`
++                relative to the event start (negative means before) or as an
++                absolute :class:`~datetime.datetime` (recommend UTC-aware).
++            attachments: Optional URI or sequence of URIs to attach to the
++                email.
++            concepts: The :attr:`~icalendar.cal.component.Component.concepts` of the alarm.
++            duration: Gap between repeated triggers. Must be paired with
++                ``repeat``. Corresponds to the :attr:`DURATION` property.
++            links: The :attr:`~icalendar.cal.component.Component.links` of the alarm.
++            refids: The :attr:`~icalendar.cal.component.Component.refids` of the alarm.
++            related_to: The :attr:`~icalendar.cal.component.Component.related_to` of the alarm.
++            repeat: Number of *additional* times to fire after the initial
++                trigger. Must be paired with ``duration``.
++                Corresponds to the :attr:`REPEAT` property.
++            uid: Unique identifier for the alarm or ``None``.
++
++        Returns:
++            :class:`Alarm` with ``ACTION:EMAIL`` set.
++
++        Raises:
++            ~icalendar.error.InvalidCalendar: If required fields are missing,
++                ``attendees`` is empty, or ``duration`` and ``repeat`` are not
++                both provided together.
++
++        Example:
++            Create an email alarm sent to two recipients. Plain email strings
++            and ``mailto:``-prefixed strings are both accepted and normalized
++            to :class:`~icalendar.prop.cal_address.vCalAddress`:
++
++            .. code-block:: pycon
++
++                >>> from datetime import timedelta
++                >>> from icalendar import Alarm
++                >>> alarm = Alarm.new_email(
++                ...     summary="Meeting reminder",
++                ...     description="Your meeting starts in 30 minutes.",
++                ...     trigger=timedelta(minutes=-30),
++                ...     attendees=["user@example.com", "mailto:boss@example.com"],
++                ... )
++                >>> print(alarm.to_ical().decode())
++                BEGIN:VALARM
++                ACTION:EMAIL
++                ATTENDEE:mailto:user@example.com
++                ATTENDEE:mailto:boss@example.com
++                DESCRIPTION:Your meeting starts in 30 minutes.
++                SUMMARY:Meeting reminder
++                TRIGGER:-PT30M
++                END:VALARM
++        """
++        if isinstance(attendees, str):
++            attendees = [attendees]
++        if isinstance(attachments, str):
++            attachments = [attachments]
++        if not summary:
++            raise InvalidCalendar("EMAIL alarm requires a summary")
++        if not description:
++            raise InvalidCalendar("EMAIL alarm requires a description")
++        if trigger is None:
++            raise InvalidCalendar("EMAIL alarm requires a trigger")
++        if not attendees:
++            raise InvalidCalendar("EMAIL alarm requires at least one attendee")
++        alarm: Alarm = cls.new(
++            summary=summary,
++            description=description,
++            uid=uid,
++            attendees=attendees,
++            links=links,
++            related_to=related_to,
++            refids=refids,
++            concepts=concepts,
++        )
++        alarm.add("ACTION", "EMAIL")
++        alarm.TRIGGER = trigger
++        if attachments:
++            for attachment in attachments:
++                alarm.add("ATTACH", attachment)
++        alarm._apply_duration_repeat(duration, repeat)
++        return alarm
++
+     @classmethod
+     def example(cls, name: str = "example") -> Alarm:
+         """Return the alarm example with the given name."""
+diff --git a/src/icalendar/cal/component.py b/src/icalendar/cal/component.py
+index c0893d50f5a08347432b38b3857eaf11180c7d78..8de9fd1ec6c755b3e0354e5b3564b62200993b2a 100644
+--- a/src/icalendar/cal/component.py
++++ b/src/icalendar/cal/component.py
+@@ -779,15 +779,28 @@ class Component(CaselessDict):
+               ['dtstart', {}, 'date', '2025-11-22']],
+              []]
+         """
+-        properties = []
+-        for key, value in self.items():
+-            for item in value if isinstance(value, list) else [value]:
+-                properties.append(item.to_jcal(key.lower()))
+-        return [
+-            self.name.lower(),
+-            properties,
+-            [subcomponent.to_jcal() for subcomponent in self.subcomponents],
+-        ]
++
++        # Iterative tree walk to avoid RecursionError on deeply nested
++        # components, mirroring the iterative iCal parser/serializer (GH #1370).
++        def make_node(comp: Component) -> list:
++            properties = [
++                item.to_jcal(key.lower())
++                for key, value in comp.items()
++                for item in (value if isinstance(value, list) else [value])
++            ]
++            return [comp.name.lower(), properties, []]
++
++        root_node = make_node(self)
++        # stack of (component, jCal node) pairs still to expand
++        stack: list[tuple[Component, list]] = [(self, root_node)]
++        while stack:
++            comp, node = stack.pop()
++            children = node[2]
++            for subcomponent in comp.subcomponents:
++                child_node = make_node(subcomponent)
++                children.append(child_node)
++                stack.append((subcomponent, child_node))
++        return root_node
+ 
+     def to_json(self) -> str:
+         """Return this component as a jCal JSON string.
+@@ -847,46 +860,27 @@ class Component(CaselessDict):
+         """
+         if isinstance(jcal, str):
+             jcal = json.loads(jcal)
+-        if not isinstance(jcal, list) or len(jcal) != 3:
+-            raise JCalParsingError(
+-                "A component must be a list with 3 items.", cls, value=jcal
+-            )
+-        name, properties, subcomponents = jcal
+-        if not isinstance(name, str):
+-            raise JCalParsingError(
+-                "The name must be a string.", cls, path=[0], value=name
+-            )
+-        if name.upper() != cls.name:
+-            # delegate to correct component class
+-            component_cls = cls.get_component_class(name.upper())
+-            return component_cls.from_jcal(jcal)
+-        component = cls()
+-        if not isinstance(properties, list):
+-            raise JCalParsingError(
+-                "The properties must be a list.", cls, path=1, value=properties
+-            )
+-        for i, prop in enumerate(properties):
+-            JCalParsingError.validate_property(prop, cls, path=[1, i])
+-            prop_name = prop[0]
+-            prop_value = prop[2]
+-            prop_cls: type[VPROPERTY] = cls.types_factory.for_property(
+-                prop_name, prop_value
+-            )
+-            with JCalParsingError.reraise_with_path_added(1, i):
+-                v_prop = prop_cls.from_jcal(prop)
+-            # if we use the default value for that property, we can delete the
+-            # VALUE parameter
+-            if prop_cls == cls.types_factory.for_property(prop_name):
+-                del v_prop.VALUE
+-            component.add(prop_name, v_prop)
+-        if not isinstance(subcomponents, list):
+-            raise JCalParsingError(
+-                "The subcomponents must be a list.", cls, 2, value=subcomponents
+-            )
+-        for i, subcomponent in enumerate(subcomponents):
+-            with JCalParsingError.reraise_with_path_added(2, i):
+-                component.subcomponents.append(cls.from_jcal(subcomponent))
+-        return component
++        # Iterative tree build to avoid RecursionError on deeply nested jCal,
++        # mirroring the iterative iCal parser (GH #1370). ``_node_from_jcal``
++        # parses a single component (without its subcomponents); the stack walks
++        # the subcomponent tree, accumulating the jCal error path ([2, i] per
++        # nesting level) so error messages match the recursive implementation.
++        root, root_subcomponents = _node_from_jcal(jcal, cls)
++        stack: list[tuple[Component, list, list]] = [(root, root_subcomponents, [])]
++        while stack:
++            parent, subcomponents, prefix = stack.pop()
++            for i, subcomponent in enumerate(subcomponents):
++                child_prefix = [*prefix, 2, i]
++                # Prepend the full nesting path so errors match the recursive
++                # implementation. This also preserves the error value and
++                # traceback, like the nested context managers did before.
++                with JCalParsingError.reraise_with_path_added(*child_prefix):
++                    child, child_subcomponents = _node_from_jcal(
++                        subcomponent, type(parent)
++                    )
++                parent.subcomponents.append(child)
++                stack.append((child, child_subcomponents, child_prefix))
++        return root
+ 
+     def copy(self, recursive: bool = False) -> Self:
+         """Copy the component.
+@@ -954,4 +948,87 @@ class Component(CaselessDict):
+         return self
+ 
+ 
++def _node_from_jcal(jcal, starting_cls: type[Component]) -> tuple[Component, list]:
++    """Parse a single jCal component without recursing into subcomponents.
++
++    Module-level helper for :meth:`Component.from_jcal`: it has no ties to a
++    class or instance (the relevant class is passed in as ``starting_cls``), so
++    it is a plain function rather than a (static) method.
++
++    Parameters:
++        jcal: The jCal list for one component.
++        starting_cls: The class used as the parser for structural validation
++            before the component type is resolved from its name (the entry
++            class for the root, the parent's resolved class for a child).
++
++    Returns:
++        A ``(component, raw_subcomponents)`` tuple. The raw subcomponents are
++        returned for the caller to walk iteratively.
++
++    Raises:
++        ~error.JCalParsingError: If this component node is invalid. The path
++            is relative to this node; callers prepend the nesting path.
++    """
++    if not isinstance(jcal, list) or len(jcal) != 3:
++        raise JCalParsingError(
++            "A component must be a list with 3 items.", starting_cls, value=jcal
++        )
++    name, properties, subcomponents = jcal
++    if not isinstance(name, str):
++        raise JCalParsingError(
++            "The name must be a string.", starting_cls, path=[0], value=name
++        )
++    if name.upper() != starting_cls.name:
++        # delegate to correct component class
++        component_cls = starting_cls.get_component_class(name.upper())
++    else:
++        component_cls = starting_cls
++    component = component_cls()
++    if not isinstance(properties, list):
++        raise JCalParsingError(
++            "The properties must be a list.",
++            component_cls,
++            path=1,
++            value=properties,
++        )
++    for i, prop in enumerate(properties):
++        JCalParsingError.validate_property(
++            prop, component_cls, path=[1, i], validate_name=False
++        )
++    for i, prop in enumerate(properties):
++        JCalParsingError.validate_property(prop, component_cls, path=[1, i])
++        prop_name = prop[0]
++        prop_value = prop[2]
++        prop_cls: type[VPROPERTY] = component_cls.types_factory.for_property(
++            prop_name, prop_value
++        )
++        with JCalParsingError.reraise_with_path_added(1, i):
++            v_prop = prop_cls.from_jcal(prop)
++        # jCal encodes the value type in the type field (``prop[2]``)
++        # instead of as a ``VALUE`` parameter (RFC 7265). Restore that
++        # parameter when the type differs from the property's default, so
++        # explicit value types such as ``RDATE;VALUE=PERIOD`` or
++        # ``TRIGGER;VALUE=DATE-TIME`` survive the round-trip (GH #1426).
++        # A type equal to the default needs no VALUE parameter, and the
++        # reserved ``unknown`` type must never become ``VALUE=UNKNOWN``
++        # (RFC 7265, section 5.2).
++        default_type = component_cls.types_factory.default_value_type(prop_name)
++        if isinstance(prop_value, str) and prop_value.lower() not in (
++            "unknown",
++            default_type,
++        ):
++            v_prop.VALUE = prop_value.upper()
++        elif "VALUE" in v_prop.params:
++            del v_prop.VALUE
++        component.add(prop_name, v_prop)
++    if not isinstance(subcomponents, list):
++        raise JCalParsingError(
++            "The subcomponents must be a list.",
++            component_cls,
++            2,
++            value=subcomponents,
++        )
++    return component, subcomponents
++
++
+ __all__ = ["Component"]
+diff --git a/src/icalendar/cal/event.py b/src/icalendar/cal/event.py
+index 8cce5f7e06e262cf1970855356bad82776aa79c8..e2fdb623ac3d99a3003b2ca81de65165c5d5a760 100644
+--- a/src/icalendar/cal/event.py
++++ b/src/icalendar/cal/event.py
+@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
+ from typing import TYPE_CHECKING, Literal
+ 
+ from icalendar.attr import (
++    ATTENDEE_TYPE_SETTER,
+     CONCEPTS_TYPE_SETTER,
+     LINKS_TYPE_SETTER,
+     RELATED_TO_TYPE_SETTER,
+@@ -430,7 +431,7 @@ class Event(Component):
+     def new(
+         cls,
+         /,
+-        attendees: list[vCalAddress] | None = None,
++        attendees: ATTENDEE_TYPE_SETTER = None,
+         categories: Sequence[str] = (),
+         classification: CLASS | None = None,
+         color: str | None = None,
+diff --git a/src/icalendar/cal/journal.py b/src/icalendar/cal/journal.py
+index cebac0d1f1da873ebfd112b9794f64615b8367af..bd717342ed6e0be4d62bcf33819fde6c50d4a1f0 100644
+--- a/src/icalendar/cal/journal.py
++++ b/src/icalendar/cal/journal.py
+@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
+ from typing import TYPE_CHECKING
+ 
+ from icalendar.attr import (
++    ATTENDEE_TYPE_SETTER,
+     CONCEPTS_TYPE_SETTER,
+     LINKS_TYPE_SETTER,
+     RELATED_TO_TYPE_SETTER,
+@@ -180,7 +181,7 @@ class Journal(Component):
+     def new(
+         cls,
+         /,
+-        attendees: list[vCalAddress] | None = None,
++        attendees: ATTENDEE_TYPE_SETTER = None,
+         categories: Sequence[str] = (),
+         classification: CLASS | None = None,
+         color: str | None = None,
+diff --git a/src/icalendar/cal/todo.py b/src/icalendar/cal/todo.py
+index 42840af4814c021af2a87a5fe6430eb0b2df6d58..7bfb39499407d46b0c93f0de318a2caf2728d401 100644
+--- a/src/icalendar/cal/todo.py
++++ b/src/icalendar/cal/todo.py
+@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
+ from typing import TYPE_CHECKING, Literal
+ 
+ from icalendar.attr import (
++    ATTENDEE_TYPE_SETTER,
+     CONCEPTS_TYPE_SETTER,
+     LINKS_TYPE_SETTER,
+     RELATED_TO_TYPE_SETTER,
+@@ -319,7 +320,7 @@ class Todo(Component):
+     def new(
+         cls,
+         /,
+-        attendees: list[vCalAddress] | None = None,
++        attendees: ATTENDEE_TYPE_SETTER = None,
+         categories: Sequence[str] = (),
+         classification: CLASS | None = None,
+         color: str | None = None,
+diff --git a/src/icalendar/compatibility.py b/src/icalendar/compatibility.py
+index 4a5b95b06020245a485c739d2d617853efdbc22b..493775c99005e3ba2a8bfdd4f582f981a2d968a7 100644
+--- a/src/icalendar/compatibility.py
++++ b/src/icalendar/compatibility.py
+@@ -7,6 +7,8 @@ Do NOT import this module directly if you use icalendar.
+ Members will be added and removed without deprecation warnings.
+ """
+ 
++import functools
++import warnings
+ from typing import TYPE_CHECKING
+ 
+ try:
+@@ -33,8 +35,25 @@ else:
+     # we cannot use a TypeGuard = "TypeGuard" hack since it's used with a parameter
+     TypeGuard = TypeIs = Self = None
+ 
++
++def deprecate_for_version_8(func):
++    """Issue a warning for deprecated functions to be removed in version 8."""
++    public_name = func.__name__.removeprefix("_")
++
++    @functools.wraps(func)
++    def wrapper(*args, **kwargs):
++        warnings.warn(
++            f"{public_name} is deprecated and will be removed in icalendar 8",
++            DeprecationWarning,
++            stacklevel=2,
++        )
++        return func(*args, **kwargs)
++
++    return wrapper
++
+ __all__ = [
+     "Self",
+     "TypeGuard",
+     "TypeIs",
++    "deprecate_for_version_8",
+ ]
+diff --git a/src/icalendar/config.py b/src/icalendar/config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb1cfcd380d38701a6d6caa3bf72f64e3a6ac90e
+--- /dev/null
++++ b/src/icalendar/config.py
+@@ -0,0 +1,12 @@
++"""Runtime configuration for resource-sensitive calendar operations."""
++
++MAX_ALARM_REPEAT: int = 10_000
++
++
++def _clamp_repeat(n: int) -> int:
++    """Clamp an alarm repeat count to the configured expansion limit."""
++    if n < 0:
++        return 0
++    if MAX_ALARM_REPEAT < 0:
++        return n
++    return min(n, MAX_ALARM_REPEAT)
+diff --git a/src/icalendar/error.py b/src/icalendar/error.py
+index 4fabb37689ad702ee032b622e8b1412e19d09b0e..2bda7ac7520d7a5dfe26011239bd74154aca7766 100644
+--- a/src/icalendar/error.py
++++ b/src/icalendar/error.py
+@@ -12,6 +12,23 @@ class InvalidCalendar(ValueError):
+     """
+ 
+ 
++class ICalParsingError(InvalidCalendar):
++    """Could not parse an iCalendar."""
++
++    def __init__(
++        self,
++        message: str,
++        line: str | None = None,
++        line_number: int | None = None,
++        value: object = None,
++    ) -> None:
++        self.message = message
++        self.line = line
++        self.line_number = line_number
++        self.value = value
++        super().__init__(message)
++
++
+ class BrokenCalendarProperty(InvalidCalendar):
+     """A property could not be parsed and its value is broken.
+ 
+@@ -134,6 +151,8 @@ class JCalParsingError(ValueError):
+         jcal_property,
+         parser: str | type,
+         path: list[str | int] | None | str | int = None,
++        *,
++        validate_name: bool = True,
+     ):
+         """Validate a jCal property.
+ 
+@@ -166,6 +185,10 @@ class JCalParsingError(ValueError):
+                 path + [2],
+                 value=jcal_property[2],
+             )
++        if validate_name:
++            cls.validate_jcal_token(
++                jcal_property[0], "property name", parser, path + [0]
++            )
+ 
+     _type_names = {
+         str: "a string",
+@@ -224,12 +247,58 @@ class JCalParsingError(ValueError):
+                     path=path + [index],
+                 )
+ 
++    @classmethod
++    def validate_jcal_token(
++        cls,
++        name: str,
++        kind: str,
++        parser: str | type = "",
++        path: list[str | int] | None | str | int = None,
++    ) -> None:
++        r"""Validate a jCal ``name`` as a lowercase iCalendar token.
++
++        jCal keeps a property name, parameter name, or ``RRULE`` part name
++        verbatim and re-emits it into the content line on serialization, so a
++        ``:``, ``;``, or lone carriage return in the name could inject
++        parameters or a new content line. A valid name matches the iCalendar
++        token pattern ``[\w.-]+`` and, per :rfc:`7265`, must be lowercase.
++
++        Parameters:
++            name: The jCal name to validate.
++            kind: Names the token in the error message, for example,
++                ``"property name"``.
++            parser: The parser or component to which the name belongs.
++            path: The jCal path to ``name``, used to locate it in the error.
++
++        Raises:
++            ~error.JCalParsingError: If ``name`` is not a valid lowercase
++                iCalendar token.
++
++        See also:
++            :meth:`~icalendar.parser.string.validate_token`
++        """
++        from icalendar.parser.string import validate_token
++
++        try:
++            validate_token(name)
++        except ValueError:
++            raise cls(
++                rf"The {kind} must be a valid iCalendar token, matching the "
++                rf"regular expression pattern `[\w.-]+`.",
++                parser,
++                path,
++                value=name,
++            ) from None
++        if name != name.lower():
++            raise cls(f"The {kind} must be lowercase.", parser, path, value=name)
++
+ 
+ __all__ = [
+     "BrokenCalendarProperty",
+     "ComponentEndMissing",
+     "ComponentStartMissing",
+     "FeatureWillBeRemovedInFutureVersion",
++    "ICalParsingError",
+     "IncompleteAlarmInformation",
+     "IncompleteComponent",
+     "InvalidCalendar",
+diff --git a/src/icalendar/parser/content_line.py b/src/icalendar/parser/content_line.py
+index 4f36d06e1cb503e48d2878033501fc3976b9e407..a2cda4be0d70dab7aaac8943b209a13dc08089fc 100644
+--- a/src/icalendar/parser/content_line.py
++++ b/src/icalendar/parser/content_line.py
+@@ -12,11 +12,20 @@ from icalendar.parser.string import (
+ )
+ from icalendar.parser_tools import DEFAULT_ENCODING, ICAL_TYPE, to_unicode
+ 
+-UFOLD = re.compile("(\r?\n)+[ \t]")
++# Equivalent to the natural ``(\r?\n)+[ \t]`` but without its quadratic cost:
++# the greedy run is re-tried at every line break of a long unfoldable block, so
++# a megabyte of bare newlines takes seconds. The leading lookbehinds pin a match
++# to the first line break of a run, making a failed attempt O(1) instead of a
++# full rescan, while matching exactly the same strings.
++UFOLD = re.compile(r"(?:(?<!\n)\r\n|(?<![\r\n])\n)(?:\r?\n)*[ \t]")
+ NEWLINE = re.compile(r"\r?\n")
+ 
+ OWS = " \t"
+-OWS_AROUND_DELIMITERS_RE = re.compile(r"[ \t]*([;=])[ \t]*")
++# ``[ \t]*([;=])[ \t]*`` in one pass rescans a long whitespace run at every
++# position. Splitting it into two anchored passes (leading then trailing) keeps
++# the result identical but removes the quadratic blow-up.
++OWS_BEFORE_DELIMITER_RE = re.compile(r"(?<![ \t])[ \t]+([;=])")
++OWS_AFTER_DELIMITER_RE = re.compile(r"([;=])[ \t]+")
+ 
+ 
+ def _strip_ows_around_delimiters(st: str, delimiters: str = ";=") -> str:
+@@ -37,7 +46,8 @@ def _strip_ows_around_delimiters(st: str, delimiters: str = ";=") -> str:
+ 
+     # Fast regex-based path for simple parameter sections without quoting/escaping.
+     if delimiters == ";=" and '"' not in st and "\\" not in st:
+-        return OWS_AROUND_DELIMITERS_RE.sub(r"\1", st).strip()
++        st = OWS_BEFORE_DELIMITER_RE.sub(r"\1", st)
++        return OWS_AFTER_DELIMITER_RE.sub(r"\1", st).strip()
+ 
+     out: list[str] = []
+     pending_ws: list[str] = []
+@@ -224,6 +234,25 @@ class Contentline(str):
+             ) from exc
+         return (name, params, values)
+ 
++    def value_separator_index(self) -> int:
++        r"""Return the index of the colon that separates the value.
++
++        This is the first colon that is not inside a quoted parameter section.
++        A colon inside a quoted parameter value (for example
++        ``ALTREP="http://x"``) is skipped, and a colon that belongs to the
++        value (``TEXT`` does not escape ``:``) is not mistaken for the
++        separator. Backslash has no special meaning in the parameter grammar
++        (RFC 5545 §3.1), so it is treated as an ordinary character. Returns
++        ``-1`` if there is none.
++        """
++        in_quotes = False
++        for i, ch in enumerate(self):
++            if ch == '"':
++                in_quotes = not in_quotes
++            elif ch == ":" and not in_quotes:
++                return i
++        return -1
++
+     @classmethod
+     def from_ical(cls, ical, strict=False):
+         """Unfold the content lines in an iCalendar into long content lines."""
+diff --git a/src/icalendar/parser/ical/component.py b/src/icalendar/parser/ical/component.py
+index c1371fd236f843f613e1cabdd7e8463b31f0e506..ee3eed1cefe50e613573c6c3f6df0dc326400659 100644
+--- a/src/icalendar/parser/ical/component.py
++++ b/src/icalendar/parser/ical/component.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, ClassVar
+ 
++from icalendar.error import ICalParsingError
+ from icalendar.parser.content_line import Contentline, Contentlines
+ from icalendar.parser.property import split_on_unescaped_comma
+ from icalendar.prop import vBroken
+@@ -85,14 +86,18 @@ class ComponentIcalParser:
+         )
+         self._content_lines_iterator = iter(self._content_lines)
+ 
+-    def handle_line_parse_error(self, exception: Exception):
++    def handle_line_parse_error(
++        self, exception: Exception, line: Contentline, line_number: int
++    ):
+         """Handle a line parsing error."""
+         # if unable to parse a line within a component
+         # that ignores exceptions, mark the component
+         # as broken and skip the line. otherwise raise.
+         component = self.component
+         if not component or not component.ignore_exceptions:
+-            raise exception
++            raise ICalParsingError(
++                str(exception), line=str(line), line_number=line_number, value=str(line)
++            ) from exception
+         component.errors.append((None, str(exception)))
+ 
+     def handle_begin_component(self, vals: str) -> None:
+@@ -141,13 +146,14 @@ class ComponentIcalParser:
+ 
+     def parse_content_lines(self) -> None:
+         """Parse the content lines."""
+-        for line in self._content_lines_iterator:
++        for line_number, line in enumerate(self._content_lines_iterator, start=1):
+             if not line:
+                 continue
++            self._line_number = line_number
+             try:
+                 name, params, vals = line.parts()
+             except ValueError as e:
+-                self.handle_line_parse_error(e)
++                self.handle_line_parse_error(e, line, line_number)
+                 continue
+ 
+             uname = name.upper()
+@@ -241,7 +247,12 @@ class ComponentIcalParser:
+     ):
+         """Handle the parse error for a property."""
+         if not self.component.ignore_exceptions and not name[:2].upper() == "X-":
+-            raise exception
++            raise ICalParsingError(
++                str(exception),
++                line=str(line),
++                line_number=getattr(self, "_line_number", None),
++                value=val,
++            ) from exception
+         # Error-tolerant mode: create vBroken
+         factory = self.get_factory_for_property(name, params)
+         expected_type = getattr(factory, "__name__", "unknown")
+@@ -266,9 +277,10 @@ class ComponentIcalParser:
+         # Special handling for CATEGORIES - need raw value
+         # before unescaping to properly split on unescaped commas
+         line_str = str(line)
+-        # Use rfind to get the last colon (value separator)
+-        # to handle parameters with colons like ALTREP="http://..."
+-        colon_idx = line_str.rfind(":")
++        # The value separator is the first colon outside a quoted parameter
++        # section. ``rfind`` here would pick a colon that belongs to the value
++        # (``TEXT`` does not escape ``:``) and truncate the categories.
++        colon_idx = line.value_separator_index()
+         if colon_idx > 0:
+             raw_value = line_str[colon_idx + 1 :]
+             # Parse categories immediately (not lazily) for both
+diff --git a/src/icalendar/parser/parameter.py b/src/icalendar/parser/parameter.py
+index 08a13523130449f2ea69d0cbd528b6872b5cdaff..ac67d6eb17771c20f3170b6c6db056603f4f55c5 100644
+--- a/src/icalendar/parser/parameter.py
++++ b/src/icalendar/parser/parameter.py
+@@ -482,6 +482,7 @@ class Parameters(CaselessDict):
+                 raise JCalParsingError(
+                     "All parameter names must be strings.", cls, value=name
+                 )
++            JCalParsingError.validate_jcal_token(name, "parameter name", cls)
+             if not (
+                 (
+                     isinstance(value, list)
+diff --git a/src/icalendar/parser/string.py b/src/icalendar/parser/string.py
+index b623f60bf3661d9df60b4de48e872e9bf76b674b..02e08e120463667a5f7204791fd6d4ff72d633ec 100644
+--- a/src/icalendar/parser/string.py
++++ b/src/icalendar/parser/string.py
+@@ -3,10 +3,10 @@
+ import re
+ import warnings
+ 
+-from icalendar.parser_tools import DEFAULT_ENCODING
++from icalendar.parser_tools import DEFAULT_ENCODING, to_unicode
+ 
+ 
+-def _escape_char(text: str | bytes) -> str | bytes:
++def _escape_char(text: str | bytes) -> str:
+     r"""Format value according to iCalendar TEXT escaping rules.
+ 
+     Escapes special characters in text values according to :rfc:`5545#section-3.3.11`
+@@ -31,6 +31,7 @@ def _escape_char(text: str | bytes) -> str | bytes:
+            newline character)
+     """
+     assert isinstance(text, (str, bytes))
++    text = to_unicode(text)
+     # NOTE: ORDER MATTERS!
+     return (
+         text.replace(r"\N", "\n")
+@@ -42,7 +43,7 @@ def _escape_char(text: str | bytes) -> str | bytes:
+     )
+ 
+ 
+-def escape_char(text: str | bytes) -> str | bytes:
++def escape_char(text: str | bytes) -> str:
+     r"""Format value according to iCalendar TEXT escaping rules.
+ 
+     .. deprecated:: 7.0.0
+@@ -173,27 +174,31 @@ def foldline(line: str, limit: int = 75, fold_sep: str = "\r\n ") -> str:
+     assert isinstance(line, str)
+     assert "\n" not in line
+ 
+-    # Use a fast and simple variant for the common case that line is all ASCII.
+-    try:
+-        line.encode("ascii")
+-    except (UnicodeEncodeError, UnicodeDecodeError):
+-        pass
+-    else:
+-        return fold_sep.join(
+-            line[i : i + limit - 1] for i in range(0, len(line), limit - 1)
+-        )
+-
+-    ret_chars: list[str] = []
++    folded_lines: list[str] = []
++    current_chars: list[str] = []
+     byte_count = 0
+     for char in line:
+         char_byte_len = len(char.encode(DEFAULT_ENCODING))
++        if current_chars and byte_count + char_byte_len >= limit:
++            # For compatibility with existing clients, avoid splitting escaped
++            # values such as TEXT backslash escapes or RFC 6868 parameter
++            # escapes across a folded line boundary. See issue #1501.
++            if len(current_chars) > 1 and current_chars[-1] in r"\^":
++                escaped_prefix = current_chars.pop()
++                folded_lines.append("".join(current_chars))
++                current_chars = [escaped_prefix]
++                byte_count = len(escaped_prefix.encode(DEFAULT_ENCODING))
++            else:
++                folded_lines.append("".join(current_chars))
++                current_chars = []
++                byte_count = 0
++        current_chars.append(char)
+         byte_count += char_byte_len
+-        if byte_count >= limit:
+-            ret_chars.append(fold_sep)
+-            byte_count = char_byte_len
+-        ret_chars.append(char)
+ 
+-    return "".join(ret_chars)
++    if current_chars:
++        folded_lines.append("".join(current_chars))
++
++    return fold_sep.join(folded_lines)
+ 
+ 
+ def _escape_string(val: str) -> str:
+@@ -212,14 +217,20 @@ def _escape_string(val: str) -> str:
+     Note:
+         Conversions:
+ 
++        - ``%`` -> ``%25``
+         - ``\,`` -> ``%2C``
+         - ``\:`` -> ``%3A``
+         - ``\;`` -> ``%3B``
+         - ``\\`` -> ``%5C``
++
++        A literal ``%`` is escaped first so that percent sequences already in
++        the value (e.g. ``%2C`` in a URI) are not confused with the markers
++        introduced here. :func:`_unescape_string` reverses it.
+     """
+     # f'{i:02X}'
+     return (
+-        val.replace(r"\,", "%2C")
++        val.replace("%", "%25")
++        .replace(r"\,", "%2C")
+         .replace(r"\:", "%3A")
+         .replace(r"\;", "%3B")
+         .replace(r"\\", "%5C")
+@@ -261,12 +272,17 @@ def _unescape_string(val: str) -> str:
+         - ``%3A`` -> ``:``
+         - ``%3B`` -> ``;``
+         - ``%5C`` -> ``\``
++        - ``%25`` -> ``%``
++
++        ``%25`` is restored last so a literal ``%`` that :func:`_escape_string`
++        protected does not re-trigger the marker replacements above.
+     """
+     return (
+         val.replace("%2C", ",")
+         .replace("%3A", ":")
+         .replace("%3B", ";")
+         .replace("%5C", "\\")
++        .replace("%25", "%")
+     )
+ 
+ 
+diff --git a/src/icalendar/prop/binary.py b/src/icalendar/prop/binary.py
+index 874ab6dc8c43060d8e069f77dd12921a50a3b808..259c4e7c5ae1c5235048d17a2af72b6cc560e01d 100644
+--- a/src/icalendar/prop/binary.py
++++ b/src/icalendar/prop/binary.py
+@@ -4,21 +4,29 @@ import base64
+ import binascii
+ from typing import ClassVar
+ 
+-from icalendar.compatibility import Self
++from icalendar.compatibility import Self, deprecate_for_version_8
+ from icalendar.error import JCalParsingError
+ from icalendar.parser import Parameters
+ from icalendar.parser_tools import to_unicode
+ 
+ 
+ class vBinary:
+-    """Binary property values are base 64 encoded."""
++    """Binary property values are Base64 encoded."""
+ 
+     default_value: ClassVar[str] = "BINARY"
+     params: Parameters
+-    obj: str
++    bytes: bytes
++    """The raw binary value of the BINARY property.
++
++    This is the authoritative storage and round-trips losslessly, including
++    for non-UTF-8 data. Use this instead of the deprecated :attr:`obj`.
++    """
+ 
+     def __init__(self, obj: str | bytes, params: dict[str, str] | None = None) -> None:
+-        self.obj = to_unicode(obj)
++        if isinstance(obj, str):
++            self.bytes = obj.encode("utf-8")
++        else:
++            self.bytes = obj
+         self.params = Parameters(encoding="BASE64", value="BINARY")
+         if params:
+             self.params.update(params)
+@@ -27,22 +35,67 @@ class vBinary:
+         return f"vBinary({self.to_ical()})"
+ 
+     def to_ical(self) -> bytes:
+-        return binascii.b2a_base64(self.obj.encode("utf-8"))[:-1]
++        return base64.b64encode(self.bytes)
+ 
+     @staticmethod
+     def from_ical(ical: str | bytes) -> bytes:
+         try:
+-            return base64.b64decode(ical)
+-        except ValueError as e:
++            return base64.b64decode(ical, validate=True)
++        except (binascii.Error, ValueError) as e:
+             raise ValueError("Not valid base 64 encoding.") from e
+ 
++    @property
++    def base64data(self) -> str:
++        """The Base64-encoded string view of this value.
++
++        This is the same string that :meth:`to_ical` produces, exposed as
++        a plain :class:`str` instead of :class:`bytes` so you don't need to
++        call :func:`base64.b64encode` yourself. See :issue:`1550`.
++
++        Returns:
++            The Base64-encoded representation of the stored value.
++        """
++        return self.to_ical().decode("ascii")
++
++    @base64data.setter
++    def base64data(self, value: str) -> None:
++        """Set this value from a Base64-encoded string.
++
++        The decoded raw bytes are stored in :attr:`bytes`, so non-UTF-8
++        payloads round-trip losslessly.
++
++        Parameters:
++            value: A Base64-encoded string.
++
++        Raises:
++            ValueError: If ``value`` isn't valid Base64.
++        """
++        self.bytes = self.from_ical(value)
++
++    @property
++    @deprecate_for_version_8
++    def obj(self) -> str:
++        """Deprecated string view of the value.
++
++        .. deprecated:: 7.1.3
++            Use :attr:`bytes` for the raw binary value. ``obj`` decodes
++            :attr:`bytes` as text and is lossy for non-UTF-8 data. It will
++            be removed in icalendar 8.
++        """
++        return to_unicode(self.bytes)
++
++    @obj.setter
++    @deprecate_for_version_8
++    def obj(self, value: str | bytes) -> None:
++        self.bytes = value.encode("utf-8") if isinstance(value, str) else value
++
+     def __eq__(self, other: object) -> bool:
+         """self == other"""
+-        return isinstance(other, vBinary) and self.obj == other.obj
++        return isinstance(other, vBinary) and self.bytes == other.bytes
+ 
+     def __hash__(self) -> int:
+         """Hash of the vBinary object."""
+-        return hash(self.obj)
++        return hash(self.bytes)
+ 
+     @classmethod
+     def examples(cls) -> list[Self]:
+@@ -57,12 +110,20 @@ class vBinary:
+         if params.get("encoding") == "BASE64":
+             # BASE64 is the only allowed encoding
+             del params["encoding"]
+-        return [name, params, self.VALUE.lower(), self.obj]
++        return [name, params, self.VALUE.lower(), self.base64data]
+ 
+     @property
+     def ical_value(self) -> bytes:
+-        """The bytes value of the BINARY property."""
+-        return base64.b64decode(self.obj)
++        """The raw ``bytes`` value of the BINARY property.
++
++        .. versionadded:: 7.1.0
++
++        .. versionchanged:: 7.1.3
++            Returns the raw stored bytes. Previously the stored value was
++            Base64-decoded, which raised :class:`ValueError` for non-Base64
++            input. See :pr:`1356`.
++        """
++        return self.bytes
+ 
+     @classmethod
+     def from_jcal(cls, jcal_property: list) -> Self:
+@@ -77,7 +138,7 @@ class vBinary:
+         JCalParsingError.validate_property(jcal_property, cls)
+         JCalParsingError.validate_value_type(jcal_property[3], str, cls, 3)
+         return cls(
+-            jcal_property[3],
++            cls.from_ical(jcal_property[3]),
+             params=Parameters.from_jcal_property(jcal_property),
+         )
+ 
+diff --git a/src/icalendar/prop/dt/datetime.py b/src/icalendar/prop/dt/datetime.py
+index 88178e4d64bae058be268b523294071a51df396e..ebf377591d5ce1fb33be815ba9986d0d331a94bf 100644
+--- a/src/icalendar/prop/dt/datetime.py
++++ b/src/icalendar/prop/dt/datetime.py
+@@ -6,6 +6,7 @@ from typing import Any, ClassVar
+ from icalendar.compatibility import Self
+ from icalendar.error import JCalParsingError
+ from icalendar.parser import Parameters
++from icalendar.parser_tools import to_unicode
+ from icalendar.timezone import tzp
+ from icalendar.timezone.tzid import is_utc
+ 
+@@ -110,26 +111,35 @@ class vDatetime(TimeBase):
+     @staticmethod
+     def from_ical(ical, timezone=None):
+         """Create a datetime from the RFC string."""
++        ical = to_unicode(ical)
+         tzinfo = None
+         if isinstance(timezone, str):
+             tzinfo = tzp.timezone(timezone)
+         elif timezone is not None:
+             tzinfo = timezone
+ 
++        # Extract the value part if parameters are present per
++        # https://datatracker.ietf.org/doc/html/rfc5545.html#section-3.3.5
++        # Form #3: TZID=America/New_York:19980119T020000
++        ical_value = ical.rpartition(":")[2]
++
++        if len(ical_value) < 15 or ical_value[8] != "T":
++            raise ValueError(f"Wrong datetime format: {ical}")
++
+         try:
+             timetuple = (
+-                int(ical[:4]),  # year
+-                int(ical[4:6]),  # month
+-                int(ical[6:8]),  # day
+-                int(ical[9:11]),  # hour
+-                int(ical[11:13]),  # minute
+-                int(ical[13:15]),  # second
++                int(ical_value[:4]),  # year
++                int(ical_value[4:6]),  # month
++                int(ical_value[6:8]),  # day
++                int(ical_value[9:11]),  # hour
++                int(ical_value[11:13]),  # minute
++                int(ical_value[13:15]),  # second
+             )
+             if tzinfo:
+                 return tzp.localize(datetime(*timetuple), tzinfo)
+-            if not ical[15:]:
++            if not ical_value[15:]:
+                 return datetime(*timetuple)
+-            if ical[15:16] == "Z":
++            if ical_value[15:] == "Z":
+                 return tzp.localize_utc(datetime(*timetuple))
+         except Exception as e:
+             raise ValueError(f"Wrong datetime format: {ical}") from e
+diff --git a/src/icalendar/prop/dt/duration.py b/src/icalendar/prop/dt/duration.py
+index 871ca5a4891eb8e97cf745e58ac711df2fe89612..abc570a858947326dc0a49ef4c92ca225b98cc71 100644
+--- a/src/icalendar/prop/dt/duration.py
++++ b/src/icalendar/prop/dt/duration.py
+@@ -130,16 +130,21 @@ class vDuration(TimeBase):
+             raise InvalidCalendar(f"Invalid iCalendar duration: {ical}")
+ 
+         sign, weeks, days, hours, minutes, seconds = match.groups()
+-        value = timedelta(
+-            weeks=int(weeks or 0),
+-            days=int(days or 0),
+-            hours=int(hours or 0),
+-            minutes=int(minutes or 0),
+-            seconds=int(seconds or 0),
+-        )
+-
+-        if sign == "-":
+-            value = -value
++        try:
++            value = timedelta(
++                weeks=int(weeks or 0),
++                days=int(days or 0),
++                hours=int(hours or 0),
++                minutes=int(minutes or 0),
++                seconds=int(seconds or 0),
++            )
++            if sign == "-":
++                value = -value
++        except OverflowError as e:
++            # ``timedelta`` rejects values that are too large for its C
++            # implementation. Raise the same error as other invalid durations
++            # instead of leaking ``OverflowError`` to callers.
++            raise InvalidCalendar(f"Impractical iCalendar duration: {ical}") from e
+ 
+         return value
+ 
+diff --git a/src/icalendar/prop/dt/list.py b/src/icalendar/prop/dt/list.py
+index 2f0ee64eda7f77a7463d07c591a7b7fcef4f8645..3339e2005066a1d6904bab3ebdd878c41756bf0a 100644
+--- a/src/icalendar/prop/dt/list.py
++++ b/src/icalendar/prop/dt/list.py
+@@ -1,3 +1,4 @@
++from collections.abc import Sequence
+ from datetime import date, datetime
+ from typing import Any, ClassVar
+ 
+@@ -20,7 +21,11 @@ class vDDDLists:
+     def __init__(self, dt_list, params: dict[str, Any] | None = None):
+         if params is None:
+             params = {}
+-        if not hasattr(dt_list, "__iter__"):
++        if not hasattr(dt_list, "__iter__") or (
++            isinstance(dt_list, Sequence) and len(dt_list) == 2 and dt_list[1] is None
++        ):
++            # A ``(dt, None)`` pair (tuple or list) is the rdates form of a single
++            # date, not a list of two values, so don't iterate it element-wise (#1439).
+             dt_list = [dt_list]
+         vddd = []
+         tzid = None
+diff --git a/src/icalendar/prop/dt/period.py b/src/icalendar/prop/dt/period.py
+index 05c3540e4aeb72908e946468d89cdfbd59268bfe..8bd7ac2ed65e1ee879b8ce3f5ca333c54bc6a79d 100644
+--- a/src/icalendar/prop/dt/period.py
++++ b/src/icalendar/prop/dt/period.py
+@@ -152,6 +152,14 @@ class vPeriod(TimeBase):
+         """Make this cooperate with the other vDDDTypes."""
+         return (self.start, (self.duration if self.by_duration else self.end))
+ 
++    @property
++    def ical_value(self) -> tuple[datetime, timedelta | datetime]:
++        """
++        Returns the period as a tuple of its start datetime
++        and either its end datetime or duration.
++        """
++        return self.dt
++
+     from icalendar.param import FBTYPE
+ 
+     @classmethod
+diff --git a/src/icalendar/prop/dt/types.py b/src/icalendar/prop/dt/types.py
+index 4ff9bf75dfd78cf6d579a010e4c6941efc32f0c9..508ef17cfba047378fa6af263fef794f87e4f5cf 100644
+--- a/src/icalendar/prop/dt/types.py
++++ b/src/icalendar/prop/dt/types.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Sequence
+ from datetime import date, datetime, time, timedelta
+ from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
+ 
+@@ -43,6 +44,10 @@ class vDDDTypes(TimeBase):
+     def __init__(self, dt, params: dict[str, Any] | None = None):
+         if params is None:
+             params = {}
++        if isinstance(dt, Sequence) and len(dt) == 2 and dt[1] is None:
++            # ``(dt, None)`` (tuple or list) is the rdates form of a single date;
++            # the ``[1] is None`` guard skips strings and real two-value pairs (#1439).
++            dt = dt[0]
+         if not isinstance(dt, (datetime, date, timedelta, time, tuple)):
+             raise TypeError(
+                 "You must use datetime, date, timedelta, time or tuple (for periods)"
+diff --git a/src/icalendar/prop/factory.py b/src/icalendar/prop/factory.py
+index 1f242b691220dc938ccda1be3fa4298c4c395776..09030a7a8d412c18c9e20a904f8cdba4fd0d3dd4 100644
+--- a/src/icalendar/prop/factory.py
++++ b/src/icalendar/prop/factory.py
+@@ -166,6 +166,7 @@ class TypesFactory(CaselessDict):
+             "related-to": "text",
+             "url": "uri",
+             "conference": "uri",  # RFC 7986
++            "image": "unknown",  # RFC 7986 has no default value type
+             "source": "uri",
+             "uid": "text",
+             # Recurrence Component Properties
+@@ -235,16 +236,61 @@ class TypesFactory(CaselessDict):
+         if value_param and name in self.types_map and value_param in self:
+             return self[value_param]
+ 
+-        if name.upper() == "IMAGE":
+-            return self[
+-                "unknown"
+-            ]  # IMAGE is always unknown, even if VALUE is URI or BINARY
+-
+         if value_param and (value_param in self) and value_param != "IMAGE":
+             return self[value_param]
+ 
+         return self[self.types_map.get(name, "unknown")]
+ 
++    #: jCal value types defined by :rfc:`7265` that are used verbatim as the
++    #: type field. Internal type keys outside of this set (for example
++    #: ``"categories"`` or ``"date-time-list"``) are mapped to their concrete
++    #: jCal type via the value class.
++    _jcal_value_types = frozenset(
++        {
++            "binary",
++            "boolean",
++            "cal-address",
++            "date",
++            "date-time",
++            "duration",
++            "float",
++            "integer",
++            "period",
++            "recur",
++            "text",
++            "time",
++            "uri",
++            "utc-offset",
++            "unknown",
++        }
++    )
++
++    def default_value_type(self, name: str) -> str:
++        """Return the default jCal value type for a property.
++
++        The result is a lowercase :rfc:`7265` value type, for example
++        ``"date-time"`` for ``DTSTART`` or ``"duration"`` for ``TRIGGER``.
++        This is the value type a property uses when no explicit ``VALUE``
++        parameter is given, so it tells :func:`Component.from_jcal` whether a
++        ``VALUE`` parameter has to be restored from the jCal type field.
++
++        Parameters:
++            name: Property name.
++
++        Returns:
++            The default jCal value type as a lowercase string.
++        """
++        internal = self.types_map.get(name.lower(), "unknown")
++        if internal in self._jcal_value_types:
++            return internal
++        # Internal keys such as ``categories`` or ``date-time-list`` are not
++        # jCal value types themselves; ask the value class for the type it
++        # actually serialises to.
++        try:
++            return self[internal].examples()[0].VALUE.lower()
++        except (KeyError, IndexError, AttributeError):
++            return "unknown"
++
+     def to_ical(self, name, value):
+         """Encodes a named value from a primitive python type to an icalendar
+         encoded string.
+diff --git a/src/icalendar/prop/geo.py b/src/icalendar/prop/geo.py
+index c598b03a29148666d37f8401053b11c09a07cde2..7ffa380ba762c15f85ecb27da25ab57324b45e49 100644
+--- a/src/icalendar/prop/geo.py
++++ b/src/icalendar/prop/geo.py
+@@ -95,6 +95,11 @@ class vGeo:
+     def to_ical(self) -> str:
+         return f"{self.latitude};{self.longitude}"
+ 
++    @property
++    def ical_value(self) -> tuple[float, float]:
++        """Geographic position as a tuple of (latitude, longitude) according to :rfc:`5545#section-3.8.1.6`."""
++        return (self.latitude, self.longitude)
++
+     @staticmethod
+     def from_ical(ical: str) -> tuple[float, float]:
+         try:
+diff --git a/src/icalendar/prop/image.py b/src/icalendar/prop/image.py
+index 08f84d9db58f420c055ae9e0a276aebe4e8668a9..71328f3328bba23bb3c4129cdd2bb9b5509e3c95 100644
+--- a/src/icalendar/prop/image.py
++++ b/src/icalendar/prop/image.py
+@@ -2,7 +2,6 @@
+ 
+ from __future__ import annotations
+ 
+-import base64
+ from typing import TYPE_CHECKING
+ 
+ from icalendar.prop.binary import vBinary
+@@ -56,7 +55,7 @@ class Image:
+         if value_type == "URI" or isinstance(value, vUri):
+             params["uri"] = str(value)
+         elif isinstance(value, vBinary):
+-            params["b64data"] = value.obj
++            params["b64data"] = value.base64data
+         elif value_type == "BINARY":
+             params["b64data"] = str(value)
+         else:
+@@ -96,7 +95,7 @@ class Image:
+         """Return the binary data, if available."""
+         if self.b64data is None:
+             return None
+-        return base64.b64decode(self.b64data)
++        return vBinary.from_ical(self.b64data)
+ 
+ 
+ __all__ = ["Image"]
+diff --git a/src/icalendar/prop/recur/recur.py b/src/icalendar/prop/recur/recur.py
+index 2a999dd1dc19437ef8fd6dba8edd4a428adc96f3..561445b5a68e23a8836cac97130f16762a3323e6 100644
+--- a/src/icalendar/prop/recur/recur.py
++++ b/src/icalendar/prop/recur/recur.py
+@@ -260,6 +260,9 @@ class vRecur(CaselessDict):
+             )
+         recur = {}
+         for key, value in jcal_property[3].items():
++            JCalParsingError.validate_jcal_token(
++                key, "recurrence rule part name", cls, path=[3, key]
++            )
+             value_type = cls.types.get(key, vText)
+             with JCalParsingError.reraise_with_path_added(3, key):
+                 if isinstance(value, list):
+diff --git a/src/icalendar/prop/recur/weekday.py b/src/icalendar/prop/recur/weekday.py
+index 9ef502e65a4e6a00d3629b6a876c3ef2e28334e0..80940749f257947847cbf4207eba9bdfec29ee57 100644
+--- a/src/icalendar/prop/recur/weekday.py
++++ b/src/icalendar/prop/recur/weekday.py
+@@ -93,6 +93,16 @@ class vWeekday(str):
+         except Exception as e:
+             raise ValueError(f"Expected weekday abbreviation, got: {ical}") from e
+ 
++    @property
++    def ical_value(self) -> str:
++        """Returns the weekday value as a string, for example, ``MO``, ``+2TH``, or ``-1SU``.
++
++        See Also:
++
++            :rfc:`5545#section-3.3.10` for the ``BYDAY`` rule grammar.
++        """
++        return str(self)
++
+     @classmethod
+     def parse_jcal_value(cls, value: Any) -> Self:
+         """Parse a jCal value for vWeekday.
+diff --git a/src/icalendar/prop/text.py b/src/icalendar/prop/text.py
+index 94c273296ea10859bbf8689378777f6f8b460105..52c2e6a8b4cb1c30e8cd80738f2e615d1b89e5a1 100644
+--- a/src/icalendar/prop/text.py
++++ b/src/icalendar/prop/text.py
+@@ -1,5 +1,6 @@
+ """TEXT values from :rfc:`5545`."""
+ 
++import re
+ from typing import Any, ClassVar
+ 
+ from icalendar.compatibility import Self
+@@ -7,6 +8,23 @@ from icalendar.error import JCalParsingError
+ from icalendar.parser import Parameters, _escape_char
+ from icalendar.parser_tools import DEFAULT_ENCODING, ICAL_TYPE, to_unicode
+ 
++# :rfc:`5545#section-3.3.11` defines TEXT as
++# ``*(TSAFE-CHAR / ":" / DQUOTE / ESCAPED-CHAR)`` where TSAFE-CHAR is in turn
++# defined by the following grammar in :rfc:`5545#section-3.1`.
++#
++# ..  code-block:: text
++#
++#     TSAFE-CHAR = WSP / %x21 / %x23-2B / %x2D-39 / %x3C-5B /
++#              %x5D-7E / NON-US-ASCII
++#        ; Any character except CONTROLs not needed by the current
++#        ; character set, DQUOTE, ";", ":", "\", ","
++#
++# CONTROL is defined in the same section as ``%x00-08 / %x0A-1F / %x7F``, so no
++# control character except the horizontal tab may appear in a TEXT value.
++# The line feed, ``\x0a``, is additionally accepted here because it is the
++# result of the escaped sequences ``\N`` and ``\n``.
++UNSAFE_TEXT_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
++
+ 
+ class vText(str):
+     r"""vText is a data type that contains human-readable text values.
+@@ -90,7 +108,22 @@ class vText(str):
+ 
+     @classmethod
+     def from_ical(cls, ical: ICAL_TYPE) -> Self:
+-        return cls(ical)
++        r"""Parse a TEXT value from its iCalendar representation.
++
++        Raises:
++            ValueError: If the value contains a control character that
++                :rfc:`5545#section-3.3.11` does not allow in TEXT values.
++                The line feed is exempt because it can only enter a parsed
++                value through the escaped sequences ``\N`` and ``\n``.
++        """
++        text = to_unicode(ical)
++        match = UNSAFE_TEXT_CHARS.search(text)
++        if match is not None:
++            raise ValueError(
++                f"Control character {match.group()!a} at index "
++                f"{match.start()} is not allowed in TEXT values."
++            )
++        return cls(text)
+ 
+     @property
+     def ical_value(self) -> str:

@@ -1,0 +1,46 @@
+--- a/lib/stripe/request_params.rb
++++ b/lib/stripe/request_params.rb
+@@ -37,7 +37,9 @@
+       # there should be no reason to change it after a variant instance is
+       # created.
+       def discriminator(name, value)
+-        fields = { name.to_sym => value }
++        # Retain a private immutable tag, not the caller's mutable string.
++        value = value.dup.freeze if value.is_a?(String)
++        fields = { name.to_sym => value }.freeze
+         define_singleton_method(:discriminator_fields) { fields }
+         define_method(name) { value }
+       end
+--- a/lib/stripe/connection_manager.rb
++++ b/lib/stripe/connection_manager.rb
+@@ -53,7 +53,17 @@
+ 
+         if connection.nil?
+           connection = create_connection(u)
+-          connection.start
++          begin
++            connection.start
++          rescue Exception # rubocop:disable Lint/RescueException
++            # A failed start never reached the pool, but may own a socket.
++            begin
++              connection.finish
++            rescue Exception # rubocop:disable Lint/RescueException
++              # Preserve the original acquisition exception.
++            end
++            raise
++          end
+ 
+           @active_connections[[u.host, u.port]] = connection
+         end
+@@ -159,9 +169,8 @@
+       end
+ 
+       connection.finish
+-    rescue IOError
+-      # The connection was never started, so there is nothing to close. Swallowed so that this
+-      # cleanup can never replace the exception that triggered it.
++    rescue Exception # rubocop:disable Lint/RescueException
++      # Cleanup is best effort and must never replace the triggering exception.
+       nil
+     end
+ 

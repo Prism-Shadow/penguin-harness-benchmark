@@ -1,0 +1,342 @@
+diff --git a/app/controllers/api/v1/problems_controller.rb b/app/controllers/api/v1/problems_controller.rb
+index 8dd657c..8225a03 100644
+--- a/app/controllers/api/v1/problems_controller.rb
++++ b/app/controllers/api/v1/problems_controller.rb
+@@ -1,6 +1,6 @@
+ class Api::V1::ProblemsController < ApplicationController
+   respond_to :json, :xml
+-  FIELDS = %w{app_id app_name environment message where first_notice_at last_notice_at resolved resolved_at notices_count}
++  FIELDS = %w{_id app_id app_name environment message where first_notice_at last_notice_at resolved resolved_at notices_count}
+ 
+   def show
+     result = benchmark("[api/v1/problems_controller/show] query time") do
+diff --git a/app/controllers/application_controller.rb b/app/controllers/application_controller.rb
+index 563dd60..c50e060 100644
+--- a/app/controllers/application_controller.rb
++++ b/app/controllers/application_controller.rb
+@@ -15,9 +15,8 @@ class ApplicationController < ActionController::Base
+   rescue_from ActionController::RedirectBackError, :with => :redirect_to_root
+ 
+   class StrongParametersWithEagerAttributesStrategy < DecentExposure::StrongParametersStrategy
+-    def attributes
+-      super
+-      @attributes ||= params[inflector.param_key] || {}
++    def assign_attributes?
++      singular? && !get? && !delete? && (params[options[:param_key] || inflector.param_key]).present?
+     end
+   end
+ 
+diff --git a/app/controllers/apps_controller.rb b/app/controllers/apps_controller.rb
+index e016bf7..3ce07b4 100644
+--- a/app/controllers/apps_controller.rb
++++ b/app/controllers/apps_controller.rb
+@@ -15,7 +15,8 @@ class AppsController < ApplicationController
+     app_scope.all.sort.to_a
+   }
+ 
+-  expose(:app, :ancestor => :app_scope)
++  expose(:app, ancestor: :app_scope, attributes: :app_params)
++
+   expose(:app_decorate) do
+     AppDecorator.new(app)
+   end
+@@ -23,6 +24,7 @@ class AppsController < ApplicationController
+   expose(:all_errs) {
+     !!params[:all_errs]
+   }
++
+   expose(:problems) {
+     if request.format == :atom
+       app.problems.unresolved.ordered
+@@ -140,4 +142,9 @@ class AppsController < ApplicationController
+         end
+       end
+     end
++
++  private
++    def app_params
++      params.require(:app).permit!
++    end
+ end
+diff --git a/app/controllers/comments_controller.rb b/app/controllers/comments_controller.rb
+index 0d36cf3..01cd064 100644
+--- a/app/controllers/comments_controller.rb
++++ b/app/controllers/comments_controller.rb
+@@ -3,7 +3,7 @@ class CommentsController < ApplicationController
+   before_filter :find_problem
+ 
+   def create
+-    @comment = Comment.new(params[:comment].merge(:user_id => current_user.id))
++    @comment = Comment.new(comment_params.merge(:user_id => current_user.id))
+     if @comment.valid?
+       @problem.comments << @comment
+       @problem.save
+@@ -36,5 +36,8 @@ class CommentsController < ApplicationController
+     def find_problem
+       @problem = @app.problems.find(params[:problem_id])
+     end
+-end
+ 
++    def comment_params
++      params.require(:comment).permit!
++    end
++end
+diff --git a/app/controllers/problems_controller.rb b/app/controllers/problems_controller.rb
+index a317400..5a61abd 100644
+--- a/app/controllers/problems_controller.rb
++++ b/app/controllers/problems_controller.rb
+@@ -153,4 +153,3 @@ class ProblemsController < ApplicationController
+     end
+   end
+ end
+-
+diff --git a/app/interactors/problem_updater_cache.rb b/app/interactors/problem_updater_cache.rb
+index e5370ab..29891a8 100644
+--- a/app/interactors/problem_updater_cache.rb
++++ b/app/interactors/problem_updater_cache.rb
+@@ -22,7 +22,7 @@ class ProblemUpdaterCache
+ 
+   def update_notices_count
+     if @notice
+-      problem.inc(:notices_count, 1)
++      problem.inc(notices_count: 1)
+     else
+       problem.update_attribute(
+         :notices_count, problem.notices.count
+diff --git a/app/models/app.rb b/app/models/app.rb
+index 293e7ae..ccc5c17 100644
+--- a/app/models/app.rb
++++ b/app/models/app.rb
+@@ -21,7 +21,7 @@ class App
+   field :_id,
+     type: String,
+     pre_processed: true,
+-    default: ->{ Moped::BSON::ObjectId.new.to_s }
++    default: ->{ BSON::ObjectId.new.to_s }
+ 
+ 
+   embeds_many :watchers
+@@ -172,7 +172,7 @@ class App
+   end
+ 
+   def regenerate_api_key!
+-    set(:api_key, SecureRandom.hex)
++    update_attribute(:api_key, SecureRandom.hex)
+   end
+ 
+   ##
+diff --git a/app/models/backtrace_line.rb b/app/models/backtrace_line.rb
+index f517ad8..34df8a2 100644
+--- a/app/models/backtrace_line.rb
++++ b/app/models/backtrace_line.rb
+@@ -10,7 +10,7 @@ class BacktraceLine
+ 
+   embedded_in :backtrace
+ 
+-  scope :in_app, where(:file => IN_APP_PATH)
++  scope :in_app, ->{ where(:file => IN_APP_PATH) }
+ 
+   delegate :app, :to => :backtrace
+ 
+@@ -40,4 +40,3 @@ class BacktraceLine
+   end
+ 
+ end
+-
+diff --git a/app/models/comment.rb b/app/models/comment.rb
+index ad63385..862a736 100644
+--- a/app/models/comment.rb
++++ b/app/models/comment.rb
+@@ -30,11 +30,11 @@ class Comment
+ 
+   protected
+     def increase_counter_cache
+-      err.inc(:comments_count, 1)
++      err.inc(comments_count: 1)
+     end
+ 
+     def decrease_counter_cache
+-      err.inc(:comments_count, -1) if err
++      err.inc(comments_count: -1) if err
+     end
+ 
+ end
+diff --git a/app/models/notice.rb b/app/models/notice.rb
+index 917bef4..4cca6d8 100644
+--- a/app/models/notice.rb
++++ b/app/models/notice.rb
+@@ -28,9 +28,13 @@ class Notice
+ 
+   validates_presence_of :backtrace, :server_environment, :notifier
+ 
+-  scope :ordered, order_by(:created_at.asc)
+-  scope :reverse_ordered, order_by(:created_at.desc)
+-  scope :for_errs, lambda {|errs| where(:err_id.in => errs.all.map(&:id))}
++  scope :ordered, ->{ order_by(:created_at.asc) }
++  scope :reverse_ordered, ->{ order_by(:created_at.desc) }
++  scope :for_errs, Proc.new { |errs|
++    if (ids = errs.all.map(&:id)) && ids.present?
++      where(:err_id.in => ids)
++    end
++  }
+ 
+   def user_agent
+     agent_string = env_vars['HTTP_USER_AGENT']
+@@ -139,7 +143,7 @@ class Notice
+   protected
+ 
+   def decrease_counter_cache
+-    problem.inc(:notices_count, -1) if err
++    problem.inc(notices_count: -1) if err
+   end
+ 
+   def remove_cached_attributes_from_problem
+@@ -162,8 +166,8 @@ class Notice
+ 
+ 
+   def sanitize_hash(h)
+-    h.recurse do
+-      |h| h.inject({}) do |h,(k,v)|
++    h.recurse do |h|
++      h.inject({}) do |h,(k,v)|
+         if k.is_a?(String)
+           h[k.gsub(/\./,'&#46;').gsub(/^\$/,'&#36;')] = v
+         else
+@@ -195,4 +199,3 @@ class Notice
+   end
+ 
+ end
+-
+diff --git a/app/models/problem.rb b/app/models/problem.rb
+index cf79536..e746024 100644
+--- a/app/models/problem.rb
++++ b/app/models/problem.rb
+@@ -43,9 +43,9 @@ class Problem
+ 
+   before_create :cache_app_attributes
+ 
+-  scope :resolved, where(:resolved => true)
+-  scope :unresolved, where(:resolved => false)
+-  scope :ordered, order_by(:last_notice_at.desc)
++  scope :resolved, ->{ where(:resolved => true) }
++  scope :unresolved, ->{ where(:resolved => false) }
++  scope :ordered, ->{ order_by(:last_notice_at.desc) }
+   scope :for_apps, lambda {|apps| where(:app_id.in => apps.all.map(&:id))}
+ 
+   validates_presence_of :last_notice_at, :first_notice_at
+@@ -184,4 +184,3 @@ class Problem
+       Digest::MD5.hexdigest(value.to_s)
+     end
+ end
+-
+diff --git a/config/application.rb b/config/application.rb
+index 8f866d3..ca4c054 100644
+--- a/config/application.rb
++++ b/config/application.rb
+@@ -47,9 +47,6 @@ module Errbit
+       g.fixture_replacement :fabrication
+     end
+ 
+-    # Enable the mongoid identity map for performance
+-    Mongoid.identity_map_enabled = true
+-
+     # IssueTracker subclasses use inheritance, so preloading models provides querying consistency in dev mode.
+     config.mongoid.preload_models = true
+ 
+@@ -73,4 +70,3 @@ module Errbit
+     config.assets.version = '1.0'
+   end
+ end
+-
+diff --git a/config/environments/development.rb b/config/environments/development.rb
+index 4ae4daa..2058a7e 100644
+--- a/config/environments/development.rb
++++ b/config/environments/development.rb
+@@ -6,8 +6,7 @@ Errbit::Application.configure do
+   # since you don't have to restart the webserver when you make code changes.
+   config.cache_classes = false
+ 
+-  # Log error messages when you accidentally call methods on nil.
+-  config.whiny_nils = true
++  config.eager_load = false
+ 
+   # Show full error reports and disable caching
+   config.consider_all_requests_local       = true
+diff --git a/config/environments/production.rb b/config/environments/production.rb
+index 0ac6957..9c7bf4f 100644
+--- a/config/environments/production.rb
++++ b/config/environments/production.rb
+@@ -5,6 +5,8 @@ Errbit::Application.configure do
+   # Code is not reloaded between requests
+   config.cache_classes = true
+ 
++  config.eager_load = true
++
+   # Shows or hides all error details if something goes wrong inside Errbit
+   config.consider_all_requests_local       = false
+   # Caching is turned on
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 5a1af4d..6e1759f 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -7,8 +7,7 @@ Errbit::Application.configure do
+   # and recreated between test runs.  Don't rely on the data there!
+   config.cache_classes = true
+ 
+-  # Log error messages when you accidentally call methods on nil.
+-  config.whiny_nils = true
++  config.eager_load = false
+ 
+   # Show full error reports and disable caching
+   config.consider_all_requests_local       = true
+diff --git a/config/initializers/mongo.rb b/config/initializers/mongo.rb
+index 1dfb74d..16cddc4 100644
+--- a/config/initializers/mongo.rb
++++ b/config/initializers/mongo.rb
+@@ -39,6 +39,4 @@ elsif ENV['HEROKU'] || ENV['USE_ENV']
+   end
+ end
+ 
+-Mongoid.allow_dynamic_fields = false
+ Mongoid.use_activesupport_time_zone = true
+-Mongoid.identity_map_enabled = true
+diff --git a/config/initializers/overrides.rb b/config/initializers/overrides.rb
+index 157232e..4d7f3ba 100644
+--- a/config/initializers/overrides.rb
++++ b/config/initializers/overrides.rb
+@@ -1,2 +1,8 @@
+ require Rails.root.join('lib/overrides/devise/failure_app')
+ require Rails.root.join('lib/overrides/hoptoad_notifier/hoptoad_notifier')
++
++class BSON::ObjectId
++  def as_json(*args)
++    to_s
++  end
++end
+diff --git a/config/mongoid.example.yml b/config/mongoid.example.yml
+index e586d88..b0d063e 100644
+--- a/config/mongoid.example.yml
++++ b/config/mongoid.example.yml
+@@ -14,7 +14,6 @@ development:
+       hosts:
+         - localhost:27017
+   options:
+-    identity_map_enabled: true
+     use_utc: true
+ 
+ test:
+@@ -24,7 +23,6 @@ test:
+         - localhost:27017
+       database: errbit_test
+   options:
+-    identity_map_enabled: true
+     use_utc: true
+ 
+ # set these environment variables on your prod server
+@@ -37,4 +35,4 @@ production:
+       username: <%= ENV['MONGOID_USERNAME'] %>
+       password: <%= ENV['MONGOID_PASSWORD'] %>
+   options:
+-    identity_map_enabled: true
++    use_utc: true
+\ No newline at end of file

@@ -1,0 +1,115 @@
+"""This is part of the MSS Python's module.
+Source: https://github.com/BoboTiG/python-mss.
+"""
+
+import os
+from collections.abc import Callable, Generator
+from hashlib import sha256
+from pathlib import Path
+from platform import system
+from typing import Any
+from zipfile import ZipFile
+
+import pytest
+
+from mss import MSS
+from mss.linux import xcb, xlib
+
+
+@pytest.fixture(autouse=True)
+def _no_warnings(recwarn: pytest.WarningsRecorder) -> Generator:
+    """Fail on warning."""
+    yield
+
+    warnings = [f"{warning.filename}:{warning.lineno} {warning.message}" for warning in recwarn]
+    for warning in warnings:
+        print(warning)
+    assert not warnings
+
+
+def purge_files() -> None:
+    """Remove all generated files from previous runs."""
+    for file in Path().glob("*.png"):
+        print(f"Deleting {file} ...")
+        file.unlink()
+
+    for file in Path().glob("*.png.old"):
+        print(f"Deleting {file} ...")
+        file.unlink()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _before_tests() -> None:
+    purge_files()
+
+
+@pytest.fixture(autouse=True)
+def no_xlib_errors(request: pytest.FixtureRequest) -> None:
+    system() == "Linux" and ("backend" not in request.fixturenames or request.getfixturevalue("backend") == "xlib")
+    assert not xlib._ERROR
+
+
+@pytest.fixture(autouse=True)
+def reset_xcb_libraries(request: pytest.FixtureRequest) -> Generator[None]:
+    # We need to test this before we yield, since the backend isn't available afterwards.
+    xcb_should_reset = system() == "Linux" and (
+        "backend" not in request.fixturenames or request.getfixturevalue("backend") == "xcb"
+    )
+    yield None
+    if xcb_should_reset:
+        xcb.LIB.reset()
+
+
+@pytest.fixture(scope="session")
+def raw() -> bytes:
+    file = Path(__file__).parent / "res" / "monitor-1024x768.raw.zip"
+    with ZipFile(file) as fh:
+        data = fh.read(file.with_suffix("").name)
+
+    assert sha256(data).hexdigest() == "d86ed4366d5a882cfe1345de82c87b81aef9f9bf085f4c42acb6f63f3967eccd"
+    return data
+
+
+@pytest.fixture(params=["xlib", "xgetimage", "xshmgetimage"] if system() == "Linux" else ["default"])
+def backend(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
+@pytest.fixture
+def mss_impl(backend: str) -> Callable[..., MSS]:
+    # We can't just use partial here, since it will read $DISPLAY at the wrong time.  This can cause problems,
+    # depending on just how the fixtures get run.
+    def impl(*args: Any, **kwargs: Any) -> MSS:
+        # I'm not really sure if adding an explicit display is needed anymore.  It was in a lot of existing code that
+        # mss_impl replaced, but it should now be the default at this point.  I'll have to investigate.
+        if system() == "Linux":
+            kwargs = {"display": os.getenv("DISPLAY")} | kwargs
+        return MSS(*args, backend=backend, **kwargs)
+
+    return impl
+
+
+@pytest.fixture(autouse=True, scope="session")
+def inhibit_x11_resets() -> Generator[None, None, None]:
+    """Ensure that an X11 connection is open during the test session.
+
+    Under X11, when the last client disconnects, the server resets.  If
+    a new client tries to connect before the reset is complete, it may fail.
+    Since we often run the tests under Xvfb, they're frequently the only
+    clients.  Since our tests run in rapid succession, this combination
+    can lead to intermittent failures.
+
+    To avoid this, we open a connection at the start of the test session
+    and keep it open until the end.
+    """
+    if system() != "Linux":
+        yield
+        return
+
+    conn, _ = xcb.connect()
+    try:
+        yield
+    finally:
+        # Some tests may have reset xcb.LIB, so make sure it's currently initialized.
+        xcb.initialize()
+        xcb.disconnect(conn)

@@ -1,0 +1,381 @@
+diff --git a/app/assets/stylesheets/standard.css b/app/assets/stylesheets/standard.css
+index 2aa773b4..cf59191a 100644
+--- a/app/assets/stylesheets/standard.css
++++ b/app/assets/stylesheets/standard.css
+@@ -32,3 +32,30 @@ input[type='file'] {
+ .payload-reveal-zone .spoiler[data-spoiler-state="revealed"] {
+   cursor: text;
+ }
++
++/* Hide payload while typing (create form eye toggle) */
++.payload-hidden {
++  -webkit-text-security: disc;
++}
++@supports not (-webkit-text-security: disc) {
++  .payload-hidden {
++    color: transparent;
++    text-shadow: 0 0 8px rgba(0, 0, 0, 0.55);
++  }
++  html[data-bs-theme="dark"] .payload-hidden {
++    text-shadow: 0 0 8px rgba(255, 255, 255, 0.55);
++  }
++}
++
++.payload-visibility-toggle {
++  color: var(--bs-body-color);
++  line-height: 1;
++  text-decoration: none;
++}
++.payload-visibility-toggle:hover,
++.payload-visibility-toggle:focus {
++  color: var(--bs-emphasis-color);
++}
++.payload-visibility-toggle .bi {
++  font-size: 1.35rem;
++}
+diff --git a/app/javascript/controllers/payload_visibility_controller.js b/app/javascript/controllers/payload_visibility_controller.js
+new file mode 100644
+index 00000000..bce1211c
+--- /dev/null
++++ b/app/javascript/controllers/payload_visibility_controller.js
+@@ -0,0 +1,64 @@
++import { Controller } from "@hotwired/stimulus"
++
++// Masks the push payload textarea while typing (eye toggle).
++// Preference is stored in localStorage.pwpush_payload_hidden (anonymous-safe).
++export default class extends Controller {
++  static targets = ["input", "toggle", "showIcon", "hideIcon"]
++
++  static values = {
++    hideLabel: { type: String, default: "Hide payload" },
++    showLabel: { type: String, default: "Show payload" }
++  }
++
++  static STORAGE_KEY = "pwpush_payload_hidden"
++
++  connect() {
++    this.apply(this.storedHidden)
++  }
++
++  toggle(event) {
++    event.preventDefault()
++    this.apply(!this.isHidden)
++  }
++
++  get isHidden() {
++    return this.inputTarget.classList.contains("payload-hidden")
++  }
++
++  get storedHidden() {
++    try {
++      return localStorage.getItem(this.constructor.STORAGE_KEY) === "true"
++    } catch (_error) {
++      return false
++    }
++  }
++
++  apply(hidden) {
++    this.inputTarget.classList.toggle("payload-hidden", hidden)
++
++    if (this.hasShowIconTarget) {
++      this.showIconTarget.classList.toggle("d-none", hidden)
++    }
++    if (this.hasHideIconTarget) {
++      this.hideIconTarget.classList.toggle("d-none", !hidden)
++    }
++
++    if (this.hasToggleTarget) {
++      this.toggleTarget.setAttribute("aria-pressed", hidden ? "true" : "false")
++      this.toggleTarget.setAttribute(
++        "aria-label",
++        hidden ? this.showLabelValue : this.hideLabelValue
++      )
++      this.toggleTarget.setAttribute(
++        "title",
++        hidden ? this.showLabelValue : this.hideLabelValue
++      )
++    }
++
++    try {
++      localStorage.setItem(this.constructor.STORAGE_KEY, hidden ? "true" : "false")
++    } catch (_error) {
++      // Ignore private-mode / disabled storage
++    }
++  }
++}
+diff --git a/app/views/pushes/_form.html.erb b/app/views/pushes/_form.html.erb
+index 23525129..3d61bf74 100644
+--- a/app/views/pushes/_form.html.erb
++++ b/app/views/pushes/_form.html.erb
+@@ -38,19 +38,45 @@
+                         <em class="bi bi-eye-slash flex-shrink-0" aria-hidden="true"></em>
+                         <span><%= _('Content is hidden for privacy. Click the field below to reveal and edit.') %></span>
+                     </p>
+-            <% end %>
+-            <%= f.text_area(:payload, { class: "form-control rounded-3#{' spoiler' if payload_blurred}",
+-                                        rows: 8,
+-                                        placeholder: _('Enter the Password or Text to push...'),
+-                                        autocomplete: "off",
+-                                        spellcheck: "false",
+-                                        autofocus: !payload_blurred,
+-                                        required: true,
+-                                        "data-pwgen-target" => "payloadInput",
+-                                        "data-passwords-target" => "payloadInput",
+-                                        "data-action" => "input->passwords#updateCharacterCount pwgen#setContentNotGenerated"
+-                                         }) %>
+-            <% if payload_blurred %>
++                    <%= f.text_area(:payload, { class: "form-control rounded-3 spoiler",
++                                                rows: 8,
++                                                placeholder: _('Enter the Password or Text to push...'),
++                                                autocomplete: "off",
++                                                spellcheck: "false",
++                                                autofocus: false,
++                                                required: true,
++                                                "data-pwgen-target" => "payloadInput",
++                                                "data-passwords-target" => "payloadInput",
++                                                "data-action" => "input->passwords#updateCharacterCount pwgen#setContentNotGenerated"
++                                                 }) %>
++                </div>
++            <% else %>
++                <div class="position-relative"
++                     data-controller="payload-visibility"
++                     data-payload-visibility-hide-label-value="<%= _('Hide payload') %>"
++                     data-payload-visibility-show-label-value="<%= _('Show payload') %>">
++                    <%= f.text_area(:payload, { class: "form-control rounded-3 pe-5",
++                                                rows: 8,
++                                                placeholder: _('Enter the Password or Text to push...'),
++                                                autocomplete: "off",
++                                                spellcheck: "false",
++                                                autofocus: true,
++                                                required: true,
++                                                "data-pwgen-target" => "payloadInput",
++                                                "data-passwords-target" => "payloadInput",
++                                                "data-payload-visibility-target" => "input",
++                                                "data-action" => "input->passwords#updateCharacterCount pwgen#setContentNotGenerated"
++                                                 }) %>
++                    <button type="button"
++                            class="btn btn-link payload-visibility-toggle position-absolute top-0 end-0 mt-1 me-1 p-1"
++                            data-payload-visibility-target="toggle"
++                            data-action="payload-visibility#toggle"
++                            aria-pressed="false"
++                            aria-label="<%= _('Hide payload') %>"
++                            title="<%= _('Hide payload') %>">
++                        <em class="bi bi-eye" data-payload-visibility-target="showIcon" aria-hidden="true"></em>
++                        <em class="bi bi-eye-slash d-none" data-payload-visibility-target="hideIcon" aria-hidden="true"></em>
++                    </button>
+                 </div>
+             <% end %>
+             <div class='position-relative'>
+diff --git a/app/views/pushes/_qr_form.html.erb b/app/views/pushes/_qr_form.html.erb
+index bf122f9e..bd4659e0 100644
+--- a/app/views/pushes/_qr_form.html.erb
++++ b/app/views/pushes/_qr_form.html.erb
+@@ -31,18 +31,34 @@
+ 
+     <div class='row'>
+         <div class='col'>
+-            <%= f.text_area(:payload, { class: "form-control rounded-3",
+-                                        rows: 8,
+-                                        placeholder: _('Enter up to 1024 characters...'),
+-                                        autocomplete: "off",
+-                                        spellcheck: "false",
+-                                        maxlength: 1024,
+-                                        autofocus: true,
+-                                        required: true,
+-                                        "data-pwgen-target" => "payloadInput",
+-                                        "data-passwords-target" => "payloadInput",
+-                                        "data-action" => "input->passwords#updateCharacterCount pwgen#setContentNotGenerated"
+-                                         }) %>
++            <div class="position-relative"
++                 data-controller="payload-visibility"
++                 data-payload-visibility-hide-label-value="<%= _('Hide payload') %>"
++                 data-payload-visibility-show-label-value="<%= _('Show payload') %>">
++                <%= f.text_area(:payload, { class: "form-control rounded-3 pe-5",
++                                            rows: 8,
++                                            placeholder: _('Enter up to 1024 characters...'),
++                                            autocomplete: "off",
++                                            spellcheck: "false",
++                                            maxlength: 1024,
++                                            autofocus: true,
++                                            required: true,
++                                            "data-pwgen-target" => "payloadInput",
++                                            "data-passwords-target" => "payloadInput",
++                                            "data-payload-visibility-target" => "input",
++                                            "data-action" => "input->passwords#updateCharacterCount pwgen#setContentNotGenerated"
++                                             }) %>
++                <button type="button"
++                        class="btn btn-link payload-visibility-toggle position-absolute top-0 end-0 mt-1 me-1 p-1"
++                        data-payload-visibility-target="toggle"
++                        data-action="payload-visibility#toggle"
++                        aria-pressed="false"
++                        aria-label="<%= _('Hide payload') %>"
++                        title="<%= _('Hide payload') %>">
++                    <em class="bi bi-eye" data-payload-visibility-target="showIcon" aria-hidden="true"></em>
++                    <em class="bi bi-eye-slash d-none" data-payload-visibility-target="hideIcon" aria-hidden="true"></em>
++                </button>
++            </div>
+             <div class='position-relative'>
+                 <div id="the-count" class="position-absolute bottom-0 end-0 m-2 px-3 opacity-75">
+                     <span id="current" data-passwords-target="currentChars">0</span>
+diff --git a/test/integration/password/password_creation_test.rb b/test/integration/password/password_creation_test.rb
+index 986a3c55..8b0e7044 100644
+--- a/test/integration/password/password_creation_test.rb
++++ b/test/integration/password/password_creation_test.rb
+@@ -23,6 +23,16 @@ class PasswordCreationTest < ActionDispatch::IntegrationTest
+     assert text_area.attribute("required").value == "required"
+   end
+ 
++  def test_payload_visibility_toggle_present
++    get new_push_path(tab: "text")
++    assert_response :success
++
++    assert_select "[data-controller='payload-visibility']", 1
++    assert_select "button[data-action='payload-visibility#toggle']", 1
++    assert_select "button[data-action='payload-visibility#toggle'][aria-label='Hide payload']", 1
++    assert_select "textarea#push_payload[data-payload-visibility-target='input']", 1
++  end
++
+   def test_password_creation
+     get new_push_path(tab: "text")
+     assert_response :success
+diff --git a/test/integration/password/password_edit_test.rb b/test/integration/password/password_edit_test.rb
+index b7d81365..7d0e3cf9 100644
+--- a/test/integration/password/password_edit_test.rb
++++ b/test/integration/password/password_edit_test.rb
+@@ -94,6 +94,10 @@ class PasswordEditTest < ActionDispatch::IntegrationTest
+     # Reveal zone with instructions is present
+     assert_select ".payload-reveal-zone", 1
+     assert_match(/Content is hidden for privacy/, response.body)
++
++    # Hide-while-typing toggle is not shown when edit blur zone is active
++    assert_select "[data-controller='payload-visibility']", 0
++    assert_select "button[data-action='payload-visibility#toggle']", 0
+   ensure
+     Settings.pw.enable_blur = true
+   end
+diff --git a/test/integration/qr/qr_creation_test.rb b/test/integration/qr/qr_creation_test.rb
+index b902c371..658f2715 100644
+--- a/test/integration/qr/qr_creation_test.rb
++++ b/test/integration/qr/qr_creation_test.rb
+@@ -40,6 +40,16 @@ class QrCreationTest < ActionDispatch::IntegrationTest
+     assert text_area.attribute("maxlength").value == "1024"
+   end
+ 
++  def test_payload_visibility_toggle_present
++    get new_push_path(tab: "qr")
++    assert_response :success
++
++    assert_select "[data-controller='payload-visibility']", 1
++    assert_select "button[data-action='payload-visibility#toggle']", 1
++    assert_select "button[data-action='payload-visibility#toggle'][aria-label='Hide payload']", 1
++    assert_select "textarea#push_payload[data-payload-visibility-target='input']", 1
++  end
++
+   def test_url_creation
+     get new_push_path(tab: "qr")
+     assert_response :success
+diff --git a/test/system/payload_visibility_test.rb b/test/system/payload_visibility_test.rb
+new file mode 100644
+index 00000000..3a3f8220
+--- /dev/null
++++ b/test/system/payload_visibility_test.rb
+@@ -0,0 +1,99 @@
++# frozen_string_literal: true
++
++require "application_system_test_case"
++
++class PayloadVisibilityTest < ApplicationSystemTestCase
++  setup do
++    Settings.enable_password_pushes = true
++    Rails.application.reload_routes!
++
++    @user = users(:luca)
++    login_as(@user, scope: :user)
++  end
++
++  teardown do
++    clear_payload_visibility_storage
++    Settings.reload!
++    Rails.application.reload_routes!
++  end
++
++  test "toggle masks and unmasks payload while keeping value" do
++    visit_text_form_with_clean_visibility
++
++    payload_input = find("textarea#push_payload", wait: 5)
++    toggle = find("button[data-action='payload-visibility#toggle']", wait: 5)
++
++    fill_in "push_payload", with: "MySecretPassword123!"
++    assert_equal "MySecretPassword123!", payload_input.value
++    assert_not payload_input[:class].to_s.include?("payload-hidden")
++    assert_equal "false", toggle["aria-pressed"]
++
++    toggle.click
++
++    assert payload_input[:class].to_s.include?("payload-hidden")
++    assert_equal "MySecretPassword123!", payload_input.value
++    assert_equal "true", toggle["aria-pressed"]
++    assert_equal "Show payload", toggle["aria-label"]
++
++    toggle.click
++
++    assert_not payload_input[:class].to_s.include?("payload-hidden")
++    assert_equal "MySecretPassword123!", payload_input.value
++    assert_equal "false", toggle["aria-pressed"]
++    assert_equal "Hide payload", toggle["aria-label"]
++  end
++
++  test "generate password works while payload is masked" do
++    visit_text_form_with_clean_visibility
++
++    payload_input = find("textarea#push_payload", wait: 5)
++    toggle = find("button[data-action='payload-visibility#toggle']", wait: 5)
++    generate_button = find("button[data-action*='pwgen#producePassword']", match: :first, wait: 5)
++
++    toggle.click
++    assert payload_input[:class].to_s.include?("payload-hidden")
++
++    generate_button.click
++    sleep 0.5
++
++    generated = payload_input.value
++    assert generated.present?
++    assert payload_input[:class].to_s.include?("payload-hidden")
++  end
++
++  test "masked preference persists across page loads" do
++    visit_text_form_with_clean_visibility
++
++    toggle = find("button[data-action='payload-visibility#toggle']", wait: 5)
++    toggle.click
++    assert_equal "true", toggle["aria-pressed"]
++
++    visit new_push_path(tab: "text")
++
++    payload_input = find("textarea#push_payload", wait: 5)
++    toggle = find("button[data-action='payload-visibility#toggle']", wait: 5)
++
++    assert payload_input[:class].to_s.include?("payload-hidden")
++    assert_equal "true", toggle["aria-pressed"]
++    assert_equal "Show payload", toggle["aria-label"]
++  end
++
++  private
++
++  def visit_text_form_with_clean_visibility
++    visit new_push_path(tab: "text")
++    clear_payload_visibility_storage
++    visit new_push_path(tab: "text")
++  end
++
++  def clear_payload_visibility_storage
++    return unless page.current_url.present? && page.current_url.start_with?("http")
++
++    page.execute_script("try { localStorage.removeItem('pwpush_payload_hidden') } catch (e) {}")
++  rescue Selenium::WebDriver::Error::WebDriverError,
++    Selenium::WebDriver::Error::InvalidSessionIdError,
++    Selenium::WebDriver::Error::NoSuchWindowError,
++    Selenium::WebDriver::Error::JavascriptError
++    # Browser already closed or on a non-http page
++  end
++end

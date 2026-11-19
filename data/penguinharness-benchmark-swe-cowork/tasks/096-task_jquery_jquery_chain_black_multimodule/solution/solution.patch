@@ -1,0 +1,4686 @@
+diff --git a/Gruntfile.js b/Gruntfile.js
+index 5021c59..156cc72 100644
+--- a/Gruntfile.js
++++ b/Gruntfile.js
+@@ -53,8 +53,7 @@ module.exports = function( grunt ) {
+ 			all: {
+ 				dest: "dist/jquery.js",
+ 				minimum: [
+-					"core",
+-					"selector"
++					"core"
+ 				],
+ 
+ 				// Exclude specified modules if the module matching the key is removed
+@@ -67,7 +66,8 @@ module.exports = function( grunt ) {
+ 						remove: [ "ajax", "effects", "queue", "core/ready" ],
+ 						include: [ "core/ready-no-deferred" ]
+ 					},
+-					event: [ "deprecated/ajax-event-alias", "deprecated/event" ]
++					event: [ "deprecated/ajax-event-alias", "deprecated/event" ],
++					selector: [ "css/hiddenVisibleSelectors", "effects/animatedSelector" ]
+ 				}
+ 			}
+ 		},
+diff --git a/build/release.cjs b/build/release.cjs
+new file mode 100644
+index 0000000..b49656a
+--- /dev/null
++++ b/build/release.cjs
+@@ -0,0 +1,85 @@
++"use strict";
++
++const fs = require( "node:fs/promises" );
++const path = require( "node:path" );
++const { rollup } = require( "rollup" );
++const pkg = require( "../package.json" );
++const root = path.resolve( __dirname, ".." );
++
++async function build( slim ) {
++
++	const suffix = slim ? ".slim" : "";
++	const excluded = /^(?:ajax(?:\/|\.js$)|callbacks\.js$|deferred(?:\/|\.js$)|effects(?:\/|\.js$)|queue(?:\/|\.js$)|manipulation\/_evalUrl\.js$|deprecated\/ajax-event-alias\.js$)/;
++	const bundle = await rollup( {
++		input: path.join( root, "src/jquery.js" ),
++		plugins: slim ? [ {
++			name: "slim-modules",
++			async load( filename ) {
++				const relative = path.relative( path.join( root, "src" ), filename );
++				if ( relative === "core/ready.js" ) {
++					return fs.readFile( path.join( root, "src/core/ready-no-deferred.js" ), "utf8" );
++				}
++				return excluded.test( relative ) ? "" : null;
++			}
++		} ] : [],
++		onwarn( warning, warn ) {
++			if ( warning.code !== "CIRCULAR_DEPENDENCY" ) {
++				warn( warning );
++			}
++		}
++	} );
++	let compiled;
++	try {
++		const result = await bundle.generate( { format: "iife", name: "jQueryModule", exports: "named" } );
++		compiled = result.output[ 0 ].code + "\nvar jQuery = jQueryModule.jQuery;\n";
++	} finally {
++		if ( bundle.close ) {
++			await bundle.close();
++		}
++	}
++	for ( const [ template, output ] of [
++		[ "wrapper.js", `dist/jquery${ suffix }.js` ],
++		[ "wrapper-esm.js", `dist-module/jquery${ suffix }.module.js` ],
++		[ "wrapper-factory.js", `dist/jquery.factory${ suffix }.js` ],
++		[ "wrapper-factory-esm.js", `dist-module/jquery.factory${ suffix }.module.js` ]
++	] ) {
++		const input = path.join( root, "src", template );
++		const source = await fs.readFile( input, "utf8" );
++		let code;
++		if ( /^[\t ]*\/\/ @CODE\s*$/m.test( source ) ) {
++			code = source.replace( /^[\t ]*\/\/ @CODE\s*$/m, () => compiled );
++		} else {
++			const nativeBundle = await rollup( { input } );
++			try {
++				const result = await nativeBundle.generate( { format: output.startsWith( "dist-module" ) ? "esm" : "cjs" } );
++				code = result.output[ 0 ].code;
++			} finally {
++				if ( nativeBundle.close ) {
++					await nativeBundle.close();
++				}
++			}
++		}
++		code = code.replace( /@VERSION/g, pkg.version + ( slim ? " slim" : "" ) )
++			.replace( /@DATE/g, new Date().toISOString() );
++		await fs.writeFile( path.join( root, output ), code );
++	}
++}
++
++async function main() {
++	for ( const directory of [ "dist", "dist-module" ] ) {
++		await fs.mkdir( path.join( root, directory ), { recursive: true } );
++		for ( const filename of await fs.readdir( path.join( __dirname, "wrappers", directory ) ) ) {
++			if ( directory === "dist-module" && filename === ".eslintrc.json" ) {
++				continue;
++			}
++			await fs.copyFile( path.join( __dirname, "wrappers", directory, filename ), path.join( root, directory, filename === "eslint-template.json" ? ".eslintrc.json" : filename ) );
++		}
++	}
++	await build( false );
++	await build( true );
++}
++
++main().catch( error => {
++	console.error( error );
++	process.exitCode = 1;
++} );
+diff --git a/build/tasks/build.js b/build/tasks/build.js
+index 06a5f40..3ceec78 100644
+--- a/build/tasks/build.js
++++ b/build/tasks/build.js
+@@ -128,11 +128,11 @@ module.exports = function( grunt ) {
+ 			 * Adds the specified module to the excluded or included list, depending on the flag
+ 			 * @param {String} flag A module path relative to
+ 			 *  the src directory starting with + or - to indicate
+-			 *  whether it should included or excluded
++			 *  whether it should be included or excluded
+ 			 */
+ 			const excluder = flag => {
+ 				let additional;
+-				const m = /^(\+|\-|)([\w\/-]+)$/.exec( flag );
++				const m = /^(\+|-|)([\w\/-]+)$/.exec( flag );
+ 				const exclude = m[ 1 ] === "-";
+ 				const module = m[ 2 ];
+ 
+@@ -150,10 +150,16 @@ module.exports = function( grunt ) {
+ 							// These are the removable dependencies
+ 							// It's fine if the directory is not there
+ 							try {
+-								excludeList(
+-									fs.readdirSync( `${ srcFolder }/${ module }` ),
+-									module
+-								);
++
++								// `selector` is a special case as we don't just remove
++								// the module, but we replace it with `selector-native`
++								// which re-uses parts of the `src/selector` folder.
++								if ( module !== "selector" ) {
++									excludeList(
++										fs.readdirSync( `${ srcFolder }/${ module }` ),
++										module
++									);
++								}
+ 							} catch ( e ) {
+ 								grunt.verbose.writeln( e );
+ 							}
+@@ -209,13 +215,15 @@ module.exports = function( grunt ) {
+ 			// Remove the jQuery export from the entry file, we'll use our own
+ 			// custom wrapper.
+ 			setOverride( inputRollupOptions.input,
+-				read( inputFileName ).replace( /\n*export default jQuery;\n*/, "\n" ) );
++				read( inputFileName )
++					.replace( /\n*export \{ jQuery, jQuery as \$ };\n*/, "\n" )
++					.replace( /\n*export default jQuery;\n*/, "\n" ) );
+ 
+ 			// Replace exports/global with a noop noConflict
+ 			if ( excluded.includes( "exports/global" ) ) {
+ 				const index = excluded.indexOf( "exports/global" );
+ 				setOverride( `${ srcFolder }/exports/global.js`,
+-					"import jQuery from \"../core.js\";\n\n" +
++					"import { jQuery } from \"../core.js\";\n\n" +
+ 						"jQuery.noConflict = function() {};" );
+ 				excluded.splice( index, 1 );
+ 			}
+@@ -232,14 +240,14 @@ module.exports = function( grunt ) {
+ 				// Remove the comma for anonymous defines
+ 				setOverride( `${ srcFolder }/exports/amd.js`,
+ 					read( "exports/amd.js" )
+-						.replace( /(\s*)"jquery"(\,\s*)/,
++						.replace( /(\s*)"jquery"(,\s*)/,
+ 							amdName ? "$1\"" + amdName + "\"$2" : "" ) );
+ 			}
+ 
+ 			grunt.verbose.writeflags( excluded, "Excluded" );
+ 			grunt.verbose.writeflags( included, "Included" );
+ 
+-			// Indicate a Slim build without listing all of the exclusions
++			// Indicate a Slim build without listing all the exclusions
+ 			// to save space.
+ 			if ( isPureSlim ) {
+ 				version += " slim";
+@@ -260,7 +268,13 @@ module.exports = function( grunt ) {
+ 
+ 				// Replace excluded modules with empty sources.
+ 				for ( const module of excluded ) {
+-					setOverride( `${ srcFolder }/${ module }.js`, "" );
++					setOverride(
++						`${ srcFolder }/${ module }.js`,
++
++						// The `selector` module is not removed, but replaced
++						// with `selector-native`.
++						module === "selector" ? read( "selector-native.js" ) : ""
++					);
+ 				}
+ 			}
+ 
+@@ -361,7 +375,9 @@ module.exports = function( grunt ) {
+ 		grunt.log.writeln( "Creating custom build...\n" );
+ 
+ 		// Ask for permission the first time
+-		if ( insight.optOut === undefined ) {
++		if ( process.env.CI ) {
++			exec( false );
++		} else if ( insight.optOut === undefined ) {
+ 			insight.askPermission( null, function( _error, result ) {
+ 				exec( result );
+ 			} );
+diff --git a/build/wrappers/dist-module/.eslintrc.json b/build/wrappers/dist-module/.eslintrc.json
+new file mode 100644
+index 0000000..7da67c2
+--- /dev/null
++++ b/build/wrappers/dist-module/.eslintrc.json
+@@ -0,0 +1,10 @@
++{
++	"root": true,
++	"extends": "../../../.eslintrc-node.json",
++	"parserOptions": {
++		"sourceType": "module"
++	},
++	"rules": {
++		"strict": "off"
++	}
++}
+diff --git a/build/wrappers/dist-module/jquery.node-module-wrapper.js b/build/wrappers/dist-module/jquery.node-module-wrapper.js
+new file mode 100644
+index 0000000..cafadcd
+--- /dev/null
++++ b/build/wrappers/dist-module/jquery.node-module-wrapper.js
+@@ -0,0 +1,5 @@
++// Node.js is able to import from a CommonJS module in an ESM one.
++import jQuery from "../dist/jquery.js";
++
++export { jQuery, jQuery as $ };
++export default jQuery;
+diff --git a/build/wrappers/dist-module/jquery.node-module-wrapper.slim.js b/build/wrappers/dist-module/jquery.node-module-wrapper.slim.js
+new file mode 100644
+index 0000000..2508b6a
+--- /dev/null
++++ b/build/wrappers/dist-module/jquery.node-module-wrapper.slim.js
+@@ -0,0 +1,5 @@
++// Node.js is able to import from a CommonJS module in an ESM one.
++import jQuery from "../dist/jquery.slim.js";
++
++export { jQuery, jQuery as $ };
++export default jQuery;
+diff --git a/build/wrappers/dist-module/package.json b/build/wrappers/dist-module/package.json
+new file mode 100644
+index 0000000..3dbc1ca
+--- /dev/null
++++ b/build/wrappers/dist-module/package.json
+@@ -0,0 +1,3 @@
++{
++  "type": "module"
++}
+diff --git a/build/wrappers/dist/eslint-template.json b/build/wrappers/dist/eslint-template.json
+new file mode 100644
+index 0000000..7f7df31
+--- /dev/null
++++ b/build/wrappers/dist/eslint-template.json
+@@ -0,0 +1,30 @@
++{
++	"root": true,
++
++	"parserOptions": {
++		"ecmaVersion": 5,
++		"sourceType": "script"
++	},
++
++	"globals": {
++		"define": false,
++		"module": true,
++		"Symbol": false
++	},
++
++	"overrides": [
++		{
++			"files": "jquery.js",
++			"extends": "../.eslintrc-browser.json",
++
++			"rules": {
++				// That is okay for the built version
++				"no-multiple-empty-lines": "off",
++				// When custom compilation is used, the version string
++				// can get large. Accept that in the built version.
++				"max-len": "off",
++				"one-var": "off"
++			}
++		}
++	]
++}
+diff --git a/build/wrappers/dist/jquery.bundler-require-wrapper.js b/build/wrappers/dist/jquery.bundler-require-wrapper.js
+new file mode 100644
+index 0000000..e6ac3af
+--- /dev/null
++++ b/build/wrappers/dist/jquery.bundler-require-wrapper.js
+@@ -0,0 +1,5 @@
++"use strict";
++
++// Bundlers are able to synchronously require an ESM module from a CommonJS one.
++const { jQuery } = require( "../dist-module/jquery.module.js" );
++module.exports = jQuery;
+diff --git a/build/wrappers/dist/jquery.bundler-require-wrapper.slim.js b/build/wrappers/dist/jquery.bundler-require-wrapper.slim.js
+new file mode 100644
+index 0000000..c34b6d0
+--- /dev/null
++++ b/build/wrappers/dist/jquery.bundler-require-wrapper.slim.js
+@@ -0,0 +1,5 @@
++"use strict";
++
++// Bundlers are able to synchronously require an ESM module from a CommonJS one.
++const { jQuery } = require( "../dist-module/jquery.slim.module.js" );
++module.exports = jQuery;
+diff --git a/build/wrappers/dist/package.json b/build/wrappers/dist/package.json
+new file mode 100644
+index 0000000..5bbefff
+--- /dev/null
++++ b/build/wrappers/dist/package.json
+@@ -0,0 +1,3 @@
++{
++  "type": "commonjs"
++}
+diff --git a/package.json b/package.json
+index 699b1c9..4995931 100644
+--- a/package.json
++++ b/package.json
+@@ -3,6 +3,46 @@
+   "title": "jQuery",
+   "description": "JavaScript library for DOM operations",
+   "version": "4.0.0-pre",
++  "type": "commonjs",
++  "exports": {
++    ".": {
++      "node": {
++        "import": "./dist-module/jquery.node-module-wrapper.js",
++        "default": "./dist/jquery.js"
++      },
++      "module": {
++        "import": "./dist-module/jquery.module.js",
++        "default": "./dist/jquery.bundler-require-wrapper.js"
++      },
++      "import": "./dist-module/jquery.module.js",
++      "default": "./dist/jquery.js"
++    },
++    "./slim": {
++      "node": {
++        "import": "./dist-module/jquery.node-module-wrapper.slim.js",
++        "default": "./dist/jquery.slim.js"
++      },
++      "module": {
++        "import": "./dist-module/jquery.slim.module.js",
++        "default": "./dist/jquery.bundler-require-wrapper.slim.js"
++      },
++      "import": "./dist-module/jquery.slim.module.js",
++      "default": "./dist/jquery.slim.js"
++    },
++    "./factory": {
++      "node": "./dist/jquery.factory.js",
++      "module": "./dist-module/jquery.factory.module.js",
++      "import": "./dist-module/jquery.factory.module.js",
++      "default": "./dist/jquery.factory.js"
++    },
++    "./factory-slim": {
++      "node": "./dist/jquery.factory.slim.js",
++      "module": "./dist-module/jquery.factory.slim.module.js",
++      "import": "./dist-module/jquery.factory.slim.module.js",
++      "default": "./dist/jquery.factory.slim.js"
++    },
++    "./src/*.js": "./src/*.js"
++  },
+   "main": "dist/jquery.js",
+   "homepage": "https://jquery.com",
+   "author": {
+@@ -68,15 +108,16 @@
+     "uglify-js": "3.4.7"
+   },
+   "scripts": {
+-    "build": "npm install && grunt",
++    "build": "node build/release.cjs",
+     "start": "grunt watch",
+     "test:browserless": "grunt && grunt test:slow",
+     "test:browser": "grunt && grunt karma:main",
+     "test:esmodules": "grunt && grunt karma:esmodules",
+     "test:amd": "grunt && grunt karma:amd",
+     "test:no-deprecated": "grunt test:prepare && grunt custom:-deprecated && grunt karma:main",
++    "test:selector-native": "grunt test:prepare && grunt custom:-selector && grunt karma:main",
+     "test:slim": "grunt test:prepare && grunt custom:slim && grunt karma:main",
+-    "test": "npm run test:slim && npm run test:no-deprecated && grunt && grunt test:slow && grunt karma:main && grunt karma:esmodules && grunt karma:amd",
++    "test": "npm run test:slim && npm run test:no-deprecated && npm run test:selector-native && grunt && grunt test:slow && grunt karma:main && grunt karma:esmodules && grunt karma:amd",
+     "jenkins": "npm run test:browserless"
+   },
+   "commitplease": {
+diff --git a/src/.eslintrc.json b/src/.eslintrc.json
+index f1b596d..9367d16 100644
+--- a/src/.eslintrc.json
++++ b/src/.eslintrc.json
+@@ -32,6 +32,15 @@
+ 	},
+ 
+ 	"overrides": [
++		{
++			"files": [ "wrapper-esm.js", "wrapper-factory-esm.js", "wrapper-factory.js" ],
++			"rules": { "no-unused-vars": [ "error", { "args": "none" } ] },
++			"globals": { "jQuery": false, "module": true }
++		},
++		{
++			"files": "wrapper-factory.js",
++			"parserOptions": { "sourceType": "script", "ecmaVersion": 2015 }
++		},
+ 		{
+ 			"files": "wrapper.js",
+ 			"parserOptions": {
+diff --git a/src/ajax.js b/src/ajax.js
+index 55b528e..44f0c4e 100644
+--- a/src/ajax.js
++++ b/src/ajax.js
+@@ -1,9 +1,9 @@
+-import jQuery from "./core.js";
+-import document from "./var/document.js";
+-import rnothtmlwhite from "./var/rnothtmlwhite.js";
+-import location from "./ajax/var/location.js";
+-import nonce from "./ajax/var/nonce.js";
+-import rquery from "./ajax/var/rquery.js";
++import { jQuery } from "./core.js";
++import { document } from "./var/document.js";
++import { rnothtmlwhite } from "./var/rnothtmlwhite.js";
++import { location } from "./ajax/var/location.js";
++import { nonce } from "./ajax/var/nonce.js";
++import { rquery } from "./ajax/var/rquery.js";
+ 
+ import "./core/init.js";
+ import "./core/parseXML.js";
+@@ -543,7 +543,7 @@ jQuery.extend( {
+ 		if ( s.crossDomain == null ) {
+ 			urlAnchor = document.createElement( "a" );
+ 
+-			// Support: IE <=8 - 11+, Edge 12 - 17 only
++			// Support: IE <=8 - 11+
+ 			// IE throws exception on accessing the href property if url is malformed,
+ 			// e.g. http://example.com:80x/
+ 			try {
+@@ -873,4 +873,4 @@ jQuery.ajaxPrefilter( function( s ) {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/ajax/jsonp.js b/src/ajax/jsonp.js
+index e115fda..add5a5c 100644
+--- a/src/ajax/jsonp.js
++++ b/src/ajax/jsonp.js
+@@ -1,6 +1,6 @@
+-import jQuery from "../core.js";
+-import nonce from "./var/nonce.js";
+-import rquery from "./var/rquery.js";
++import { jQuery } from "../core.js";
++import { nonce } from "./var/nonce.js";
++import { rquery } from "./var/rquery.js";
+ 
+ import "../ajax.js";
+ 
+diff --git a/src/ajax/load.js b/src/ajax/load.js
+index 9a91b99..044dc09 100644
+--- a/src/ajax/load.js
++++ b/src/ajax/load.js
+@@ -1,5 +1,5 @@
+-import jQuery from "../core.js";
+-import stripAndCollapse from "../core/stripAndCollapse.js";
++import { jQuery } from "../core.js";
++import { stripAndCollapse } from "../core/stripAndCollapse.js";
+ 
+ import "../core/parseHTML.js";
+ import "../ajax.js";
+diff --git a/src/ajax/script.js b/src/ajax/script.js
+index 203ea08..9eec16b 100644
+--- a/src/ajax/script.js
++++ b/src/ajax/script.js
+@@ -1,5 +1,5 @@
+-import jQuery from "../core.js";
+-import document from "../var/document.js";
++import { jQuery } from "../core.js";
++import { document } from "../var/document.js";
+ 
+ import "../ajax.js";
+ 
+diff --git a/src/ajax/var/location.js b/src/ajax/var/location.js
+index 78e6f07..316b198 100644
+--- a/src/ajax/var/location.js
++++ b/src/ajax/var/location.js
+@@ -1 +1 @@
+-export default window.location;
++export var location = window.location;
+diff --git a/src/ajax/var/nonce.js b/src/ajax/var/nonce.js
+index b0070c6..9b3d3e8 100644
+--- a/src/ajax/var/nonce.js
++++ b/src/ajax/var/nonce.js
+@@ -1 +1 @@
+-export default { guid: Date.now() };
++export var nonce = { guid: Date.now() };
+diff --git a/src/ajax/var/rquery.js b/src/ajax/var/rquery.js
+index f18f876..e694e82 100644
+--- a/src/ajax/var/rquery.js
++++ b/src/ajax/var/rquery.js
+@@ -1 +1 @@
+-export default ( /\?/ );
++export var rquery = /\?/;
+diff --git a/src/ajax/xhr.js b/src/ajax/xhr.js
+index 2c9bc81..cd83389 100644
+--- a/src/ajax/xhr.js
++++ b/src/ajax/xhr.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ import "../ajax.js";
+ 
+diff --git a/src/attributes.js b/src/attributes.js
+index 646107a..278d513 100644
+--- a/src/attributes.js
++++ b/src/attributes.js
+@@ -1,4 +1,4 @@
+-import jQuery from "./core.js";
++import { jQuery } from "./core.js";
+ 
+ import "./attributes/attr.js";
+ import "./attributes/prop.js";
+@@ -6,4 +6,4 @@ import "./attributes/classes.js";
+ import "./attributes/val.js";
+ 
+ // Return jQuery for attributes-only inclusion
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/attributes/attr.js b/src/attributes/attr.js
+index 2773a38..0440cc9 100644
+--- a/src/attributes/attr.js
++++ b/src/attributes/attr.js
+@@ -1,8 +1,8 @@
+-import jQuery from "../core.js";
+-import access from "../core/access.js";
+-import nodeName from "../core/nodeName.js";
+-import rnothtmlwhite from "../var/rnothtmlwhite.js";
+-import isIE from "../var/isIE.js";
++import { jQuery } from "../core.js";
++import { access } from "../core/access.js";
++import { nodeName } from "../core/nodeName.js";
++import { rnothtmlwhite } from "../var/rnothtmlwhite.js";
++import { isIE } from "../var/isIE.js";
+ 
+ import "../selector.js";
+ 
+diff --git a/src/attributes/classes.js b/src/attributes/classes.js
+index 796fbcc..f666d33 100644
+--- a/src/attributes/classes.js
++++ b/src/attributes/classes.js
+@@ -1,6 +1,6 @@
+-import jQuery from "../core.js";
+-import stripAndCollapse from "../core/stripAndCollapse.js";
+-import rnothtmlwhite from "../var/rnothtmlwhite.js";
++import { jQuery } from "../core.js";
++import { stripAndCollapse } from "../core/stripAndCollapse.js";
++import { rnothtmlwhite } from "../var/rnothtmlwhite.js";
+ 
+ import "../core/init.js";
+ 
+diff --git a/src/attributes/prop.js b/src/attributes/prop.js
+index d58adf3..57ba15b 100644
+--- a/src/attributes/prop.js
++++ b/src/attributes/prop.js
+@@ -1,6 +1,6 @@
+-import jQuery from "../core.js";
+-import access from "../core/access.js";
+-import isIE from "../var/isIE.js";
++import { jQuery } from "../core.js";
++import { access } from "../core/access.js";
++import { isIE } from "../var/isIE.js";
+ 
+ import "../selector.js";
+ 
+@@ -69,8 +69,10 @@ jQuery.extend( {
+ 
+ 				if (
+ 					rfocusable.test( elem.nodeName ) ||
+-					rclickable.test( elem.nodeName ) &&
+-					elem.href
++
++					// href-less anchor's `tabIndex` property value is `0` and
++					// the `tabindex` attribute value: `null`. We want `-1`.
++					rclickable.test( elem.nodeName ) && elem.href
+ 				) {
+ 					return 0;
+ 				}
+diff --git a/src/attributes/val.js b/src/attributes/val.js
+index f200f97..5d5e8c2 100644
+--- a/src/attributes/val.js
++++ b/src/attributes/val.js
+@@ -1,7 +1,7 @@
+-import jQuery from "../core.js";
+-import isIE from "../var/isIE.js";
+-import stripAndCollapse from "../core/stripAndCollapse.js";
+-import nodeName from "../core/nodeName.js";
++import { jQuery } from "../core.js";
++import { isIE } from "../var/isIE.js";
++import { stripAndCollapse } from "../core/stripAndCollapse.js";
++import { nodeName } from "../core/nodeName.js";
+ 
+ import "../core/init.js";
+ 
+diff --git a/src/callbacks.js b/src/callbacks.js
+index 19b3d7c..e4f05e7 100644
+--- a/src/callbacks.js
++++ b/src/callbacks.js
+@@ -1,6 +1,6 @@
+-import jQuery from "./core.js";
+-import toType from "./core/toType.js";
+-import rnothtmlwhite from "./var/rnothtmlwhite.js";
++import { jQuery } from "./core.js";
++import { toType } from "./core/toType.js";
++import { rnothtmlwhite } from "./var/rnothtmlwhite.js";
+ 
+ // Convert String-formatted options into Object-formatted ones
+ function createOptions( options ) {
+@@ -227,4 +227,4 @@ jQuery.Callbacks = function( options ) {
+ 	return self;
+ };
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/core.js b/src/core.js
+index ccc5389..c794555 100644
+--- a/src/core.js
++++ b/src/core.js
+@@ -1,18 +1,17 @@
+-import arr from "./var/arr.js";
+-import getProto from "./var/getProto.js";
+-import slice from "./var/slice.js";
+-import flat from "./var/flat.js";
+-import push from "./var/push.js";
+-import indexOf from "./var/indexOf.js";
+-import class2type from "./var/class2type.js";
+-import toString from "./var/toString.js";
+-import hasOwn from "./var/hasOwn.js";
+-import fnToString from "./var/fnToString.js";
+-import ObjectFunctionString from "./var/ObjectFunctionString.js";
+-import support from "./var/support.js";
+-import isWindow from "./var/isWindow.js";
+-import DOMEval from "./core/DOMEval.js";
+-import toType from "./core/toType.js";
++import { arr } from "./var/arr.js";
++import { getProto } from "./var/getProto.js";
++import { slice } from "./var/slice.js";
++import { flat } from "./var/flat.js";
++import { push } from "./var/push.js";
++import { indexOf } from "./var/indexOf.js";
++import { class2type } from "./var/class2type.js";
++import { toString } from "./var/toString.js";
++import { hasOwn } from "./var/hasOwn.js";
++import { fnToString } from "./var/fnToString.js";
++import { ObjectFunctionString } from "./var/ObjectFunctionString.js";
++import { support } from "./var/support.js";
++import { isArrayLike } from "./core/isArrayLike.js";
++import { DOMEval } from "./core/DOMEval.js";
+ 
+ var version = "@VERSION",
+ 
+@@ -272,20 +271,14 @@ jQuery.extend( {
+ 				// Do not traverse comment nodes
+ 				ret += jQuery.text( node );
+ 			}
+-		} else if ( nodeType === 1 || nodeType === 9 || nodeType === 11 ) {
+-
+-			// Use textContent for elements
+-			// innerText usage removed for consistency of new lines (jQuery #11153)
+-			if ( typeof elem.textContent === "string" ) {
+-				return elem.textContent;
+-			} else {
+-
+-				// Traverse its children
+-				for ( elem = elem.firstChild; elem; elem = elem.nextSibling ) {
+-					ret += jQuery.text( elem );
+-				}
+-			}
+-		} else if ( nodeType === 3 || nodeType === 4 ) {
++		}
++		if ( nodeType === 1 || nodeType === 11 ) {
++			return elem.textContent;
++		}
++		if ( nodeType === 9 ) {
++			return elem.documentElement.textContent;
++		}
++		if ( nodeType === 3 || nodeType === 4 ) {
+ 			return elem.nodeValue;
+ 		}
+ 
+@@ -318,14 +311,28 @@ jQuery.extend( {
+ 	},
+ 
+ 	isXMLDoc: function( elem ) {
+-		var namespace = elem.namespaceURI,
+-			docElem = ( elem.ownerDocument || elem ).documentElement;
++		var namespace = elem && elem.namespaceURI,
++			docElem = elem && ( elem.ownerDocument || elem ).documentElement;
+ 
+ 		// Assume HTML when documentElement doesn't yet exist, such as inside
+ 		// document fragments.
+ 		return !rhtmlSuffix.test( namespace || docElem && docElem.nodeName || "HTML" );
+ 	},
+ 
++	// Note: an element does not contain itself
++	contains: function( a, b ) {
++		var bup = b && b.parentNode;
++
++		return a === bup || !!( bup && bup.nodeType === 1 && (
++
++			// Support: IE 9 - 11+
++			// IE doesn't have `contains` on SVG.
++			a.contains ?
++				a.contains( bup ) :
++				a.compareDocumentPosition && a.compareDocumentPosition( bup ) & 16
++		) );
++	},
++
+ 	merge: function( first, second ) {
+ 		var len = +second.length,
+ 			j = 0,
+@@ -409,17 +416,4 @@ jQuery.each( "Boolean Number String Function Array Date RegExp Object Error Symb
+ 		class2type[ "[object " + name + "]" ] = name.toLowerCase();
+ 	} );
+ 
+-function isArrayLike( obj ) {
+-
+-	var length = !!obj && obj.length,
+-		type = toType( obj );
+-
+-	if ( typeof obj === "function" || isWindow( obj ) ) {
+-		return false;
+-	}
+-
+-	return type === "array" || length === 0 ||
+-		typeof length === "number" && length > 0 && ( length - 1 ) in obj;
+-}
+-
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/core/DOMEval.js b/src/core/DOMEval.js
+index b0238fd..806f29e 100644
+--- a/src/core/DOMEval.js
++++ b/src/core/DOMEval.js
+@@ -1,4 +1,4 @@
+-import document from "../var/document.js";
++import { document } from "../var/document.js";
+ 
+ var preservedScriptAttributes = {
+ 	type: true,
+@@ -7,33 +7,19 @@ var preservedScriptAttributes = {
+ 	noModule: true
+ };
+ 
+-function DOMEval( code, node, doc ) {
++export function DOMEval( code, node, doc ) {
+ 	doc = doc || document;
+ 
+-	var i, val,
++	var i,
+ 		script = doc.createElement( "script" );
+ 
+ 	script.text = code;
+ 	if ( node ) {
+ 		for ( i in preservedScriptAttributes ) {
+-
+-			// Support: Firefox <=64 - 66+, Edge <=18+
+-			// Some browsers don't support the "nonce" property on scripts.
+-			// On the other hand, just using `getAttribute` is not enough as
+-			// the `nonce` attribute is reset to an empty string whenever it
+-			// becomes browsing-context connected.
+-			// See https://github.com/whatwg/html/issues/2369
+-			// See https://html.spec.whatwg.org/#nonce-attributes
+-			// The `node.getAttribute` check was added for the sake of
+-			// `jQuery.globalEval` so that it can fake a nonce-containing node
+-			// via an object.
+-			val = node[ i ] || node.getAttribute && node.getAttribute( i );
+-			if ( val ) {
+-				script.setAttribute( i, val );
++			if ( node[ i ] ) {
++				script[ i ] = node[ i ];
+ 			}
+ 		}
+ 	}
+ 	doc.head.appendChild( script ).parentNode.removeChild( script );
+ }
+-
+-export default DOMEval;
+diff --git a/src/core/access.js b/src/core/access.js
+index 6b717b9..86bac12 100644
+--- a/src/core/access.js
++++ b/src/core/access.js
+@@ -1,9 +1,9 @@
+-import jQuery from "../core.js";
+-import toType from "../core/toType.js";
++import { jQuery } from "../core.js";
++import { toType } from "../core/toType.js";
+ 
+ // Multifunctional method to get and set values of a collection
+ // The value/s can optionally be executed if it's a function
+-var access = function( elems, fn, key, value, chainable, emptyGet, raw ) {
++export function access( elems, fn, key, value, chainable, emptyGet, raw ) {
+ 	var i = 0,
+ 		len = elems.length,
+ 		bulk = key == null;
+@@ -60,6 +60,4 @@ var access = function( elems, fn, key, value, chainable, emptyGet, raw ) {
+ 	}
+ 
+ 	return len ? fn( elems[ 0 ], key ) : emptyGet;
+-};
+-
+-export default access;
++}
+diff --git a/src/core/camelCase.js b/src/core/camelCase.js
+index f12a2c6..dca86fc 100644
+--- a/src/core/camelCase.js
++++ b/src/core/camelCase.js
+@@ -7,8 +7,6 @@ function fcamelCase( _all, letter ) {
+ }
+ 
+ // Convert dashed to camelCase
+-function camelCase( string ) {
++export function camelCase( string ) {
+ 	return string.replace( rdashAlpha, fcamelCase );
+ }
+-
+-export default camelCase;
+diff --git a/src/core/init.js b/src/core/init.js
+index a97fc10..d9ac90f 100644
+--- a/src/core/init.js
++++ b/src/core/init.js
+@@ -1,7 +1,8 @@
+ // Initialize a jQuery object
+-import jQuery from "../core.js";
+-import document from "../var/document.js";
+-import rsingleTag from "./var/rsingleTag.js";
++import { jQuery } from "../core.js";
++import { document } from "../var/document.js";
++import { rsingleTag } from "./var/rsingleTag.js";
++import { isObviousHtml } from "./isObviousHtml.js";
+ 
+ import "../traversing/findFilter.js";
+ 
+@@ -14,7 +15,7 @@ var rootjQuery,
+ 	// Shortcut simple #id case for speed
+ 	rquickExpr = /^(?:\s*(<[\w\W]+>)[^>]*|#([\w-]+))$/,
+ 
+-	init = jQuery.fn.init = function( selector, context, root ) {
++	init = jQuery.fn.init = function( selector, context ) {
+ 		var match, elem;
+ 
+ 		// HANDLE: $(""), $(null), $(undefined), $(false)
+@@ -22,24 +23,41 @@ var rootjQuery,
+ 			return this;
+ 		}
+ 
+-		// Method init() accepts an alternate rootjQuery
+-		// so migrate can support jQuery.sub (gh-2101)
+-		root = root || rootjQuery;
++		// HANDLE: $(DOMElement)
++		if ( selector.nodeType ) {
++			this[ 0 ] = selector;
++			this.length = 1;
++			return this;
+ 
+-		// Handle HTML strings
+-		if ( typeof selector === "string" ) {
+-			if ( selector[ 0 ] === "<" &&
+-				selector[ selector.length - 1 ] === ">" &&
+-				selector.length >= 3 ) {
++		// HANDLE: $(function)
++		// Shortcut for document ready
++		} else if ( typeof selector === "function" ) {
++			return rootjQuery.ready !== undefined ?
++				rootjQuery.ready( selector ) :
+ 
+-				// Assume that strings that start and end with <> are HTML and skip the regex check
++				// Execute immediately if ready is not present
++				selector( jQuery );
++
++		} else {
++
++			// Handle obvious HTML strings
++			match = selector + "";
++			if ( isObviousHtml( match ) ) {
++
++				// Assume that strings that start and end with <> are HTML and skip
++				// the regex check. This also handles browser-supported HTML wrappers
++				// like TrustedHTML.
+ 				match = [ null, selector, null ];
+ 
+-			} else {
++			// Handle HTML strings or selectors
++			} else if ( typeof selector === "string" ) {
+ 				match = rquickExpr.exec( selector );
++			} else {
++				return jQuery.makeArray( selector, this );
+ 			}
+ 
+ 			// Match html or make sure no context is specified for #id
++			// Note: match[1] may be a string or a TrustedHTML wrapper
+ 			if ( match && ( match[ 1 ] || !context ) ) {
+ 
+ 				// HANDLE: $(html) -> $(array)
+@@ -84,33 +102,17 @@ var rootjQuery,
+ 					return this;
+ 				}
+ 
+-			// HANDLE: $(expr, $(...))
++			// HANDLE: $(expr) & $(expr, $(...))
+ 			} else if ( !context || context.jquery ) {
+-				return ( context || root ).find( selector );
++				return ( context || rootjQuery ).find( selector );
+ 
+ 			// HANDLE: $(expr, context)
+ 			// (which is just equivalent to: $(context).find(expr)
+ 			} else {
+ 				return this.constructor( context ).find( selector );
+ 			}
+-
+-		// HANDLE: $(DOMElement)
+-		} else if ( selector.nodeType ) {
+-			this[ 0 ] = selector;
+-			this.length = 1;
+-			return this;
+-
+-		// HANDLE: $(function)
+-		// Shortcut for document ready
+-		} else if ( typeof selector === "function" ) {
+-			return root.ready !== undefined ?
+-				root.ready( selector ) :
+-
+-				// Execute immediately if ready is not present
+-				selector( jQuery );
+ 		}
+ 
+-		return jQuery.makeArray( selector, this );
+ 	};
+ 
+ // Give the init function the jQuery prototype for later instantiation
+diff --git a/src/core/isArrayLike.js b/src/core/isArrayLike.js
+new file mode 100644
+index 0000000..bc24b32
+--- /dev/null
++++ b/src/core/isArrayLike.js
+@@ -0,0 +1,15 @@
++import { toType } from "./toType.js";
++import { isWindow } from "../var/isWindow.js";
++
++export function isArrayLike( obj ) {
++
++	var length = !!obj && obj.length,
++		type = toType( obj );
++
++	if ( typeof obj === "function" || isWindow( obj ) ) {
++		return false;
++	}
++
++	return type === "array" || length === 0 ||
++		typeof length === "number" && length > 0 && ( length - 1 ) in obj;
++}
+diff --git a/src/core/isAttached.js b/src/core/isAttached.js
+index 3857d94..12a60ee 100644
+--- a/src/core/isAttached.js
++++ b/src/core/isAttached.js
+@@ -1,20 +1,19 @@
+-import jQuery from "../core.js";
+-import documentElement from "../var/documentElement.js";
+-
+-import "../selector/contains.js"; // jQuery.contains
++import { jQuery } from "../core.js";
++import { documentElement } from "../var/documentElement.js";
+ 
+ var isAttached = function( elem ) {
+-		return jQuery.contains( elem.ownerDocument, elem );
++		return jQuery.contains( elem.ownerDocument, elem ) ||
++			elem.getRootNode( composed ) === elem.ownerDocument;
+ 	},
+ 	composed = { composed: true };
+ 
+-// Support: IE 9 - 11+, Edge 12 - 18+
+-// Check attachment across shadow DOM boundaries when possible (gh-3504)
+-if ( documentElement.getRootNode ) {
++// Support: IE 9 - 11+
++// Check attachment across shadow DOM boundaries when possible (gh-3504).
++// Provide a fallback for browsers without Shadow DOM v1 support.
++if ( !documentElement.getRootNode ) {
+ 	isAttached = function( elem ) {
+-		return jQuery.contains( elem.ownerDocument, elem ) ||
+-			elem.getRootNode( composed ) === elem.ownerDocument;
++		return jQuery.contains( elem.ownerDocument, elem );
+ 	};
+ }
+ 
+-export default isAttached;
++export { isAttached };
+diff --git a/src/core/isObviousHtml.js b/src/core/isObviousHtml.js
+new file mode 100644
+index 0000000..715b47c
+--- /dev/null
++++ b/src/core/isObviousHtml.js
+@@ -0,0 +1,5 @@
++export function isObviousHtml( input ) {
++	return input[ 0 ] === "<" &&
++		input[ input.length - 1 ] === ">" &&
++		input.length >= 3;
++}
+diff --git a/src/core/nodeName.js b/src/core/nodeName.js
+index ac90c60..014672b 100644
+--- a/src/core/nodeName.js
++++ b/src/core/nodeName.js
+@@ -1,7 +1,3 @@
+-function nodeName( elem, name ) {
+-
++export function nodeName( elem, name ) {
+ 	return elem.nodeName && elem.nodeName.toLowerCase() === name.toLowerCase();
+-
+ }
+-
+-export default nodeName;
+diff --git a/src/core/parseHTML.js b/src/core/parseHTML.js
+index 15278fa..6de02e8 100644
+--- a/src/core/parseHTML.js
++++ b/src/core/parseHTML.js
+@@ -1,14 +1,15 @@
+-import jQuery from "../core.js";
+-import document from "../var/document.js";
+-import rsingleTag from "./var/rsingleTag.js";
+-import buildFragment from "../manipulation/buildFragment.js";
++import { jQuery } from "../core.js";
++import { document } from "../var/document.js";
++import { rsingleTag } from "./var/rsingleTag.js";
++import { buildFragment } from "../manipulation/buildFragment.js";
++import { isObviousHtml } from "./isObviousHtml.js";
+ 
+-// Argument "data" should be string of html
++// Argument "data" should be string of html or a TrustedHTML wrapper of obvious HTML
+ // context (optional): If specified, the fragment will be created in this context,
+ // defaults to document
+ // keepScripts (optional): If true, will include scripts passed in the html string
+ jQuery.parseHTML = function( data, context, keepScripts ) {
+-	if ( typeof data !== "string" ) {
++	if ( typeof data !== "string" && !isObviousHtml( data + "" ) ) {
+ 		return [];
+ 	}
+ 	if ( typeof context === "boolean" ) {
+diff --git a/src/core/parseXML.js b/src/core/parseXML.js
+index 715f59f..fa1b94c 100644
+--- a/src/core/parseXML.js
++++ b/src/core/parseXML.js
+@@ -1,8 +1,8 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ // Cross-browser xml parsing
+ jQuery.parseXML = function( data ) {
+-	var xml;
++	var xml, parserErrorElem;
+ 	if ( !data || typeof data !== "string" ) {
+ 		return null;
+ 	}
+@@ -11,12 +11,17 @@ jQuery.parseXML = function( data ) {
+ 	// IE throws on parseFromString with invalid input.
+ 	try {
+ 		xml = ( new window.DOMParser() ).parseFromString( data, "text/xml" );
+-	} catch ( e ) {
+-		xml = undefined;
+-	}
++	} catch ( e ) {}
+ 
+-	if ( !xml || xml.getElementsByTagName( "parsererror" ).length ) {
+-		jQuery.error( "Invalid XML: " + data );
++	parserErrorElem = xml && xml.getElementsByTagName( "parsererror" )[ 0 ];
++	if ( !xml || parserErrorElem ) {
++		jQuery.error( "Invalid XML: " + (
++			parserErrorElem ?
++				jQuery.map( parserErrorElem.childNodes, function( el ) {
++					return el.textContent;
++				} ).join( "\n" ) :
++				data
++		) );
+ 	}
+ 	return xml;
+ };
+diff --git a/src/core/ready-no-deferred.js b/src/core/ready-no-deferred.js
+index 51f6d7f..a0acc80 100644
+--- a/src/core/ready-no-deferred.js
++++ b/src/core/ready-no-deferred.js
+@@ -1,5 +1,5 @@
+-import jQuery from "../core.js";
+-import document from "../var/document.js";
++import { jQuery } from "../core.js";
++import { document } from "../var/document.js";
+ 
+ var readyCallbacks = [],
+ 	whenReady = function( fn ) {
+diff --git a/src/core/ready.js b/src/core/ready.js
+index d6c507e..fb73366 100644
+--- a/src/core/ready.js
++++ b/src/core/ready.js
+@@ -1,5 +1,5 @@
+-import jQuery from "../core.js";
+-import document from "../var/document.js";
++import { jQuery } from "../core.js";
++import { document } from "../var/document.js";
+ 
+ import "../core/readyException.js";
+ import "../deferred.js";
+diff --git a/src/core/readyException.js b/src/core/readyException.js
+index 1b5512c..ff5296a 100644
+--- a/src/core/readyException.js
++++ b/src/core/readyException.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ jQuery.readyException = function( error ) {
+ 	window.setTimeout( function() {
+diff --git a/src/core/stripAndCollapse.js b/src/core/stripAndCollapse.js
+index 944a793..c9a73c6 100644
+--- a/src/core/stripAndCollapse.js
++++ b/src/core/stripAndCollapse.js
+@@ -1,10 +1,8 @@
+-import rnothtmlwhite from "../var/rnothtmlwhite.js";
++import { rnothtmlwhite } from "../var/rnothtmlwhite.js";
+ 
+ // Strip and collapse whitespace according to HTML spec
+ // https://infra.spec.whatwg.org/#strip-and-collapse-ascii-whitespace
+-function stripAndCollapse( value ) {
++export function stripAndCollapse( value ) {
+ 	var tokens = value.match( rnothtmlwhite ) || [];
+ 	return tokens.join( " " );
+ }
+-
+-export default stripAndCollapse;
+diff --git a/src/core/toType.js b/src/core/toType.js
+index 67af8a6..9df6c02 100644
+--- a/src/core/toType.js
++++ b/src/core/toType.js
+@@ -1,7 +1,7 @@
+-import class2type from "../var/class2type.js";
+-import toString from "../var/toString.js";
++import { class2type } from "../var/class2type.js";
++import { toString } from "../var/toString.js";
+ 
+-function toType( obj ) {
++export function toType( obj ) {
+ 	if ( obj == null ) {
+ 		return obj + "";
+ 	}
+@@ -10,5 +10,3 @@ function toType( obj ) {
+ 		class2type[ toString.call( obj ) ] || "object" :
+ 		typeof obj;
+ }
+-
+-export default toType;
+diff --git a/src/core/var/rsingleTag.js b/src/core/var/rsingleTag.js
+index 5bf52d5..8cead25 100644
+--- a/src/core/var/rsingleTag.js
++++ b/src/core/var/rsingleTag.js
+@@ -1,3 +1,3 @@
+ // rsingleTag matches a string consisting of a single HTML element with no attributes
+ // and captures the element's name
+-export default ( /^<([a-z][^\/\0>:\x20\t\r\n\f]*)[\x20\t\r\n\f]*\/?>(?:<\/\1>|)$/i );
++export var rsingleTag = /^<([a-z][^\/\0>:\x20\t\r\n\f]*)[\x20\t\r\n\f]*\/?>(?:<\/\1>|)$/i;
+diff --git a/src/css.js b/src/css.js
+index 8c4070c..cf7d733 100644
+--- a/src/css.js
++++ b/src/css.js
+@@ -1,18 +1,18 @@
+-import jQuery from "./core.js";
+-import access from "./core/access.js";
+-import nodeName from "./core/nodeName.js";
+-import rcssNum from "./var/rcssNum.js";
+-import isIE from "./var/isIE.js";
+-import rnumnonpx from "./css/var/rnumnonpx.js";
+-import cssExpand from "./css/var/cssExpand.js";
+-import isAutoPx from "./css/isAutoPx.js";
+-import cssCamelCase from "./css/cssCamelCase.js";
+-import getStyles from "./css/var/getStyles.js";
+-import swap from "./css/var/swap.js";
+-import curCSS from "./css/curCSS.js";
+-import adjustCSS from "./css/adjustCSS.js";
+-import support from "./css/support.js";
+-import finalPropName from "./css/finalPropName.js";
++import { jQuery } from "./core.js";
++import { access } from "./core/access.js";
++import { nodeName } from "./core/nodeName.js";
++import { rcssNum } from "./var/rcssNum.js";
++import { isIE } from "./var/isIE.js";
++import { rnumnonpx } from "./css/var/rnumnonpx.js";
++import { rcustomProp } from "./css/var/rcustomProp.js";
++import { cssExpand } from "./css/var/cssExpand.js";
++import { isAutoPx } from "./css/isAutoPx.js";
++import { cssCamelCase } from "./css/cssCamelCase.js";
++import { getStyles } from "./css/var/getStyles.js";
++import { swap } from "./css/var/swap.js";
++import { curCSS } from "./css/curCSS.js";
++import { adjustCSS } from "./css/adjustCSS.js";
++import { finalPropName } from "./css/finalPropName.js";
+ 
+ import "./core/init.js";
+ import "./core/ready.js";
+@@ -24,7 +24,6 @@ var
+ 	// except "table", "table-cell", or "table-caption"
+ 	// See here for display values: https://developer.mozilla.org/en-US/docs/CSS/display
+ 	rdisplayswap = /^(none|table(?!-c[ea]).+)/,
+-	rcustomProp = /^--/,
+ 	cssShow = { position: "absolute", visibility: "hidden", display: "block" },
+ 	cssNormalTransform = {
+ 		letterSpacing: "0",
+@@ -135,15 +134,19 @@ function getWidthOrHeight( elem, dimension, extra ) {
+ 	}
+ 
+ 
+-	// Support: IE 9 - 11+
+-	// Use offsetWidth/offsetHeight for when box sizing is unreliable.
+-	// In those cases, the computed value can be trusted to be border-box.
+-	if ( ( isIE && isBorderBox ||
++	if ( ( isIE &&
++		(
+ 
+-		// Support: IE 10 - 11+, Edge 15 - 18+
+-		// IE/Edge misreport `getComputedStyle` of table rows with width/height
+-		// set in CSS while `offset*` properties report correct values.
+-		!support.reliableTrDimensions() && nodeName( elem, "tr" ) ||
++			// Support: IE 9 - 11+
++			// Use offsetWidth/offsetHeight for when box sizing is unreliable.
++			// In those cases, the computed value can be trusted to be border-box.
++			isBorderBox ||
++
++			// Support: IE 10 - 11+
++			// IE misreports `getComputedStyle` of table rows with width/height
++			// set in CSS while `offset*` properties report correct values.
++			nodeName( elem, "tr" )
++		) ||
+ 
+ 		// Fall back to offsetWidth/offsetHeight when value is "auto"
+ 		// This happens for inline elements with no explicit setting (gh-3571)
+@@ -410,4 +413,4 @@ jQuery.fn.extend( {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/css/adjustCSS.js b/src/css/adjustCSS.js
+index d973ff3..a5263f0 100644
+--- a/src/css/adjustCSS.js
++++ b/src/css/adjustCSS.js
+@@ -1,8 +1,8 @@
+-import jQuery from "../core.js";
+-import isAutoPx from "./isAutoPx.js";
+-import rcssNum from "../var/rcssNum.js";
++import { jQuery } from "../core.js";
++import { isAutoPx } from "./isAutoPx.js";
++import { rcssNum } from "../var/rcssNum.js";
+ 
+-function adjustCSS( elem, prop, valueParts, tween ) {
++export function adjustCSS( elem, prop, valueParts, tween ) {
+ 	var adjusted, scale,
+ 		maxIterations = 20,
+ 		currentValue = tween ?
+@@ -66,5 +66,3 @@ function adjustCSS( elem, prop, valueParts, tween ) {
+ 	}
+ 	return adjusted;
+ }
+-
+-export default adjustCSS;
+diff --git a/src/css/cssCamelCase.js b/src/css/cssCamelCase.js
+index 8953032..18f4b71 100644
+--- a/src/css/cssCamelCase.js
++++ b/src/css/cssCamelCase.js
+@@ -1,14 +1,12 @@
+-import camelCase from "../core/camelCase.js";
++import { camelCase } from "../core/camelCase.js";
+ 
+ // Matches dashed string for camelizing
+ var rmsPrefix = /^-ms-/;
+ 
+ // Convert dashed to camelCase, handle vendor prefixes.
+ // Used by the css & effects modules.
+-// Support: IE <=9 - 11+, Edge 12 - 18+
++// Support: IE <=9 - 11+
+ // Microsoft forgot to hump their vendor prefix (#9572)
+-function cssCamelCase( string ) {
++export function cssCamelCase( string ) {
+ 	return camelCase( string.replace( rmsPrefix, "ms-" ) );
+ }
+-
+-export default cssCamelCase;
+diff --git a/src/css/curCSS.js b/src/css/curCSS.js
+index 59a639f..373c0f7 100644
+--- a/src/css/curCSS.js
++++ b/src/css/curCSS.js
+@@ -1,9 +1,11 @@
+-import jQuery from "../core.js";
+-import isAttached from "../core/isAttached.js";
+-import getStyles from "./var/getStyles.js";
++import { jQuery } from "../core.js";
++import { isAttached } from "../core/isAttached.js";
++import { getStyles } from "./var/getStyles.js";
++import { rcustomProp } from "./var/rcustomProp.js";
+ 
+-function curCSS( elem, name, computed ) {
+-	var ret;
++export function curCSS( elem, name, computed ) {
++	var ret,
++		isCustomProp = rcustomProp.test( name );
+ 
+ 	computed = computed || getStyles( elem );
+ 
+@@ -16,6 +18,12 @@ function curCSS( elem, name, computed ) {
+ 		}
+ 	}
+ 
++	// CSS whitespace is narrower than JavaScript whitespace. Missing values
++	// keep their existing undefined result, including detached elements.
++	if ( isCustomProp && typeof ret === "string" ) {
++		ret = ret.replace( /^[\x20\t\r\n\f]+|[\x20\t\r\n\f]+$/g, "" );
++	}
++
+ 	return ret !== undefined ?
+ 
+ 		// Support: IE <=9 - 11+
+@@ -23,5 +31,3 @@ function curCSS( elem, name, computed ) {
+ 		ret + "" :
+ 		ret;
+ }
+-
+-export default curCSS;
+diff --git a/src/css/finalPropName.js b/src/css/finalPropName.js
+index 40d2fb1..b11e923 100644
+--- a/src/css/finalPropName.js
++++ b/src/css/finalPropName.js
+@@ -1,4 +1,4 @@
+-import document from "../var/document.js";
++import { document } from "../var/document.js";
+ 
+ var cssPrefixes = [ "Webkit", "Moz", "ms" ],
+ 	emptyStyle = document.createElement( "div" ).style,
+@@ -20,7 +20,7 @@ function vendorPropName( name ) {
+ }
+ 
+ // Return a potentially-mapped vendor prefixed property
+-function finalPropName( name ) {
++export function finalPropName( name ) {
+ 	var final = vendorProps[ name ];
+ 
+ 	if ( final ) {
+@@ -31,5 +31,3 @@ function finalPropName( name ) {
+ 	}
+ 	return vendorProps[ name ] = vendorPropName( name ) || name;
+ }
+-
+-export default finalPropName;
+diff --git a/src/css/hiddenVisibleSelectors.js b/src/css/hiddenVisibleSelectors.js
+index 1f892df..5e07094 100644
+--- a/src/css/hiddenVisibleSelectors.js
++++ b/src/css/hiddenVisibleSelectors.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ import "../selector.js";
+ 
+diff --git a/src/css/isAutoPx.js b/src/css/isAutoPx.js
+index ca9b35a..96501be 100644
+--- a/src/css/isAutoPx.js
++++ b/src/css/isAutoPx.js
+@@ -23,7 +23,7 @@ var ralphaStart = /^[a-z]/,
+ 	//                           \ Max /       \ Height /
+ 	rautoPx = /^(?:Border(?:Top|Right|Bottom|Left)?(?:Width|)|(?:Margin|Padding)?(?:Top|Right|Bottom|Left)?|(?:Min|Max)?(?:Width|Height))$/;
+ 
+-function isAutoPx( prop ) {
++export function isAutoPx( prop ) {
+ 
+ 	// The first test is used to ensure that:
+ 	// 1. The prop starts with a lowercase letter (as we uppercase it for the second regex).
+@@ -31,5 +31,3 @@ function isAutoPx( prop ) {
+ 	return ralphaStart.test( prop ) &&
+ 		rautoPx.test( prop[ 0 ].toUpperCase() + prop.slice( 1 ) );
+ }
+-
+-export default isAutoPx;
+diff --git a/src/css/showHide.js b/src/css/showHide.js
+index dc273f9..77ddc5b 100644
+--- a/src/css/showHide.js
++++ b/src/css/showHide.js
+@@ -1,6 +1,6 @@
+-import jQuery from "../core.js";
+-import dataPriv from "../data/var/dataPriv.js";
+-import isHiddenWithinTree from "../css/var/isHiddenWithinTree.js";
++import { jQuery } from "../core.js";
++import { dataPriv } from "../data/var/dataPriv.js";
++import { isHiddenWithinTree } from "../css/var/isHiddenWithinTree.js";
+ 
+ var defaultDisplayMap = {};
+ 
+@@ -27,7 +27,7 @@ function getDefaultDisplay( elem ) {
+ 	return display;
+ }
+ 
+-function showHide( elements, show ) {
++export function showHide( elements, show ) {
+ 	var display, elem,
+ 		values = [],
+ 		index = 0,
+@@ -96,5 +96,3 @@ jQuery.fn.extend( {
+ 		} );
+ 	}
+ } );
+-
+-export default showHide;
+diff --git a/src/css/support.js b/src/css/support.js
+deleted file mode 100644
+index dc18708..0000000
+--- a/src/css/support.js
++++ /dev/null
+@@ -1,34 +0,0 @@
+-import document from "../var/document.js";
+-import documentElement from "../var/documentElement.js";
+-import support from "../var/support.js";
+-
+-var reliableTrDimensionsVal;
+-
+-// Support: IE 11+, Edge 15 - 18+
+-// IE/Edge misreport `getComputedStyle` of table rows with width/height
+-// set in CSS while `offset*` properties report correct values.
+-support.reliableTrDimensions = function() {
+-	var table, tr, trChild, trStyle;
+-	if ( reliableTrDimensionsVal == null ) {
+-		table = document.createElement( "table" );
+-		tr = document.createElement( "tr" );
+-		trChild = document.createElement( "div" );
+-
+-		table.style.cssText = "position:absolute;left:-11111px";
+-		tr.style.height = "1px";
+-		trChild.style.height = "9px";
+-
+-		documentElement
+-			.appendChild( table )
+-			.appendChild( tr )
+-			.appendChild( trChild );
+-
+-		trStyle = window.getComputedStyle( tr );
+-		reliableTrDimensionsVal = parseInt( trStyle.height ) > 3;
+-
+-		documentElement.removeChild( table );
+-	}
+-	return reliableTrDimensionsVal;
+-};
+-
+-export default support;
+diff --git a/src/css/var/cssExpand.js b/src/css/var/cssExpand.js
+index 66062e2..10f4e89 100644
+--- a/src/css/var/cssExpand.js
++++ b/src/css/var/cssExpand.js
+@@ -1 +1 @@
+-export default [ "Top", "Right", "Bottom", "Left" ];
++export var cssExpand = [ "Top", "Right", "Bottom", "Left" ];
+diff --git a/src/css/var/getStyles.js b/src/css/var/getStyles.js
+index d25af67..9dc4298 100644
+--- a/src/css/var/getStyles.js
++++ b/src/css/var/getStyles.js
+@@ -1,4 +1,4 @@
+-export default function( elem ) {
++export function getStyles( elem ) {
+ 
+ 	// Support: IE <=11+ (trac-14150)
+ 	// In IE popup's `window` is the opener window which makes `window.getComputedStyle( elem )`
+diff --git a/src/css/var/isHiddenWithinTree.js b/src/css/var/isHiddenWithinTree.js
+index c887478..22b8221 100644
+--- a/src/css/var/isHiddenWithinTree.js
++++ b/src/css/var/isHiddenWithinTree.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../../core.js";
++import { jQuery } from "../../core.js";
+ 
+ // isHiddenWithinTree reports if an element has a non-"none" display style (inline and/or
+ // through the CSS cascade), which is useful in deciding whether or not to make it visible.
+@@ -7,7 +7,7 @@ import jQuery from "../../core.js";
+ // * Being disconnected from the document does not force an element to be classified as hidden.
+ // These differences improve the behavior of .toggle() et al. when applied to elements that are
+ // detached or contained within hidden ancestors (gh-2404, gh-2863).
+-export default function( elem, el ) {
++export function isHiddenWithinTree( elem, el ) {
+ 
+ 	// isHiddenWithinTree might be called from jQuery#filter function;
+ 	// in that case, element will be second argument
+diff --git a/src/css/var/rcustomProp.js b/src/css/var/rcustomProp.js
+new file mode 100644
+index 0000000..18b8686
+--- /dev/null
++++ b/src/css/var/rcustomProp.js
+@@ -0,0 +1 @@
++export var rcustomProp = /^--/;
+diff --git a/src/css/var/rnumnonpx.js b/src/css/var/rnumnonpx.js
+index 18a9dad..0386b00 100644
+--- a/src/css/var/rnumnonpx.js
++++ b/src/css/var/rnumnonpx.js
+@@ -1,3 +1,3 @@
+-import pnum from "../../var/pnum.js";
++import { pnum } from "../../var/pnum.js";
+ 
+-export default new RegExp( "^(" + pnum + ")(?!px)[a-z%]+$", "i" );
++export var rnumnonpx = new RegExp( "^(" + pnum + ")(?!px)[a-z%]+$", "i" );
+diff --git a/src/css/var/swap.js b/src/css/var/swap.js
+index f5d8f23..90b31d5 100644
+--- a/src/css/var/swap.js
++++ b/src/css/var/swap.js
+@@ -1,5 +1,5 @@
+ // A method for quickly swapping in/out CSS properties to get correct calculations.
+-export default function( elem, options, callback ) {
++export function swap( elem, options, callback ) {
+ 	var ret, name,
+ 		old = {};
+ 
+diff --git a/src/data.js b/src/data.js
+index cd658b3..e27e342 100644
+--- a/src/data.js
++++ b/src/data.js
+@@ -1,8 +1,8 @@
+-import jQuery from "./core.js";
+-import access from "./core/access.js";
+-import camelCase from "./core/camelCase.js";
+-import dataPriv from "./data/var/dataPriv.js";
+-import dataUser from "./data/var/dataUser.js";
++import { jQuery } from "./core.js";
++import { access } from "./core/access.js";
++import { camelCase } from "./core/camelCase.js";
++import { dataPriv } from "./data/var/dataPriv.js";
++import { dataUser } from "./data/var/dataUser.js";
+ 
+ //	Implementation Summary
+ //
+@@ -172,4 +172,4 @@ jQuery.fn.extend( {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/data/Data.js b/src/data/Data.js
+index a5eb090..e101674 100644
+--- a/src/data/Data.js
++++ b/src/data/Data.js
+@@ -1,9 +1,9 @@
+-import jQuery from "../core.js";
+-import camelCase from "../core/camelCase.js";
+-import rnothtmlwhite from "../var/rnothtmlwhite.js";
+-import acceptData from "./var/acceptData.js";
++import { jQuery } from "../core.js";
++import { camelCase } from "../core/camelCase.js";
++import { rnothtmlwhite } from "../var/rnothtmlwhite.js";
++import { acceptData } from "./var/acceptData.js";
+ 
+-function Data() {
++export function Data() {
+ 	this.expando = jQuery.expando + Data.uid++;
+ }
+ 
+@@ -153,5 +153,3 @@ Data.prototype = {
+ 		return cache !== undefined && !jQuery.isEmptyObject( cache );
+ 	}
+ };
+-
+-export default Data;
+diff --git a/src/data/var/acceptData.js b/src/data/var/acceptData.js
+index 6b154c5..dbb93ee 100644
+--- a/src/data/var/acceptData.js
++++ b/src/data/var/acceptData.js
+@@ -1,7 +1,7 @@
+ /**
+  * Determines whether an object can have data
+  */
+-export default function( owner ) {
++export function acceptData( owner ) {
+ 
+ 	// Accepts only:
+ 	//  - Node
+diff --git a/src/data/var/dataPriv.js b/src/data/var/dataPriv.js
+index 94ea119..aaa43bd 100644
+--- a/src/data/var/dataPriv.js
++++ b/src/data/var/dataPriv.js
+@@ -1,3 +1,3 @@
+-import Data from "../Data.js";
++import { Data } from "../Data.js";
+ 
+-export default new Data();
++export var dataPriv = new Data();
+diff --git a/src/data/var/dataUser.js b/src/data/var/dataUser.js
+index 94ea119..a0504b6 100644
+--- a/src/data/var/dataUser.js
++++ b/src/data/var/dataUser.js
+@@ -1,3 +1,3 @@
+-import Data from "../Data.js";
++import { Data } from "../Data.js";
+ 
+-export default new Data();
++export var dataUser = new Data();
+diff --git a/src/deferred.js b/src/deferred.js
+index d4eaf7a..1c87af2 100644
+--- a/src/deferred.js
++++ b/src/deferred.js
+@@ -1,5 +1,5 @@
+-import jQuery from "./core.js";
+-import slice from "./var/slice.js";
++import { jQuery } from "./core.js";
++import { slice } from "./var/slice.js";
+ 
+ import "./callbacks.js";
+ 
+@@ -389,4 +389,4 @@ jQuery.extend( {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/deferred/exceptionHook.js b/src/deferred/exceptionHook.js
+index 2e3c7cc..683426e 100644
+--- a/src/deferred/exceptionHook.js
++++ b/src/deferred/exceptionHook.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ import "../deferred.js";
+ 
+diff --git a/src/deprecated.js b/src/deprecated.js
+index e58156f..b2f767c 100644
+--- a/src/deprecated.js
++++ b/src/deprecated.js
+@@ -1,5 +1,5 @@
+-import jQuery from "./core.js";
+-import slice from "./var/slice.js";
++import { jQuery } from "./core.js";
++import { slice } from "./var/slice.js";
+ 
+ import "./deprecated/ajax-event-alias.js";
+ import "./deprecated/event.js";
+@@ -42,3 +42,5 @@ jQuery.holdReady = function( hold ) {
+ 		jQuery.ready( true );
+ 	}
+ };
++
++export { jQuery, jQuery as $ };
+diff --git a/src/deprecated/ajax-event-alias.js b/src/deprecated/ajax-event-alias.js
+index e4fe115..134b4f6 100644
+--- a/src/deprecated/ajax-event-alias.js
++++ b/src/deprecated/ajax-event-alias.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ import "../ajax.js";
+ import "../event.js";
+diff --git a/src/deprecated/event.js b/src/deprecated/event.js
+index 84ff5ba..fbfce1f 100644
+--- a/src/deprecated/event.js
++++ b/src/deprecated/event.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ import "../event.js";
+ import "../event/trigger.js";
+diff --git a/src/dimensions.js b/src/dimensions.js
+index 42e4453..a5e1a61 100644
+--- a/src/dimensions.js
++++ b/src/dimensions.js
+@@ -1,6 +1,6 @@
+-import jQuery from "./core.js";
+-import access from "./core/access.js";
+-import isWindow from "./var/isWindow.js";
++import { jQuery } from "./core.js";
++import { access } from "./core/access.js";
++import { isWindow } from "./var/isWindow.js";
+ 
+ import "./css.js";
+ 
+@@ -53,4 +53,4 @@ jQuery.each( { Height: "height", Width: "width" }, function( name, type ) {
+ 	} );
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/effects.js b/src/effects.js
+index f94da06..5f90fe4 100644
+--- a/src/effects.js
++++ b/src/effects.js
+@@ -1,13 +1,13 @@
+-import jQuery from "./core.js";
+-import document from "./var/document.js";
+-import rcssNum from "./var/rcssNum.js";
+-import rnothtmlwhite from "./var/rnothtmlwhite.js";
+-import cssExpand from "./css/var/cssExpand.js";
+-import isHiddenWithinTree from "./css/var/isHiddenWithinTree.js";
+-import adjustCSS from "./css/adjustCSS.js";
+-import cssCamelCase from "./css/cssCamelCase.js";
+-import dataPriv from "./data/var/dataPriv.js";
+-import showHide from "./css/showHide.js";
++import { jQuery } from "./core.js";
++import { document } from "./var/document.js";
++import { rcssNum } from "./var/rcssNum.js";
++import { rnothtmlwhite } from "./var/rnothtmlwhite.js";
++import { cssExpand } from "./css/var/cssExpand.js";
++import { isHiddenWithinTree } from "./css/var/isHiddenWithinTree.js";
++import { adjustCSS } from "./css/adjustCSS.js";
++import { cssCamelCase } from "./css/cssCamelCase.js";
++import { dataPriv } from "./data/var/dataPriv.js";
++import { showHide } from "./css/showHide.js";
+ 
+ import "./core/init.js";
+ import "./queue.js";
+@@ -143,10 +143,9 @@ function defaultPrefilter( elem, props, opts ) {
+ 	// Restrict "overflow" and "display" styles during box animations
+ 	if ( isBox && elem.nodeType === 1 ) {
+ 
+-		// Support: IE <=9 - 11+, Edge 12 - 18+
++		// Support: IE <=9 - 11+
+ 		// Record all 3 overflow attributes because IE does not infer the shorthand
+-		// from identically-valued overflowX and overflowY and Edge just mirrors
+-		// the overflowX value there.
++		// from identically-valued overflowX and overflowY.
+ 		opts.overflow = [ style.overflow, style.overflowX, style.overflowY ];
+ 
+ 		// Identify a display type, preferring old show/hide data over the CSS cascade
+@@ -686,4 +685,4 @@ jQuery.fx.speeds = {
+ 	_default: 400
+ };
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/effects/Tween.js b/src/effects/Tween.js
+index c0220bd..7acd279 100644
+--- a/src/effects/Tween.js
++++ b/src/effects/Tween.js
+@@ -1,6 +1,6 @@
+-import jQuery from "../core.js";
+-import isAutoPx from "../css/isAutoPx.js";
+-import finalPropName from "../css/finalPropName.js";
++import { jQuery } from "../core.js";
++import { isAutoPx } from "../css/isAutoPx.js";
++import { finalPropName } from "../css/finalPropName.js";
+ 
+ import "../css.js";
+ 
+diff --git a/src/effects/animatedSelector.js b/src/effects/animatedSelector.js
+index 327956f..0e0b377 100644
+--- a/src/effects/animatedSelector.js
++++ b/src/effects/animatedSelector.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ import "../selector.js";
+ import "../effects.js";
+diff --git a/src/event.js b/src/event.js
+index b8c5e96..aeba833 100644
+--- a/src/event.js
++++ b/src/event.js
+@@ -1,12 +1,12 @@
+-import jQuery from "./core.js";
+-import document from "./var/document.js";
+-import documentElement from "./var/documentElement.js";
+-import rnothtmlwhite from "./var/rnothtmlwhite.js";
+-import rcheckableType from "./var/rcheckableType.js";
+-import slice from "./var/slice.js";
+-import acceptData from "./data/var/acceptData.js";
+-import dataPriv from "./data/var/dataPriv.js";
+-import nodeName from "./core/nodeName.js";
++import { jQuery } from "./core.js";
++import { documentElement } from "./var/documentElement.js";
++import { rnothtmlwhite } from "./var/rnothtmlwhite.js";
++import { rcheckableType } from "./var/rcheckableType.js";
++import { slice } from "./var/slice.js";
++import { isIE } from "./var/isIE.js";
++import { acceptData } from "./data/var/acceptData.js";
++import { dataPriv } from "./data/var/dataPriv.js";
++import { nodeName } from "./core/nodeName.js";
+ 
+ import "./core/init.js";
+ import "./selector.js";
+@@ -21,16 +21,6 @@ function returnFalse() {
+ 	return false;
+ }
+ 
+-// Support: IE <=9 - 11+
+-// focus() and blur() are asynchronous, except when they are no-op.
+-// So expect focus to be synchronous when the element is already active,
+-// and blur to be synchronous when the element is not already active.
+-// (focus and blur are always synchronous in other supported browsers,
+-// this just defines when we can count on it).
+-function expectSync( elem, type ) {
+-	return ( elem === document.activeElement ) === ( type === "focus" );
+-}
+-
+ function on( elem, types, selector, data, fn, one ) {
+ 	var origFn, type;
+ 
+@@ -439,7 +429,7 @@ jQuery.event = {
+ 			new jQuery.Event( originalEvent );
+ 	},
+ 
+-	special: {
++	special: jQuery.extend( Object.create( null ), {
+ 		load: {
+ 
+ 			// Prevent triggered image.load events from bubbling to window.load
+@@ -459,7 +449,7 @@ jQuery.event = {
+ 					el.click && nodeName( el, "input" ) ) {
+ 
+ 					// dataPriv.set( el, "click", ... )
+-					leverageNative( el, "click", returnTrue );
++					leverageNative( el, "click", true );
+ 				}
+ 
+ 				// Return false to allow normal processing in the caller
+@@ -504,17 +494,17 @@ jQuery.event = {
+ 				}
+ 			}
+ 		}
+-	}
++	} )
+ };
+ 
+ // Ensure the presence of an event listener that handles manually-triggered
+ // synthetic events by interrupting progress until reinvoked in response to
+ // *native* events that it fires directly, ensuring that state changes have
+ // already occurred before other listeners are invoked.
+-function leverageNative( el, type, expectSync ) {
++function leverageNative( el, type, isSetup ) {
+ 
+-	// Missing expectSync indicates a trigger call, which must force setup through jQuery.event.add
+-	if ( !expectSync ) {
++	// Missing `isSetup` indicates a trigger call, which must force setup through jQuery.event.add
++	if ( !isSetup ) {
+ 		if ( dataPriv.get( el, type ) === undefined ) {
+ 			jQuery.event.add( el, type, returnTrue );
+ 		}
+@@ -526,69 +516,86 @@ function leverageNative( el, type, expectSync ) {
+ 	jQuery.event.add( el, type, {
+ 		namespace: false,
+ 		handler: function( event ) {
+-			var notAsync, result,
++			var result,
+ 				saved = dataPriv.get( this, type );
+ 
++			// This controller function is invoked under multiple circumstances,
++			// differentiated by the stored value in `saved`:
++			// 1. For an outer synthetic `.trigger()`ed event (detected by
++			//    `event.isTrigger & 1` and non-array `saved`), it records arguments
++			//    as an array and fires an [inner] native event to prompt state
++			//    changes that should be observed by registered listeners (such as
++			//    checkbox toggling and focus updating), then clears the stored value.
++			// 2. For an [inner] native event (detected by `saved` being
++			//    an array), it triggers an inner synthetic event, records the
++			//    result, and preempts propagation to further jQuery listeners.
++			// 3. For an inner synthetic event (detected by `event.isTrigger & 1` and
++			//    array `saved`), it prevents double-propagation of surrogate events
++			//    but otherwise allows everything to proceed (particularly including
++			//    further listeners).
++			// Possible `saved` data shapes: `[...], `{ value }`, `false`.
+ 			if ( ( event.isTrigger & 1 ) && this[ type ] ) {
+ 
+ 				// Interrupt processing of the outer synthetic .trigger()ed event
+-				// Saved data should be false in such cases, but might be a leftover capture object
+-				// from an async native handler (gh-4350)
+ 				if ( !saved.length ) {
+ 
+ 					// Store arguments for use when handling the inner native event
+-					// There will always be at least one argument (an event object), so this array
+-					// will not be confused with a leftover capture object.
++					// There will always be at least one argument (an event object),
++					// so this array will not be confused with a leftover capture object.
+ 					saved = slice.call( arguments );
+ 					dataPriv.set( this, type, saved );
+ 
+ 					// Trigger the native event and capture its result
+-					// Support: IE <=9 - 11+
+-					// focus() and blur() are asynchronous
+-					notAsync = expectSync( this, type );
+ 					this[ type ]();
+ 					result = dataPriv.get( this, type );
+-					if ( saved !== result || notAsync ) {
+-						dataPriv.set( this, type, false );
+-					} else {
+-						result = {};
+-					}
++					dataPriv.set( this, type, false );
++
+ 					if ( saved !== result ) {
+ 
+ 						// Cancel the outer synthetic event
+ 						event.stopImmediatePropagation();
+ 						event.preventDefault();
+-						return result.value;
++
++						// Support: Chrome 86+
++						// In Chrome, if an element having a focusout handler is
++						// blurred by clicking outside of it, it invokes the handler
++						// synchronously. If that handler calls `.remove()` on
++						// the element, the data is cleared, leaving `result`
++						// undefined. We need to guard against this.
++						return result && result.value;
+ 					}
+ 
+-				// If this is an inner synthetic event for an event with a bubbling surrogate
+-				// (focus or blur), assume that the surrogate already propagated from triggering the
+-				// native event and prevent that from happening again here.
+-				// This technically gets the ordering wrong w.r.t. to `.trigger()` (in which the
+-				// bubbling surrogate propagates *after* the non-bubbling base), but that seems
+-				// less bad than duplication.
++				// If this is an inner synthetic event for an event with a bubbling
++				// surrogate (focus or blur), assume that the surrogate already
++				// propagated from triggering the native event and prevent that
++				// from happening again here.
+ 				} else if ( ( jQuery.event.special[ type ] || {} ).delegateType ) {
+ 					event.stopPropagation();
+ 				}
+ 
+-			// If this is a native event triggered above, everything is now in order
+-			// Fire an inner synthetic event with the original arguments
++			// If this is a native event triggered above, everything is now in order.
++			// Fire an inner synthetic event with the original arguments.
+ 			} else if ( saved.length ) {
+ 
+ 				// ...and capture the result
+ 				dataPriv.set( this, type, {
+ 					value: jQuery.event.trigger(
+-
+-						// Support: IE <=9 - 11+
+-						// Extend with the prototype to reset the above stopImmediatePropagation()
+-						jQuery.extend( saved[ 0 ], jQuery.Event.prototype ),
++						saved[ 0 ],
+ 						saved.slice( 1 ),
+ 						this
+ 					)
+ 				} );
+ 
+-				// Abort handling of the native event
+-				event.stopImmediatePropagation();
++				// Abort handling of the native event by all jQuery handlers while allowing
++				// native handlers on the same element to run. On target, this is achieved
++				// by stopping immediate propagation just on the jQuery event. However,
++				// the native event is re-wrapped by a jQuery one on each level of the
++				// propagation so the only way to stop it for jQuery is to stop it for
++				// everyone via native `stopPropagation()`. This is not a problem for
++				// focus/blur which don't bubble, but it does also stop click on checkboxes
++				// and radios. We accept this limitation.
++				event.stopPropagation();
++				event.isImmediatePropagationStopped = returnTrue;
+ 			}
+ 		}
+ 	} );
+@@ -718,6 +725,29 @@ jQuery.each( {
+ }, jQuery.event.addProp );
+ 
+ jQuery.each( { focus: "focusin", blur: "focusout" }, function( type, delegateType ) {
++
++	// Support: IE 11+
++	// Attach a single focusin/focusout handler on the document while someone wants focus/blur.
++	// This is because the former are synchronous in IE while the latter are async. In other
++	// browsers, all those handlers are invoked synchronously.
++	function focusMappedHandler( nativeEvent ) {
++
++		// `eventHandle` would already wrap the event, but we need to change the `type` here.
++		var event = jQuery.event.fix( nativeEvent );
++		event.type = nativeEvent.type === "focusin" ? "focus" : "blur";
++		event.isSimulated = true;
++
++		// focus/blur don't bubble while focusin/focusout do; simulate the former by only
++		// invoking the handler at the lower level.
++		if ( event.target === event.currentTarget ) {
++
++			// The setup part calls `leverageNative`, which, in turn, calls
++			// `jQuery.event.add`, so event handle will already have been set
++			// by this point.
++			dataPriv.get( this, "handle" )( event );
++		}
++	}
++
+ 	jQuery.event.special[ type ] = {
+ 
+ 		// Utilize native event if possible so blur/focus sequence is correct
+@@ -726,10 +756,15 @@ jQuery.each( { focus: "focusin", blur: "focusout" }, function( type, delegateTyp
+ 			// Claim the first handler
+ 			// dataPriv.set( this, "focus", ... )
+ 			// dataPriv.set( this, "blur", ... )
+-			leverageNative( this, type, expectSync );
++			leverageNative( this, type, true );
++
++			if ( isIE ) {
++				this.addEventListener( delegateType, focusMappedHandler );
++			} else {
+ 
+-			// Return false to allow normal processing in the caller
+-			return false;
++				// Return false to allow normal processing in the caller
++				return false;
++			}
+ 		},
+ 		trigger: function() {
+ 
+@@ -740,6 +775,22 @@ jQuery.each( { focus: "focusin", blur: "focusout" }, function( type, delegateTyp
+ 			return true;
+ 		},
+ 
++		teardown: function() {
++			if ( isIE ) {
++				this.removeEventListener( delegateType, focusMappedHandler );
++			} else {
++
++				// Return false to indicate standard teardown should be applied
++				return false;
++			}
++		},
++
++		// Suppress native focus or blur if we're currently inside
++		// a leveraged native-event stack
++		_default: function( event ) {
++			return dataPriv.get( event.target, type );
++		},
++
+ 		delegateType: delegateType
+ 	};
+ } );
+@@ -821,4 +872,4 @@ jQuery.fn.extend( {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/event/trigger.js b/src/event/trigger.js
+index 7919a50..7ecb8c8 100644
+--- a/src/event/trigger.js
++++ b/src/event/trigger.js
+@@ -1,9 +1,9 @@
+-import jQuery from "../core.js";
+-import document from "../var/document.js";
+-import dataPriv from "../data/var/dataPriv.js";
+-import acceptData from "../data/var/acceptData.js";
+-import hasOwn from "../var/hasOwn.js";
+-import isWindow from "../var/isWindow.js";
++import { jQuery } from "../core.js";
++import { document } from "../var/document.js";
++import { dataPriv } from "../data/var/dataPriv.js";
++import { acceptData } from "../data/var/acceptData.js";
++import { hasOwn } from "../var/hasOwn.js";
++import { isWindow } from "../var/isWindow.js";
+ 
+ import "../event.js";
+ 
+diff --git a/src/exports/amd.js b/src/exports/amd.js
+index 44587ab..85a66ee 100644
+--- a/src/exports/amd.js
++++ b/src/exports/amd.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ // Register as a named AMD module, since jQuery can be concatenated with other
+ // files that may use define, but not via a proper concatenation script that
+diff --git a/src/exports/global.js b/src/exports/global.js
+index b49496f..fe6d51b 100644
+--- a/src/exports/global.js
++++ b/src/exports/global.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ var
+ 
+diff --git a/src/jquery.js b/src/jquery.js
+index a0d5d36..6c56d40 100644
+--- a/src/jquery.js
++++ b/src/jquery.js
+@@ -1,4 +1,4 @@
+-import jQuery from "./core.js";
++import { jQuery } from "./core.js";
+ 
+ import "./selector.js";
+ import "./traversing.js";
+@@ -34,4 +34,7 @@ import "./deprecated.js";
+ import "./exports/amd.js";
+ import "./exports/global.js";
+ 
++export { jQuery, jQuery as $ };
++
++// Preserve the existing source-entry default for browser test and AMD consumers.
+ export default jQuery;
+diff --git a/src/manipulation.js b/src/manipulation.js
+index 7838e22..0a72094 100644
+--- a/src/manipulation.js
++++ b/src/manipulation.js
+@@ -1,20 +1,17 @@
+-import jQuery from "./core.js";
+-import isAttached from "./core/isAttached.js";
+-import flat from "./var/flat.js";
+-import isIE from "./var/isIE.js";
+-import push from "./var/push.js";
+-import access from "./core/access.js";
+-import rtagName from "./manipulation/var/rtagName.js";
+-import rscriptType from "./manipulation/var/rscriptType.js";
+-import wrapMap from "./manipulation/wrapMap.js";
+-import getAll from "./manipulation/getAll.js";
+-import setGlobalEval from "./manipulation/setGlobalEval.js";
+-import buildFragment from "./manipulation/buildFragment.js";
+-import dataPriv from "./data/var/dataPriv.js";
+-import dataUser from "./data/var/dataUser.js";
+-import acceptData from "./data/var/acceptData.js";
+-import DOMEval from "./core/DOMEval.js";
+-import nodeName from "./core/nodeName.js";
++import { jQuery } from "./core.js";
++import { isAttached } from "./core/isAttached.js";
++import { isIE } from "./var/isIE.js";
++import { push } from "./var/push.js";
++import { access } from "./core/access.js";
++import { rtagName } from "./manipulation/var/rtagName.js";
++import { wrapMap } from "./manipulation/wrapMap.js";
++import { getAll } from "./manipulation/getAll.js";
++import { domManip } from "./manipulation/domManip.js";
++import { setGlobalEval } from "./manipulation/setGlobalEval.js";
++import { dataPriv } from "./data/var/dataPriv.js";
++import { dataUser } from "./data/var/dataUser.js";
++import { acceptData } from "./data/var/acceptData.js";
++import { nodeName } from "./core/nodeName.js";
+ 
+ import "./core/init.js";
+ import "./traversing.js";
+@@ -23,12 +20,9 @@ import "./event.js";
+ 
+ var
+ 
+-	// Support: IE <=10 - 11+, Edge 12 - 13 only
+-	// In IE/Edge using regex groups here causes severe slowdowns.
+-	// See https://connect.microsoft.com/IE/feedback/details/1736512/
+-	rnoInnerhtml = /<script|<style|<link/i,
+-
+-	rcleanScript = /^\s*<!(?:\[CDATA\[|--)|(?:\]\]|--)>\s*$/g;
++	// Support: IE <=10 - 11+
++	// In IE using regex groups here causes severe slowdowns.
++	rnoInnerhtml = /<script|<style|<link/i;
+ 
+ // Prefer a tbody over its parent table for containing new rows
+ function manipulationTarget( elem, content ) {
+@@ -41,21 +35,6 @@ function manipulationTarget( elem, content ) {
+ 	return elem;
+ }
+ 
+-// Replace/restore the type attribute of script elements for safe DOM manipulation
+-function disableScript( elem ) {
+-	elem.type = ( elem.getAttribute( "type" ) !== null ) + "/" + elem.type;
+-	return elem;
+-}
+-function restoreScript( elem ) {
+-	if ( ( elem.type || "" ).slice( 0, 5 ) === "true/" ) {
+-		elem.type = elem.type.slice( 5 );
+-	} else {
+-		elem.removeAttribute( "type" );
+-	}
+-
+-	return elem;
+-}
+-
+ function cloneCopyEvent( src, dest ) {
+ 	var i, l, type, pdataOld, udataOld, udataCur, events;
+ 
+@@ -88,91 +67,6 @@ function cloneCopyEvent( src, dest ) {
+ 	}
+ }
+ 
+-function domManip( collection, args, callback, ignored ) {
+-
+-	// Flatten any nested arrays
+-	args = flat( args );
+-
+-	var fragment, first, scripts, hasScripts, node, doc,
+-		i = 0,
+-		l = collection.length,
+-		iNoClone = l - 1,
+-		value = args[ 0 ],
+-		valueIsFunction = typeof value === "function";
+-
+-	if ( valueIsFunction ) {
+-		return collection.each( function( index ) {
+-			var self = collection.eq( index );
+-			args[ 0 ] = value.call( this, index, self.html() );
+-			domManip( self, args, callback, ignored );
+-		} );
+-	}
+-
+-	if ( l ) {
+-		fragment = buildFragment( args, collection[ 0 ].ownerDocument, false, collection, ignored );
+-		first = fragment.firstChild;
+-
+-		if ( fragment.childNodes.length === 1 ) {
+-			fragment = first;
+-		}
+-
+-		// Require either new content or an interest in ignored elements to invoke the callback
+-		if ( first || ignored ) {
+-			scripts = jQuery.map( getAll( fragment, "script" ), disableScript );
+-			hasScripts = scripts.length;
+-
+-			// Use the original fragment for the last item
+-			// instead of the first because it can end up
+-			// being emptied incorrectly in certain situations (#8070).
+-			for ( ; i < l; i++ ) {
+-				node = fragment;
+-
+-				if ( i !== iNoClone ) {
+-					node = jQuery.clone( node, true, true );
+-
+-					// Keep references to cloned scripts for later restoration
+-					if ( hasScripts ) {
+-						jQuery.merge( scripts, getAll( node, "script" ) );
+-					}
+-				}
+-
+-				callback.call( collection[ i ], node, i );
+-			}
+-
+-			if ( hasScripts ) {
+-				doc = scripts[ scripts.length - 1 ].ownerDocument;
+-
+-				// Reenable scripts
+-				jQuery.map( scripts, restoreScript );
+-
+-				// Evaluate executable scripts on first document insertion
+-				for ( i = 0; i < hasScripts; i++ ) {
+-					node = scripts[ i ];
+-					if ( rscriptType.test( node.type || "" ) &&
+-						!dataPriv.access( node, "globalEval" ) &&
+-						jQuery.contains( doc, node ) ) {
+-
+-						if ( node.src && ( node.type || "" ).toLowerCase()  !== "module" ) {
+-
+-							// Optional AJAX dependency, but won't run scripts if not present
+-							if ( jQuery._evalUrl && !node.noModule ) {
+-								jQuery._evalUrl( node.src, {
+-									nonce: node.nonce || node.getAttribute( "nonce" ),
+-									crossOrigin: node.crossOrigin
+-								}, doc );
+-							}
+-						} else {
+-							DOMEval( node.textContent.replace( rcleanScript, "" ), node, doc );
+-						}
+-					}
+-				}
+-			}
+-		}
+-	}
+-
+-	return collection;
+-}
+-
+ function remove( elem, selector, keepData ) {
+ 	var node,
+ 		nodes = selector ? jQuery.filter( selector, elem ) : elem,
+@@ -447,4 +341,4 @@ jQuery.each( {
+ 	};
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/manipulation/_evalUrl.js b/src/manipulation/_evalUrl.js
+index 8a8d63d..8c8af48 100644
+--- a/src/manipulation/_evalUrl.js
++++ b/src/manipulation/_evalUrl.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../ajax.js";
++import { jQuery } from "../ajax.js";
+ 
+ jQuery._evalUrl = function( url, options, doc ) {
+ 	return jQuery.ajax( {
+diff --git a/src/manipulation/buildFragment.js b/src/manipulation/buildFragment.js
+index 9ac71ac..0bd48fe 100644
+--- a/src/manipulation/buildFragment.js
++++ b/src/manipulation/buildFragment.js
+@@ -1,16 +1,17 @@
+-import jQuery from "../core.js";
+-import toType from "../core/toType.js";
+-import isAttached from "../core/isAttached.js";
+-import arr from "../var/arr.js";
+-import rtagName from "./var/rtagName.js";
+-import rscriptType from "./var/rscriptType.js";
+-import wrapMap from "./wrapMap.js";
+-import getAll from "./getAll.js";
+-import setGlobalEval from "./setGlobalEval.js";
++import { jQuery } from "../core.js";
++import { toType } from "../core/toType.js";
++import { isAttached } from "../core/isAttached.js";
++import { arr } from "../var/arr.js";
++import { rtagName } from "./var/rtagName.js";
++import { rscriptType } from "./var/rscriptType.js";
++import { wrapMap } from "./wrapMap.js";
++import { getAll } from "./getAll.js";
++import { setGlobalEval } from "./setGlobalEval.js";
++import { isArrayLike } from "../core/isArrayLike.js";
+ 
+ var rhtml = /<|&#?\w+;/;
+ 
+-function buildFragment( elems, context, scripts, selection, ignored ) {
++export function buildFragment( elems, context, scripts, selection, ignored ) {
+ 	var elem, tmp, tag, wrap, attached, j,
+ 		fragment = context.createDocumentFragment(),
+ 		nodes = [],
+@@ -23,7 +24,7 @@ function buildFragment( elems, context, scripts, selection, ignored ) {
+ 		if ( elem || elem === 0 ) {
+ 
+ 			// Add nodes directly
+-			if ( toType( elem ) === "object" ) {
++			if ( toType( elem ) === "object" && ( elem.nodeType || isArrayLike( elem ) ) ) {
+ 				jQuery.merge( nodes, elem.nodeType ? [ elem ] : elem );
+ 
+ 			// Convert non-html into a text node
+@@ -94,5 +95,3 @@ function buildFragment( elems, context, scripts, selection, ignored ) {
+ 
+ 	return fragment;
+ }
+-
+-export default buildFragment;
+diff --git a/src/manipulation/domManip.js b/src/manipulation/domManip.js
+new file mode 100644
+index 0000000..c5bf696
+--- /dev/null
++++ b/src/manipulation/domManip.js
+@@ -0,0 +1,107 @@
++import { jQuery } from "../core.js";
++import { flat } from "../var/flat.js";
++import { rscriptType } from "./var/rscriptType.js";
++import { getAll } from "./getAll.js";
++import { buildFragment } from "./buildFragment.js";
++import { dataPriv } from "../data/var/dataPriv.js";
++import { DOMEval } from "../core/DOMEval.js";
++
++// Replace/restore the type attribute of script elements for safe DOM manipulation
++function disableScript( elem ) {
++	elem.type = ( elem.getAttribute( "type" ) !== null ) + "/" + elem.type;
++	return elem;
++}
++function restoreScript( elem ) {
++	if ( ( elem.type || "" ).slice( 0, 5 ) === "true/" ) {
++		elem.type = elem.type.slice( 5 );
++	} else {
++		elem.removeAttribute( "type" );
++	}
++
++	return elem;
++}
++
++export function domManip( collection, args, callback, ignored ) {
++
++	// Flatten any nested arrays
++	args = flat( args );
++
++	var fragment, first, scripts, hasScripts, node, doc,
++		i = 0,
++		l = collection.length,
++		iNoClone = l - 1,
++		value = args[ 0 ],
++		valueIsFunction = typeof value === "function";
++
++	if ( valueIsFunction ) {
++		return collection.each( function( index ) {
++			var self = collection.eq( index );
++			args[ 0 ] = value.call( this, index, self.html() );
++			domManip( self, args, callback, ignored );
++		} );
++	}
++
++	if ( l ) {
++		fragment = buildFragment( args, collection[ 0 ].ownerDocument, false, collection, ignored );
++		first = fragment.firstChild;
++
++		if ( fragment.childNodes.length === 1 ) {
++			fragment = first;
++		}
++
++		// Require either new content or an interest in ignored elements to invoke the callback
++		if ( first || ignored ) {
++			scripts = jQuery.map( getAll( fragment, "script" ), disableScript );
++			hasScripts = scripts.length;
++
++			// Use the original fragment for the last item
++			// instead of the first because it can end up
++			// being emptied incorrectly in certain situations (trac-8070).
++			for ( ; i < l; i++ ) {
++				node = fragment;
++
++				if ( i !== iNoClone ) {
++					node = jQuery.clone( node, true, true );
++
++					// Keep references to cloned scripts for later restoration
++					if ( hasScripts ) {
++						jQuery.merge( scripts, getAll( node, "script" ) );
++					}
++				}
++
++				callback.call( collection[ i ], node, i );
++			}
++
++			if ( hasScripts ) {
++				doc = scripts[ scripts.length - 1 ].ownerDocument;
++
++				// Reenable scripts
++				jQuery.map( scripts, restoreScript );
++
++				// Evaluate executable scripts on first document insertion
++				for ( i = 0; i < hasScripts; i++ ) {
++					node = scripts[ i ];
++					if ( rscriptType.test( node.type || "" ) &&
++						!dataPriv.access( node, "globalEval" ) &&
++						jQuery.contains( doc, node ) ) {
++
++						if ( node.src && ( node.type || "" ).toLowerCase()  !== "module" ) {
++
++							// Optional AJAX dependency, but won't run scripts if not present
++							if ( jQuery._evalUrl && !node.noModule ) {
++								jQuery._evalUrl( node.src, {
++									nonce: node.nonce,
++									crossOrigin: node.crossOrigin
++								}, doc );
++							}
++						} else {
++							DOMEval( node.textContent, node, doc );
++						}
++					}
++				}
++			}
++		}
++	}
++
++	return collection;
++}
+diff --git a/src/manipulation/getAll.js b/src/manipulation/getAll.js
+index 995d22c..cbe2675 100644
+--- a/src/manipulation/getAll.js
++++ b/src/manipulation/getAll.js
+@@ -1,7 +1,7 @@
+-import jQuery from "../core.js";
+-import nodeName from "../core/nodeName.js";
++import { jQuery } from "../core.js";
++import { nodeName } from "../core/nodeName.js";
+ 
+-function getAll( context, tag ) {
++export function getAll( context, tag ) {
+ 
+ 	// Support: IE <=9 - 11+
+ 	// Use typeof to avoid zero-argument method invocation on host objects (#15151)
+@@ -23,5 +23,3 @@ function getAll( context, tag ) {
+ 
+ 	return ret;
+ }
+-
+-export default getAll;
+diff --git a/src/manipulation/setGlobalEval.js b/src/manipulation/setGlobalEval.js
+index c6f7ee9..9571bdc 100644
+--- a/src/manipulation/setGlobalEval.js
++++ b/src/manipulation/setGlobalEval.js
+@@ -1,7 +1,7 @@
+-import dataPriv from "../data/var/dataPriv.js";
++import { dataPriv } from "../data/var/dataPriv.js";
+ 
+ // Mark scripts as having already been evaluated
+-function setGlobalEval( elems, refElements ) {
++export function setGlobalEval( elems, refElements ) {
+ 	var i = 0,
+ 		l = elems.length;
+ 
+@@ -13,5 +13,3 @@ function setGlobalEval( elems, refElements ) {
+ 		);
+ 	}
+ }
+-
+-export default setGlobalEval;
+diff --git a/src/manipulation/var/rscriptType.js b/src/manipulation/var/rscriptType.js
+index 879651c..e3977e9 100644
+--- a/src/manipulation/var/rscriptType.js
++++ b/src/manipulation/var/rscriptType.js
+@@ -1 +1 @@
+-export default ( /^$|^module$|\/(?:java|ecma)script/i );
++export var rscriptType = /^$|^module$|\/(?:java|ecma)script/i;
+diff --git a/src/manipulation/var/rtagName.js b/src/manipulation/var/rtagName.js
+index b35acc9..fceba67 100644
+--- a/src/manipulation/var/rtagName.js
++++ b/src/manipulation/var/rtagName.js
+@@ -1,4 +1,4 @@
+ // rtagName captures the name from the first start tag in a string of HTML
+ // https://html.spec.whatwg.org/multipage/syntax.html#tag-open-state
+ // https://html.spec.whatwg.org/multipage/syntax.html#tag-name-state
+-export default ( /<([a-z][^\/\0>\x20\t\r\n\f]*)/i );
++export var rtagName = /<([a-z][^\/\0>\x20\t\r\n\f]*)/i;
+diff --git a/src/manipulation/wrapMap.js b/src/manipulation/wrapMap.js
+index 4579025..a69bcec 100644
+--- a/src/manipulation/wrapMap.js
++++ b/src/manipulation/wrapMap.js
+@@ -1,4 +1,4 @@
+-var wrapMap = {
++export var wrapMap = {
+ 
+ 	// Table parts need to be wrapped with `<table>` or they're
+ 	// stripped to their contents when put in a div.
+@@ -13,5 +13,3 @@ var wrapMap = {
+ 
+ wrapMap.tbody = wrapMap.tfoot = wrapMap.colgroup = wrapMap.caption = wrapMap.thead;
+ wrapMap.th = wrapMap.td;
+-
+-export default wrapMap;
+diff --git a/src/offset.js b/src/offset.js
+index 7d98083..5a9d3c3 100644
+--- a/src/offset.js
++++ b/src/offset.js
+@@ -1,7 +1,7 @@
+-import jQuery from "./core.js";
+-import access from "./core/access.js";
+-import documentElement from "./var/documentElement.js";
+-import isWindow from "./var/isWindow.js";
++import { jQuery } from "./core.js";
++import { access } from "./core/access.js";
++import { documentElement } from "./var/documentElement.js";
++import { isWindow } from "./var/isWindow.js";
+ 
+ import "./core/init.js";
+ import "./css.js";
+@@ -198,4 +198,4 @@ jQuery.each( { scrollLeft: "pageXOffset", scrollTop: "pageYOffset" }, function(
+ 	};
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/package.json b/src/package.json
+new file mode 100644
+index 0000000..3dbc1ca
+--- /dev/null
++++ b/src/package.json
+@@ -0,0 +1,3 @@
++{
++  "type": "module"
++}
+diff --git a/src/queue.js b/src/queue.js
+index 0028d7e..3621eaf 100644
+--- a/src/queue.js
++++ b/src/queue.js
+@@ -1,5 +1,5 @@
+-import jQuery from "./core.js";
+-import dataPriv from "./data/var/dataPriv.js";
++import { jQuery } from "./core.js";
++import { dataPriv } from "./data/var/dataPriv.js";
+ 
+ import "./deferred.js";
+ import "./callbacks.js";
+@@ -138,4 +138,4 @@ jQuery.fn.extend( {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/queue/delay.js b/src/queue/delay.js
+index fe3a6f6..58a6283 100644
+--- a/src/queue/delay.js
++++ b/src/queue/delay.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ import "../queue.js";
+ import "../effects.js"; // Delay is optional because of this dependency
+diff --git a/src/selector-native.js b/src/selector-native.js
+new file mode 100644
+index 0000000..d409a5c
+--- /dev/null
++++ b/src/selector-native.js
+@@ -0,0 +1,148 @@
++/*
++ * Optional limited selector module for custom builds.
++ *
++ * Note that this DOES NOT SUPPORT many documented jQuery
++ * features in exchange for its smaller size:
++ *
++ * * Attribute not equal selector (!=)
++ * * Positional selectors (:first; :eq(n); :odd; etc.)
++ * * Type selectors (:input; :checkbox; :button; etc.)
++ * * State-based selectors (:animated; :visible; :hidden; etc.)
++ * * :has(selector) in browsers without native support
++ * * :not(complex selector) in IE
++ * * custom selectors via jQuery extensions
++ * * Reliable functionality on XML fragments
++ * * Matching against non-elements
++ * * Reliable sorting of disconnected nodes
++ * * querySelectorAll bug fixes (e.g., unreliable :focus on WebKit)
++ *
++ * If any of these are unacceptable tradeoffs, either use the full
++ * selector engine or  customize this stub for the project's specific
++ * needs.
++ */
++
++import { jQuery } from "./core.js";
++import { document } from "./var/document.js";
++import { whitespace } from "./var/whitespace.js";
++import { isIE } from "./var/isIE.js";
++import { booleans } from "./selector/var/booleans.js";
++import { rleadingCombinator } from "./selector/var/rleadingCombinator.js";
++import { rdescend } from "./selector/var/rdescend.js";
++import { rsibling } from "./selector/var/rsibling.js";
++import { matches } from "./selector/var/matches.js";
++import { testContext } from "./selector/testContext.js";
++import { filterMatchExpr } from "./selector/filterMatchExpr.js";
++import { preFilter } from "./selector/preFilter.js";
++import { tokenize } from "./selector/tokenize.js";
++import { toSelector } from "./selector/toSelector.js";
++
++// The following utils are attached directly to the jQuery object.
++import "./selector/escapeSelector.js";
++import "./selector/uniqueSort.js";
++
++var matchExpr = jQuery.extend( {
++	bool: new RegExp( "^(?:" + booleans + ")$", "i" ),
++	needsContext: new RegExp( "^" + whitespace + "*[>+~]" )
++}, filterMatchExpr );
++
++jQuery.extend( {
++	find: function( selector, context, results, seed ) {
++		var elem, nid, groups, newSelector,
++			newContext = context && context.ownerDocument,
++
++			// nodeType defaults to 9, since context defaults to document
++			nodeType = context ? context.nodeType : 9,
++			i = 0;
++
++		results = results || [];
++		context = context || document;
++
++		// Same basic safeguard as in the full selector module
++		if ( !selector || typeof selector !== "string" ) {
++			return results;
++		}
++
++		// Early return if context is not an element, document or document fragment
++		if ( nodeType !== 1 && nodeType !== 9 && nodeType !== 11 ) {
++			return [];
++		}
++
++		if ( seed ) {
++			while ( ( elem = seed[ i++ ] ) ) {
++				if ( jQuery.find.matchesSelector( elem, selector ) ) {
++					results.push( elem );
++				}
++			}
++		} else {
++
++			newSelector = selector;
++			newContext = context;
++
++			// qSA considers elements outside a scoping root when evaluating child or
++			// descendant combinators, which is not what we want.
++			// In such cases, we work around the behavior by prefixing every selector in the
++			// list with an ID selector referencing the scope context.
++			// The technique has to be used as well when a leading combinator is used
++			// as such selectors are not recognized by querySelectorAll.
++			// Thanks to Andrew Dupont for this technique.
++			if ( nodeType === 1 &&
++				( rdescend.test( selector ) || rleadingCombinator.test( selector ) ) ) {
++
++				// Expand context for sibling selectors
++				newContext = rsibling.test( selector ) &&
++					testContext( context.parentNode ) ||
++					context;
++
++				// Outside of IE, if we're not changing the context we can
++				// use :scope instead of an ID.
++				if ( newContext !== context || isIE ) {
++
++					// Capture the context ID, setting it first if necessary
++					if ( ( nid = context.getAttribute( "id" ) ) ) {
++						nid = jQuery.escapeSelector( nid );
++					} else {
++						context.setAttribute( "id", ( nid = jQuery.expando ) );
++					}
++				}
++
++				// Prefix every selector in the list
++				groups = tokenize( selector );
++				i = groups.length;
++				while ( i-- ) {
++					groups[ i ] = ( nid ? "#" + nid : ":scope" ) + " " +
++						toSelector( groups[ i ] );
++				}
++				newSelector = groups.join( "," );
++			}
++
++			try {
++				jQuery.merge( results, newContext.querySelectorAll( newSelector ) );
++			} finally {
++				if ( nid === jQuery.expando ) {
++					context.removeAttribute( "id" );
++				}
++			}
++		}
++
++		return results;
++	},
++	expr: {
++
++		// Can be adjusted by the user
++		cacheLength: 50,
++
++		match: matchExpr,
++		preFilter: preFilter
++	}
++} );
++
++jQuery.extend( jQuery.find, {
++	matches: function( expr, elements ) {
++		return jQuery.find( expr, null, null, elements );
++	},
++	matchesSelector: function( elem, expr ) {
++		return matches.call( elem, expr );
++	}
++} );
++
++export { jQuery, jQuery as $ };
+diff --git a/src/selector.js b/src/selector.js
+index 0d80c6f..786fecf 100644
+--- a/src/selector.js
++++ b/src/selector.js
+@@ -1,26 +1,37 @@
+-import jQuery from "./core.js";
+-import nodeName from "./core/nodeName.js";
+-import document from "./var/document.js";
+-import documentElement from "./var/documentElement.js";
+-import indexOf from "./var/indexOf.js";
+-import pop from "./var/pop.js";
+-import push from "./var/push.js";
+-import whitespace from "./selector/var/whitespace.js";
+-import rbuggyQSA from "./selector/rbuggyQSA.js";
+-import support from "./selector/support.js";
++import { jQuery } from "./core.js";
++import { nodeName } from "./core/nodeName.js";
++import { document } from "./var/document.js";
++import { indexOf } from "./var/indexOf.js";
++import { pop } from "./var/pop.js";
++import { push } from "./var/push.js";
++import { whitespace } from "./var/whitespace.js";
++import { rbuggyQSA } from "./selector/rbuggyQSA.js";
++import { rtrim } from "./var/rtrim.js";
++import { isIE } from "./var/isIE.js";
++import { identifier } from "./selector/var/identifier.js";
++import { booleans } from "./selector/var/booleans.js";
++import { rleadingCombinator } from "./selector/var/rleadingCombinator.js";
++import { rdescend } from "./selector/var/rdescend.js";
++import { rsibling } from "./selector/var/rsibling.js";
++import { matches } from "./selector/var/matches.js";
++import { createCache } from "./selector/createCache.js";
++import { testContext } from "./selector/testContext.js";
++import { filterMatchExpr } from "./selector/filterMatchExpr.js";
++import { preFilter } from "./selector/preFilter.js";
++import { selectorError } from "./selector/selectorError.js";
++import { unescapeSelector } from "./selector/unescapeSelector.js";
++import { tokenize } from "./selector/tokenize.js";
++import { toSelector } from "./selector/toSelector.js";
+ 
+ // The following utils are attached directly to the jQuery object.
+-import "./selector/contains.js";
+ import "./selector/escapeSelector.js";
+ import "./selector/uniqueSort.js";
+ 
+-var preferredDoc = document,
+-	matches = documentElement.matches || documentElement.msMatchesSelector;
++var preferredDoc = document;
+ 
+ ( function() {
+ 
+ var i,
+-	Expr,
+ 	outermostContext,
+ 
+ 	// Local document vars
+@@ -28,69 +39,23 @@ var i,
+ 	documentElement,
+ 	documentIsHTML,
+ 
++	builtinPseudos,
++
+ 	// Instance-specific data
+-	expando = jQuery.expando,
+ 	dirruns = 0,
+ 	done = 0,
+ 	classCache = createCache(),
+-	tokenCache = createCache(),
+ 	compilerCache = createCache(),
+ 	nonnativeSelectorCache = createCache(),
+ 
+-	booleans = "checked|selected|async|autofocus|autoplay|controls|defer|disabled|hidden|ismap|" +
+-		"loop|multiple|open|readonly|required|scoped",
+-
+ 	// Regular expressions
+ 
+-	// https://www.w3.org/TR/css-syntax-3/#ident-token-diagram
+-	identifier = "(?:\\\\[\\da-fA-F]{1,6}" + whitespace +
+-		"?|\\\\[^\\r\\n\\f]|[\\w-]|[^\0-\\x7f])+",
+-
+-	// Attribute selectors: https://www.w3.org/TR/selectors/#attribute-selectors
+-	attributes = "\\[" + whitespace + "*(" + identifier + ")(?:" + whitespace +
+-
+-		// Operator (capture 2)
+-		"*([*^$|!~]?=)" + whitespace +
+-
+-		// "Attribute values must be CSS identifiers [capture 5] or strings [capture 3 or capture 4]"
+-		"*(?:'((?:\\\\.|[^\\\\'])*)'|\"((?:\\\\.|[^\\\\\"])*)\"|(" + identifier + "))|)" +
+-		whitespace + "*\\]",
+-
+-	pseudos = ":(" + identifier + ")(?:\\((" +
+-
+-		// To reduce the number of selectors needing tokenize in the preFilter, prefer arguments:
+-		// 1. quoted (capture 3; capture 4 or capture 5)
+-		"('((?:\\\\.|[^\\\\'])*)'|\"((?:\\\\.|[^\\\\\"])*)\")|" +
+-
+-		// 2. simple (capture 6)
+-		"((?:\\\\.|[^\\\\()[\\]]|" + attributes + ")*)|" +
+-
+-		// 3. anything else (capture 2)
+-		".*" +
+-		")\\)|)",
+-
+ 	// Leading and non-escaped trailing whitespace, capturing some non-whitespace characters preceding the latter
+ 	rwhitespace = new RegExp( whitespace + "+", "g" ),
+-	rtrim = new RegExp( "^" + whitespace + "+|((?:^|[^\\\\])(?:\\\\.)*)" + whitespace + "+$", "g" ),
+ 
+-	rcomma = new RegExp( "^" + whitespace + "*," + whitespace + "*" ),
+-	rcombinators = new RegExp( "^" + whitespace + "*([>+~]|" + whitespace + ")" +
+-		whitespace + "*" ),
+-	rdescend = new RegExp( whitespace + "|>" ),
+-
+-	rpseudo = new RegExp( pseudos ),
+ 	ridentifier = new RegExp( "^" + identifier + "$" ),
+ 
+-	matchExpr = {
+-		ID: new RegExp( "^#(" + identifier + ")" ),
+-		CLASS: new RegExp( "^\\.(" + identifier + ")" ),
+-		TAG: new RegExp( "^(" + identifier + "|[*])" ),
+-		ATTR: new RegExp( "^" + attributes ),
+-		PSEUDO: new RegExp( "^" + pseudos ),
+-		CHILD: new RegExp(
+-			"^:(only|first|last|nth|nth-last)-(child|of-type)(?:\\(" +
+-				whitespace + "*(even|odd|(([+-]|)(\\d*)n|)" + whitespace + "*(?:([+-]|)" +
+-				whitespace + "*(\\d+)|))" + whitespace + "*\\)|)", "i" ),
++	matchExpr = jQuery.extend( {
+ 		bool: new RegExp( "^(?:" + booleans + ")$", "i" ),
+ 
+ 		// For use in libraries implementing .is()
+@@ -98,7 +63,7 @@ var i,
+ 		needsContext: new RegExp( "^" + whitespace +
+ 			"*[>+~]|:(even|odd|eq|gt|lt|nth|first|last)(?:\\(" + whitespace +
+ 			"*((?:-\\d)?\\d*)" + whitespace + "*\\)|)(?=[^-]|$)", "i" )
+-	},
++	}, filterMatchExpr ),
+ 
+ 	rinputs = /^(?:input|select|textarea|button)$/i,
+ 	rheader = /^h\d$/i,
+@@ -106,34 +71,10 @@ var i,
+ 	// Easily-parseable/retrievable ID or TAG or CLASS selectors
+ 	rquickExpr = /^(?:#([\w-]+)|(\w+)|\.([\w-]+))$/,
+ 
+-	rsibling = /[+~]/,
+-
+-	// CSS escapes
+-	// https://www.w3.org/TR/CSS21/syndata.html#escaped-characters
+-	runescape = new RegExp( "\\\\[\\da-fA-F]{1,6}" + whitespace +
+-		"?|\\\\([^\\r\\n\\f])", "g" ),
+-	funescape = function( escape, nonHex ) {
+-		var high = "0x" + escape.slice( 1 ) - 0x10000;
+-
+-		if ( nonHex ) {
+-
+-			// Strip the backslash prefix from a non-hex escape sequence
+-			return nonHex;
+-		}
+-
+-		// Replace a hexadecimal escape sequence with the encoded Unicode code point
+-		// Support: IE <=11+
+-		// For values outside the Basic Multilingual Plane (BMP), manually construct a
+-		// surrogate pair
+-		return high < 0 ?
+-			String.fromCharCode( high + 0x10000 ) :
+-			String.fromCharCode( high >> 10 | 0xD800, high & 0x3FF | 0xDC00 );
+-	},
+-
+ 	// Used for iframes; see `setDocument`.
+-	// Support: IE 9 - 11+, Edge 12 - 18+
++	// Support: IE 9 - 11+
+ 	// Removing the function wrapper causes a "Permission Denied"
+-	// error in IE/Edge.
++	// error in IE.
+ 	unloadHandler = function() {
+ 		setDocument();
+ 	},
+@@ -145,10 +86,6 @@ var i,
+ 		{ dir: "parentNode", next: "legend" }
+ 	);
+ 
+-function selectorError( msg ) {
+-	throw new Error( "Syntax error, unrecognized expression: " + msg );
+-}
+-
+ function find( selector, context, results, seed ) {
+ 	var m, i, elem, nid, match, groups, newSelector,
+ 		newContext = context && context.ownerDocument,
+@@ -223,21 +160,22 @@ function find( selector, context, results, seed ) {
+ 				// as such selectors are not recognized by querySelectorAll.
+ 				// Thanks to Andrew Dupont for this technique.
+ 				if ( nodeType === 1 &&
+-					( rdescend.test( selector ) || rcombinators.test( selector ) ) ) {
++					( rdescend.test( selector ) || rleadingCombinator.test( selector ) ) ) {
+ 
+ 					// Expand context for sibling selectors
+-					newContext = rsibling.test( selector ) && testContext( context.parentNode ) ||
++					newContext = rsibling.test( selector ) &&
++						testContext( context.parentNode ) ||
+ 						context;
+ 
+-					// We can use :scope instead of the ID hack if the browser
+-					// supports it & if we're not changing the context.
+-					if ( newContext !== context || !support.scope ) {
++					// Outside of IE, if we're not changing the context we can
++					// use :scope instead of an ID.
++					if ( newContext !== context || isIE ) {
+ 
+ 						// Capture the context ID, setting it first if necessary
+ 						if ( ( nid = context.getAttribute( "id" ) ) ) {
+ 							nid = jQuery.escapeSelector( nid );
+ 						} else {
+-							context.setAttribute( "id", ( nid = expando ) );
++							context.setAttribute( "id", ( nid = jQuery.expando ) );
+ 						}
+ 					}
+ 
+@@ -259,7 +197,7 @@ function find( selector, context, results, seed ) {
+ 				} catch ( qsaError ) {
+ 					nonnativeSelectorCache( selector, true );
+ 				} finally {
+-					if ( nid === expando ) {
++					if ( nid === jQuery.expando ) {
+ 						context.removeAttribute( "id" );
+ 					}
+ 				}
+@@ -271,34 +209,12 @@ function find( selector, context, results, seed ) {
+ 	return select( selector.replace( rtrim, "$1" ), context, results, seed );
+ }
+ 
+-/**
+- * Create key-value caches of limited size
+- * @returns {function(string, object)} Returns the Object data after storing it on itself with
+- *	property name the (space-suffixed) string and (if the cache is larger than Expr.cacheLength)
+- *	deleting the oldest entry
+- */
+-function createCache() {
+-	var keys = [];
+-
+-	function cache( key, value ) {
+-
+-		// Use (key + " ") to avoid collision with native prototype properties (see Issue #157)
+-		if ( keys.push( key + " " ) > Expr.cacheLength ) {
+-
+-			// Only keep the most recent entries
+-			delete cache[ keys.shift() ];
+-		}
+-		return ( cache[ key + " " ] = value );
+-	}
+-	return cache;
+-}
+-
+ /**
+  * Mark a function for special use by jQuery selector module
+  * @param {Function} fn The function to mark
+  */
+ function markFunction( fn ) {
+-	fn[ expando ] = true;
++	fn[ jQuery.expando ] = true;
+ 	return fn;
+ }
+ 
+@@ -360,7 +276,6 @@ function createDisabledPseudo( disabled ) {
+ 				return elem.isDisabled === disabled ||
+ 
+ 					// Where there is no isDisabled, check manually
+-					/* jshint -W018 */
+ 					elem.isDisabled !== !disabled &&
+ 						inDisabledFieldset( elem ) === disabled;
+ 			}
+@@ -401,15 +316,6 @@ function createPositionalPseudo( fn ) {
+ 	} );
+ }
+ 
+-/**
+- * Checks a node for validity as a jQuery selector context
+- * @param {Element|Object=} context
+- * @returns {Element|Object|Boolean} The input node if acceptable, otherwise a falsy value
+- */
+-function testContext( context ) {
+-	return context && typeof context.getElementsByTagName !== "undefined" && context;
+-}
+-
+ /**
+  * Sets document-related variables once based on the current document
+  * @param {Element|Object} [node] An element or document object to use to set the document
+@@ -419,8 +325,8 @@ function setDocument( node ) {
+ 		doc = node ? node.ownerDocument || node : preferredDoc;
+ 
+ 	// Return early if doc is invalid or already selected
+-	// Support: IE 11+, Edge 17 - 18+
+-	// IE/Edge sometimes throw a "Permission denied" error when strict-comparing
++	// Support: IE 11+
++	// IE sometimes throws a "Permission denied" error when strict-comparing
+ 	// two documents; shallow comparisons work.
+ 	// eslint-disable-next-line eqeqeq
+ 	if ( doc == document || doc.nodeType !== 9 ) {
+@@ -432,16 +338,14 @@ function setDocument( node ) {
+ 	documentElement = document.documentElement;
+ 	documentIsHTML = !jQuery.isXMLDoc( document );
+ 
+-	// Support: IE 9 - 11+, Edge 12 - 18+
++	// Support: IE 9 - 11+
+ 	// Accessing iframe documents after unload throws "permission denied" errors (jQuery #13936)
+-	// Support: IE 11+, Edge 17 - 18+
+-	// IE/Edge sometimes throw a "Permission denied" error when strict-comparing
++	// Support: IE 11+
++	// IE sometimes throws a "Permission denied" error when strict-comparing
+ 	// two documents; shallow comparisons work.
+ 	// eslint-disable-next-line eqeqeq
+-	if ( preferredDoc != document &&
++	if ( isIE && preferredDoc != document &&
+ 		( subWindow = document.defaultView ) && subWindow.top !== subWindow ) {
+-
+-		// Support: IE 9 - 11+, Edge 12 - 18+
+ 		subWindow.addEventListener( "unload", unloadHandler );
+ 	}
+ }
+@@ -467,7 +371,7 @@ find.matchesSelector = function( elem, expr ) {
+ 	return find( expr, document, null, [ elem ] ).length > 0;
+ };
+ 
+-Expr = jQuery.expr = {
++jQuery.expr = {
+ 
+ 	// Can be adjusted by the user
+ 	cacheLength: 50,
+@@ -508,99 +412,18 @@ Expr = jQuery.expr = {
+ 		"~": { dir: "previousSibling" }
+ 	},
+ 
+-	preFilter: {
+-		ATTR: function( match ) {
+-			match[ 1 ] = match[ 1 ].replace( runescape, funescape );
+-
+-			// Move the given value to match[3] whether quoted or unquoted
+-			match[ 3 ] = ( match[ 3 ] || match[ 4 ] || match[ 5 ] || "" )
+-				.replace( runescape, funescape );
+-
+-			if ( match[ 2 ] === "~=" ) {
+-				match[ 3 ] = " " + match[ 3 ] + " ";
+-			}
+-
+-			return match.slice( 0, 4 );
+-		},
+-
+-		CHILD: function( match ) {
+-
+-			/* matches from matchExpr["CHILD"]
+-				1 type (only|nth|...)
+-				2 what (child|of-type)
+-				3 argument (even|odd|\d*|\d*n([+-]\d+)?|...)
+-				4 xn-component of xn+y argument ([+-]?\d*n|)
+-				5 sign of xn-component
+-				6 x of xn-component
+-				7 sign of y-component
+-				8 y of y-component
+-			*/
+-			match[ 1 ] = match[ 1 ].toLowerCase();
+-
+-			if ( match[ 1 ].slice( 0, 3 ) === "nth" ) {
+-
+-				// nth-* requires argument
+-				if ( !match[ 3 ] ) {
+-					selectorError( match[ 0 ] );
+-				}
+-
+-				// numeric x and y parameters for Expr.filter.CHILD
+-				// remember that false/true cast respectively to 0/1
+-				match[ 4 ] = +( match[ 4 ] ?
+-					match[ 5 ] + ( match[ 6 ] || 1 ) :
+-					2 * ( match[ 3 ] === "even" || match[ 3 ] === "odd" )
+-				);
+-				match[ 5 ] = +( ( match[ 7 ] + match[ 8 ] ) || match[ 3 ] === "odd" );
+-
+-			// other types prohibit arguments
+-			} else if ( match[ 3 ] ) {
+-				selectorError( match[ 0 ] );
+-			}
+-
+-			return match;
+-		},
+-
+-		PSEUDO: function( match ) {
+-			var excess,
+-				unquoted = !match[ 6 ] && match[ 2 ];
+-
+-			if ( matchExpr.CHILD.test( match[ 0 ] ) ) {
+-				return null;
+-			}
+-
+-			// Accept quoted arguments as-is
+-			if ( match[ 3 ] ) {
+-				match[ 2 ] = match[ 4 ] || match[ 5 ] || "";
+-
+-			// Strip excess characters from unquoted arguments
+-			} else if ( unquoted && rpseudo.test( unquoted ) &&
+-
+-				// Get excess from tokenize (recursively)
+-				( excess = tokenize( unquoted, true ) ) &&
+-
+-				// advance to the next closing parenthesis
+-				( excess = unquoted.indexOf( ")", unquoted.length - excess ) - unquoted.length ) ) {
+-
+-				// excess is a negative index
+-				match[ 0 ] = match[ 0 ].slice( 0, excess );
+-				match[ 2 ] = unquoted.slice( 0, excess );
+-			}
+-
+-			// Return only captures needed by the pseudo filter method (type and argument)
+-			return match.slice( 0, 3 );
+-		}
+-	},
++	preFilter: preFilter,
+ 
+ 	filter: {
+ 		ID: function( id ) {
+-			var attrId = id.replace( runescape, funescape );
++			var attrId = unescapeSelector( id );
+ 			return function( elem ) {
+ 				return elem.getAttribute( "id" ) === attrId;
+ 			};
+ 		},
+ 
+ 		TAG: function( nodeNameSelector ) {
+-			var expectedNodeName = nodeNameSelector.replace( runescape, funescape ).toLowerCase();
++			var expectedNodeName = unescapeSelector( nodeNameSelector ).toLowerCase();
+ 			return nodeNameSelector === "*" ?
+ 
+ 				function() {
+@@ -715,7 +538,8 @@ Expr = jQuery.expr = {
+ 						if ( forward && useCache ) {
+ 
+ 							// Seek `elem` from a previously-cached index
+-							outerCache = parent[ expando ] || ( parent[ expando ] = {} );
++							outerCache = parent[ jQuery.expando ] ||
++								( parent[ jQuery.expando ] = {} );
+ 							cache = outerCache[ type ] || [];
+ 							nodeIndex = cache[ 0 ] === dirruns && cache[ 1 ];
+ 							diff = nodeIndex && cache[ 2 ];
+@@ -737,7 +561,8 @@ Expr = jQuery.expr = {
+ 
+ 							// Use previously-cached element index if available
+ 							if ( useCache ) {
+-								outerCache = elem[ expando ] || ( elem[ expando ] = {} );
++								outerCache = elem[ jQuery.expando ] ||
++									( elem[ jQuery.expando ] = {} );
+ 								cache = outerCache[ type ] || [];
+ 								nodeIndex = cache[ 0 ] === dirruns && cache[ 1 ];
+ 								diff = nodeIndex;
+@@ -758,8 +583,8 @@ Expr = jQuery.expr = {
+ 
+ 										// Cache the index of each encountered element
+ 										if ( useCache ) {
+-											outerCache = node[ expando ] ||
+-												( node[ expando ] = {} );
++											outerCache = node[ jQuery.expando ] ||
++												( node[ jQuery.expando ] = {} );
+ 											outerCache[ type ] = [ dirruns, diff ];
+ 										}
+ 
+@@ -784,36 +609,25 @@ Expr = jQuery.expr = {
+ 			// https://www.w3.org/TR/selectors/#pseudo-classes
+ 			// Prioritize by case sensitivity in case custom pseudos are added with uppercase letters
+ 			// Remember that setFilters inherits from pseudos
+-			var args,
+-				fn = Expr.pseudos[ pseudo ] || Expr.setFilters[ pseudo.toLowerCase() ] ||
+-					selectorError( "unsupported pseudo: " + pseudo );
++			var builtin,
++				fn = jQuery.expr.pseudos[ pseudo ] ||
++				jQuery.expr.setFilters[ pseudo.toLowerCase() ] ||
++				selectorError( "unsupported pseudo: " + pseudo );
+ 
+ 			// The user may use createPseudo to indicate that
+ 			// arguments are needed to create the filter function
+ 			// just as jQuery does
+-			if ( fn[ expando ] ) {
+-				return fn( argument );
++			builtin = builtinPseudos[ pseudo ] === fn ||
++				builtinPseudos[ pseudo.toLowerCase() ] === fn;
++			if ( fn[ jQuery.expando ] ) {
++				fn = fn( argument );
+ 			}
+ 
+-			// But maintain support for old signatures
+-			if ( fn.length > 1 ) {
+-				args = [ pseudo, pseudo, "", argument ];
+-				return Expr.setFilters.hasOwnProperty( pseudo.toLowerCase() ) ?
+-					markFunction( function( seed, matches ) {
+-						var idx,
+-							matched = fn( seed, argument ),
+-							i = matched.length;
+-						while ( i-- ) {
+-							idx = indexOf.call( seed, matched[ i ] );
+-							seed[ idx ] = !( matches[ idx ] = matched[ i ] );
+-						}
+-					} ) :
+-					function( elem ) {
+-						return fn( elem, 0, args );
+-					};
+-			}
+-
+-			return fn;
++			// Internal matchers still carry context/XML or set state. Plugin
++			// element predicates receive only the public element argument.
++			return builtin || fn[ jQuery.expando ] ? fn : function( elem ) {
++				return fn( elem );
++			};
+ 		}
+ 	},
+ 
+@@ -829,7 +643,7 @@ Expr = jQuery.expr = {
+ 				results = [],
+ 				matcher = compile( selector.replace( rtrim, "$1" ) );
+ 
+-			return matcher[ expando ] ?
++			return matcher[ jQuery.expando ] ?
+ 				markFunction( function( seed, matches, _context, xml ) {
+ 					var elem,
+ 						unmatched = matcher( seed, null, xml, [] ),
+@@ -859,7 +673,7 @@ Expr = jQuery.expr = {
+ 		} ),
+ 
+ 		contains: markFunction( function( text ) {
+-			text = text.replace( runescape, funescape );
++			text = unescapeSelector( text );
+ 			return function( elem ) {
+ 				return ( elem.textContent || jQuery.text( elem ) ).indexOf( text ) > -1;
+ 			};
+@@ -878,7 +692,7 @@ Expr = jQuery.expr = {
+ 			if ( !ridentifier.test( lang || "" ) ) {
+ 				selectorError( "unsupported lang: " + lang );
+ 			}
+-			lang = lang.replace( runescape, funescape ).toLowerCase();
++			lang = unescapeSelector( lang ).toLowerCase();
+ 			return function( elem ) {
+ 				var elemLang;
+ 				do {
+@@ -928,7 +742,7 @@ Expr = jQuery.expr = {
+ 			// Accessing the selectedIndex property
+ 			// forces the browser to treat the default option as
+ 			// selected when in an optgroup.
+-			if ( elem.parentNode ) {
++			if ( isIE && elem.parentNode ) {
+ 				// eslint-disable-next-line no-unused-expressions
+ 				elem.parentNode.selectedIndex;
+ 			}
+@@ -952,7 +766,7 @@ Expr = jQuery.expr = {
+ 		},
+ 
+ 		parent: function( elem ) {
+-			return !Expr.pseudos.empty( elem );
++			return !jQuery.expr.pseudos.empty( elem );
+ 		},
+ 
+ 		// Element/input types
+@@ -1029,102 +843,22 @@ Expr = jQuery.expr = {
+ 	}
+ };
+ 
+-Expr.pseudos.nth = Expr.pseudos.eq;
++jQuery.expr.pseudos.nth = jQuery.expr.pseudos.eq;
+ 
+ // Add button/input type pseudos
+ for ( i in { radio: true, checkbox: true, file: true, password: true, image: true } ) {
+-	Expr.pseudos[ i ] = createInputPseudo( i );
++	jQuery.expr.pseudos[ i ] = createInputPseudo( i );
+ }
+ for ( i in { submit: true, reset: true } ) {
+-	Expr.pseudos[ i ] = createButtonPseudo( i );
++	jQuery.expr.pseudos[ i ] = createButtonPseudo( i );
+ }
+ 
++builtinPseudos = jQuery.extend( {}, jQuery.expr.pseudos );
++
+ // Easy API for creating new setFilters
+ function setFilters() {}
+-setFilters.prototype = Expr.filters = Expr.pseudos;
+-Expr.setFilters = new setFilters();
+-
+-function tokenize( selector, parseOnly ) {
+-	var matched, match, tokens, type,
+-		soFar, groups, preFilters,
+-		cached = tokenCache[ selector + " " ];
+-
+-	if ( cached ) {
+-		return parseOnly ? 0 : cached.slice( 0 );
+-	}
+-
+-	soFar = selector;
+-	groups = [];
+-	preFilters = Expr.preFilter;
+-
+-	while ( soFar ) {
+-
+-		// Comma and first run
+-		if ( !matched || ( match = rcomma.exec( soFar ) ) ) {
+-			if ( match ) {
+-
+-				// Don't consume trailing commas as valid
+-				soFar = soFar.slice( match[ 0 ].length ) || soFar;
+-			}
+-			groups.push( ( tokens = [] ) );
+-		}
+-
+-		matched = false;
+-
+-		// Combinators
+-		if ( ( match = rcombinators.exec( soFar ) ) ) {
+-			matched = match.shift();
+-			tokens.push( {
+-				value: matched,
+-
+-				// Cast descendant combinators to space
+-				type: match[ 0 ].replace( rtrim, " " )
+-			} );
+-			soFar = soFar.slice( matched.length );
+-		}
+-
+-		// Filters
+-		for ( type in Expr.filter ) {
+-			if ( ( match = matchExpr[ type ].exec( soFar ) ) && ( !preFilters[ type ] ||
+-				( match = preFilters[ type ]( match ) ) ) ) {
+-				matched = match.shift();
+-				tokens.push( {
+-					value: matched,
+-					type: type,
+-					matches: match
+-				} );
+-				soFar = soFar.slice( matched.length );
+-			}
+-		}
+-
+-		if ( !matched ) {
+-			break;
+-		}
+-	}
+-
+-	// Return the length of the invalid excess
+-	// if we're just parsing
+-	// Otherwise, throw an error or return tokens
+-	if ( parseOnly ) {
+-		return soFar.length;
+-	}
+-
+-	return soFar ?
+-		selectorError( selector ) :
+-
+-		// Cache the tokens
+-		tokenCache( selector, groups ).slice( 0 );
+-}
+-
+-function toSelector( tokens ) {
+-	var i = 0,
+-		len = tokens.length,
+-		selector = "";
+-	for ( ; i < len; i++ ) {
+-		selector += tokens[ i ].value;
+-	}
+-	return selector;
+-}
++setFilters.prototype = jQuery.expr.filters = jQuery.expr.pseudos;
++jQuery.expr.setFilters = new setFilters();
+ 
+ function addCombinator( matcher, combinator, base ) {
+ 	var dir = combinator.dir,
+@@ -1162,7 +896,7 @@ function addCombinator( matcher, combinator, base ) {
+ 			} else {
+ 				while ( ( elem = elem[ dir ] ) ) {
+ 					if ( elem.nodeType === 1 || checkNonElements ) {
+-						outerCache = elem[ expando ] || ( elem[ expando ] = {} );
++						outerCache = elem[ jQuery.expando ] || ( elem[ jQuery.expando ] = {} );
+ 
+ 						if ( skip && nodeName( elem, skip ) ) {
+ 							elem = elem[ dir ] || elem;
+@@ -1233,10 +967,10 @@ function condense( unmatched, map, filter, context, xml ) {
+ }
+ 
+ function setMatcher( preFilter, selector, matcher, postFilter, postFinder, postSelector ) {
+-	if ( postFilter && !postFilter[ expando ] ) {
++	if ( postFilter && !postFilter[ jQuery.expando ] ) {
+ 		postFilter = setMatcher( postFilter );
+ 	}
+-	if ( postFinder && !postFinder[ expando ] ) {
++	if ( postFinder && !postFinder[ jQuery.expando ] ) {
+ 		postFinder = setMatcher( postFinder, postSelector );
+ 	}
+ 	return markFunction( function( seed, results, context, xml ) {
+@@ -1334,8 +1068,8 @@ function setMatcher( preFilter, selector, matcher, postFilter, postFinder, postS
+ function matcherFromTokens( tokens ) {
+ 	var checkContext, matcher, j,
+ 		len = tokens.length,
+-		leadingRelative = Expr.relative[ tokens[ 0 ].type ],
+-		implicitRelative = leadingRelative || Expr.relative[ " " ],
++		leadingRelative = jQuery.expr.relative[ tokens[ 0 ].type ],
++		implicitRelative = leadingRelative || jQuery.expr.relative[ " " ],
+ 		i = leadingRelative ? 1 : 0,
+ 
+ 		// The foundational matcher ensures that elements are reachable from top-level context(s)
+@@ -1357,18 +1091,18 @@ function matcherFromTokens( tokens ) {
+ 		} ];
+ 
+ 	for ( ; i < len; i++ ) {
+-		if ( ( matcher = Expr.relative[ tokens[ i ].type ] ) ) {
++		if ( ( matcher = jQuery.expr.relative[ tokens[ i ].type ] ) ) {
+ 			matchers = [ addCombinator( elementMatcher( matchers ), matcher ) ];
+ 		} else {
+-			matcher = Expr.filter[ tokens[ i ].type ].apply( null, tokens[ i ].matches );
++			matcher = jQuery.expr.filter[ tokens[ i ].type ].apply( null, tokens[ i ].matches );
+ 
+ 			// Return special upon seeing a positional matcher
+-			if ( matcher[ expando ] ) {
++			if ( matcher[ jQuery.expando ] ) {
+ 
+ 				// Find the next relative operator (if any) for proper handling
+ 				j = ++i;
+ 				for ( ; j < len; j++ ) {
+-					if ( Expr.relative[ tokens[ j ].type ] ) {
++					if ( jQuery.expr.relative[ tokens[ j ].type ] ) {
+ 						break;
+ 					}
+ 				}
+@@ -1405,15 +1139,15 @@ function matcherFromGroupMatchers( elementMatchers, setMatchers ) {
+ 				contextBackup = outermostContext,
+ 
+ 				// We must always have either seed elements or outermost context
+-				elems = seed || byElement && Expr.find.TAG( "*", outermost ),
++				elems = seed || byElement && jQuery.expr.find.TAG( "*", outermost ),
+ 
+ 				// Use integer dirruns iff this is the outermost matcher
+ 				dirrunsUnique = ( dirruns += contextBackup == null ? 1 : Math.random() || 0.1 );
+ 
+ 			if ( outermost ) {
+ 
+-				// Support: IE 11+, Edge 17 - 18+
+-				// IE/Edge sometimes throw a "Permission denied" error when strict-comparing
++				// Support: IE 11+
++				// IE sometimes throws a "Permission denied" error when strict-comparing
+ 				// two documents; shallow comparisons work.
+ 				// eslint-disable-next-line eqeqeq
+ 				outermostContext = context == document || context || outermost;
+@@ -1424,8 +1158,8 @@ function matcherFromGroupMatchers( elementMatchers, setMatchers ) {
+ 				if ( byElement && elem ) {
+ 					j = 0;
+ 
+-					// Support: IE 11+, Edge 17 - 18+
+-					// IE/Edge sometimes throw a "Permission denied" error when strict-comparing
++					// Support: IE 11+
++					// IE sometimes throws a "Permission denied" error when strict-comparing
+ 					// two documents; shallow comparisons work.
+ 					// eslint-disable-next-line eqeqeq
+ 					if ( !context && elem.ownerDocument != document ) {
+@@ -1530,7 +1264,7 @@ function compile( selector, match /* Internal Use Only */ ) {
+ 		i = match.length;
+ 		while ( i-- ) {
+ 			cached = matcherFromTokens( match[ i ] );
+-			if ( cached[ expando ] ) {
++			if ( cached[ jQuery.expando ] ) {
+ 				setMatchers.push( cached );
+ 			} else {
+ 				elementMatchers.push( cached );
+@@ -1570,10 +1304,11 @@ function select( selector, context, results, seed ) {
+ 		// Reduce context if the leading compound selector is an ID
+ 		tokens = match[ 0 ] = match[ 0 ].slice( 0 );
+ 		if ( tokens.length > 2 && ( token = tokens[ 0 ] ).type === "ID" &&
+-				context.nodeType === 9 && documentIsHTML && Expr.relative[ tokens[ 1 ].type ] ) {
++				context.nodeType === 9 && documentIsHTML &&
++				jQuery.expr.relative[ tokens[ 1 ].type ] ) {
+ 
+-			context = ( Expr.find.ID(
+-				token.matches[ 0 ].replace( runescape, funescape ),
++			context = ( jQuery.expr.find.ID(
++				unescapeSelector( token.matches[ 0 ] ),
+ 				context
+ 			) || [] )[ 0 ];
+ 			if ( !context ) {
+@@ -1593,14 +1328,14 @@ function select( selector, context, results, seed ) {
+ 			token = tokens[ i ];
+ 
+ 			// Abort if we hit a combinator
+-			if ( Expr.relative[ ( type = token.type ) ] ) {
++			if ( jQuery.expr.relative[ ( type = token.type ) ] ) {
+ 				break;
+ 			}
+-			if ( ( find = Expr.find[ type ] ) ) {
++			if ( ( find = jQuery.expr.find[ type ] ) ) {
+ 
+ 				// Search, expanding context for leading sibling combinators
+ 				if ( ( seed = find(
+-					token.matches[ 0 ].replace( runescape, funescape ),
++					unescapeSelector( token.matches[ 0 ] ),
+ 					rsibling.test( tokens[ 0 ].type ) &&
+ 						testContext( context.parentNode ) || context
+ 				) ) ) {
+@@ -1637,3 +1372,5 @@ setDocument();
+ jQuery.find = find;
+ 
+ } )();
++
++export { jQuery, jQuery as $ };
+diff --git a/src/selector/contains.js b/src/selector/contains.js
+deleted file mode 100644
+index a62b97a..0000000
+--- a/src/selector/contains.js
++++ /dev/null
+@@ -1,16 +0,0 @@
+-import jQuery from "../core.js";
+-
+-// Note: an element does not contain itself
+-jQuery.contains = function( a, b ) {
+-	var adown = a.nodeType === 9 ? a.documentElement : a,
+-		bup = b && b.parentNode;
+-
+-	return a === bup || !!( bup && bup.nodeType === 1 && (
+-
+-		// Support: IE 9 - 11+
+-		// IE doesn't have `contains` on SVG.
+-		adown.contains ?
+-			adown.contains( bup ) :
+-			a.compareDocumentPosition && a.compareDocumentPosition( bup ) & 16
+-	) );
+-};
+diff --git a/src/selector/createCache.js b/src/selector/createCache.js
+new file mode 100644
+index 0000000..d46985f
+--- /dev/null
++++ b/src/selector/createCache.js
+@@ -0,0 +1,24 @@
++import { jQuery } from "../core.js";
++
++/**
++ * Create key-value caches of limited size
++ * @returns {function(string, object)} Returns the Object data after storing it on itself with
++ *	property name the (space-suffixed) string and (if the cache is larger than Expr.cacheLength)
++ *	deleting the oldest entry
++ */
++export function createCache() {
++	var keys = [];
++
++	function cache( key, value ) {
++
++		// Use (key + " ") to avoid collision with native prototype properties
++		// (see https://github.com/jquery/sizzle/issues/157)
++		if ( keys.push( key + " " ) > jQuery.expr.cacheLength ) {
++
++			// Only keep the most recent entries
++			delete cache[ keys.shift() ];
++		}
++		return ( cache[ key + " " ] = value );
++	}
++	return cache;
++}
+diff --git a/src/selector/escapeSelector.js b/src/selector/escapeSelector.js
+index bc61355..18c6591 100644
+--- a/src/selector/escapeSelector.js
++++ b/src/selector/escapeSelector.js
+@@ -1,4 +1,4 @@
+-import jQuery from "../core.js";
++import { jQuery } from "../core.js";
+ 
+ // CSS string/identifier serialization
+ // https://drafts.csswg.org/cssom/#common-serializing-idioms
+diff --git a/src/selector/filterMatchExpr.js b/src/selector/filterMatchExpr.js
+new file mode 100644
+index 0000000..65675bd
+--- /dev/null
++++ b/src/selector/filterMatchExpr.js
+@@ -0,0 +1,16 @@
++import { whitespace } from "../var/whitespace.js";
++import { identifier } from "./var/identifier.js";
++import { attributes } from "./var/attributes.js";
++import { pseudos } from "./var/pseudos.js";
++
++export var filterMatchExpr = {
++	ID: new RegExp( "^#(" + identifier + ")" ),
++	CLASS: new RegExp( "^\\.(" + identifier + ")" ),
++	TAG: new RegExp( "^(" + identifier + "|[*])" ),
++	ATTR: new RegExp( "^" + attributes ),
++	PSEUDO: new RegExp( "^" + pseudos ),
++	CHILD: new RegExp(
++		"^:(only|first|last|nth|nth-last)-(child|of-type)(?:\\(" +
++		whitespace + "*(even|odd|(([+-]|)(\\d*)n|)" + whitespace + "*(?:([+-]|)" +
++		whitespace + "*(\\d+)|))" + whitespace + "*\\)|)", "i" )
++};
+diff --git a/src/selector/preFilter.js b/src/selector/preFilter.js
+new file mode 100644
+index 0000000..c6a9cdf
+--- /dev/null
++++ b/src/selector/preFilter.js
+@@ -0,0 +1,88 @@
++import { rpseudo } from "./var/rpseudo.js";
++import { filterMatchExpr } from "./filterMatchExpr.js";
++import { unescapeSelector } from "./unescapeSelector.js";
++import { selectorError } from "./selectorError.js";
++import { tokenize } from "./tokenize.js";
++
++export var preFilter = {
++	ATTR: function( match ) {
++		match[ 1 ] = unescapeSelector( match[ 1 ] );
++
++		// Move the given value to match[3] whether quoted or unquoted
++		match[ 3 ] = unescapeSelector( match[ 3 ] || match[ 4 ] || match[ 5 ] || "" );
++
++		if ( match[ 2 ] === "~=" ) {
++			match[ 3 ] = " " + match[ 3 ] + " ";
++		}
++
++		return match.slice( 0, 4 );
++	},
++
++	CHILD: function( match ) {
++
++		/* matches from filterMatchExpr["CHILD"]
++			1 type (only|nth|...)
++			2 what (child|of-type)
++			3 argument (even|odd|\d*|\d*n([+-]\d+)?|...)
++			4 xn-component of xn+y argument ([+-]?\d*n|)
++			5 sign of xn-component
++			6 x of xn-component
++			7 sign of y-component
++			8 y of y-component
++		*/
++		match[ 1 ] = match[ 1 ].toLowerCase();
++
++		if ( match[ 1 ].slice( 0, 3 ) === "nth" ) {
++
++			// nth-* requires argument
++			if ( !match[ 3 ] ) {
++				selectorError( match[ 0 ] );
++			}
++
++			// numeric x and y parameters for jQuery.expr.filter.CHILD
++			// remember that false/true cast respectively to 0/1
++			match[ 4 ] = +( match[ 4 ] ?
++				match[ 5 ] + ( match[ 6 ] || 1 ) :
++				2 * ( match[ 3 ] === "even" || match[ 3 ] === "odd" )
++			);
++			match[ 5 ] = +( ( match[ 7 ] + match[ 8 ] ) || match[ 3 ] === "odd" );
++
++		// other types prohibit arguments
++		} else if ( match[ 3 ] ) {
++			selectorError( match[ 0 ] );
++		}
++
++		return match;
++	},
++
++	PSEUDO: function( match ) {
++		var excess,
++			unquoted = !match[ 6 ] && match[ 2 ];
++
++		if ( filterMatchExpr.CHILD.test( match[ 0 ] ) ) {
++			return null;
++		}
++
++		// Accept quoted arguments as-is
++		if ( match[ 3 ] ) {
++			match[ 2 ] = match[ 4 ] || match[ 5 ] || "";
++
++		// Strip excess characters from unquoted arguments
++		} else if ( unquoted && rpseudo.test( unquoted ) &&
++
++			// Get excess from tokenize (recursively)
++			( excess = tokenize( unquoted, true ) ) &&
++
++			// advance to the next closing parenthesis
++			( excess = unquoted.indexOf( ")", unquoted.length - excess ) -
++				unquoted.length ) ) {
++
++			// excess is a negative index
++			match[ 0 ] = match[ 0 ].slice( 0, excess );
++			match[ 2 ] = unquoted.slice( 0, excess );
++		}
++
++		// Return only captures needed by the pseudo filter method (type and argument)
++		return match.slice( 0, 3 );
++	}
++};
+diff --git a/src/selector/rbuggyQSA.js b/src/selector/rbuggyQSA.js
+index e9ebbb3..7e4632c 100644
+--- a/src/selector/rbuggyQSA.js
++++ b/src/selector/rbuggyQSA.js
+@@ -1,29 +1,35 @@
+-import document from "../var/document.js";
+-import isIE from "../var/isIE.js";
+-import whitespace from "./var/whitespace.js";
++import { isIE } from "../var/isIE.js";
++import { whitespace } from "../var/whitespace.js";
++import { support } from "./support.js";
+ 
+-var rbuggyQSA = [],
+-	testEl = document.createElement( "div" ),
+-	input = document.createElement( "input" );
++export var rbuggyQSA = [];
+ 
+-// Support: IE 9 - 11+
+-// IE's :disabled selector does not pick up the children of disabled fieldsets
+ if ( isIE ) {
+-	rbuggyQSA.push( ":enabled", ":disabled" );
++	rbuggyQSA.push(
++
++		// Support: IE 9 - 11+
++		// IE's :disabled selector does not pick up the children of disabled fieldsets
++		":enabled",
++		":disabled",
++
++		// Support: IE 11+
++		// IE 11 doesn't find elements on a `[name='']` query in some cases.
++		// Adding a temporary attribute to the document before the selection works
++		// around the issue.
++		"\\[" + whitespace + "*name" + whitespace + "*=" +
++			whitespace + "*(?:''|\"\")"
++	);
+ }
+ 
+-// Support: IE 11+, Edge 15 - 18+
+-// IE 11/Edge don't find elements on a `[name='']` query in some cases.
+-// Adding a temporary attribute to the document before the selection works
+-// around the issue.
+-// Interestingly, IE 10 & older don't seem to have the issue.
+-input.setAttribute( "name", "" );
+-testEl.appendChild( input );
+-if ( !testEl.querySelectorAll( "[name='']" ).length ) {
+-	rbuggyQSA.push( "\\[" + whitespace + "*name" + whitespace + "*=" +
+-		whitespace + "*(?:''|\"\")" );
++if ( !support.cssHas ) {
++
++	// Support: Chrome 105 - 110+, Safari 15.4 - 16.3+
++	// Our regular `try-catch` mechanism fails to detect natively-unsupported
++	// pseudo-classes inside `:has()` (such as `:has(:contains("Foo"))`)
++	// in browsers that parse the `:has()` argument as a forgiving selector list.
++	// https://drafts.csswg.org/selectors/#relational now requires the argument
++	// to be parsed unforgivingly, but browsers have not yet fully adjusted.
++	rbuggyQSA.push( ":has" );
+ }
+ 
+ rbuggyQSA = rbuggyQSA.length && new RegExp( rbuggyQSA.join( "|" ) );
+-
+-export default rbuggyQSA;
+diff --git a/src/selector/selectorError.js b/src/selector/selectorError.js
+new file mode 100644
+index 0000000..69770ec
+--- /dev/null
++++ b/src/selector/selectorError.js
+@@ -0,0 +1,3 @@
++export function selectorError( msg ) {
++	throw new Error( "Syntax error, unrecognized expression: " + msg );
++}
+diff --git a/src/selector/support.js b/src/selector/support.js
+index cc584bf..0c75387 100644
+--- a/src/selector/support.js
++++ b/src/selector/support.js
+@@ -1,11 +1,20 @@
+-import document from "../var/document.js";
+-import support from "../var/support.js";
++import { document } from "../var/document.js";
++import { support } from "../var/support.js";
+ 
+-// Support: IE 9 - 11+, Edge 12 - 18+
+-// IE/Edge don't support the :scope pseudo-class.
++// Support: Chrome 105 - 110+, Safari 15.4 - 16.3+
++// Make sure the the `:has()` argument is parsed unforgivingly.
++// We include `*` in the test to detect buggy implementations that are
++// _selectively_ forgiving (specifically when the list includes at least
++// one valid selector).
++// Note that we treat complete lack of support for `:has()` as if it were
++// spec-compliant support, which is fine because use of `:has()` in such
++// environments will fail in the qSA path and fall back to jQuery traversal
++// anyway.
+ try {
+-	document.querySelectorAll( ":scope" );
+-	support.scope = true;
+-} catch ( e ) {}
++	document.querySelector( ":has(*,:jqfake)" );
++	support.cssHas = false;
++} catch ( e ) {
++	support.cssHas = true;
++}
+ 
+-export default support;
++export { support };
+diff --git a/src/selector/testContext.js b/src/selector/testContext.js
+new file mode 100644
+index 0000000..cb37629
+--- /dev/null
++++ b/src/selector/testContext.js
+@@ -0,0 +1,8 @@
++/**
++ * Checks a node for validity as a jQuery selector context
++ * @param {Element|Object=} context
++ * @returns {Element|Object|Boolean} The input node if acceptable, otherwise a falsy value
++ */
++export function testContext( context ) {
++	return context && typeof context.getElementsByTagName !== "undefined" && context;
++}
+diff --git a/src/selector/toSelector.js b/src/selector/toSelector.js
+new file mode 100644
+index 0000000..71cdebc
+--- /dev/null
++++ b/src/selector/toSelector.js
+@@ -0,0 +1,9 @@
++export function toSelector( tokens ) {
++	var i = 0,
++		len = tokens.length,
++		selector = "";
++	for ( ; i < len; i++ ) {
++		selector += tokens[ i ].value;
++	}
++	return selector;
++}
+diff --git a/src/selector/tokenize.js b/src/selector/tokenize.js
+new file mode 100644
+index 0000000..3c1e06c
+--- /dev/null
++++ b/src/selector/tokenize.js
+@@ -0,0 +1,81 @@
++import { jQuery } from "../core.js";
++import { rcomma } from "./var/rcomma.js";
++import { rleadingCombinator } from "./var/rleadingCombinator.js";
++import { rtrim } from "../var/rtrim.js";
++import { createCache } from "./createCache.js";
++import { selectorError } from "./selectorError.js";
++import { filterMatchExpr } from "./filterMatchExpr.js";
++
++var tokenCache = createCache();
++
++export function tokenize( selector, parseOnly ) {
++	var matched, match, tokens, type,
++		soFar, groups, preFilters,
++		cached = tokenCache[ selector + " " ];
++
++	if ( cached ) {
++		return parseOnly ? 0 : cached.slice( 0 );
++	}
++
++	soFar = selector;
++	groups = [];
++	preFilters = jQuery.expr.preFilter;
++
++	while ( soFar ) {
++
++		// Comma and first run
++		if ( !matched || ( match = rcomma.exec( soFar ) ) ) {
++			if ( match ) {
++
++				// Don't consume trailing commas as valid
++				soFar = soFar.slice( match[ 0 ].length ) || soFar;
++			}
++			groups.push( ( tokens = [] ) );
++		}
++
++		matched = false;
++
++		// Combinators
++		if ( ( match = rleadingCombinator.exec( soFar ) ) ) {
++			matched = match.shift();
++			tokens.push( {
++				value: matched,
++
++				// Cast descendant combinators to space
++				type: match[ 0 ].replace( rtrim, " " )
++			} );
++			soFar = soFar.slice( matched.length );
++		}
++
++		// Filters
++		for ( type in filterMatchExpr ) {
++			if ( ( match = jQuery.expr.match[ type ].exec( soFar ) ) && ( !preFilters[ type ] ||
++				( match = preFilters[ type ]( match ) ) ) ) {
++				matched = match.shift();
++				tokens.push( {
++					value: matched,
++					type: type,
++					matches: match
++				} );
++				soFar = soFar.slice( matched.length );
++			}
++		}
++
++		if ( !matched ) {
++			break;
++		}
++	}
++
++	// Return the length of the invalid excess
++	// if we're just parsing
++	// Otherwise, throw an error or return tokens
++	if ( parseOnly ) {
++		return soFar.length;
++	}
++
++	return soFar ?
++		selectorError( selector ) :
++
++		// Cache the tokens
++		tokenCache( selector, groups ).slice( 0 );
++}
+diff --git a/src/selector/unescapeSelector.js b/src/selector/unescapeSelector.js
+new file mode 100644
+index 0000000..05c1d9e
+--- /dev/null
++++ b/src/selector/unescapeSelector.js
+@@ -0,0 +1,27 @@
++// CSS escapes
++// https://www.w3.org/TR/CSS21/syndata.html#escaped-characters
++import { whitespace } from "../var/whitespace.js";
++
++var runescape = new RegExp( "\\\\[\\da-fA-F]{1,6}" + whitespace +
++	"?|\\\\([^\\r\\n\\f])", "g" ),
++	funescape = function( escape, nonHex ) {
++		var high = "0x" + escape.slice( 1 ) - 0x10000;
++
++		if ( nonHex ) {
++
++			// Strip the backslash prefix from a non-hex escape sequence
++			return nonHex;
++		}
++
++		// Replace a hexadecimal escape sequence with the encoded Unicode code point
++		// Support: IE <=11+
++		// For values outside the Basic Multilingual Plane (BMP), manually construct a
++		// surrogate pair
++		return high < 0 ?
++			String.fromCharCode( high + 0x10000 ) :
++			String.fromCharCode( high >> 10 | 0xD800, high & 0x3FF | 0xDC00 );
++	};
++
++export function unescapeSelector( sel ) {
++	return sel.replace( runescape, funescape );
++}
+diff --git a/src/selector/uniqueSort.js b/src/selector/uniqueSort.js
+index d0bf691..0a66a6c 100644
+--- a/src/selector/uniqueSort.js
++++ b/src/selector/uniqueSort.js
+@@ -1,15 +1,14 @@
+-import jQuery from "../core.js";
+-import document from "../var/document.js";
+-import sort from "../var/sort.js";
+-
+-var hasDuplicate;
++import { jQuery } from "../core.js";
++import { document } from "../var/document.js";
++import { sort } from "../var/sort.js";
++import { splice } from "../var/splice.js";
++import { slice } from "../var/slice.js";
+ 
+ // Document order sorting
+ function sortOrder( a, b ) {
+ 
+ 	// Flag for duplicate removal
+ 	if ( a === b ) {
+-		hasDuplicate = true;
+ 		return 0;
+ 	}
+ 
+@@ -20,8 +19,8 @@ function sortOrder( a, b ) {
+ 	}
+ 
+ 	// Calculate position if both inputs belong to the same document
+-	// Support: IE 11+, Edge 17 - 18+
+-	// IE/Edge sometimes throw a "Permission denied" error when strict-comparing
++	// Support: IE 11+
++	// IE sometimes throws a "Permission denied" error when strict-comparing
+ 	// two documents; shallow comparisons work.
+ 	// eslint-disable-next-line eqeqeq
+ 	compare = ( a.ownerDocument || a ) == ( b.ownerDocument || b ) ?
+@@ -34,8 +33,8 @@ function sortOrder( a, b ) {
+ 	if ( compare & 1 ) {
+ 
+ 		// Choose the first element that is related to the document
+-		// Support: IE 11+, Edge 17 - 18+
+-		// IE/Edge sometimes throw a "Permission denied" error when strict-comparing
++		// Support: IE 11+
++		// IE sometimes throws a "Permission denied" error when strict-comparing
+ 		// two documents; shallow comparisons work.
+ 		// eslint-disable-next-line eqeqeq
+ 		if ( a == document || a.ownerDocument == document &&
+@@ -43,8 +42,8 @@ function sortOrder( a, b ) {
+ 			return -1;
+ 		}
+ 
+-		// Support: IE 11+, Edge 17 - 18+
+-		// IE/Edge sometimes throw a "Permission denied" error when strict-comparing
++		// Support: IE 11+
++		// IE sometimes throws a "Permission denied" error when strict-comparing
+ 		// two documents; shallow comparisons work.
+ 		// eslint-disable-next-line eqeqeq
+ 		if ( b == document || b.ownerDocument == document &&
+@@ -69,20 +68,23 @@ jQuery.uniqueSort = function( results ) {
+ 		j = 0,
+ 		i = 0;
+ 
+-	hasDuplicate = false;
+-
+ 	sort.call( results, sortOrder );
+ 
+-	if ( hasDuplicate ) {
+-		while ( ( elem = results[ i++ ] ) ) {
+-			if ( elem === results[ i ] ) {
+-				j = duplicates.push( i );
+-			}
+-		}
+-		while ( j-- ) {
+-			results.splice( duplicates[ j ], 1 );
++	// Stable native sort need not compare equal disconnected nodes with one
++	// another. Remove repeated identities even when they remain nonadjacent.
++	while ( ( elem = results[ i ] ) ) {
++		if ( jQuery.inArray( elem, results ) !== i ) {
++			j = duplicates.push( i );
+ 		}
++		i++;
++	}
++	while ( j-- ) {
++		splice.call( results, duplicates[ j ], 1 );
+ 	}
+ 
+ 	return results;
+ };
++
++jQuery.fn.uniqueSort = function() {
++	return this.pushStack( jQuery.uniqueSort( slice.apply( this ) ) );
++};
+diff --git a/src/selector/var/attributes.js b/src/selector/var/attributes.js
+new file mode 100644
+index 0000000..33ba1ac
+--- /dev/null
++++ b/src/selector/var/attributes.js
+@@ -0,0 +1,12 @@
++import { whitespace } from "../../var/whitespace.js";
++import { identifier } from "./identifier.js";
++
++// Attribute selectors: https://www.w3.org/TR/selectors/#attribute-selectors
++export var attributes = "\\[" + whitespace + "*(" + identifier + ")(?:" + whitespace +
++
++	// Operator (capture 2)
++	"*([*^$|!~]?=)" + whitespace +
++
++	// "Attribute values must be CSS identifiers [capture 5] or strings [capture 3 or capture 4]"
++	"*(?:'((?:\\\\.|[^\\\\'])*)'|\"((?:\\\\.|[^\\\\\"])*)\"|(" + identifier + "))|)" +
++	whitespace + "*\\]";
+diff --git a/src/selector/var/booleans.js b/src/selector/var/booleans.js
+new file mode 100644
+index 0000000..bbdc4fd
+--- /dev/null
++++ b/src/selector/var/booleans.js
+@@ -0,0 +1,2 @@
++export var booleans = "checked|selected|async|autofocus|autoplay|controls|" +
++	"defer|disabled|hidden|ismap|loop|multiple|open|readonly|required|scoped";
+diff --git a/src/selector/var/identifier.js b/src/selector/var/identifier.js
+new file mode 100644
+index 0000000..d7e77ca
+--- /dev/null
++++ b/src/selector/var/identifier.js
+@@ -0,0 +1,5 @@
++import { whitespace } from "../../var/whitespace.js";
++
++// https://www.w3.org/TR/css-syntax-3/#ident-token-diagram
++export var identifier = "(?:\\\\[\\da-fA-F]{1,6}" + whitespace +
++	"?|\\\\[^\\r\\n\\f]|[\\w-]|[^\0-\\x7f])+";
+diff --git a/src/selector/var/matches.js b/src/selector/var/matches.js
+new file mode 100644
+index 0000000..3d87db3
+--- /dev/null
++++ b/src/selector/var/matches.js
+@@ -0,0 +1,5 @@
++import { documentElement } from "../../var/documentElement.js";
++
++// Support: IE 9 - 11+
++// IE requires a prefix.
++export var matches = documentElement.matches || documentElement.msMatchesSelector;
+diff --git a/src/selector/var/pseudos.js b/src/selector/var/pseudos.js
+new file mode 100644
+index 0000000..64fde1d
+--- /dev/null
++++ b/src/selector/var/pseudos.js
+@@ -0,0 +1,15 @@
++import { identifier } from "./identifier.js";
++import { attributes } from "./attributes.js";
++
++export var pseudos = ":(" + identifier + ")(?:\\((" +
++
++	// To reduce the number of selectors needing tokenize in the preFilter, prefer arguments:
++	// 1. quoted (capture 3; capture 4 or capture 5)
++	"('((?:\\\\.|[^\\\\'])*)'|\"((?:\\\\.|[^\\\\\"])*)\")|" +
++
++	// 2. simple (capture 6)
++	"((?:\\\\.|[^\\\\()[\\]]|" + attributes + ")*)|" +
++
++	// 3. anything else (capture 2)
++	".*" +
++	")\\)|)";
+diff --git a/src/selector/var/rcomma.js b/src/selector/var/rcomma.js
+new file mode 100644
+index 0000000..acb6516
+--- /dev/null
++++ b/src/selector/var/rcomma.js
+@@ -0,0 +1,3 @@
++import { whitespace } from "../../var/whitespace.js";
++
++export var rcomma = new RegExp( "^" + whitespace + "*," + whitespace + "*" );
+diff --git a/src/selector/var/rdescend.js b/src/selector/var/rdescend.js
+new file mode 100644
+index 0000000..6a4cd88
+--- /dev/null
++++ b/src/selector/var/rdescend.js
+@@ -0,0 +1,3 @@
++import { whitespace } from "../../var/whitespace.js";
++
++export var rdescend = new RegExp( whitespace + "|>" );
+diff --git a/src/selector/var/rleadingCombinator.js b/src/selector/var/rleadingCombinator.js
+new file mode 100644
+index 0000000..c620dc9
+--- /dev/null
++++ b/src/selector/var/rleadingCombinator.js
+@@ -0,0 +1,4 @@
++import { whitespace } from "../../var/whitespace.js";
++
++export var rleadingCombinator = new RegExp( "^" + whitespace + "*([>+~]|" +
++	whitespace + ")" + whitespace + "*" );
+diff --git a/src/selector/var/rpseudo.js b/src/selector/var/rpseudo.js
+new file mode 100644
+index 0000000..bcf8693
+--- /dev/null
++++ b/src/selector/var/rpseudo.js
+@@ -0,0 +1,3 @@
++import { pseudos } from "./pseudos.js";
++
++export var rpseudo = new RegExp( pseudos );
+diff --git a/src/selector/var/rsibling.js b/src/selector/var/rsibling.js
+new file mode 100644
+index 0000000..e80fcf9
+--- /dev/null
++++ b/src/selector/var/rsibling.js
+@@ -0,0 +1 @@
++export var rsibling = /[+~]/;
+diff --git a/src/serialize.js b/src/serialize.js
+index ebe7334..704fe09 100644
+--- a/src/serialize.js
++++ b/src/serialize.js
+@@ -1,6 +1,6 @@
+-import jQuery from "./core.js";
+-import toType from "./core/toType.js";
+-import rcheckableType from "./var/rcheckableType.js";
++import { jQuery } from "./core.js";
++import { toType } from "./core/toType.js";
++import { rcheckableType } from "./var/rcheckableType.js";
+ 
+ import "./core/init.js";
+ import "./traversing.js"; // filter
+@@ -126,4 +126,4 @@ jQuery.fn.extend( {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/traversing.js b/src/traversing.js
+index 5ce33f3..374c4b7 100644
+--- a/src/traversing.js
++++ b/src/traversing.js
+@@ -1,10 +1,10 @@
+-import jQuery from "./core.js";
+-import getProto from "./var/getProto.js";
+-import indexOf from "./var/indexOf.js";
+-import dir from "./traversing/var/dir.js";
+-import siblings from "./traversing/var/siblings.js";
+-import rneedsContext from "./traversing/var/rneedsContext.js";
+-import nodeName from "./core/nodeName.js";
++import { jQuery } from "./core.js";
++import { getProto } from "./var/getProto.js";
++import { indexOf } from "./var/indexOf.js";
++import { dir } from "./traversing/var/dir.js";
++import { siblings } from "./traversing/var/siblings.js";
++import { rneedsContext } from "./traversing/var/rneedsContext.js";
++import { nodeName } from "./core/nodeName.js";
+ 
+ import "./core/init.js";
+ import "./traversing/findFilter.js";
+@@ -190,4 +190,4 @@ jQuery.each( {
+ 	};
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/traversing/findFilter.js b/src/traversing/findFilter.js
+index 4202218..66fd766 100644
+--- a/src/traversing/findFilter.js
++++ b/src/traversing/findFilter.js
+@@ -1,6 +1,6 @@
+-import jQuery from "../core.js";
+-import indexOf from "../var/indexOf.js";
+-import rneedsContext from "./var/rneedsContext.js";
++import { jQuery } from "../core.js";
++import { indexOf } from "../var/indexOf.js";
++import { rneedsContext } from "./var/rneedsContext.js";
+ 
+ import "../selector.js";
+ 
+diff --git a/src/traversing/var/dir.js b/src/traversing/var/dir.js
+index 3729d9b..93dbf8c 100644
+--- a/src/traversing/var/dir.js
++++ b/src/traversing/var/dir.js
+@@ -1,6 +1,6 @@
+-import jQuery from "../../core.js";
++import { jQuery } from "../../core.js";
+ 
+-export default function( elem, dir, until ) {
++export function dir( elem, dir, until ) {
+ 	var matched = [],
+ 		truncate = until !== undefined;
+ 
+diff --git a/src/traversing/var/rneedsContext.js b/src/traversing/var/rneedsContext.js
+index 9038e17..667303f 100644
+--- a/src/traversing/var/rneedsContext.js
++++ b/src/traversing/var/rneedsContext.js
+@@ -1,5 +1,5 @@
+-import jQuery from "../../core.js";
++import { jQuery } from "../../core.js";
+ 
+ import "../../selector.js";
+ 
+-export default jQuery.expr.match.needsContext;
++export var rneedsContext = jQuery.expr.match.needsContext;
+diff --git a/src/traversing/var/siblings.js b/src/traversing/var/siblings.js
+index fe51094..3b908d7 100644
+--- a/src/traversing/var/siblings.js
++++ b/src/traversing/var/siblings.js
+@@ -1,4 +1,4 @@
+-export default function( n, elem ) {
++export function siblings( n, elem ) {
+ 	var matched = [];
+ 
+ 	for ( ; n; n = n.nextSibling ) {
+diff --git a/src/var/ObjectFunctionString.js b/src/var/ObjectFunctionString.js
+index c8fdcd9..89430c4 100644
+--- a/src/var/ObjectFunctionString.js
++++ b/src/var/ObjectFunctionString.js
+@@ -1,3 +1,3 @@
+-import fnToString from "./fnToString.js";
++import { fnToString } from "./fnToString.js";
+ 
+-export default fnToString.call( Object );
++export var ObjectFunctionString = fnToString.call( Object );
+diff --git a/src/var/arr.js b/src/var/arr.js
+index d6d1738..2b63536 100644
+--- a/src/var/arr.js
++++ b/src/var/arr.js
+@@ -1 +1 @@
+-export default [];
++export var arr = [];
+diff --git a/src/var/class2type.js b/src/var/class2type.js
+index 758dff6..7ef6b59 100644
+--- a/src/var/class2type.js
++++ b/src/var/class2type.js
+@@ -1,2 +1,2 @@
+ // [[Class]] -> type pairs
+-export default {};
++export var class2type = {};
+diff --git a/src/var/document.js b/src/var/document.js
+index db89b68..8f09bef 100644
+--- a/src/var/document.js
++++ b/src/var/document.js
+@@ -1 +1 @@
+-export default window.document;
++export var document = window.document;
+diff --git a/src/var/documentElement.js b/src/var/documentElement.js
+index 4bad20e..d2fa523 100644
+--- a/src/var/documentElement.js
++++ b/src/var/documentElement.js
+@@ -1,3 +1,3 @@
+-import document from "./document.js";
++import { document } from "./document.js";
+ 
+-export default document.documentElement;
++export var documentElement = document.documentElement;
+diff --git a/src/var/flat.js b/src/var/flat.js
+index 1724205..269ebec 100644
+--- a/src/var/flat.js
++++ b/src/var/flat.js
+@@ -1,8 +1,8 @@
+-import arr from "./arr.js";
++import { arr } from "./arr.js";
+ 
+-// Support: IE 11+, Edge 18+
+-// Provide fallback for browsers without Array#flat.
+-export default arr.flat ? function( array ) {
++// Support: IE 11+
++// IE doesn't have Array#flat; provide a fallback.
++export var flat = arr.flat ? function( array ) {
+ 	return arr.flat.call( array );
+ } : function( array ) {
+ 	return arr.concat.apply( [], array );
+diff --git a/src/var/fnToString.js b/src/var/fnToString.js
+index 1004213..332dd12 100644
+--- a/src/var/fnToString.js
++++ b/src/var/fnToString.js
+@@ -1,3 +1,3 @@
+-import hasOwn from "./hasOwn.js";
++import { hasOwn } from "./hasOwn.js";
+ 
+-export default hasOwn.toString;
++export var fnToString = hasOwn.toString;
+diff --git a/src/var/getProto.js b/src/var/getProto.js
+index 392cd39..519db04 100644
+--- a/src/var/getProto.js
++++ b/src/var/getProto.js
+@@ -1 +1 @@
+-export default Object.getPrototypeOf;
++export var getProto = Object.getPrototypeOf;
+diff --git a/src/var/hasOwn.js b/src/var/hasOwn.js
+index 62f2c18..eff6b78 100644
+--- a/src/var/hasOwn.js
++++ b/src/var/hasOwn.js
+@@ -1,3 +1,3 @@
+-import class2type from "./class2type.js";
++import { class2type } from "./class2type.js";
+ 
+-export default class2type.hasOwnProperty;
++export var hasOwn = class2type.hasOwnProperty;
+diff --git a/src/var/indexOf.js b/src/var/indexOf.js
+index f1342c8..93cd31b 100644
+--- a/src/var/indexOf.js
++++ b/src/var/indexOf.js
+@@ -1,3 +1,3 @@
+-import arr from "./arr.js";
++import { arr } from "./arr.js";
+ 
+-export default arr.indexOf;
++export var indexOf = arr.indexOf;
+diff --git a/src/var/isIE.js b/src/var/isIE.js
+index a239745..6a66455 100644
+--- a/src/var/isIE.js
++++ b/src/var/isIE.js
+@@ -1,3 +1,3 @@
+-import document from "./document.js";
++import { document } from "./document.js";
+ 
+-export default document.documentMode;
++export var isIE = document.documentMode;
+diff --git a/src/var/isWindow.js b/src/var/isWindow.js
+index 25f22db..3018a37 100644
+--- a/src/var/isWindow.js
++++ b/src/var/isWindow.js
+@@ -1,3 +1,3 @@
+-export default function isWindow( obj ) {
++export function isWindow( obj ) {
+ 	return obj != null && obj === obj.window;
+ }
+diff --git a/src/var/pnum.js b/src/var/pnum.js
+index 5f6bca4..d8426e5 100644
+--- a/src/var/pnum.js
++++ b/src/var/pnum.js
+@@ -1 +1 @@
+-export default ( /[+-]?(?:\d*\.|)\d+(?:[eE][+-]?\d+|)/ ).source;
++export var pnum = /[+-]?(?:\d*\.|)\d+(?:[eE][+-]?\d+|)/.source;
+diff --git a/src/var/pop.js b/src/var/pop.js
+index b1c9131..4ab9514 100644
+--- a/src/var/pop.js
++++ b/src/var/pop.js
+@@ -1,3 +1,3 @@
+-import arr from "./arr.js";
++import { arr } from "./arr.js";
+ 
+-export default arr.pop;
++export var pop = arr.pop;
+diff --git a/src/var/push.js b/src/var/push.js
+index 2758aa5..51ba05c 100644
+--- a/src/var/push.js
++++ b/src/var/push.js
+@@ -1,3 +1,3 @@
+-import arr from "./arr.js";
++import { arr } from "./arr.js";
+ 
+-export default arr.push;
++export var push = arr.push;
+diff --git a/src/var/rcheckableType.js b/src/var/rcheckableType.js
+index 9fc4b55..19da179 100644
+--- a/src/var/rcheckableType.js
++++ b/src/var/rcheckableType.js
+@@ -1 +1 @@
+-export default ( /^(?:checkbox|radio)$/i );
++export var rcheckableType = /^(?:checkbox|radio)$/i;
+diff --git a/src/var/rcssNum.js b/src/var/rcssNum.js
+index c96eb65..823636c 100644
+--- a/src/var/rcssNum.js
++++ b/src/var/rcssNum.js
+@@ -1,3 +1,3 @@
+-import pnum from "../var/pnum.js";
++import { pnum } from "../var/pnum.js";
+ 
+-export default new RegExp( "^(?:([+-])=|)(" + pnum + ")([a-z%]*)$", "i" );
++export var rcssNum = new RegExp( "^(?:([+-])=|)(" + pnum + ")([a-z%]*)$", "i" );
+diff --git a/src/var/rnothtmlwhite.js b/src/var/rnothtmlwhite.js
+index db2a9e3..ac8586d 100644
+--- a/src/var/rnothtmlwhite.js
++++ b/src/var/rnothtmlwhite.js
+@@ -1,4 +1,4 @@
+ // Only count HTML whitespace
+ // Other whitespace should count in values
+ // https://infra.spec.whatwg.org/#ascii-whitespace
+-export default ( /[^\x20\t\r\n\f]+/g );
++export var rnothtmlwhite = /[^\x20\t\r\n\f]+/g;
+diff --git a/src/var/rtrim.js b/src/var/rtrim.js
+new file mode 100644
+index 0000000..aa20c96
+--- /dev/null
++++ b/src/var/rtrim.js
+@@ -0,0 +1,6 @@
++import { whitespace } from "./whitespace.js";
++
++export var rtrim = new RegExp(
++	"^" + whitespace + "+|((?:^|[^\\\\])(?:\\\\.)*)" + whitespace + "+$",
++	"g"
++);
+diff --git a/src/var/slice.js b/src/var/slice.js
+index 4d767ac..386d342 100644
+--- a/src/var/slice.js
++++ b/src/var/slice.js
+@@ -1,3 +1,3 @@
+-import arr from "./arr.js";
++import { arr } from "./arr.js";
+ 
+-export default arr.slice;
++export var slice = arr.slice;
+diff --git a/src/var/sort.js b/src/var/sort.js
+index 031be77..2752de2 100644
+--- a/src/var/sort.js
++++ b/src/var/sort.js
+@@ -1,3 +1,3 @@
+-import arr from "./arr.js";
++import { arr } from "./arr.js";
+ 
+-export default arr.sort;
++export var sort = arr.sort;
+diff --git a/src/var/splice.js b/src/var/splice.js
+new file mode 100644
+index 0000000..253866f
+--- /dev/null
++++ b/src/var/splice.js
+@@ -0,0 +1,3 @@
++import { arr } from "./arr.js";
++
++export var splice = arr.splice;
+diff --git a/src/var/support.js b/src/var/support.js
+index cc0a15d..5d114af 100644
+--- a/src/var/support.js
++++ b/src/var/support.js
+@@ -1,2 +1,2 @@
+ // All support tests are defined in their respective modules.
+-export default {};
++export var support = {};
+diff --git a/src/var/toString.js b/src/var/toString.js
+index 01682d6..f60fc5e 100644
+--- a/src/var/toString.js
++++ b/src/var/toString.js
+@@ -1,3 +1,3 @@
+-import class2type from "./class2type.js";
++import { class2type } from "./class2type.js";
+ 
+-export default class2type.toString;
++export var toString = class2type.toString;
+diff --git a/src/selector/var/whitespace.js b/src/var/whitespace.js
+similarity index 52%
+rename from src/selector/var/whitespace.js
+rename to src/var/whitespace.js
+index dcac814..375e76e 100644
+--- a/src/selector/var/whitespace.js
++++ b/src/var/whitespace.js
+@@ -1,2 +1,2 @@
+ // https://www.w3.org/TR/css3-selectors/#whitespace
+-export default "[\\x20\\t\\r\\n\\f]";
++export var whitespace = "[\\x20\\t\\r\\n\\f]";
+diff --git a/src/wrap.js b/src/wrap.js
+index cd7636b..4a37002 100644
+--- a/src/wrap.js
++++ b/src/wrap.js
+@@ -1,4 +1,4 @@
+-import jQuery from "./core.js";
++import { jQuery } from "./core.js";
+ 
+ import "./core/init.js";
+ import "./manipulation.js"; // clone
+@@ -70,4 +70,4 @@ jQuery.fn.extend( {
+ 	}
+ } );
+ 
+-export default jQuery;
++export { jQuery, jQuery as $ };
+diff --git a/src/wrapper-esm.js b/src/wrapper-esm.js
+new file mode 100644
+index 0000000..fd21787
+--- /dev/null
++++ b/src/wrapper-esm.js
+@@ -0,0 +1,30 @@
++/*!
++ * jQuery JavaScript Library v@VERSION
++ * https://jquery.com/
++ *
++ * Copyright OpenJS Foundation and other contributors
++ * Released under the MIT license
++ * https://jquery.org/license
++ *
++ * Date: @DATE
++ */
++// For ECMAScript module environments where a proper `window`
++// is present, execute the factory and get jQuery.
++function jQueryFactory( window, noGlobal ) {
++
++	if ( typeof window === "undefined" || !window.document ) {
++		throw new Error( "jQuery requires a window with a document" );
++	}
++
++	// @CODE
++	// build.js inserts compiled jQuery here
++
++	return jQuery;
++
++}
++
++var jQuery = jQueryFactory( window, true );
++
++export { jQuery, jQuery as $ };
++
++export default jQuery;
+diff --git a/src/wrapper-factory-esm.js b/src/wrapper-factory-esm.js
+new file mode 100644
+index 0000000..0d8c76a
+--- /dev/null
++++ b/src/wrapper-factory-esm.js
+@@ -0,0 +1,33 @@
++/*!
++ * jQuery JavaScript Library v@VERSION
++ * https://jquery.com/
++ *
++ * Copyright OpenJS Foundation and other contributors
++ * Released under the MIT license
++ * https://jquery.org/license
++ *
++ * Date: @DATE
++ */
++// Expose a factory as `jQueryFactory`. Aimed at environments without
++// a real `window` where an emulated window needs to be constructed. Example:
++//
++//     import { jQueryFactory } from "jquery/factory";
++//     const jQuery = jQueryFactory( window );
++//
++// See ticket trac-14549 for more info.
++function jQueryFactoryWrapper( window, noGlobal ) {
++
++	if ( !window.document ) {
++		throw new Error( "jQuery requires a window with a document" );
++	}
++
++	// @CODE
++	// build.js inserts compiled jQuery here
++
++	return jQuery;
++
++}
++
++export function jQueryFactory( window ) {
++	return jQueryFactoryWrapper( window, true );
++}
+diff --git a/src/wrapper-factory.js b/src/wrapper-factory.js
+new file mode 100644
+index 0000000..f56508b
+--- /dev/null
++++ b/src/wrapper-factory.js
+@@ -0,0 +1,38 @@
++/*!
++ * jQuery JavaScript Library v@VERSION
++ * https://jquery.com/
++ *
++ * Copyright OpenJS Foundation and other contributors
++ * Released under the MIT license
++ * https://jquery.org/license
++ *
++ * Date: @DATE
++ */
++// Expose a factory as `jQueryFactory`. Aimed at environments without
++// a real `window` where an emulated window needs to be constructed. Example:
++//
++//     const jQuery = require( "jquery/factory" )( window );
++//
++// See ticket trac-14549 for more info.
++function jQueryFactoryWrapper( window, noGlobal ) {
++
++	"use strict";
++
++	if ( !window.document ) {
++		throw new Error( "jQuery requires a window with a document" );
++	}
++
++	// @CODE
++	// build.js inserts compiled jQuery here
++
++	return jQuery;
++
++}
++
++function jQueryFactory( window ) {
++	"use strict";
++
++	return jQueryFactoryWrapper( window, true );
++}
++
++module.exports = { jQueryFactory: jQueryFactory };
+diff --git a/src/wrapper.js b/src/wrapper.js
+index 8a0b2a1..984ad5b 100644
+--- a/src/wrapper.js
++++ b/src/wrapper.js
+@@ -16,15 +16,10 @@
+ 
+ 		// For CommonJS and CommonJS-like environments where a proper `window`
+ 		// is present, execute the factory and get jQuery.
+-		// For environments that do not have a `window` with a `document`
+-		// (such as Node.js), expose a factory as module.exports.
+-		// This accentuates the need for the creation of a real `window`.
+-		// e.g. var jQuery = require("jquery")(window);
+-		// See ticket #14549 for more info.
+ 		module.exports = global.document ?
+ 			factory( global, true ) :
+ 			function( w ) {
+-				if ( !w.document ) {
++				if ( !w || !w.document ) {
+ 					throw new Error( "jQuery requires a window with a document" );
+ 				}
+ 				return factory( w );
+@@ -38,8 +33,13 @@
+ 
+ "use strict";
+ 
++if ( !window.document ) {
++	throw new Error( "jQuery requires a window with a document" );
++}
++
+ // @CODE
+ // build.js inserts compiled jQuery here
+ 
+ return jQuery;
++
+ } );
+diff --git a/test/unit/css.js b/test/unit/css.js
+index 095f364..eb95042 100644
+--- a/test/unit/css.js
++++ b/test/unit/css.js
+@@ -1789,8 +1789,8 @@ QUnit.testUnlessIE( "css(--customProperty)", function( assert ) {
+ 
+ 	assert.equal( $elem.css( "--prop1" ), "val1", "Basic CSS custom property" );
+ 
+-	assert.equal( $elem.css( "--prop2" ), " val2", "Preceding whitespace maintained" );
+-	assert.equal( $elem.css( "--prop3" ), "val3 ", "Following whitespace maintained" );
++	assert.equal( $elem.css( "--prop2" ), "val2", "Preceding CSS whitespace trimmed" );
++	assert.equal( $elem.css( "--prop3" ), "val3", "Following CSS whitespace trimmed" );
+ 
+ 	// Support: Chrome <=49 - 73+, Safari <=9.1 - 12.1+
+ 	// Chrome treats single quotes as double ones.

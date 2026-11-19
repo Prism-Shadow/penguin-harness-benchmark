@@ -1,0 +1,1537 @@
+diff --git a/app/assets/stylesheets/issue_tracker_icons.css.erb b/app/assets/stylesheets/issue_tracker_icons.css.erb
+index 81eb7bb..fca8eae 100644
+--- a/app/assets/stylesheets/issue_tracker_icons.css.erb
++++ b/app/assets/stylesheets/issue_tracker_icons.css.erb
+@@ -1,18 +1,9 @@
+ /* Issue Tracker inactive, select, create and goto icons */
+-<% trackers = IssueTracker.subclasses.map{|t| t.label } << 'none' %>
+ 
+-<% trackers.each do |tracker| %>
+-div.issue_tracker.nested label.<%= tracker %> {
+-  background: url(<%= asset_path "#{ tracker }_inactive.png" %>) no-repeat;
+-}
+-div.issue_tracker.nested label.r_on.<%= tracker %> {
+-  background: url(<%= asset_path "#{ tracker }_create.png" %>) no-repeat;
+-}
+-#action-bar a.<%= tracker %>_create {
+-  background: transparent url(<%= asset_path "#{ tracker }_create.png" %>) 6px 5px no-repeat;
+-}
+-#action-bar a.<%= tracker %>_goto {
+-  background: transparent url(<%= asset_path "#{ tracker }_goto.png" %>) 6px 5px no-repeat;
+-}
++<% ErrbitPlugin::Registry.issue_trackers.keys.each do |label| %>
++div.issue_tracker.nested label.<%= label %> { background: url(<%= asset_path "#{ label }_inactive.png" %>) no-repeat; }
++div.issue_tracker.nested label.r_on.<%= label %> { background: url(<%= asset_path "#{ label }_create.png" %>) no-repeat; }
++#action-bar a.<%= label %>_create { background: transparent url(<%= asset_path "#{ label }_create.png" %>) 6px 5px no-repeat; }
++#action-bar a.<%= label %>_goto { background: transparent url(<%= asset_path "#{ label }_goto.png" %>) 6px 5px no-repeat; }
+ <% end %>
+ 
+diff --git a/app/controllers/apps_controller.rb b/app/controllers/apps_controller.rb
+index a6ff2d7..e016bf7 100644
+--- a/app/controllers/apps_controller.rb
++++ b/app/controllers/apps_controller.rb
+@@ -16,6 +16,9 @@ class AppsController < ApplicationController
+   }
+ 
+   expose(:app, :ancestor => :app_scope)
++  expose(:app_decorate) do
++    AppDecorator.new(app)
++  end
+ 
+   expose(:all_errs) {
+     !!params[:all_errs]
+@@ -50,7 +53,6 @@ class AppsController < ApplicationController
+   end
+ 
+   def create
+-    initialize_subclassed_issue_tracker
+     initialize_subclassed_notification_service
+     if app.save
+       redirect_to app_url(app), :flash => { :success => I18n.t('controllers.apps.flash.create.success') }
+@@ -61,7 +63,6 @@ class AppsController < ApplicationController
+   end
+ 
+   def update
+-    initialize_subclassed_issue_tracker
+     initialize_subclassed_notification_service
+     if app.save
+       redirect_to app_url(app), :flash => { :success => I18n.t('controllers.apps.flash.update.success') }
+@@ -91,17 +92,6 @@ class AppsController < ApplicationController
+ 
+   protected
+ 
+-    def initialize_subclassed_issue_tracker
+-      # set the app's issue tracker
+-      if params[:app][:issue_tracker_attributes] && tracker_type = params[:app][:issue_tracker_attributes][:type]
+-        available_tracker_classes = [IssueTracker] + IssueTracker.subclasses
+-        tracker_class = available_tracker_classes.detect{|c| c.name == tracker_type}
+-        if !tracker_class.nil?
+-          app.issue_tracker = tracker_class.new(params[:app][:issue_tracker_attributes])
+-        end
+-      end
+-    end
+-
+     def initialize_subclassed_notification_service
+       # set the app's notification service
+       if params[:app][:notification_service_attributes] && notification_type = params[:app][:notification_service_attributes][:type]
+@@ -115,7 +105,7 @@ class AppsController < ApplicationController
+ 
+     def plug_params app
+       app.watchers.build if app.watchers.none?
+-      app.issue_tracker = IssueTracker.new unless app.issue_tracker_configured?
++      app.issue_tracker ||= IssueTracker.new
+       app.notification_service = NotificationService.new unless app.notification_service_configured?
+       app.copy_attributes_from(params[:copy_attributes_from]) if params[:copy_attributes_from]
+     end
+diff --git a/app/controllers/problems_controller.rb b/app/controllers/problems_controller.rb
+index f241166..a317400 100644
+--- a/app/controllers/problems_controller.rb
++++ b/app/controllers/problems_controller.rb
+@@ -62,8 +62,7 @@ class ProblemsController < ApplicationController
+   end
+ 
+   def create_issue
+-    IssueTracker.update_url_options(request)
+-    issue_creation = IssueCreation.new(problem, current_user, params[:tracker])
++    issue_creation = IssueCreation.new(problem, current_user, params[:tracker], request)
+ 
+     unless issue_creation.execute
+       flash[:error] = issue_creation.errors.full_messages.join(', ')
+diff --git a/app/decorators/app_decorator.rb b/app/decorators/app_decorator.rb
+new file mode 100644
+index 0000000..bc6e131
+--- /dev/null
++++ b/app/decorators/app_decorator.rb
+@@ -0,0 +1,19 @@
++class AppDecorator < Draper::Decorator
++
++  decorates_association :watchers
++  decorates_association :issue_tracker, :with => IssueTrackerDecorator
++  delegate_all
++
++  def email_at_notices
++    object.email_at_notices.join(', ')
++  end
++
++  def notify_user_display
++    object.notify_all_users ? 'display: none;' : ''
++  end
++
++  def notify_err_display
++    object.notify_on_errs ? '' : 'display: none;'
++  end
++
++end
+diff --git a/app/decorators/issue_tracker_decorator.rb b/app/decorators/issue_tracker_decorator.rb
+new file mode 100644
+index 0000000..c7ab0e4
+--- /dev/null
++++ b/app/decorators/issue_tracker_decorator.rb
+@@ -0,0 +1,37 @@
++class IssueTrackerDecorator < Draper::Decorator
++
++  def initialize(object, key)
++    @object = object
++    @key = key
++  end
++  attr_reader :key
++
++  delegate_all
++
++  def issue_trackers
++    ErrbitPlugin::Registry.issue_trackers.each do |key, object|
++      yield IssueTrackerDecorator.new(object, key)
++    end
++  end
++
++  def note
++    object.note.html_safe
++  end
++
++  def fields
++    object.fields.each do |field, field_info|
++      yield IssueTrackerFieldDecorator.new(field, field_info)
++    end
++  end
++
++  def params_class(tracker)
++    [chosen?(tracker), label].join(" ").strip
++  end
++
++  private
++
++  def chosen?(issue_tracker)
++    key == issue_tracker.type_tracker.to_s ? 'chosen' : ''
++  end
++
++end
+diff --git a/app/decorators/issue_tracker_field_decorator.rb b/app/decorators/issue_tracker_field_decorator.rb
+new file mode 100644
+index 0000000..bd6d508
+--- /dev/null
++++ b/app/decorators/issue_tracker_field_decorator.rb
+@@ -0,0 +1,27 @@
++class IssueTrackerFieldDecorator < Draper::Decorator
++
++  def initialize(field, field_info)
++    @object = field
++    @field_info = field_info
++  end
++  attr_reader :object, :field_info
++
++  alias :key :object
++
++  def label
++    field_info[:label] || object.to_s.titleize
++  end
++
++
++  def input(form, issue_tracker)
++    form.send(input_field, key.to_s,
++              :placeholder => field_info[:placeholder],
++              :value => issue_tracker.options[key.to_s])
++  end
++
++  private
++
++  def input_field
++    object == :password ? :password_field : :text_field
++  end
++end
+diff --git a/app/decorators/watcher_decorator.rb b/app/decorators/watcher_decorator.rb
+new file mode 100644
+index 0000000..092ce41
+--- /dev/null
++++ b/app/decorators/watcher_decorator.rb
+@@ -0,0 +1,9 @@
++class WatcherDecorator < Draper::Decorator
++
++  delegate_all
++
++  def email_choosen
++    object.email.blank? ? 'chosen' : ''
++  end
++
++end
+diff --git a/app/interactors/issue_creation.rb b/app/interactors/issue_creation.rb
+index ef0e70d..880524d 100644
+--- a/app/interactors/issue_creation.rb
++++ b/app/interactors/issue_creation.rb
+@@ -5,12 +5,24 @@ class IssueCreation
+ 
+   delegate :app, :to => :problem
+ 
+-  def initialize(problem, user, tracker_name)
++  def initialize(problem, user, tracker_name, request)
+     @problem = problem
+     @user    = user
+     @tracker_name = tracker_name
++    IssueTracker.update_url_options(request)
+   end
+ 
++  def execute
++    tracker.create_issue(problem, user) if tracker
++    errors.empty?
++  rescue => ex
++    Rails.logger.error "Error during issue creation: " << ex.message
++    errors.add :base, "There was an error during issue creation: #{ex.message}"
++    false
++  end
++
++  private
++
+   def tracker
+     return @tracker if @tracker
+ 
+@@ -21,10 +33,11 @@ class IssueCreation
+       elsif !user.github_account?
+         errors.add :base, "You haven't linked your Github account."
+       else
+-        @tracker = GithubIssuesTracker.new(
+-          :app         => app,
+-          :username    => user.github_login,
+-          :oauth_token => user.github_oauth_token
++        @tracker = ErrbitGithubPlugin::IssueTracker.new(
++          app, {
++            :username    => user.github_login,
++            :oauth_token => user.github_oauth_token
++          }
+         )
+       end
+ 
+@@ -39,13 +52,4 @@ class IssueCreation
+ 
+     @tracker
+   end
+-
+-  def execute
+-    tracker.create_issue problem, user if tracker
+-    errors.empty?
+-  rescue => ex
+-    Rails.logger.error "Error during issue creation: " << ex.message
+-    errors.add :base, "There was an error during issue creation: #{ex.message}"
+-    false
+-  end
+ end
+diff --git a/app/models/app.rb b/app/models/app.rb
+index c5006ea..293e7ae 100644
+--- a/app/models/app.rb
++++ b/app/models/app.rb
+@@ -26,7 +26,7 @@ class App
+ 
+   embeds_many :watchers
+   embeds_many :deploys
+-  embeds_one :issue_tracker
++  embeds_one :issue_tracker, :class_name => 'IssueTracker'
+   embeds_one :notification_service
+ 
+   has_many :problems, :inverse_of => :app, :dependent => :destroy
+@@ -44,7 +44,7 @@ class App
+   accepts_nested_attributes_for :watchers, :allow_destroy => true,
+     :reject_if => proc { |attrs| attrs[:user_id].blank? && attrs[:email].blank? }
+   accepts_nested_attributes_for :issue_tracker, :allow_destroy => true,
+-    :reject_if => proc { |attrs| !IssueTracker.subclasses.map(&:to_s).include?(attrs[:type].to_s) }
++    :reject_if => proc { |attrs| !ErrbitPlugin::Registry.issue_trackers.keys.map(&:to_s).include?(attrs[:type_tracker].to_s) }
+   accepts_nested_attributes_for :notification_service, :allow_destroy => true,
+     :reject_if => proc { |attrs| !NotificationService.subclasses.map(&:to_s).include?(attrs[:type].to_s) }
+ 
+@@ -120,7 +120,7 @@ class App
+ 
+ 
+   def issue_tracker_configured?
+-    !!(issue_tracker.class < IssueTracker && issue_tracker.configured?)
++    !!issue_tracker && !!(issue_tracker.configured?)
+   end
+ 
+   def notification_service_configured?
+@@ -175,6 +175,13 @@ class App
+     set(:api_key, SecureRandom.hex)
+   end
+ 
++  ##
++  # Check if comments can be allowed on this application
++  #
++  def comments_allowed?
++    !issue_tracker || issue_tracker.comments_allowed?
++  end
++
+   protected
+ 
+     def store_cached_attributes_on_problems
+@@ -202,5 +209,6 @@ class App
+       github_repo.sub!(/(git@|https?:\/\/)#{github_host}(\/|:)/, '')
+       github_repo.sub!(/\.git$/, '')
+     end
++
+ end
+ 
+diff --git a/app/models/issue_tracker.rb b/app/models/issue_tracker.rb
+index bdc9688..830e2f8 100644
+--- a/app/models/issue_tracker.rb
++++ b/app/models/issue_tracker.rb
+@@ -1,54 +1,18 @@
+ class IssueTracker
+   include Mongoid::Document
+   include Mongoid::Timestamps
+-  include HashHelper
++
+   include Rails.application.routes.url_helpers
++
+   default_url_options[:host] = ActionMailer::Base.default_url_options[:host]
+   default_url_options[:port] = ActionMailer::Base.default_url_options[:port]
+ 
+   embedded_in :app, :inverse_of => :issue_tracker
+ 
+-  field :project_id, :type => String
+-  field :alt_project_id, :type => String # Specify an alternative project id. e.g. for viewing files
+-  field :api_token, :type => String
+-  field :account, :type => String
+-  field :username, :type => String
+-  field :password, :type => String
+-  field :ticket_properties, :type => String
+-  field :subdomain, :type => String
+-  field :milestone_id, :type => String
+-
+-  # Is there any better way to enhance the props? Putting them into the subclass leads to
+-  # an error while rendering the form fields -.-
+-  field :base_url, :type => String
+-  field :context_path, :type => String
+-  field :issue_type, :type => String
+-  field :issue_component, :type => String
+-  field :issue_priority, :type => String
+-
+-  validate :check_params
+-
+-  # Subclasses are responsible for overwriting this method.
+-  def check_params; true; end
+-
+-  def issue_title(problem)
+-    "[#{ problem.environment }][#{ problem.where }] #{problem.message.to_s.truncate(100)}"
+-  end
+-
+-  # Allows us to set the issue tracker class from a single form.
+-  def type; self._type; end
+-  def type=(t); self._type=t; end
++  field :type_tracker, :type => String
++  field :options, :type => Hash, :default => {}
+ 
+-  def url; nil; end
+-
+-  # Retrieve tracker label from either class or instance.
+-  Label = ''
+-  def self.label; self::Label; end
+-  def label; self.class.label; end
+-
+-  def configured?
+-    project_id.present?
+-  end
++  validate :validate_tracker
+ 
+   ##
+   # Update default_url_option with valid data from the request information
+@@ -60,4 +24,23 @@ class IssueTracker
+     IssueTracker.default_url_options[:port] = request.port
+     IssueTracker.default_url_options[:protocol] = request.scheme
+   end
++
++  def tracker
++    klass = ErrbitPlugin::Registry.issue_trackers[self.type_tracker]
++    klass = ErrbitPlugin::NoneIssueTracker unless klass
++
++    @tracker = klass.new(app, self.options)
++  end
++
++  # Allow the tracker to validate its own params
++  def validate_tracker
++    (tracker.errors || {}).each do |k,v|
++      errors.add k, v
++    end
++  end
++
++  delegate :configured?, :to => :tracker
++  delegate :create_issue, :to => :tracker
++  delegate :comments_allowed?, :to => :tracker
++  delegate :url, :to => :tracker
+ end
+diff --git a/app/models/issue_trackers/bitbucket_issues_tracker.rb b/app/models/issue_trackers/bitbucket_issues_tracker.rb
+deleted file mode 100644
+index c28d3fe..0000000
+--- a/app/models/issue_trackers/bitbucket_issues_tracker.rb
++++ /dev/null
+@@ -1,55 +0,0 @@
+-begin
+-  require 'bitbucket_rest_api'
+-rescue LoadError
+-end
+-
+-if defined? BitBucket
+-  class IssueTrackers::BitbucketIssuesTracker < IssueTracker
+-    Label = "bitbucket"
+-    Note = 'Please configure your Bitbucket repository in the <strong>BITBUCKET REPO</strong> field above.'
+-    Fields = [
+-      [:api_token, {
+-        :placeholder => "Your username on Bitbucket account",
+-        :label => "Username"
+-      }],
+-      [:project_id, {
+-        :placeholder => "Password for your Bitbucket account",
+-        :label => "Password"
+-      }]
+-    ]
+-
+-    def check_params
+-      if Fields.detect {|f| self[f[0]].blank? }
+-        errors.add :base, 'You must specify your Bitbucket username and password'
+-      end
+-    end
+-
+-    def repo_name
+-      app.bitbucket_repo
+-    end
+-
+-    def create_issue(problem, reported_by = nil)
+-      bitbucket = BitBucket.new :basic_auth => "#{api_token}:#{project_id}"
+-
+-      begin
+-        r_user = repo_name.split('/')[0]
+-        r_name = repo_name.split('/')[1]
+-        issue = bitbucket.issues.create r_user, r_name, :title => issue_title(problem), :content => body_template.result(binding), :priority => 'critical'
+-        problem.update_attributes(
+-          :issue_link => "https://bitbucket.org/#{repo_name}/issue/#{issue.local_id}/",
+-          :issue_type => Label
+-        )
+-      rescue BitBucket::Error::Unauthorized
+-        raise IssueTrackers::AuthenticationError, "Could not authenticate with BitBucket. Please check your username and password."
+-      end
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/bitbucket_issues_body.txt.erb"))
+-    end
+-
+-    def url
+-      "https://www.bitbucket.org/#{repo_name}/issues"
+-    end
+-  end
+-end
+diff --git a/app/models/issue_trackers/fogbugz_tracker.rb b/app/models/issue_trackers/fogbugz_tracker.rb
+deleted file mode 100644
+index 3ef9d44..0000000
+--- a/app/models/issue_trackers/fogbugz_tracker.rb
++++ /dev/null
+@@ -1,53 +0,0 @@
+-if defined? Fogbugz
+-  class IssueTrackers::FogbugzTracker < IssueTracker
+-    Label = "fogbugz"
+-    Fields = [
+-      [:project_id, {
+-        :label       => "Area Name"
+-      }],
+-      [:account, {
+-        :label       => "FogBugz URL",
+-        :placeholder => "abc from http://abc.fogbugz.com/"
+-      }],
+-      [:username, {
+-        :placeholder => "Username/Email for your account"
+-      }],
+-      [:password, {
+-        :placeholder => "Password for your account"
+-      }]
+-    ]
+-
+-    def check_params
+-      if Fields.detect {|f| self[f[0]].blank? }
+-        errors.add :base, 'You must specify your FogBugz Area Name, FogBugz URL, Username, and Password'
+-      end
+-    end
+-
+-    def create_issue(problem, reported_by = nil)
+-      fogbugz = Fogbugz::Interface.new(:email => username, :password => password, :uri => "https://#{account}.fogbugz.com")
+-      fogbugz.authenticate
+-
+-      issue = {}
+-      issue['sTitle'] = issue_title problem
+-      issue['sArea'] = project_id
+-      issue['sEvent'] = body_template.result(binding)
+-      issue['sTags'] = ['errbit'].join(',')
+-      issue['cols'] = ['ixBug'].join(',')
+-
+-      fb_resp = fogbugz.command(:new, issue)
+-      problem.update_attributes(
+-        :issue_link => "https://#{account}.fogbugz.com/default.asp?#{fb_resp['case']['ixBug']}",
+-        :issue_type => Label
+-      )
+-
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/fogbugz_body.txt.erb"))
+-    end
+-
+-    def url
+-      "http://#{account}.fogbugz.com/"
+-    end
+-  end
+-end
+diff --git a/app/models/issue_trackers/github_issues_tracker.rb b/app/models/issue_trackers/github_issues_tracker.rb
+deleted file mode 100644
+index e39692a..0000000
+--- a/app/models/issue_trackers/github_issues_tracker.rb
++++ /dev/null
+@@ -1,61 +0,0 @@
+-if defined? Octokit
+-  class IssueTrackers::GithubIssuesTracker < IssueTracker
+-    Label = "github"
+-    Note = 'Please configure your github repository in the <strong>GITHUB REPO</strong> field above.<br/>' <<
+-           'Instead of providing your username & password, you can link your Github account ' <<
+-           'to your user profile, and allow Errbit to create issues using your OAuth token.'
+-
+-    Fields = [
+-      [:username, {
+-        :placeholder => "Your username on GitHub"
+-      }],
+-      [:password, {
+-        :placeholder => "Password for your account"
+-      }]
+-    ]
+-
+-    attr_accessor :oauth_token
+-
+-    def project_id
+-      app.github_repo
+-    end
+-
+-    def check_params
+-      if Fields.detect {|f| self[f[0]].blank? }
+-        errors.add :base, 'You must specify your GitHub username and password'
+-      end
+-    end
+-
+-    def create_issue(problem, reported_by = nil)
+-      # Login using OAuth token, if given.
+-      if oauth_token
+-        client = Octokit::Client.new(:login => username, :access_token => oauth_token)
+-      else
+-        client = Octokit::Client.new(:login => username, :password => password)
+-      end
+-
+-      begin
+-        issue = client.create_issue(
+-          project_id,
+-          issue_title(problem),
+-          body_template.result(binding).unpack('C*').pack('U*')
+-        )
+-        problem.update_attributes(
+-          :issue_link => issue.rels[:html].href,
+-          :issue_type => Label
+-        )
+-
+-      rescue Octokit::Unauthorized
+-        raise IssueTrackers::AuthenticationError, "Could not authenticate with GitHub. Please check your username and password."
+-      end
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/github_issues_body.txt.erb").gsub(/^\s*/, ''))
+-    end
+-
+-    def url
+-      "https://github.com/#{project_id}/issues"
+-    end
+-  end
+-end
+diff --git a/app/models/issue_trackers/gitlab_tracker.rb b/app/models/issue_trackers/gitlab_tracker.rb
+deleted file mode 100644
+index 64d2a7d..0000000
+--- a/app/models/issue_trackers/gitlab_tracker.rb
++++ /dev/null
+@@ -1,53 +0,0 @@
+-if defined? Gitlab
+-  class IssueTrackers::GitlabTracker < IssueTracker
+-    Label = "gitlab"
+-    Fields = [
+-      [:account, {
+-        :label       => "Gitlab URL",
+-        :placeholder => "e.g. https://example.net"
+-      }],
+-      [:api_token, {
+-        :placeholder => "API Token for your account"
+-      }],
+-      [:project_id, {
+-        :label       => "Ticket Project ID (use Number)",
+-        :placeholder => "Gitlab Project where issues will be created"
+-      }],
+-      [:alt_project_id, {
+-        :label       => "Project Name (namespace/project)",
+-        :placeholder => "Gitlab Project where issues will be created"
+-      }]
+-    ]
+-
+-    def check_params
+-      if Fields.detect {|f| self[f[0]].blank?}
+-        errors.add :base, 'You must specify your Gitlab URL, API token, Project ID and Project Name'
+-      end
+-    end
+-
+-    def create_issue(problem, reported_by = nil)
+-      Gitlab.configure do |config|
+-        config.endpoint = "#{account}/api/v3"
+-        config.private_token = api_token
+-        config.user_agent = 'Errbit User Agent'
+-      end
+-      title = issue_title problem
+-      description_summary = summary_template.result(binding)
+-      description_body = body_template.result(binding)
+-      ticket = Gitlab.create_issue(project_id, title, { :description => description_summary, :labels => "errbit" } )
+-      Gitlab.create_issue_note(project_id, ticket.id, description_body)
+-    end
+-
+-    def summary_template
+-      @@summary_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/gitlab_summary.txt.erb").gsub(/^\s*/, ''))
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/gitlab_body.txt.erb").gsub(/^\s*/, ''))
+-    end
+-
+-    def url
+-      "#{account}/#{alt_project_id}/issues"
+-    end
+-  end
+-end
+diff --git a/app/models/issue_trackers/jira_tracker.rb b/app/models/issue_trackers/jira_tracker.rb
+deleted file mode 100644
+index 2c9f68a..0000000
+--- a/app/models/issue_trackers/jira_tracker.rb
++++ /dev/null
+@@ -1,110 +0,0 @@
+-if defined? JIRA
+-  class IssueTrackers::JiraTracker < IssueTracker
+-    Label = 'jira'
+-
+-    Fields = [
+-        [:base_url, {
+-            :label => 'Jira URL without trailing slash',
+-            :placeholder => 'https://jira.example.org/'
+-        }],
+-        [:context_path, {
+-            :optional => true,
+-            :label => 'Context Path (Just "/" if empty otherwise with leading slash)',
+-            :placeholder => "/jira"
+-        }],
+-        [:username, {
+-            :optional => true,
+-            :label => 'HTTP Basic Auth User',
+-            :placeholder => 'johndoe'
+-        }],
+-        [:password, {
+-            :optional => true,
+-            :label => 'HTTP Basic Auth Password',
+-            :placeholder => 'p@assW0rd'
+-        }],
+-        [:project_id, {
+-            :label => 'Project Key',
+-            :placeholder => 'The project Key where the issue will be created'
+-        }],
+-        [:account, {
+-            :optional => true,
+-            :label => 'Assign to this user. If empty, Jira takes the project default.',
+-            :placeholder => "username"
+-        }],
+-        [:issue_component, {
+-            :label => 'Issue category',
+-            :placeholder => 'Website - Other'
+-        }],
+-        [:issue_type, {
+-            :label => 'Issue type',
+-            :placeholder => 'Bug'
+-        }],
+-        [:issue_priority, {
+-            :label => 'Priority',
+-            :placeholder => 'Normal'
+-        }]
+-    ]
+-
+-    def check_params
+-      if Fields.detect { |f| self[f[0]].blank? && !f[1][:optional] }
+-        errors.add :base, 'You must specify all non optional values!'
+-      end
+-    end
+-
+-
+-    #
+-    # @param problem Problem
+-    def create_issue(problem, reported_by = nil)
+-      options = {
+-          :username => username,
+-          :password => password,
+-          :site => base_url,
+-          :context_path => context_path,
+-          :auth_type => :basic,
+-          :use_ssl => base_url.match(/^https/) ? true : false
+-      }
+-      client = JIRA::Client.new(options)
+-
+-      issue = {
+-          :fields => {
+-              :project => {
+-                  :key => project_id
+-              },
+-              :summary => issue_title(problem),
+-              :description => body_template.result(binding),
+-              :issuetype => {
+-                  :name => issue_type
+-              },
+-              :priority => {
+-                  :name => issue_priority,
+-              },
+-
+-              :components => [{:name => issue_component}]
+-          }
+-      }
+-
+-      issue[:fields][:assignee] = {:name => account} if account
+-
+-      issue_build = client.Issue.build
+-      issue_build.save(issue)
+-      issue_build.fetch
+-
+-      problem.update_attributes(
+-          :issue_link => "#{base_url}#{context_path}browse/#{issue_build.key}",
+-          :issue_type => Label
+-      )
+-
+-      # Maybe in a later version?
+-      #remote_link = {
+-      #    :url => app_problem_url(problem.app, problem),
+-      #    :name => "Link to Errbit Issue"
+-      #}
+-      #remote_link_build = issue_build.remotelink.build
+-      #remote_link_build.save(remote_link)
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/jira_body.txt.erb"))
+-    end
+-  end
+-end
+\ No newline at end of file
+diff --git a/app/models/issue_trackers/lighthouse_tracker.rb b/app/models/issue_trackers/lighthouse_tracker.rb
+deleted file mode 100644
+index 21aaaeb..0000000
+--- a/app/models/issue_trackers/lighthouse_tracker.rb
++++ /dev/null
+@@ -1,53 +0,0 @@
+-if defined? Lighthouse
+-  class IssueTrackers::LighthouseTracker < IssueTracker
+-    Label = "lighthouseapp"
+-    Fields = [
+-      [:account, {
+-        :label       => "Subdomain",
+-        :placeholder => "subdomain from http://{{subdomain}}.lighthouseapp.com"
+-      }],
+-      [:api_token, {
+-        :label       => "API Token",
+-        :placeholder => "123456789abcdef123456789abcdef"
+-      }],
+-      [:project_id, {
+-        :label       => "Project ID",
+-        :placeholder => "123456"
+-      }]
+-    ]
+-
+-    def check_params
+-      if Fields.detect {|f| self[f[0]].blank? }
+-        errors.add :base, 'You must specify your Lighthouseapp Subdomain, API token and Project ID'
+-      end
+-    end
+-
+-    def create_issue(problem, reported_by = nil)
+-      Lighthouse.account = account
+-      Lighthouse.token = api_token
+-      # updating lighthouse account
+-      Lighthouse::Ticket.site
+-      Lighthouse::Ticket.format = :xml
+-      ticket = Lighthouse::Ticket.new(:project_id => project_id)
+-      ticket.title = issue_title problem
+-
+-      ticket.body = body_template.result(binding)
+-
+-      ticket.tags << "errbit"
+-      ticket.save!
+-      problem.update_attributes(
+-        :issue_link => "#{Lighthouse::Ticket.site.to_s.sub(/#{Lighthouse::Ticket.site.path}$/, '')}#{Lighthouse::Ticket.element_path(ticket.id, :project_id => project_id)}".sub(/\.xml$/, ''),
+-        :issue_type => Label
+-      )
+-
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/lighthouseapp_body.txt.erb").gsub(/^\s*/, ''))
+-    end
+-
+-    def url
+-      "http://#{account}.lighthouseapp.com"
+-    end
+-  end
+-end
+\ No newline at end of file
+diff --git a/app/models/issue_trackers/mingle_tracker.rb b/app/models/issue_trackers/mingle_tracker.rb
+deleted file mode 100644
+index 2105148..0000000
+--- a/app/models/issue_trackers/mingle_tracker.rb
++++ /dev/null
+@@ -1,71 +0,0 @@
+-class IssueTrackers::MingleTracker < IssueTracker
+-  Label = "mingle"
+-  Note = "Note: <strong>CARD PROPERTIES</strong> must be comma separated <em>key = value</em> pairs"
+-
+-  Fields = [
+-    [:account, {
+-      :label       => "Mingle URL",
+-      :placeholder => "http://mingle.example.com/"
+-    }],
+-    [:project_id, {
+-      :placeholder => "Mingle project"
+-    }],
+-    [:ticket_properties, {
+-      :label       => "Card Properties",
+-      :placeholder => "card_type = Defect, defect_status = Open, priority = Essential"
+-    }],
+-    [:username, {
+-      :label       => "Sign-in name",
+-      :placeholder => "Sign-in name for your account"
+-    }],
+-    [:password, {
+-      :placeholder => "Password for your account"
+-    }]
+-  ]
+-
+-  def check_params
+-    if Fields.detect {|f| self[f[0]].blank? } or !ticket_properties_hash["card_type"]
+-      errors.add :base, 'You must specify your Mingle URL, Project ID, Card Type (in default card properties), Sign-in name, and Password'
+-    end
+-  end
+-
+-  def create_issue(problem, reported_by = nil)
+-    properties = ticket_properties_hash
+-    basic_auth = account.gsub(/https?:\/\//, "https://#{username}:#{password}@")
+-    Mingle.set_site "#{basic_auth}/api/v1/projects/#{project_id}/"
+-
+-    card = Mingle::Card.new
+-    card.card_type_name = properties.delete("card_type")
+-    card.name = issue_title(problem)
+-    card.description = body_template.result(binding)
+-    properties.each do |property, value|
+-      card.send("cp_#{property}=", value)
+-    end
+-
+-    card.save!
+-    problem.update_attributes(
+-      :issue_link => URI.parse("#{account}/projects/#{project_id}/cards/#{card.id}").to_s,
+-      :issue_type => Label
+-    )
+-  end
+-
+-  def body_template
+-    @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/textile_body.txt.erb"))
+-  end
+-
+-  def ticket_properties_hash
+-    # Parses 'key=value, key2=value2' from ticket_properties into a ruby hash.
+-    self.ticket_properties.to_s.split(",").inject({}) do |hash, pair|
+-      key, value = pair.split("=").map(&:strip)
+-      hash[key] = value
+-      hash
+-    end
+-  end
+-
+-  def url
+-    acc_url = account.start_with?('http') ? account : "http://#{account}"
+-    URI.parse("#{acc_url}/projects/#{project_id}").to_s
+-  rescue URI::InvalidURIError
+-  end
+-end
+-
+diff --git a/app/models/issue_trackers/pivotal_labs_tracker.rb b/app/models/issue_trackers/pivotal_labs_tracker.rb
+deleted file mode 100644
+index cc014f9..0000000
+--- a/app/models/issue_trackers/pivotal_labs_tracker.rb
++++ /dev/null
+@@ -1,43 +0,0 @@
+-if defined? PivotalTracker
+-  class IssueTrackers::PivotalLabsTracker < IssueTracker
+-    Label = "pivotal"
+-    Fields = [
+-      [:api_token, {
+-        :placeholder => "API Token for your account"
+-      }],
+-      [:project_id, {}]
+-    ]
+-
+-    def check_params
+-      if Fields.detect {|f| self[f[0]].blank? }
+-        errors.add :base, 'You must specify your Pivotal Tracker API token and Project ID'
+-      end
+-    end
+-
+-    def create_issue(problem, reported_by = nil)
+-      PivotalTracker::Client.token = api_token
+-      PivotalTracker::Client.use_ssl = true
+-      project = PivotalTracker::Project.find project_id.to_i
+-      story = project.stories.create :name => issue_title(problem),
+-        :story_type => 'bug', :description => body_template.result(binding),
+-        :requested_by => reported_by.name
+-
+-      if story.errors.present?
+-        raise IssueTrackers::IssueTrackerError, story.errors.first
+-      else
+-        problem.update_attributes(
+-          :issue_link => "https://www.pivotaltracker.com/story/show/#{story.id}",
+-          :issue_type => Label
+-        )
+-      end
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/pivotal_body.txt.erb"))
+-    end
+-
+-    def url
+-      "https://www.pivotaltracker.com/"
+-    end
+-  end
+-end
+\ No newline at end of file
+diff --git a/app/models/issue_trackers/redmine_tracker.rb b/app/models/issue_trackers/redmine_tracker.rb
+deleted file mode 100644
+index 1b3b717..0000000
+--- a/app/models/issue_trackers/redmine_tracker.rb
++++ /dev/null
+@@ -1,75 +0,0 @@
+-if defined? RedmineClient
+-  class IssueTrackers::RedmineTracker < IssueTracker
+-    Label = "redmine"
+-    Fields = [
+-      [:account, {
+-        :label       => "Redmine URL",
+-        :placeholder => "http://www.redmine.org/"
+-      }],
+-      [:api_token, {
+-        :placeholder => "API Token for your account"
+-      }],
+-      [:username, {
+-        :placeholder => "Your username"
+-      }],
+-      [:password, {
+-        :placeholder => "Your password"
+-      }],
+-      [:project_id, {
+-        :label       => "Ticket Project",
+-        :placeholder => "Redmine Project where tickets will be created"
+-      }],
+-      [:alt_project_id, {
+-        :optional    => true,
+-        :label       => "App Project",
+-        :placeholder => "Where app's files & revisions can be viewed. (Leave blank to use the above project by default)"
+-      }]
+-    ]
+-
+-    def check_params
+-      if Fields.detect {|f| self[f[0]].blank? && !f[1][:optional]}
+-        errors.add :base, 'You must specify your Redmine URL, API token, Username, Password and Project ID'
+-      end
+-    end
+-
+-    def create_issue(problem, reported_by = nil)
+-      token = api_token
+-      acc = account
+-      user = username
+-      passwd = password
+-      RedmineClient::Base.configure do
+-        self.token = token
+-        self.user = user
+-        self.password = passwd
+-        self.site = acc
+-        self.format = :xml
+-      end
+-      issue = RedmineClient::Issue.new(:project_id => project_id)
+-      issue.subject = issue_title problem
+-      issue.description = body_template.result(binding)
+-      issue.save!
+-      problem.update_attributes(
+-        :issue_link => "#{RedmineClient::Issue.site.to_s.sub(/#{RedmineClient::Issue.site.path}$/, '')}#{RedmineClient::Issue.element_path(issue.id, :project_id => project_id)}".sub(/\.xml\?project_id=#{project_id}$/, "\?project_id=#{project_id}"),
+-        :issue_type => Label
+-      )
+-    end
+-
+-    def url_to_file(file_path, line_number = nil)
+-      # alt_project_id let's users specify a different project for tickets / app files.
+-      project = self.alt_project_id.present? ? self.alt_project_id : self.project_id
+-      url = "#{self.account.gsub(/\/$/, '')}/projects/#{project}/repository/revisions/#{app.repository_branch}/entry/#{file_path.sub(/\[PROJECT_ROOT\]/, '').sub(/^\//,'')}"
+-      line_number ? url << "#L#{line_number}" : url
+-    end
+-
+-    def body_template
+-      @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/redmine_body.txt.erb"))
+-    end
+-
+-    def url
+-      acc_url = account.start_with?('http') ? account : "http://#{account}"
+-      acc_url = acc_url.gsub(/\/$/, '')
+-      URI.parse("#{acc_url}/projects/#{project_id}").to_s
+-    rescue URI::InvalidURIError
+-    end
+-  end
+-end
+diff --git a/app/models/issue_trackers/unfuddle_tracker.rb b/app/models/issue_trackers/unfuddle_tracker.rb
+deleted file mode 100644
+index 243bc6d..0000000
+--- a/app/models/issue_trackers/unfuddle_tracker.rb
++++ /dev/null
+@@ -1,69 +0,0 @@
+-class IssueTrackers::UnfuddleTracker < IssueTracker
+-  Label = "unfuddle"
+-  Fields = [
+-
+-            [:account, {
+-               :placeholder => "Your domain"
+-             }],
+-
+-
+-            [:username, {
+-               :placeholder => "Your username"
+-             }],
+-
+-            [:password, {
+-               :placeholder => "Your password"
+-             }],
+-
+-            [:project_id, {
+-               :label       => "Ticket Project",
+-               :placeholder => "Project where tickets will be created"
+-             }],
+-
+-            [:milestone_id, {
+-               :optional    => true,
+-               :label       => "Ticket Milestone",
+-               :placeholder => "Milestone where tickets will be created"
+-             }]
+-
+-
+-           ]
+-
+-  def check_params
+-    if Fields.detect {|f| self[f[0]].blank? && !f[1][:optional]}
+-      errors.add :base, 'You must specify your Account, Username, Password and Project ID'
+-    end
+-  end
+-
+-  def create_issue(problem, reported_by = nil)
+-
+-    Unfuddle.config(account, username, password)
+-    begin
+-      issue_options = {:project_id => project_id,
+-        :summary => issue_title(problem),
+-        :priority => '5',
+-        :status => "new",
+-        :description => body_template.result(binding),
+-        'description-format' => 'textile' }
+-
+-      issue_options[:milestone_id] = milestone_id if milestone_id.present?
+-
+-      issue = Unfuddle::Ticket.create(issue_options)
+-      problem.update_attributes(
+-                                :issue_link => File.join("#{url}/tickets/#{issue.id}"),
+-                                :issue_type => Label
+-                                )
+-    rescue ActiveResource::UnauthorizedAccess
+-      raise ActiveResource::UnauthorizedAccess, "Could not authenticate with Unfuddle. Please check your username and password."
+-    end
+-
+-  end
+-
+-  def body_template
+-    @@body_template ||= ERB.new(File.read(Rails.root + "app/views/issue_trackers/textile_body.txt.erb"))
+-  end
+-
+-  def url
+-    "https://#{account}.unfuddle.com/projects/#{project_id}"
+-  end
+-end
+diff --git a/app/models/problem.rb b/app/models/problem.rb
+index ad2cfc2..cf79536 100644
+--- a/app/models/problem.rb
++++ b/app/models/problem.rb
+@@ -62,12 +62,19 @@ class Problem
+     env.present? ? where(:environment => env) : scoped
+   end
+ 
++  def url
++    Rails.application.routes.url_helpers.app_problem_url(app, self,
++      :host => Errbit::Config.host,
++      :port => Errbit::Config.port
++    )
++  end
++
+   def notices
+     Notice.for_errs(errs).ordered
+   end
+ 
+   def comments_allowed?
+-    Errbit::Config.allow_comments_with_issue_tracker || !app.issue_tracker_configured?
++    Errbit::Config.allow_comments_with_issue_tracker || app.comments_allowed?
+   end
+ 
+   def resolve!
+@@ -148,7 +155,7 @@ class Problem
+   def issue_type
+     # Return issue_type if configured, but fall back to detecting app's issue tracker
+     attributes['issue_type'] ||=
+-    (app.issue_tracker_configured? && app.issue_tracker.label) || nil
++    (app.issue_tracker_configured? && app.issue_tracker.type_tracker) || nil
+   end
+ 
+   def self.search(value)
+diff --git a/app/views/apps/_fields.html.haml b/app/views/apps/_fields.html.haml
+index e76f3a0..0d43a25 100644
+--- a/app/views/apps/_fields.html.haml
++++ b/app/views/apps/_fields.html.haml
+@@ -32,9 +32,9 @@
+     = f.check_box :notify_on_errs, 'data-show-when-checked' => '.email_at_notices_nested'
+     = f.label :notify_on_errs, 'Notify on errors'
+   - if Errbit::Config.per_app_email_at_notices
+-    %div.email_at_notices_nested{:style => f.object.notify_on_errs ? '' : 'display: none;'}
++    %div.email_at_notices_nested{:style => app_decorate.notify_err_display}
+       .field-helpertext Send a notification every
+-      = f.text_field :email_at_notices, :value => f.object.email_at_notices.join(", ")
++      = f.text_field :email_at_notices, :value => app_decorate.email_at_notices
+       .field-helpertext times an error occurs (comma separated).
+   %div.checkbox
+     = f.check_box :notify_on_deploys
+@@ -45,13 +45,13 @@
+   = f.label :notify_all_users, 'Send notifications to all users'
+ 
+ 
+-%fieldset.watchers.nested-wrapper{:style => f.object.notify_all_users ? 'display: none;' : ''}
++%fieldset.watchers.nested-wrapper{:style => app_decorate.notify_user_display}
+   %legend Watchers
+   = f.fields_for :watchers do |w|
+     %div.watcher.nested
+       %div.choose
+         = w.radio_button :watcher_type, :user
+-        = label_tag :watcher_type_user, 'User', :for => label_for_attr(w, 'watcher_type_user')
++        = w.label :watcher_type_user, 'User'
+         = w.radio_button :watcher_type, :email
+         = label_tag :watcher_type_email, 'Email Address', :for => label_for_attr(w, 'watcher_type_email')
+       %div.watcher_params.user{:class => w.object.email.blank? ? 'chosen' : nil}
+diff --git a/app/views/apps/_issue_tracker_fields.html.haml b/app/views/apps/_issue_tracker_fields.html.haml
+index b1b70c5..36e9228 100644
+--- a/app/views/apps/_issue_tracker_fields.html.haml
++++ b/app/views/apps/_issue_tracker_fields.html.haml
+@@ -1,29 +1,23 @@
+ %fieldset
+-  %legend Issue tracker
+-  = f.fields_for :issue_tracker do |w|
++  %legend= t('.legend')
++  = f.fields_for :issue_tracker do |issue_tracker_form|
+     %div.issue_tracker.nested
+       %div.choose
+-        = label_tag :type_none, :for => label_for_attr(w, 'type_issuetracker'), :class => "label_radio none" do
+-          = w.radio_button :type, "IssueTracker", 'data-section' => 'none'
+-          (None)
+-        - IssueTracker.subclasses.each do |tracker|
+-          = label_tag "type_#{tracker.label}:", :for => label_for_attr(w, "type_#{tracker.name.downcase.gsub(':','')}"), :class => "label_radio #{tracker.label}" do
+-            = w.radio_button :type, tracker.name, 'data-section' => tracker.label
+-            = tracker.name[/::(.*)Tracker/,1].titleize
++        - issue_tracker_form.object.issue_trackers do |tracker|
++          = issue_tracker_form.label :type_tracker, :class => "label_radio #{tracker.label}", :value => tracker.key do
++            = issue_tracker_form.radio_button :type_tracker, tracker.key, 'data-section' => tracker.label
++            = tracker.label
+ 
+-      %div.tracker_params.none{:class => (w.object && !(w.object.class < IssueTracker)) ? 'chosen' : nil}
+-        %p When no issue tracker has been configured, you will be able to leave comments on errors.
+-      - IssueTracker.subclasses.each do |tracker|
+-        %div.tracker_params{:class => (w.object.is_a?(tracker) ? 'chosen ' : '') << tracker.label}
+-          - if defined?(tracker::Note)
+-            %p= tracker::Note.html_safe
+-          - tracker::Fields.each do |field, field_info|
+-            = w.label field, field_info[:label] || field.to_s.titleize
+-            - field_type = field == :password ? :password_field : :text_field
+-            = w.send field_type, field, :placeholder => field_info[:placeholder], :value => w.object.send(field)
++      - issue_tracker_form.object.issue_trackers do |tracker|
++        %div.tracker_params{:class => tracker.params_class(issue_tracker_form.object)}
++          = issue_tracker_form.fields_for(:options) do |options_form|
++            %p= tracker.note
++            - tracker.fields do |field|
++              = options_form.label field.key, field.label
++              = field.input(options_form, issue_tracker_form.object)
+ 
+       .image_preloader
+-        - (IssueTracker.subclasses.map{|t| t.label } << 'none').each do |tracker|
+-          = image_tag "#{tracker}_inactive.png"
+-          = image_tag "#{tracker}_create.png"
++        - issue_tracker_form.object.issue_trackers do |tracker|
++          = image_tag "#{tracker.label}_inactive.png"
++          = image_tag "#{tracker.label}_create.png"
+ 
+diff --git a/app/views/apps/edit.html.haml b/app/views/apps/edit.html.haml
+index 90199b3..9a516bb 100644
+--- a/app/views/apps/edit.html.haml
++++ b/app/views/apps/edit.html.haml
+@@ -1,15 +1,15 @@
+-- content_for :title, 'Edit App'
++- content_for :title, t('.title')
+ - content_for :action_bar do
+   = link_to_copy_attributes_from_other_app
+   = link_to 'delete all errs', destroy_all_app_problems_path(app), :method => :post,
+     :data => { :confirm => t('apps.confirm_destroy_all_problems') }, :class => 'button'
+   = link_to 'delete application', app_path(app), :method => :delete,
+     :data => { :confirm => t('apps.confirm_delete') }, :class => 'button'
+-  = link_to('cancel', app_path(app), :class => 'button')
++  = link_to(t('.cancel'), app_path(app), :class => 'button')
+ 
+-= form_for app do |f|
++= form_for app_decorate do |f|
+ 
+   = render 'fields', :f => f
+ 
+-  %div.buttons= f.submit 'Update App'
++  %div.buttons= f.submit t('.update')
+ 
+diff --git a/app/views/apps/index.html.haml b/app/views/apps/index.html.haml
+index 19f8064..0278076 100644
+--- a/app/views/apps/index.html.haml
++++ b/app/views/apps/index.html.haml
+@@ -36,7 +36,7 @@
+         - if any_issue_trackers?
+           %td.issue_tracker
+             - if app.issue_tracker_configured?
+-              - tracker_img = image_tag("#{app.issue_tracker.label}_goto.png")
++              - tracker_img = image_tag("#{app.issue_tracker.type_tracker}_goto.png")
+               - if app.issue_tracker.url
+                 = link_to( tracker_img, app.issue_tracker.url )
+               - else
+diff --git a/app/views/apps/new.html.haml b/app/views/apps/new.html.haml
+index 9a1f1d3..a825f5b 100644
+--- a/app/views/apps/new.html.haml
++++ b/app/views/apps/new.html.haml
+@@ -1,11 +1,11 @@
+-- content_for :title, 'Add App'
++- content_for :title, t('.title')
+ - content_for :action_bar do
+   = link_to_copy_attributes_from_other_app
+-  = link_to('cancel', apps_path, :class => 'button')
++  = link_to(t('.cancel'), apps_path, :class => 'button')
+ 
+-= form_for app do |f|
++= form_for app_decorate do |f|
+ 
+   = render 'fields', :f => f
+ 
+-  %div.buttons= f.submit 'Add App'
++  %div.buttons= f.submit t('.add_app')
+ 
+diff --git a/app/views/problems/_issue_tracker_links.html.haml b/app/views/problems/_issue_tracker_links.html.haml
+index 0c293de..2df004a 100644
+--- a/app/views/problems/_issue_tracker_links.html.haml
++++ b/app/views/problems/_issue_tracker_links.html.haml
+@@ -6,10 +6,10 @@
+     %span.disabled= link_to 'creating...', '#', :class => "#{problem.issue_type}_inactive create-issue"
+     = link_to 'retry', create_issue_app_problem_path(app, problem), :method => :post
+   - else
+-    - if app.github_repo?
++    - if app.issue_tracker_configured? && !app.issue_tracker.type_tracker.eql?('github')
++      %span= link_to 'create issue', create_issue_app_problem_path(app, problem), :method => :post, :class => "#{app.issue_tracker.type_tracker}_create create-issue"
++    - elsif app.github_repo?
+       - if current_user.can_create_github_issues?
+         %span= link_to 'create issue', create_issue_app_problem_path(app, problem, :tracker => 'user_github'), :method => :post, :class => "github_create create-issue"
+-      - elsif app.issue_tracker_configured? && app.issue_tracker.label.eql?('github')
++      - elsif app.issue_tracker_configured? && app.issue_tracker.type_tracker.eql?('github')
+         %span= link_to 'create issue', create_issue_app_problem_path(app, problem), :method => :post, :class => "github_create create-issue"
+-    - if app.issue_tracker_configured? && !app.issue_tracker.label.eql?('github')
+-      %span= link_to 'create issue', create_issue_app_problem_path(app, problem), :method => :post, :class => "#{app.issue_tracker.label}_create create-issue"
+diff --git a/config/application.rb b/config/application.rb
+index 0b3e78d..8f866d3 100644
+--- a/config/application.rb
++++ b/config/application.rb
+@@ -9,6 +9,8 @@ require "action_mailer/railtie"
+ require 'mongoid/railtie'
+ require "sprockets/railtie"
+ 
++require 'draper'
++
+ if defined?(Bundler)
+   # If you precompile assets before deploying to production, use this line
+   Bundler.require(*Rails.groups(:assets => %w(development test)))
+diff --git a/config/initializers/issue_trackers.rb b/config/initializers/issue_trackers.rb
+deleted file mode 100644
+index 61dfa34..0000000
+--- a/config/initializers/issue_trackers.rb
++++ /dev/null
+@@ -1,7 +0,0 @@
+-# Require all issue tracker apis in lib/issue_tracker_apis
+-Dir.glob(Rails.root.join('lib/issue_trackers/apis/*.rb')).each {|t| require t }
+-# Require issue tracker error classes
+-require Rails.root.join('lib/issue_trackers/errors')
+-
+-# Include nested issue tracker models
+-include IssueTrackers
+diff --git a/config/locales/en.yml b/config/locales/en.yml
+index ec6438f..b576a2d 100644
+--- a/config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -127,4 +127,16 @@ en:
+       watchers: Watchers
+       when:  When
+       who: Who
++    issue_tracker_fields:
++      legend: Issue Tracker
++    new:
++      add_app: "Add App"
++      cancel: "cancel"
++      title: "Add App"
++    edit:
++      title: 'Edit App'
++      destroy: 'destroy application'
++      cancel: 'cancel'
++      seriously: 'Seriously?'
++      update: 'Update App'
+ 
+diff --git a/db/migrate/20110812135951_move_issue_trackers_to_sti.rb b/db/migrate/20110812135951_move_issue_trackers_to_sti.rb
+index 26a5d4d..3c042b3 100644
+--- a/db/migrate/20110812135951_move_issue_trackers_to_sti.rb
++++ b/db/migrate/20110812135951_move_issue_trackers_to_sti.rb
+@@ -5,21 +5,27 @@ class MoveIssueTrackersToSti < Mongoid::Migration
+       # All issue trackers now subclass the IssueTracker model,
+       # and their class is stored in the '_type' field, which is
+       # also aliased to 'type'.
+-      if app.issue_tracker && app.issue_tracker.attributes["issue_tracker_type"]
+-        app.issue_tracker._type = case app.issue_tracker.issue_tracker_type
+-        when 'lighthouseapp'; "LighthouseTracker"
+-        when 'redmine'; "RedmineTracker"
+-        when 'pivotal'; "PivotalLabsTracker"
+-        when 'fogbugz'; "FogbugzTracker"
+-        when 'mingle'; "MingleTracker"
++      tracker = app.attributes['issue_tracker']
++      if tracker && tracker['issue_tracker_type']
++        tracker['_type'] = case tracker['issue_tracker_type']
++        when 'lighthouseapp'; "IssueTrackers::LighthouseTracker"
++        when 'redmine'; "IssueTrackers::RedmineTracker"
++        when 'pivotal'; "IssueTrackers::PivotalLabsTracker"
++        when 'fogbugz'; "IssueTrackers::FogbugzTracker"
++        when 'mingle'; "IssueTrackers::MingleTracker"
+         else; nil
+         end
+-        if app.issue_tracker.issue_tracker_type == "none"
+-          app.issue_tracker = nil
++
++        if tracker['issue_tracker_type'] == "none"
++          App.collection.where({ _id: app.id }).update({
++            "$unset" => { :issue_tracker => 1 }
++          })
+         else
+-          app.issue_tracker.issue_tracker_type = nil
++          tracker.delete('issue_tracker_type')
++          App.collection.where({ _id: app.id }).update({
++            "$set" => { :issue_tracker => tracker }
++          })
+         end
+-        app.save
+       end
+     end
+   end
+diff --git a/db/migrate/20120603112130_change_github_url_to_github_repo.rb b/db/migrate/20120603112130_change_github_url_to_github_repo.rb
+index 1b28226..c2ce2a4 100644
+--- a/db/migrate/20120603112130_change_github_url_to_github_repo.rb
++++ b/db/migrate/20120603112130_change_github_url_to_github_repo.rb
+@@ -1,9 +1,21 @@
+ class ChangeGithubUrlToGithubRepo < Mongoid::Migration
++  def self.normalize_github_repo(repo)
++    return if repo.blank?
++    github_host = URI.parse(Errbit::Config.github_url).host
++    github_host = Regexp.escape(github_host)
++    repo.strip!
++    repo.sub!(/(git@|https?:\/\/)#{github_host}(\/|:)/, '')
++    repo.sub!(/\.git$/, '')
++    repo
++  end
++
+   def self.up
+     App.collection.find.update({'$rename' => {'github_url' => 'github_repo'}}, :multi => true, :safe => true)
+     App.all.each do |app|
+-      app.send :normalize_github_repo
+-      app.save
++      normalized_repo = self.normalize_github_repo(app.attributes['github_repo'])
++      App.collection.where({ _id: app.id }).update({
++        "$set" => { :github_repo =>  normalized_repo }
++      })
+     end
+   end
+ 
+diff --git a/db/migrate/20131011155638_extract_issue_tracker.rb b/db/migrate/20131011155638_extract_issue_tracker.rb
+new file mode 100644
+index 0000000..e5503b9
+--- /dev/null
++++ b/db/migrate/20131011155638_extract_issue_tracker.rb
+@@ -0,0 +1,48 @@
++class ExtractIssueTracker < Mongoid::Migration
++
++  TRACKER_MAPPING = {
++    'ErrbitTracPlugin::IssueTracker' => 'trac',
++    'IssueTrackers::BitbucketIssuesTracker' => 'bitbucket',
++    'IssueTrackers::FogbugzTracker' => 'fogbugz',
++    'IssueTrackers::GithubIssuesTracker' => 'github',
++    'IssueTrackers::GitlabTracker' => 'gitlab',
++    'IssueTrackers::JiraTracker' => 'jira',
++    'IssueTrackers::LighthouseTracker' => 'lighthouse',
++    'IssueTrackers::PivotalLabsTracker' => 'pivotal',
++    'IssueTrackers::RedmineTracker' => 'redmine',
++    'IssueTrackers::UnfuddleTracker' => 'unfuddle'
++  }
++
++  def self.up
++    App.all.each do |app|
++      require 'pry'
++      binding.pry
++      next unless app.attributes['issue_tracker'].present?
++      next unless app.attributes['issue_tracker']['_type'].present?
++
++      options = app['issue_tracker'].dup
++      options.delete('_type')
++      options.delete('_id')
++
++      _type = app.attributes['issue_tracker']['_type']
++      updated_at = options.delete('updated_at')
++      created_at = options.delete('created_at')
++
++      if TRACKER_MAPPING.include?(_type)
++        tracker = {
++          'type_tracker' => TRACKER_MAPPING[_type],
++          'options' => options,
++          'updated_at' => updated_at,
++          'created_at' => created_at
++        }
++
++        App.collection.where({ _id: app.id }).update({
++          "$set" => { :issue_tracker => tracker }
++        })
++      end
++    end
++  end
++
++  def self.down
++  end
++end
+diff --git a/lib/issue_trackers/apis/mingle.rb b/lib/issue_trackers/apis/mingle.rb
+deleted file mode 100644
+index 52304b2..0000000
+--- a/lib/issue_trackers/apis/mingle.rb
++++ /dev/null
+@@ -1,17 +0,0 @@
+-require 'active_resource'
+-
+-module Mingle
+-  class Card < ActiveResource::Base
+-    # site template ~> "https://username:password@mingle.example.com/api/v1/projects/:project_id/"
+-    self.format = :xml
+-  end
+-  def self.set_site(site)
+-    # ActiveResource seems to clone and freeze the @site variable
+-    # after the first use. It seems that the only way to change @site
+-    # is to drop the subclass, and then reload it.
+-    Mingle.send(:remove_const, :Card)
+-    load File.join(Rails.root,'lib','issue_trackers', 'apis','mingle.rb')
+-    Mingle::Card.site = site
+-  end
+-end
+-
+diff --git a/lib/issue_trackers/apis/unfuddle.rb b/lib/issue_trackers/apis/unfuddle.rb
+deleted file mode 100644
+index 3f59647..0000000
+--- a/lib/issue_trackers/apis/unfuddle.rb
++++ /dev/null
+@@ -1,13 +0,0 @@
+-require 'active_resource'
+-
+-module Unfuddle
+-  class Ticket < ActiveResource::Base
+-    self.format = :xml
+-  end
+-
+-  def self.config(account, username, password)
+-    Unfuddle::Ticket.site = "https://#{account}.unfuddle.com/api/v1/projects/:project_id"
+-    Unfuddle::Ticket.user = username
+-    Unfuddle::Ticket.password = password
+-  end
+-end
+diff --git a/lib/issue_trackers/errors.rb b/lib/issue_trackers/errors.rb
+deleted file mode 100644
+index ca2efbb..0000000
+--- a/lib/issue_trackers/errors.rb
++++ /dev/null
+@@ -1,4 +0,0 @@
+-module IssueTrackers
+-  class IssueTrackerError < StandardError; end
+-  class AuthenticationError < IssueTrackerError; end
+-end

@@ -1,0 +1,176 @@
+diff --git a/ktorm-ksp-annotations/src/main/kotlin/org/ktorm/ksp/annotation/References.kt b/ktorm-ksp-annotations/src/main/kotlin/org/ktorm/ksp/annotation/References.kt
+index a24173effe290b465d0040cccb994f3b56997d4f..b38a7e5bf580691b537b3a2152ec1028344ac042 100644
+--- a/ktorm-ksp-annotations/src/main/kotlin/org/ktorm/ksp/annotation/References.kt
++++ b/ktorm-ksp-annotations/src/main/kotlin/org/ktorm/ksp/annotation/References.kt
+@@ -54,11 +54,11 @@ public annotation class References(
+     val propertyName: String = "",
+ 
+     /**
+-     * The name of the corresponding property in the Refs wrapper class.
++     * The name of the corresponding referenced table property in the Refs wrapper class.
+      *
+      * If not specified, the name will be the annotated property's name. This behavior can be configured by KSP option
+      * `ktorm.codingNamingStrategy`, which accepts an implementation class name of
+      * `org.ktorm.ksp.spi.CodingNamingStrategy`.
+      */
+-    val propertyNameForRefs: String = "",
++    val refTablePropertyName: String = "",
+ )
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+index f246dcf1c0c8781ba99ec5c21139fcdc71392b2a..c9aa0010f9f322f371099d899a29d185b56d7f1b 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+@@ -95,6 +95,8 @@ public class KtormProcessorProvider : SymbolProcessorProvider {
+                 .replace(Regex(""",\s*"""), ", ")
+                 .replace(Regex(""",\s*\)"""), ")")
+                 .replace(Regex("""\s*get\(\)\s="""), " get() =")
++                .replace(Regex("""\s+=\s+"""), " = ")
++                .replace("import org.ktorm.ksp.`annotation`", "import org.ktorm.ksp.annotation")
+ 
+             return ktLintRuleEngine.format(code)
+         } catch (e: Exception) {
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/RefsClassGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/RefsClassGenerator.kt
+index 4c81617743b2affbf962eac464dca7434ba1e568..1395ad3d89f076df31221762f311016fa4dda20e 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/RefsClassGenerator.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/RefsClassGenerator.kt
+@@ -2,6 +2,7 @@ package org.ktorm.ksp.compiler.generator
+ 
+ import com.squareup.kotlinpoet.*
+ import org.ktorm.ksp.spi.TableMetadata
++import org.ktorm.schema.Table
+ 
+ /**
+  * Created by vince at Jul 15, 2023.
+@@ -16,11 +17,10 @@ internal object RefsClassGenerator {
+             .primaryConstructor(FunSpec.constructorBuilder().addParameter("t", tableClass).build())
+ 
+         for (column in table.columns) {
+-            val propertyNameForRefs = column.columnPropertyNameForRefs ?: continue
+             val refTable = column.referenceTable ?: continue
+             val refTableClass = ClassName(refTable.entityClass.packageName.asString(), refTable.tableClassName)
+ 
+-            val propertySpec = PropertySpec.builder(propertyNameForRefs, refTableClass)
++            val propertySpec = PropertySpec.builder(column.refTablePropertyName!!, refTableClass)
+                 .addKdoc("Return the referenced table [${refTable.tableClassName}].")
+                 .initializer(CodeBlock.of("t.%N.referenceTable as %T", column.columnPropertyName, refTableClass))
+                 .build()
+@@ -28,6 +28,17 @@ internal object RefsClassGenerator {
+             typeSpec.addProperty(propertySpec)
+         }
+ 
++        val funSpec = FunSpec.builder("toList")
++            .addKdoc("Return all referenced tables as a list.")
++            .returns(typeNameOf<List<Table<*>>>())
++            .addCode("return·listOf(")
++
++        for (column in table.columns) {
++            val refTablePropertyName = column.refTablePropertyName ?: continue
++            funSpec.addCode("%N, ", refTablePropertyName)
++        }
++
++        typeSpec.addFunction(funSpec.addCode(")").build())
+         return typeSpec.build()
+     }
+ }
+\ No newline at end of file
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
+index ee59790dd7b15320e334dddee1008b07dbced65a..98ffac5d3cdb261e53bc154f0e5bdab063c14239 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
+@@ -150,7 +150,7 @@ internal class MetadataParser(resolver: Resolver, environment: SymbolProcessorEn
+             isReference = false,
+             referenceTable = null,
+             columnPropertyName = propertyName,
+-            columnPropertyNameForRefs = null
++            refTablePropertyName = null
+         )
+     }
+ 
+@@ -230,8 +230,8 @@ internal class MetadataParser(resolver: Resolver, environment: SymbolProcessorEn
+             )
+         }
+ 
+-        val referenceTable = parseTableMetadata(refEntityClass)
+-        val primaryKeys = referenceTable.columns.filter { it.isPrimaryKey }
++        val refTable = parseTableMetadata(refEntityClass)
++        val primaryKeys = refTable.columns.filter { it.isPrimaryKey }
+         if (primaryKeys.isEmpty()) {
+             throw IllegalStateException(
+                 "Parse ref column error for property $propName: the referenced table doesn't have a primary key."
+@@ -247,18 +247,17 @@ internal class MetadataParser(resolver: Resolver, environment: SymbolProcessorEn
+         val reference = property.getAnnotationsByType(References::class).first()
+         var name = reference.name
+         if (name.isEmpty()) {
+-            name = _databaseNamingStrategy.getRefColumnName(table.entityClass, property, referenceTable)
++            name = _databaseNamingStrategy.getRefColumnName(table.entityClass, property, refTable)
+         }
+ 
+         var propertyName = reference.propertyName
+         if (propertyName.isEmpty()) {
+-            propertyName = _codingNamingStrategy.getRefColumnPropertyName(table.entityClass, property, referenceTable)
++            propertyName = _codingNamingStrategy.getRefColumnPropertyName(table.entityClass, property, refTable)
+         }
+ 
+-        var propertyNameForRefs = reference.propertyNameForRefs
+-        if (propertyNameForRefs.isEmpty()) {
+-            propertyNameForRefs = _codingNamingStrategy
+-                .getRefColumnPropertyNameForRefs(table.entityClass, property, referenceTable)
++        var refTablePropertyName = reference.refTablePropertyName
++        if (refTablePropertyName.isEmpty()) {
++            refTablePropertyName = _codingNamingStrategy.getRefTablePropertyName(table.entityClass, property, refTable)
+         }
+ 
+         return ColumnMetadata(
+@@ -268,9 +267,9 @@ internal class MetadataParser(resolver: Resolver, environment: SymbolProcessorEn
+             isPrimaryKey = property.isAnnotationPresent(PrimaryKey::class),
+             sqlType = primaryKeys[0].sqlType,
+             isReference = true,
+-            referenceTable = referenceTable,
++            referenceTable = refTable,
+             columnPropertyName = propertyName,
+-            columnPropertyNameForRefs = propertyNameForRefs
++            refTablePropertyName = refTablePropertyName
+         )
+     }
+ 
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/Namings.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/Namings.kt
+index 1619bdd4efb8437dc43d16e4f6cffc8a81c3fe0f..3172f66f2a4ab818376eb4e5845170732e5ff0ef 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/Namings.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/Namings.kt
+@@ -76,7 +76,7 @@ internal object DefaultCodingNamingStrategy : CodingNamingStrategy {
+         return prop.simpleName.asString() + pk.columnPropertyName.replaceFirstChar { it.uppercase() }
+     }
+ 
+-    override fun getRefColumnPropertyNameForRefs(
++    override fun getRefTablePropertyName(
+         c: KSClassDeclaration, prop: KSPropertyDeclaration, ref: TableMetadata
+     ): String {
+         return prop.simpleName.asString()
+diff --git a/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/CodingNamingStrategy.kt b/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/CodingNamingStrategy.kt
+index cf0fb391960d23cb668c80f1daa6c5d2b03895e7..ecf1b9db6e0639fb0a439bbcda7451c316a2b3e5 100644
+--- a/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/CodingNamingStrategy.kt
++++ b/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/CodingNamingStrategy.kt
+@@ -45,7 +45,7 @@ public interface CodingNamingStrategy {
+     public fun getRefColumnPropertyName(c: KSClassDeclaration, prop: KSPropertyDeclaration, ref: TableMetadata): String
+ 
+     /**
+-     * Generate the property name in the Refs wrapper class.
++     * Generate the name of the referenced table property in the Refs wrapper class.
+      */
+-    public fun getRefColumnPropertyNameForRefs(c: KSClassDeclaration, prop: KSPropertyDeclaration, ref: TableMetadata): String
++    public fun getRefTablePropertyName(c: KSClassDeclaration, prop: KSPropertyDeclaration, ref: TableMetadata): String
+ }
+diff --git a/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/ColumnMetadata.kt b/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/ColumnMetadata.kt
+index 2343fa513fe1a40ac31041da30b8407d6416b05f..acc9cb2a3cc22a0d281a4c667d4fbc308cf4cf2c 100644
+--- a/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/ColumnMetadata.kt
++++ b/ktorm-ksp-spi/src/main/kotlin/org/ktorm/ksp/spi/ColumnMetadata.kt
+@@ -65,7 +65,7 @@ public data class ColumnMetadata(
+     val columnPropertyName: String,
+ 
+     /**
+-     * The name of the corresponding property in the Refs wrapper class.
++     * The name of the corresponding referenced table property in the Refs wrapper class.
+      */
+-    val columnPropertyNameForRefs: String?
++    val refTablePropertyName: String?
+ )

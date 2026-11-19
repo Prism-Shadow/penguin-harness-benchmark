@@ -1,0 +1,1097 @@
+diff --git a/app/controllers/api/v2/entries_controller.rb b/app/controllers/api/v2/entries_controller.rb
+index 8ac534a..f5b80f2 100644
+--- a/app/controllers/api/v2/entries_controller.rb
++++ b/app/controllers/api/v2/entries_controller.rb
+@@ -25,24 +25,16 @@ module Api
+       end
+ 
+       def text
+-        if @user.can_read_entry?(params[:id])
+-          entry = Entry.find(params[:id])
+-          render plain: EntriesHelper.text_format(entry.content), content_type: "text/plain"
+-        else
+-          render_404
+-        end
++        entry = authorized_entry or return
++        render plain: EntriesHelper.text_format(entry.content), content_type: "text/plain"
+       end
+ 
+       def watch
+         @user = current_user
+-        if @user.can_read_entry?(params[:id])
+-          @titles = @user.subscriptions.pluck(:feed_id, :title).each_with_object({}) { |(feed_id, title), hash|
+-            hash[feed_id] = title
+-          }
+-          @entry = Entry.find(params[:id])
+-        else
+-          render_404
+-        end
++        @entry = authorized_entry or return
++        @titles = @user.subscriptions.pluck(:feed_id, :title).each_with_object({}) { |(feed_id, title), hash|
++          hash[feed_id] = title
++        }
+       end
+ 
+       private
+diff --git a/app/controllers/application_controller.rb b/app/controllers/application_controller.rb
+index 0b2c0c1..e3620be 100644
+--- a/app/controllers/application_controller.rb
++++ b/app/controllers/application_controller.rb
+@@ -27,6 +27,13 @@ class ApplicationController < ActionController::Base
+     end
+   end
+ 
++  def authorized_entry(id = params[:id])
++    entry = Entry.find_by(id: id)
++    return entry if entry && current_user&.can_read_entry?(entry.id)
++    render_404
++    nil
++  end
++
+   def logged_in
+     clear_location
+     get_feeds_list
+diff --git a/app/controllers/embeds_controller.rb b/app/controllers/embeds_controller.rb
+index 485d757..aa9497f 100644
+--- a/app/controllers/embeds_controller.rb
++++ b/app/controllers/embeds_controller.rb
+@@ -4,7 +4,7 @@ class EmbedsController < ApplicationController
+     @dom_id = params[:dom_id]
+     @media = IframeEmbed::Twitter.download(@url)
+     render "embed", locals: {source: "twitter"}, formats: :js
+-  rescue JSON::ParserError
++  rescue JSON::ParserError, TypeError
+     head :ok
+   end
+ 
+diff --git a/app/controllers/errors_controller.rb b/app/controllers/errors_controller.rb
+index c407360..cf66161 100644
+--- a/app/controllers/errors_controller.rb
++++ b/app/controllers/errors_controller.rb
+@@ -1,5 +1,6 @@
+ class ErrorsController < ApplicationController
+   skip_before_action :authorize
++  skip_before_action :verify_authenticity_token
+ 
+   def not_found
+     render_404
+diff --git a/app/controllers/extracts_controller.rb b/app/controllers/extracts_controller.rb
+index da69329..b6d7155 100644
+--- a/app/controllers/extracts_controller.rb
++++ b/app/controllers/extracts_controller.rb
+@@ -1,34 +1,28 @@
+ class ExtractsController < ApplicationController
+   def entry
+     @user = current_user
++    @entry = authorized_entry or return
+ 
+-    if @user.can_read_entry?(params[:id])
+-      @entry = Entry.find params[:id]
+-
+-      @extract = params[:extract] == "true"
+-      begin
+-        if @extract
+-          url = @entry.fully_qualified_url
+-          @content_info = MercuryParser.parse(url)
+-          @content = @content_info.content
+-        else
+-          @content = @entry.content
+-        end
+-      rescue => exception
+-        Rails.logger.error exception.message
+-        Rails.logger.error exception.backtrace.join("\n")
+-        @content = nil
+-      end
+-
+-      begin
+-        @content = ContentFormatter.format!(@content, nil, true, url)
+-      rescue
+-        @content = nil
++    @extract = params[:extract] == "true"
++    begin
++      if @extract
++        url = @entry.fully_qualified_url
++        @content_info = MercuryParser.parse(url)
++        @content = @content_info.content
++      else
++        @content = @entry.content
+       end
+-    else
+-      render_404
++    rescue => exception
++      Rails.logger.error exception.message
++      Rails.logger.error exception.backtrace.join("\n")
++      @content = nil
+     end
+ 
++    begin
++      @content = ContentFormatter.format!(@content, nil, true, url)
++    rescue
++      @content = nil
++    end
+   end
+ 
+   def modal
+diff --git a/app/controllers/microposts_controller.rb b/app/controllers/microposts_controller.rb
+index 7187c1e..25f4f2f 100644
+--- a/app/controllers/microposts_controller.rb
++++ b/app/controllers/microposts_controller.rb
+@@ -1,7 +1,7 @@
+ class MicropostsController < ApplicationController
+   def thread
+     @user = current_user
+-    @entry = Entry.find(params[:id])
++    @entry = authorized_entry or return
+     @microposts = Rails.cache.fetch("microblog_thread:#{@entry.id}", expires_in: 2.minutes) {
+       build_microposts
+     }
+@@ -34,7 +34,4 @@ class MicropostsController < ApplicationController
+     @entry.entry_id
+   end
+ 
+-  def authorize
+-    super && current_user.can_read_entry?(params[:id])
+-  end
+ end
+diff --git a/app/controllers/pages_controller.rb b/app/controllers/pages_controller.rb
+index 84ba8dc..1d7e3d7 100644
+--- a/app/controllers/pages_controller.rb
++++ b/app/controllers/pages_controller.rb
+@@ -1,11 +1,11 @@
+ class PagesController < ApplicationController
+-  skip_before_action :verify_authenticity_token
+   skip_before_action :authorize, only: [:options]
+ 
+   after_action :cors_headers, only: [:create, :options]
+ 
+   def create
+     save_page
++    head :ok
+   end
+ 
+   def fallback
+@@ -19,6 +19,10 @@ class PagesController < ApplicationController
+ 
+   private
+ 
++  def verify_authenticity_token
++    super if params[:page_token].blank? && request.authorization.blank? && request.headers["Sec-Fetch-Site"] != "none"
++  end
++
+   def save_page
+     SavePage.perform_async(current_user.id, params[:url], params[:title])
+   end
+diff --git a/app/controllers/settings/import_items_controller.rb b/app/controllers/settings/import_items_controller.rb
+index cf4608f..a0e46ce 100644
+--- a/app/controllers/settings/import_items_controller.rb
++++ b/app/controllers/settings/import_items_controller.rb
+@@ -3,7 +3,6 @@ module Settings
+     def update
+       @user = current_user
+       @import_item = @user.import_items.find(params[:id])
+-      @import_item.complete!
+       FeedImportFixer.perform_async(@user.id, @import_item.id, params[:discovered_feed][:id].to_i)
+     end
+   end
+diff --git a/app/controllers/settings/imports_controller.rb b/app/controllers/settings/imports_controller.rb
+index 67d9fda..460b326 100644
+--- a/app/controllers/settings/imports_controller.rb
++++ b/app/controllers/settings/imports_controller.rb
+@@ -52,11 +52,10 @@ class Settings::ImportsController < ApplicationController
+     @user = current_user
+     @import = @user.imports.find(params[:id])
+     @import.import_items.fixable.each do |import_item|
+-      import_item.complete!
+       FeedImportFixer.perform_async(@user.id, import_item.id)
+     end
+     respond_to do |format|
+-      format.html { redirect_to settings_import_url(@import), notice: "Imports replaced." }
++      format.html { redirect_to settings_import_url(@import), notice: "Replacing feeds." }
+       format.js { }
+     end
+   end
+diff --git a/app/controllers/settings_controller.rb b/app/controllers/settings_controller.rb
+index 6d4d018..9e06f89 100644
+--- a/app/controllers/settings_controller.rb
++++ b/app/controllers/settings_controller.rb
+@@ -80,6 +80,7 @@ class SettingsController < ApplicationController
+   def sticky
+     @user = current_user
+     @subscription = @user.subscriptions.where(feed_id: params[:feed_id]).first
++    return head :ok if @subscription.nil?
+     if @subscription.present?
+       @subscription.update(view_inline: !@subscription.view_inline)
+     end
+diff --git a/app/controllers/starred_entries_controller.rb b/app/controllers/starred_entries_controller.rb
+index eb80f02..d248a84 100644
+--- a/app/controllers/starred_entries_controller.rb
++++ b/app/controllers/starred_entries_controller.rb
+@@ -25,7 +25,7 @@ class StarredEntriesController < ApplicationController
+ 
+   def update
+     @user = current_user
+-    @entry = Entry.find(params[:id])
++    @entry = authorized_entry or return
+     starred_entry = StarredEntry.where(user: @user, entry: @entry)
+ 
+     if starred_entry.present?
+diff --git a/app/controllers/supported_sharing_services_controller.rb b/app/controllers/supported_sharing_services_controller.rb
+index 6529ba6..06dce76 100644
+--- a/app/controllers/supported_sharing_services_controller.rb
++++ b/app/controllers/supported_sharing_services_controller.rb
+@@ -37,6 +37,7 @@ class SupportedSharingServicesController < ApplicationController
+ 
+   def share
+     @user = current_user
++    authorized_entry(params[:entry_id]) or return
+     sharing_service = @user.supported_sharing_services.where(id: params[:id]).first!
+     Librato.increment("supported_sharing_services.share", source: sharing_service.service_id)
+     @response = sharing_service.share(params.to_unsafe_h)
+diff --git a/app/controllers/tags_controller.rb b/app/controllers/tags_controller.rb
+index 41349cb..e4e80df 100644
+--- a/app/controllers/tags_controller.rb
++++ b/app/controllers/tags_controller.rb
+@@ -5,7 +5,7 @@ class TagsController < ApplicationController
+     @user = current_user
+     @tags = @user.feed_tags.pluck(:name)
+ 
+-    @tags = @tags.find_all { |tag| tag.downcase.include?(params[:query].downcase) }.first(3)
++    @tags = @tags.find_all { |tag| tag.downcase.include?(params[:query].to_s.downcase) }.first(3)
+     respond_to do |format|
+       format.json { render json: {suggestions: @tags.map { |tag| {value: tag, data: tag} }}.to_json }
+     end
+diff --git a/app/controllers/unread_entries_controller.rb b/app/controllers/unread_entries_controller.rb
+index cf99a1b..36447a1 100644
+--- a/app/controllers/unread_entries_controller.rb
++++ b/app/controllers/unread_entries_controller.rb
+@@ -1,7 +1,7 @@
+ class UnreadEntriesController < ApplicationController
+   def update
+     @user = current_user
+-    @entry = Entry.find(params[:id])
++    @entry = authorized_entry or return
+     unread_entry = UnreadEntry.where(user: @user, entry: @entry)
+ 
+     if unread_entry.present?
+diff --git a/app/jobs/account_migrator/import_feed.rb b/app/jobs/account_migrator/import_feed.rb
+index 04b6639..64b0cda 100644
+--- a/app/jobs/account_migrator/import_feed.rb
++++ b/app/jobs/account_migrator/import_feed.rb
+@@ -82,6 +82,7 @@ module AccountMigrator
+       end
+ 
+       result = StarredEntry.import(records, validate: false, on_duplicate_key_ignore: true)
++      increment_starred_counter_cache(result.ids)
+ 
+       expected_count = feed_items.count
+       actual_count = result.ids.count
+@@ -89,6 +90,12 @@ module AccountMigrator
+       build_message(expected_count, actual_count, "starred")
+     end
+ 
++    def increment_starred_counter_cache(starred_entry_ids)
++      return if starred_entry_ids.blank?
++      entry_ids = StarredEntry.where(id: starred_entry_ids).pluck(:entry_id)
++      Entry.where(id: entry_ids).update_all("starred_entries_count = starred_entries_count + 1")
++    end
++
+     def build_entry(feed_item)
+       {
+         title:               feed_item.safe_dig("title")&.strip,
+diff --git a/app/jobs/feed_import_fixer.rb b/app/jobs/feed_import_fixer.rb
+index 423e444..6e873ef 100644
+--- a/app/jobs/feed_import_fixer.rb
++++ b/app/jobs/feed_import_fixer.rb
+@@ -25,7 +25,15 @@ class FeedImportFixer
+ 
+     feed = feeds.first
+ 
+-    user.subscriptions.create_with(title: import_item.details[:title]).find_or_create_by(feed: feed)
++    subscription = user.subscriptions.create_with(title: import_item.details[:title]).find_or_create_by(feed: feed)
++    return unless subscription.persisted?
+     feed.tag(import_item.details[:tag], user, false) if import_item.details[:tag]
++
++    # Completing the item is what removes it from the Fixable tab, so it can
++    # only happen once the subscription exists. The early returns above leave
++    # it fixable, which is what lets the user try the other suggestion -- these
++    # are feeds whose original url already failed once, so the replacement
++    # failing to fetch is the ordinary case.
++    import_item.complete!
+   end
+ end
+diff --git a/app/jobs/image_saver.rb b/app/jobs/image_saver.rb
+index f64b2dc..c88f947 100644
+--- a/app/jobs/image_saver.rb
++++ b/app/jobs/image_saver.rb
+@@ -13,11 +13,13 @@ class ImageSaver
+       unless already_uploaded? file
+         upload file
+       end
++    rescue HTTP::Error, Addressable::URI::InvalidURIError
++      next
+     ensure
+       file.delete if file
+     end
+     @entry.update(archived_images: true)
+-  rescue ActiveRecord::RecordNotFound, HTTP
++  rescue ActiveRecord::RecordNotFound, HTTP::Error
+   end
+ 
+   private
+@@ -40,7 +42,9 @@ class ImageSaver
+ 
+   def upload(file)
+     path = file.download
+-    client.put_object(ENV["AWS_S3_BUCKET_ARCHIVE"], file.path, File.open(path), STORAGE_OPTIONS.dup.merge("Content-Type" => file.content_type))
++    File.open(path, "rb") do |input|
++      client.put_object(ENV["AWS_S3_BUCKET_ARCHIVE"], file.path, input, STORAGE_OPTIONS.dup.merge("Content-Type" => file.content_type))
++    end
+   end
+ 
+   def client
+diff --git a/app/jobs/search/percolate_create.rb b/app/jobs/search/percolate_create.rb
+index e3ba67d..f67acaf 100644
+--- a/app/jobs/search/percolate_create.rb
++++ b/app/jobs/search/percolate_create.rb
+@@ -3,8 +3,11 @@ module Search
+     include Sidekiq::Worker
+     sidekiq_options queue: :network_search
+ 
++    # Enqueued from an after_commit, so a create followed quickly by a destroy
++    # leaves a job for an id that is already gone. PercolateDestroy has its own
++    # job; there is nothing to do here.
+     def perform(action_id)
+-      @action = Action.find(action_id)
++      return unless @action = Action.find_by(id: action_id)
+ 
+       if @action.computed_feed_ids.empty?
+         percolate_destroy
+diff --git a/app/jobs/starred_entries_export.rb b/app/jobs/starred_entries_export.rb
+index fd4e351..1dd6746 100644
+--- a/app/jobs/starred_entries_export.rb
++++ b/app/jobs/starred_entries_export.rb
+@@ -12,19 +12,23 @@ class StarredEntriesExport
+     file.unlink
+   end
+ 
++  # The separator goes before every entry but the first, so nothing has to be
++  # truncated off the end afterwards. Trimming the trailing ",\n" by byte count
++  # asked the kernel to truncate to -1 whenever no entry was written -- an
++  # account with nothing starred, or one whose stars have all aged out of the
++  # entries table.
+   def build_file(user, file)
+     starred_ids = user.starred_entries.order("created_at desc").pluck(:entry_id)
+     file.write("[")
++    first = true
+     starred_ids.each_slice(100) do |entry_ids|
+       entries = Entry.where(id: entry_ids).includes(:feed)
+       entries.each do |entry|
+-        json = JSON.generate(build_hash(entry))
+-        file.write("#{json},\n")
++        file.write(",\n") unless first
++        file.write(JSON.generate(build_hash(entry)))
++        first = false
+       end
+     end
+-    file.close
+-    File.truncate(file.path, File.size(file.path) - 2)
+-    file = File.open(file.path, "a")
+     file.write("]")
+     file.close
+   end
+diff --git a/app/models/action.rb b/app/models/action.rb
+index 9457105..a42bacb 100644
+--- a/app/models/action.rb
++++ b/app/models/action.rb
+@@ -100,8 +100,10 @@ class Action < ApplicationRecord
+   end
+ 
+   def results
+-    response = Search.client { _1.search(Search.index_name(Entry.table_name), query: search_options) }
+-    OpenStruct.new({total: response.total, records: response.records(Entry).includes(:feed)})
++    @results ||= begin
++      response = Search.client { _1.search(Search.index_name(Entry.table_name), query: search_options) }
++      OpenStruct.new({total: response.total, records: response.records(Entry).includes(:feed)})
++    end
+   end
+ 
+   def error_hint
+diff --git a/app/models/api_client.rb b/app/models/api_client.rb
+index c8aa017..d84b9fa 100644
+--- a/app/models/api_client.rb
++++ b/app/models/api_client.rb
+@@ -2,6 +2,8 @@ class ApiClient
+   class Error < StandardError
+   end
+ 
++  PAGE_SIZE = 100
++
+   def initialize(access_token)
+     @access_token = access_token
+   end
+@@ -25,17 +27,22 @@ class ApiClient
+   private
+ 
+   def paged_feed_items(path:, params:, limit:)
+-    params[:offset] = 0 if params[:offset].nil?
++    request_params = params.dup
++    offset = request_params[:offset] || request_params["offset"] || 0
++    request_params.delete("offset")
++    request_params[:offset] = offset
+     all = []
+     loop do
+-      response = request(path: path, params: params)
+-      result = response.safe_dig("feed_items")
++      break if limit && all.length >= limit
++      response = request(path: path, params: request_params)
++      result = response.safe_dig("feed_items") || []
+       break if result.count == 0
+-      all += result
+-      params[:offset] += 100
+-      break if !limit.nil? && params[:offset] == limit
++      remaining = limit ? limit - all.length : result.length
++      all.concat(result.first(remaining))
++      offset += PAGE_SIZE
++      request_params[:offset] = offset
+     end
+-    all
++    limit.nil? ? all : all.first(limit)
+   end
+ 
+   def request(path:, params: {})
+@@ -64,4 +71,4 @@ class ApiClient
+   def default_params
+     { access_token: @access_token }
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/app/models/authentication_token.rb b/app/models/authentication_token.rb
+index 3479752..cbc569e 100644
+--- a/app/models/authentication_token.rb
++++ b/app/models/authentication_token.rb
+@@ -40,16 +40,19 @@ class AuthenticationToken < ApplicationRecord
+     AuthenticationToken.newsletters.new.generate_token
+   end
+ 
++  # Returns nil when every attempt collided, rather than the last taken token:
++  # a saturated prefix is reachable, and handing the caller an address that is
++  # already someone else's only defers the failure to a uniqueness violation on
++  # save.
+   def self.generate_custom_token(prefix)
+-    token = nil
+-    count = AuthenticationToken.newsletters.where("token LIKE :query", query: "#{prefix}.%").count
+-    length = count > 900 ? 4 : 3
+-    1_000.times do |count|
++    taken = AuthenticationToken.newsletters.where("token LIKE :query", query: "#{prefix}.%").count
++    length = taken > 900 ? 4 : 3
++    1_000.times do
+       numbers = Array.new(length) { (0..9).to_a.sample }.join
+       token = "#{prefix}.#{numbers}"
+-      break unless AuthenticationToken.exists?(token: token, purpose: :newsletters)
++      return token unless AuthenticationToken.exists?(token: token, purpose: :newsletters)
+     end
+-    token
++    nil
+   end
+ 
+   def title
+diff --git a/app/models/concerns/searchable.rb b/app/models/concerns/searchable.rb
+index a818c92..3f72ce2 100644
+--- a/app/models/concerns/searchable.rb
++++ b/app/models/concerns/searchable.rb
+@@ -14,17 +14,18 @@ module Searchable
+ 
+     def self.saved_search_count(user)
+       saved_searches = user.saved_searches
+-      if saved_searches.length < 50
+-        unread_entries = user.unread_entries.pluck(:entry_id)
+-        searches = build_multi_search(user, saved_searches)
+-        records = searches.map { Search::MultiSearchRecord.new(query: _1.query) }
+-
+-        if records.present?
+-          responses = Search.client { _1.msearch(Search.index_name(Entry.table_name), records: records) }
+-          entry_ids = responses.map(&:ids)
+-          search_ids = searches.map(&:id)
+-          Hash[search_ids.zip(entry_ids)]
+-        end
++      return unless saved_searches.length < 50
++      searches = build_multi_search(user, saved_searches)
++      return if searches.empty?
++      aggs = searches.each_with_index.to_h do |search, index|
++        [index.to_s, {filter: search.query[:query], aggs: {
++          matches: {top_hits: {size: 50, _source: false, sort: [{published: "desc"}]}}
++        }}]
++      end
++      payload = Search.client { _1.aggregations(Search.index_name(Entry.table_name), query: {size: 0, aggs: aggs}) }
++      searches.each_with_index.to_h do |search, index|
++        hits = payload.safe_dig(index.to_s, "matches", "hits", "hits") || []
++        [search.id, hits.map { _1["_id"].to_i }]
+       end
+     end
+ 
+diff --git a/app/models/content_filters/attributes.rb b/app/models/content_filters/attributes.rb
+index 207b967..2a7aac1 100644
+--- a/app/models/content_filters/attributes.rb
++++ b/app/models/content_filters/attributes.rb
+@@ -32,6 +32,16 @@ module ContentFilters
+           element["class"] = classes.join(" ")
+         end
+       end
++      # Loofah allows every data-* attribute through without a protocol check,
++      # and Feedbin's front end dispatches on them: data-behavior, data-controller
++      # and data-iframe-* all reach the app's own handlers. None of them may come
++      # from the content, so they go here rather than being allow-listed. The
++      # ones Feedbin sets itself are added by filters that run after this one.
++      #
++      # Selecting the attribute nodes directly keeps the matching in libxml.
++      # Walking every element and every attribute from Ruby measured ~6x slower
++      # on real entry content and got worse as the document grew.
++      doc.xpath('.//@*[starts-with(name(), "data-")]').each(&:unlink)
+       doc
+     end
+   end
+diff --git a/app/models/crawl_data.rb b/app/models/crawl_data.rb
+index 3f33440..5bced3b 100644
+--- a/app/models/crawl_data.rb
++++ b/app/models/crawl_data.rb
+@@ -72,9 +72,14 @@ class CrawlData
+   end
+ 
+   def save(response)
+-    @data.etag                 = response.etag
+-    @data.last_modified        = response.last_modified
+-    @data.download_fingerprint = response.checksum
++    if response.status == 304
++      @data.etag          = response.etag          if response.etag
++      @data.last_modified = response.last_modified if response.last_modified
++    else
++      @data.etag                 = response.etag
++      @data.last_modified        = response.last_modified
++      @data.download_fingerprint = response.checksum
++    end
+     if retry_after = FeedCrawler::Throttle.retry_after(response.url)
+       @data.retry_after = retry_after
+     end
+diff --git a/app/models/download.rb b/app/models/download.rb
+index 1dd7da2..2daeeee 100644
+--- a/app/models/download.rb
++++ b/app/models/download.rb
+@@ -44,8 +44,13 @@ class Download
+     @extension ||= File.extname parsed_url.path
+   end
+ 
++  # Addressable rather than URI: `url` is an <img src> lifted verbatim out of
++  # entry content, and URI.parse implements RFC 3986 strictly enough to reject
++  # things browsers accept without complaint -- an unescaped space in a
++  # filename, a scheme with no authority. Both start with "http", so both clear
++  # the only filter ImageSaver applies before handing them here.
+   def parsed_url
+-    URI.parse url
++    Addressable::URI.parse url
+   end
+ 
+   def key
+diff --git a/app/models/email_newsletter.rb b/app/models/email_newsletter.rb
+index 1683f5d..6673f62 100644
+--- a/app/models/email_newsletter.rb
++++ b/app/models/email_newsletter.rb
+@@ -12,7 +12,7 @@ class EmailNewsletter
+   end
+ 
+   def valid?
+-    true
++    domain.present?
+   end
+ 
+   def token
+@@ -20,7 +20,7 @@ class EmailNewsletter
+   end
+ 
+   def from_email
+-    parsed_from.address
++    parsed_from&.address
+   end
+ 
+   def to_email
+@@ -28,15 +28,15 @@ class EmailNewsletter
+   end
+ 
+   def from_name
+-    parsed_from.name || from_email
++    parsed_from&.name || from_email
+   end
+ 
+   def name
+-    parsed_from.name
++    parsed_from&.name
+   end
+ 
+   def from
+-    parsed_from.decoded
++    parsed_from&.decoded
+   end
+ 
+   def subject
+@@ -60,6 +60,7 @@ class EmailNewsletter
+   end
+ 
+   def feed_id
++    return nil unless valid?
+     @feed_id ||= Digest::SHA1.hexdigest("#{full_token}#{from_email}")
+   end
+ 
+@@ -68,14 +69,16 @@ class EmailNewsletter
+   end
+ 
+   def domain
+-    parsed_from.domain
++    parsed_from&.domain
+   end
+ 
+   def feed_url
++    return nil unless valid?
+     "#{site_url}?#{feed_id}"
+   end
+ 
+   def site_url
++    return nil unless valid?
+     @site_url ||= URI::HTTP.build(host: domain).to_s
+   end
+ 
+@@ -122,7 +125,7 @@ class EmailNewsletter
+   end
+ 
+   def parsed_from
+-    @email[:from].element.addresses.first
++    @email[:from]&.element&.addresses&.find { |address| address.domain.present? }
+   end
+ 
+   def parsed_to
+diff --git a/app/models/entry.rb b/app/models/entry.rb
+index d2a6a19..79831ff 100644
+--- a/app/models/entry.rb
++++ b/app/models/entry.rb
+@@ -181,11 +181,14 @@ class Entry < ApplicationRecord
+     end
+   end
+ 
++  # nil, not 0, when the feed gave no itunes:duration -- the element is
++  # optional and plenty of feeds omit it. Returning 0 made every caller's nil
++  # guard dead code, so a durationless episode rendered as "0 minutes".
+   def audio_duration
+     seconds = 0
+     duration = data && data["itunes_duration"]
+ 
+-    return seconds if duration.nil?
++    return nil if duration.nil?
+ 
+     parts = duration.to_s.split(":").map(&:to_i).compact
+     parts.first(3).reverse.each_with_index do |item, index|
+@@ -413,7 +416,7 @@ class Entry < ApplicationRecord
+ 
+     subscriptions.each do |subscription|
+       if subscription.subscribed? && !subscription.filtered?(podcast_search_data)
+-        queued_entries.push QueuedEntry.new(user_id: subscription.user_id, feed_id: feed_id, entry_id: id, order: Time.now.to_i, progress: 0, duration: audio_duration)
++        queued_entries.push QueuedEntry.new(user_id: subscription.user_id, feed_id: feed_id, entry_id: id, order: Time.now.to_i, progress: 0, duration: audio_duration.to_i)
+         notification_ids.push subscription.user_id
+       elsif subscription.bookmarked?
+         notification_ids.push subscription.user_id
+diff --git a/app/models/favicon.rb b/app/models/favicon.rb
+index 822f090..f3a4f69 100644
+--- a/app/models/favicon.rb
++++ b/app/models/favicon.rb
+@@ -3,6 +3,15 @@ class Favicon < ApplicationRecord
+ 
+   validates :url, presence: true
+ 
++  # Pages entries are looked up by the entry's own host rather than the feed's,
++  # so there is no association to preload. Resolve the whole collection in one
++  # query instead of one per rendered row.
++  def self.for_entries(entries)
++    hosts = Array(entries).filter_map { _1.hostname if _1.feed&.pages? }.uniq
++    return {} if hosts.empty?
++    where(host: hosts).index_by(&:host)
++  end
++
+   after_commit :touch_owners
+ 
+   def touch_owners
+diff --git a/app/models/jws_verifier.rb b/app/models/jws_verifier.rb
+index 98b3c30..3cbe49d 100644
+--- a/app/models/jws_verifier.rb
++++ b/app/models/jws_verifier.rb
+@@ -11,17 +11,30 @@ class JwsVerifier
+ 
+   def verify
+     [root_ends_chain?, chain_valid?, jwt_valid?].all?
++  rescue StandardError
++    # Authentication boundaries must fail closed for every malformed token,
++    # including JSON values that are valid JSON but not a header object.
++    false
+   end
+ 
+   private
+ 
++  # A verifier's contract is to answer false for anything it cannot validate,
++  # so everything malformed resolves to an empty chain rather than raising.
++  # This gates an endpoint with every authentication filter skipped, where a
++  # raise is an anonymous 500 that Apple then retries.
+   def chain
+     @chain ||= begin
+-      parts = @token.split(".").map { |part| Base64.decode64(part) }
+-      header = JSON.parse(parts.first)
+-      header["x5c"].map { |part| OpenSSL::X509::Certificate.new(Base64.decode64(part))}
++      # JWT is base64url; decode64 mangles any part containing - or _.
++      parts = @token.to_s.split(".").map { |part| Base64.urlsafe_decode64(part) }
++      header = JSON.parse(parts.first.to_s)
++      return [] unless parts.length == 3 && header.is_a?(Hash)
++      certificates = header["x5c"]
++      certificates = [] unless certificates.is_a?(Array)
++      # x5c members are standard base64, per RFC 7515.
++      certificates.map { |part| OpenSSL::X509::Certificate.new(Base64.decode64(part)) }
+     end
+-  rescue JSON::ParserError
++  rescue JSON::ParserError, ArgumentError, TypeError, OpenSSL::X509::CertificateError
+     []
+   end
+ 
+@@ -29,7 +42,10 @@ class JwsVerifier
+     chain.last == ROOT_CERT
+   end
+ 
++  # Trust is established by root_ends_chain?; every supplied link must verify.
+   def chain_valid?
++    return false if chain.empty?
++
+     chain.each_cons(2).all? do |(first, second)|
+       first.verify(second.public_key)
+     end
+@@ -43,4 +59,4 @@ class JwsVerifier
+   rescue JWT::DecodeError
+     false
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/app/models/opml/parser.rb b/app/models/opml/parser.rb
+index 76ffb7a..64dcfff 100644
+--- a/app/models/opml/parser.rb
++++ b/app/models/opml/parser.rb
+@@ -18,16 +18,23 @@ module Opml
+       @outlines ||= Nokogiri::XML.parse(@xml).css("body").children
+     end
+ 
++    # OPML's rule is that an outline carrying an xmlUrl is a subscription;
++    # nesting is orthogonal to that. Classifying on node.children counted the
++    # whitespace between a paired <outline></outline> as a child and dropped
++    # the feed, which is every feed in the file for a producer that writes
++    # them that way.
+     def parse(data = nil, tag = nil)
+       data ||= outlines
+       data.each do |node|
+         next unless node.name == "outline"
+         outline = Outline.new(node, tag).to_h
+-        if node.children.length > 0
++
++        @feeds << outline if outline[:xml_url].present?
++
++        nested = node.element_children.select { _1.name == "outline" }
++        if nested.any?
+           title = outline[:title] || outline[:text]
+-          parse(node.children, title)
+-        else
+-          @feeds << outline
++          parse(nested, title)
+         end
+       end
+     end
+diff --git a/app/models/search/connection.rb b/app/models/search/connection.rb
+index 8bfdf2f..b103b5e 100644
+--- a/app/models/search/connection.rb
++++ b/app/models/search/connection.rb
+@@ -1,5 +1,11 @@
+ module Search
+   class Connection
++    # Raised when a response cannot be parsed. Carries the status, content
++    # type, and leading bytes of the body, because the underlying ParseError
++    # reports none of them -- a header-less proxy error page surfaced only as
++    # "Unknown MIME type:" with no clue as to what actually answered.
++    class ResponseError < StandardError; end
++
+     PATHS = {
+       document: "/%{index}/_doc/%{id}",
+       search:   "/%{index}/_search",
+@@ -10,8 +16,23 @@ module Search
+       bulk:     "/_bulk",
+       aliases:  "/_aliases",
+       alias:    "/_alias/%{name}",
++      pit:       "/%{index}/_pit",
++      pit_close: "/_pit",
++      # A point-in-time search names its index in the body, not the path.
++      pit_search: "/_search",
+     }
+ 
++    # Long enough to walk a large match set, short enough that an abandoned
++    # cursor releases its segments promptly.
++    PIT_KEEP_ALIVE = "2m"
++
++    # Elasticsearch rejects a from + size above index.max_result_window, so
++    # there is no point honouring a larger page than this.
++    MAX_PER_PAGE = 1_000
++
++    # How many hits all_matches walks at a time.
++    ALL_MATCHES_PER_PAGE = 1_000
++
+     def initialize(url, username: nil, password: nil)
+       @url = url
+       @username = username
+@@ -19,10 +40,15 @@ module Search
+     end
+ 
+     def search(index, query:, page: 1, per_page: WillPaginate.per_page)
++      # Both arrive straight from the query string on most paths, so coerce
++      # here rather than relying on every caller to have done it.
++      page = page.to_i.clamp(1, Float::INFINITY).to_i
++      per_page = per_page.to_i.clamp(1, MAX_PER_PAGE)
++
+       path = PATHS[:search] % {index:}
+       data = request(:get, path, json: query, params: {
+         :_source => false,
+-        :from    => (page.to_i - 1) * per_page,
++        :from    => (page - 1) * per_page,
+         :size    => per_page
+       })
+       Response.new(data, page: page, per_page: per_page)
+@@ -61,6 +87,11 @@ module Search
+       end
+     end
+ 
++    def aggregations(index, query:)
++      path = PATHS[:search] % {index:}
++      request(:get, path, json: query).fetch("aggregations", {}) || {}
++    end
++
+     def validate(index, query:)
+       path = PATHS[:validate] % {index:}
+       result = request(:get, path, json: query)
+@@ -81,14 +112,57 @@ module Search
+       request(:delete, "/#{index}")
+     end
+ 
++    # Walks the whole match set with search_after rather than from/size.
++    #
++    # Paginating could not do this job. The page count came from the reported
++    # total, which Elasticsearch caps at track_total_hits and reports as fact,
++    # so anything past the cap was dropped with no indication it had stopped
++    # early -- and past index.max_result_window from/size would have been
++    # rejected outright. search_after has neither ceiling.
+     def all_matches(index, query:)
+-      callback = proc do |page|
+-        search(index, query: query, page: page, per_page: 1_000)
+-      end
+-      result = callback.call(1)
+-      2.upto(result.pagination.total_pages).each_with_object(result.ids) do |page, ids|
+-        ids.concat callback.call(page).ids
++      pit_id = open_pit(index)
++
++      # _shard_doc is the tiebreaker a point-in-time provides, so this needs
++      # nothing from the index's own mapping -- the entries and actions
++      # indexes do not share a sortable field.
++      body = query.deep_dup.except(:from, "from", :sort, "sort").merge(
++        pit: {id: pit_id, keep_alive: PIT_KEEP_ALIVE},
++        sort: [{_shard_doc: "asc"}],
++        size: ALL_MATCHES_PER_PAGE,
++        track_total_hits: false
++      )
++
++      ids = []
++      loop do
++        data = request(:get, PATHS[:pit_search], json: body, params: {:_source => false})
++        pit_id = data["pit_id"] || pit_id
++        hits = data.safe_dig("hits", "hits") || []
++        break if hits.empty?
++
++        ids.concat hits.map { _1["_id"].to_i }
++        break if hits.length < ALL_MATCHES_PER_PAGE
++
++        # The pit id can be rotated between requests.
++        body = body.merge(
++          pit: {id: pit_id, keep_alive: PIT_KEEP_ALIVE},
++          search_after: hits.last["sort"]
++        )
+       end
++      ids
++    ensure
++      close_pit(pit_id) if pit_id
++    end
++
++    def open_pit(index)
++      path = PATHS[:pit] % {index:}
++      request(:post, path, params: {keep_alive: PIT_KEEP_ALIVE})["id"]
++    end
++
++    def close_pit(pit_id)
++      request(:delete, PATHS[:pit_close], json: {id: pit_id})
++    rescue
++      # The keep_alive expires on its own; a failure to close is not worth
++      # replacing the caller's result with an exception.
+     end
+ 
+     def add_alias(index, alias_name:)
+@@ -126,7 +200,7 @@ module Search
+     end
+ 
+     def reindex(index, mappings:, &block)
+-      new_index = "#{index}-#{Time.now.to_i}"
++      new_index = "#{index}-#{Time.now.strftime("%s%L")}"
+       request(:put, new_index, json: mappings)
+       begin
+         yield(new_index)
+@@ -134,7 +208,10 @@ module Search
+         delete_index(new_index)
+         raise
+       end
+-      old_indexes = get_indexes_from_alias(index)
++      # If a reindex reuses a still-aliased name (two runs in the same clock
++      # second), treating it as an old index would delete it right after the
++      # alias swap points at it.
++      old_indexes = get_indexes_from_alias(index) - [new_index]
+       update_alias(alias_name: index, old_indexes: old_indexes, new_index: new_index)
+       old_indexes.each { delete_index(_1) }
+     end
+@@ -143,7 +220,15 @@ module Search
+       unless path.start_with?("/")
+         path = "/#{path}"
+       end
+-      connection.request(method.to_sym, path, **options).parse
++      response = connection.request(method.to_sym, path, **options)
++      begin
++        response.parse
++      rescue HTTP::Error => exception
++        # Reading the body here also keeps the persistent connection usable;
++        # parse dies before consuming it when the content type is missing.
++        body = response.to_s.byteslice(0, 500).scrub rescue nil
++        raise ResponseError, "#{exception.message} (status: #{response.status.code}, content_type: #{response.content_type.mime_type.inspect}, body: #{body.inspect})"
++      end
+     end
+ 
+     def close
+diff --git a/app/models/subscription.rb b/app/models/subscription.rb
+index 2e9ac05..e8c8076 100644
+--- a/app/models/subscription.rb
++++ b/app/models/subscription.rb
+@@ -13,6 +13,7 @@ class Subscription < ApplicationRecord
+ 
+   before_destroy :prevent_generated_destroy
+   before_destroy :mark_as_read
++  before_destroy :clear_updated_entries
+   before_destroy :untag
+ 
+   after_create :refresh_favicon
+@@ -59,6 +60,10 @@ class Subscription < ApplicationRecord
+     UnreadEntry.where(user_id: user_id, feed_id: feed_id).delete_all
+   end
+ 
++  def clear_updated_entries
++    UpdatedEntry.where(user_id: user_id, feed_id: feed_id).delete_all
++  end
++
+   def add_feed_to_action
+     Search::AddFeedToAction.perform_async(user_id)
+   end
+diff --git a/app/presenters/base_presenter.rb b/app/presenters/base_presenter.rb
+index bdda047..a4d9bf7 100644
+--- a/app/presenters/base_presenter.rb
++++ b/app/presenters/base_presenter.rb
+@@ -7,7 +7,9 @@ class BasePresenter
+ 
+   def favicon(feed, entry = nil)
+     @favicon ||= begin
+-      @template.render FaviconComponent.new(feed:, entry:)
++      # The entry list resolves the whole page's Pages favicons up front and
++      # hands the map down as a local; a caller rendering one entry has none.
++      @template.render FaviconComponent.new(feed:, entry:, favicons: @locals && @locals[:favicons])
+     end
+   end
+ 
+diff --git a/app/views/components/favicon_component.rb b/app/views/components/favicon_component.rb
+index d89cfc4..2ca0f45 100644
+--- a/app/views/components/favicon_component.rb
++++ b/app/views/components/favicon_component.rb
+@@ -1,8 +1,9 @@
+ class FaviconComponent < ApplicationComponent
+ 
+-  def initialize(feed:, entry: nil)
++  def initialize(feed:, entry: nil, favicons: nil)
+     @feed = feed
+     @entry = entry
++    @favicons = favicons
+   end
+ 
+   def view_template(&)
+@@ -50,7 +51,7 @@ class FaviconComponent < ApplicationComponent
+   end
+ 
+   def icon_pages
+-    icon = Favicon.find_by_host(@entry.hostname)
++    icon = pages_favicon
+     if icon&.cdn_url
+       icon_favicon(icon)
+     else
+@@ -58,6 +59,18 @@ class FaviconComponent < ApplicationComponent
+     end
+   end
+ 
++  # favicons is the collection-wide map the entry list resolves up front. Fall
++  # back to a lookup for the callers that render one entry on its own.
++  #
++  # host is nullable, so an entry whose url will not parse would otherwise
++  # query host IS NULL and bind to an unrelated row.
++  def pages_favicon
++    hostname = @entry.hostname
++    return nil if hostname.blank?
++    return @favicons[hostname] if @favicons
++    Favicon.find_by_host(hostname)
++  end
++
+   def icon_pages_default
+     span class: "favicon-wrap collection-favicon" do
+       Icon("favicon-saved")
+diff --git a/app/views/entries/_entry.html.erb b/app/views/entries/_entry.html.erb
+index fb17364..20b1395 100644
+--- a/app/views/entries/_entry.html.erb
++++ b/app/views/entries/_entry.html.erb
+@@ -1,4 +1,4 @@
+-<% present entry do |entry_presenter| %>
++<% present entry, {favicons: local_assigns[:favicons]} do |entry_presenter| %>
+     <%= entry_presenter.entry_summary do %>
+         <%= entry_presenter.entry_link do %>
+             <div class="entry-summary-inner">
+diff --git a/app/views/shared/_entries.js.erb b/app/views/shared/_entries.js.erb
+index 64784c8..4026623 100644
+--- a/app/views/shared/_entries.js.erb
++++ b/app/views/shared/_entries.js.erb
+@@ -2,7 +2,8 @@ var callback = function() {
+     <% if @entries.length == 0 %>
+         var entries = "<%= j render partial: "entries/no_entry" %>";
+     <% else %>
+-        var entries = "<%= j render partial: "entries/entry", collection: @entries, cached: -> (entry) { [entry, entry.feed.custom_icon, entry.feed.favicon, "v6"] } %>";
++        <% favicons = Favicon.for_entries(@entries) %>
++        var entries = "<%= j render partial: "entries/entry", collection: @entries, locals: {favicons: favicons}, cached: -> (entry) { [entry, entry.feed.custom_icon, entry.feed.favicon, "v6"] } %>";
+     <% end %>
+ 
+     <% if @append %>
+diff --git a/lib/compressed_request.rb b/lib/compressed_request.rb
+index 1914bba..d4c623c 100644
+--- a/lib/compressed_request.rb
++++ b/lib/compressed_request.rb
+@@ -18,7 +18,7 @@ class CompressedRequest
+   private
+ 
+   def extension?(env)
+-    env["REQUEST_PATH"].start_with?("/extension/v1/pages")
++    env["PATH_INFO"].to_s.start_with?("/extension/v1/pages")
+   end
+ 
+   def gzipped?(env)
