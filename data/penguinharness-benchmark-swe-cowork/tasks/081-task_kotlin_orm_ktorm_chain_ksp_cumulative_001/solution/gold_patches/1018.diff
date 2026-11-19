@@ -1,0 +1,146 @@
+diff --git a/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts b/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts
+index fc700e36470921b15a0d1088eb15e13a4de369ba..0f7549ffd08e9db14bfb11c5d5a19f926bf8cf61 100644
+--- a/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts
++++ b/ktorm-ksp-compiler-maven-plugin/ktorm-ksp-compiler-maven-plugin.gradle.kts
+@@ -7,6 +7,8 @@ plugins {
+ 
+ dependencies {
+     compileOnly(kotlin("maven-plugin"))
++    compileOnly(kotlin("compiler"))
+     compileOnly("org.apache.maven:maven-core:3.9.3")
+-    implementation("com.google.devtools.ksp:symbol-processing:1.7.22-1.0.8")
++    implementation("com.google.devtools.ksp:symbol-processing-cmdline:1.7.22-1.0.8")
++    implementation(project(":ktorm-ksp-compiler"))
+ }
+diff --git a/ktorm-ksp-compiler-maven-plugin/src/main/kotlin/org/ktorm/ksp/compiler/maven/KtormKspMavenPluginExtension.kt b/ktorm-ksp-compiler-maven-plugin/src/main/kotlin/org/ktorm/ksp/compiler/maven/KtormKspMavenPluginExtension.kt
+index d2de2d32eb67221d4e750387f2a955b6bb611270..e0229c298def71ca256b43b90d4af39db9877ab3 100644
+--- a/ktorm-ksp-compiler-maven-plugin/src/main/kotlin/org/ktorm/ksp/compiler/maven/KtormKspMavenPluginExtension.kt
++++ b/ktorm-ksp-compiler-maven-plugin/src/main/kotlin/org/ktorm/ksp/compiler/maven/KtormKspMavenPluginExtension.kt
+@@ -1,13 +1,15 @@
+ package org.ktorm.ksp.compiler.maven
+ 
++import com.google.devtools.ksp.KspCliOption
++import org.apache.maven.artifact.resolver.ArtifactResolutionRequest
+ import org.apache.maven.plugin.MojoExecution
+-import org.apache.maven.plugin.MojoExecutionException
+ import org.apache.maven.project.MavenProject
+ import org.apache.maven.repository.RepositorySystem
+ import org.codehaus.plexus.component.annotations.Component
+ import org.codehaus.plexus.component.annotations.Requirement
+ import org.jetbrains.kotlin.maven.KotlinMavenPluginExtension
+ import org.jetbrains.kotlin.maven.PluginOption
++import java.io.File
+ 
+ /**
+  * Extension that enables KSP for the kotlin maven plugin
+@@ -22,10 +24,85 @@ public class KtormKspMavenPluginExtension : KotlinMavenPluginExtension {
+     }
+ 
+     override fun isApplicable(project: MavenProject, execution: MojoExecution): Boolean {
+-        return true
++        return execution.mojoDescriptor.goal == "compile" || execution.mojoDescriptor.goal == "test-compile"
+     }
+ 
+     override fun getPluginOptions(project: MavenProject, execution: MojoExecution): List<PluginOption> {
+-        throw MojoExecutionException("test ktorm ksp")
++//        val request = ArtifactResolutionRequest()
++//        request.artifact = repositorySystem.createArtifactWithClassifier("com.pinterest", "ktlint", "0.50.0", "jar", "all")
++//        request.remoteRepositories = project.remoteArtifactRepositories
++//
++//        val resolved = repositorySystem.resolve(request)
++//        throw MojoExecutionException("test ktorm ksp: ${resolved.artifacts.map { it.file }}")
++        val options = buildDefaultOptions(project, execution)
++        return options.map { (option, value) -> PluginOption("ksp", compilerPluginId, option.optionName, value) }
++    }
++
++    private fun parseUserOptions(execution: MojoExecution): Map<KspCliOption, List<String>> {
++        val pluginOptions = execution.configuration.getChild("pluginOptions") ?: return emptyMap()
++        val availableOptions = KspCliOption.values().associateBy { it.optionName }
++        val pattern = Regex("([^:]+):([^=]+)=(.*)")
++
++        return pluginOptions.children
++            .mapNotNull { pattern.matchEntire(it.value) }
++            .map { it.destructured }
++            .filter { (plugin, key, _) -> plugin == "ksp" && key in availableOptions }
++            .groupBy({ (_, key, _) -> availableOptions[key]!! }, { (_, _, value) -> value })
++    }
++
++    private fun buildDefaultOptions(project: MavenProject, execution: MojoExecution): Map<KspCliOption, String> {
++        val baseDir = project.basedir.path
++        val buildDir = project.build.directory
++
++        if (execution.mojoDescriptor.goal == "compile") {
++            return mapOf(
++                KspCliOption.CLASS_OUTPUT_DIR_OPTION to project.build.outputDirectory,
++                KspCliOption.JAVA_OUTPUT_DIR_OPTION to path(buildDir, "generated-sources", "ksp-java"),
++                KspCliOption.KOTLIN_OUTPUT_DIR_OPTION to path(buildDir, "generated-sources", "ksp"),
++                KspCliOption.RESOURCE_OUTPUT_DIR_OPTION to project.build.outputDirectory,
++                KspCliOption.CACHES_DIR_OPTION to path(buildDir, "kspCaches"),
++                KspCliOption.PROJECT_BASE_DIR_OPTION to baseDir,
++                KspCliOption.KSP_OUTPUT_DIR_OPTION to path(buildDir, "ksp"),
++                KspCliOption.PROCESSOR_CLASSPATH_OPTION to buildProcessorClasspath(project, execution),
++                KspCliOption.WITH_COMPILATION_OPTION to "true"
++            )
++        }
++
++        if (execution.mojoDescriptor.goal == "test-compile") {
++            return mapOf(
++                KspCliOption.CLASS_OUTPUT_DIR_OPTION to project.build.testOutputDirectory,
++                KspCliOption.JAVA_OUTPUT_DIR_OPTION to path(buildDir, "generated-test-sources", "ksp-java"),
++                KspCliOption.KOTLIN_OUTPUT_DIR_OPTION to path(buildDir, "generated-test-sources", "ksp"),
++                KspCliOption.RESOURCE_OUTPUT_DIR_OPTION to project.build.testOutputDirectory,
++                KspCliOption.CACHES_DIR_OPTION to path(buildDir, "kspCaches"),
++                KspCliOption.PROJECT_BASE_DIR_OPTION to baseDir,
++                KspCliOption.KSP_OUTPUT_DIR_OPTION to path(buildDir, "ksp-test"),
++                KspCliOption.PROCESSOR_CLASSPATH_OPTION to buildProcessorClasspath(project, execution),
++                KspCliOption.WITH_COMPILATION_OPTION to "true"
++            )
++        }
++
++        return emptyMap()
++    }
++
++    private fun path(parent: String, vararg children: String): String {
++        val file = children.fold(File(parent)) { acc, child -> File(acc, child) }
++        return file.path
++    }
++
++    private fun buildProcessorClasspath(project: MavenProject, execution: MojoExecution): String {
++        val files = ArrayList<File>()
++        for (dependency in execution.plugin.dependencies) {
++            val request = ArtifactResolutionRequest()
++            request.artifact = repositorySystem.createDependencyArtifact(dependency)
++            request.localRepository = repositorySystem.createDefaultLocalRepository()
++            request.remoteRepositories = project.pluginArtifactRepositories
++            request.isResolveTransitively = true
++
++            val resolved = repositorySystem.resolve(request)
++            files += resolved.artifacts.mapNotNull { it.file }.filter { it.exists() }
++        }
++
++        return files.joinToString(File.pathSeparator) { it.path }
+     }
+ }
+diff --git a/ktorm-ksp-compiler-maven-plugin/src/main/resources/META-INF/plexus/components.xml b/ktorm-ksp-compiler-maven-plugin/src/main/resources/META-INF/plexus/components.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..831c70493987b6fbcbc9276c17a44516bdf5e26a
+--- /dev/null
++++ b/ktorm-ksp-compiler-maven-plugin/src/main/resources/META-INF/plexus/components.xml
+@@ -0,0 +1,17 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<component-set>
++    <components>
++        <component>
++            <role>org.jetbrains.kotlin.maven.KotlinMavenPluginExtension</role>
++            <role-hint>ksp</role-hint>
++            <implementation>org.ktorm.ksp.compiler.maven.KtormKspMavenPluginExtension</implementation>
++            <isolated-realm>false</isolated-realm>
++            <requirements>
++                <requirement>
++                    <role>org.apache.maven.repository.RepositorySystem</role>
++                    <field-name>repositorySystem</field-name>
++                </requirement>
++            </requirements>
++        </component>
++    </components>
++</component-set>
