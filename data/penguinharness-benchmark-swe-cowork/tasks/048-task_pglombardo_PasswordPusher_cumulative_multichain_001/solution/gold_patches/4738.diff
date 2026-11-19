@@ -1,0 +1,525 @@
+diff --git a/app/controllers/api/v1/pushes_controller.rb b/app/controllers/api/v1/pushes_controller.rb
+index 66d7a6c4..a8b3e67a 100644
+--- a/app/controllers/api/v1/pushes_controller.rb
++++ b/app/controllers/api/v1/pushes_controller.rb
+@@ -38,25 +38,18 @@ class Api::V1::PushesController < Api::BaseController
+     https://docs.pwpush.com/docs/json-api/
+   EOS
+   def show
+-    # This push may have expired since the last view.  Validate the url
+-    # expiration before doing anything.
++    # Expire pushes that are already past days/views so passphrase-protected
++    # exhausted pushes still skip the passphrase gate (legacy behavior).
+     @push.check_limits
+ 
+-    if @push.expired
+-      log_view(@push)
+-      render template: "pushes/show", status: :ok
+-      return
+-    end
+-
+-    # Passphrase handling
+-    if @push.passphrase.present?
++    # Passphrase gate before any payload access or view claim
++    if @push.passphrase.present? && !@push.expired?
+       # JSON requests must pass the passphrase in the params
+       has_passphrase = ActiveSupport::SecurityUtils.secure_compare(@push.passphrase.to_s, params[:passphrase].to_s)
+ 
+       unless has_passphrase
+         log_failed_passphrase(@push)
+ 
+-        # Passphrase hasn't been provided or is incorrect
+         render json: {
+           error: "That passphrase is incorrect.",
+           message: "This push requires a passphrase. Please provide it using the 'passphrase' parameter (e.g. ?passphrase=mysecret)",
+@@ -66,18 +59,20 @@ class Api::V1::PushesController < Api::BaseController
+       end
+     end
+ 
+-    log_view(@push)
+-    expires_now
++    result = @push.claim_view!(
++      viewer: user_signed_in? ? current_user : nil,
++      admin: user_signed_in? && current_user.admin?,
++      ip: request.remote_ip,
++      user_agent: request.env["HTTP_USER_AGENT"],
++      referrer: request.env["HTTP_REFERER"]
++    )
+ 
++    expires_now
+     render template: "pushes/show", status: :ok
+ 
+-    # If files are attached, we can't expire immediately as the viewer still needs
+-    # to download the files.  In the case of files, this push will be expired on the
+-    # next ExpirePushesJob run or next view attempt.  Whichever comes first.
+-    if !@push.files.attached? && !@push.views_remaining.positive?
+-      # Expire if this is the last view for this push
+-      @push.expire!
+-    end
++    # Expire after response so the last successful view still reports
++    # expired=false with payload (legacy API shape). View was logged under lock.
++    @push.expire! if result.expire_after_response
+   end
+ 
+   api :POST, "/p.json", "Create a new push."
+diff --git a/app/controllers/pushes_controller.rb b/app/controllers/pushes_controller.rb
+index 9da714a1..4bf61aea 100644
+--- a/app/controllers/pushes_controller.rb
++++ b/app/controllers/pushes_controller.rb
+@@ -14,59 +14,54 @@ class PushesController < BaseController
+     with: -> { redirect_to preview_push_path(@push), alert: I18n._("Too many email notification requests. Please try again in a minute.") }
+ 
+   def show
+-    # This push may have expired since the last view.  Validate the push
+-    # expiration before doing anything.
++    # Expire pushes that are already past days/views so passphrase-protected
++    # exhausted pushes still skip the passphrase gate (legacy behavior).
+     @push.check_limits
+ 
+-    if @push.expired
+-      log_view(@push)
+-      render template: "pushes/show_expired", layout: "naked"
+-      return
+-    else
+-      @payload = @push.payload
+-    end
+-
+-    # Passphrase handling
+-    if @push.passphrase.present?
+-      # Construct the passphrase cookie name
++    # Passphrase gate before any payload access or view claim
++    if @push.passphrase.present? && !@push.expired?
+       name = "#{@push.url_token}-p"
+ 
+       # The passphrase can be passed in the params or in the cookie (default)
+-      # JSON requests must pass the passphrase in the params
+       has_passphrase = ActiveSupport::SecurityUtils.secure_compare(@push.passphrase.to_s, params[:passphrase].to_s) ||
+         ActiveSupport::SecurityUtils.secure_compare(@push.passphrase_ciphertext.to_s, cookies[name].to_s)
+ 
+       unless has_passphrase
+-        # Passphrase hasn't been provided or is incorrect
+-        # Redirect to the passphrase page
+         redirect_to passphrase_push_path(@push.url_token)
+         return
+       end
+ 
+-      # Delete the cookie
+       cookies.delete name
+     end
+ 
+-    log_view(@push)
++    result = @push.claim_view!(
++      viewer: user_signed_in? ? current_user : nil,
++      admin: user_signed_in? && current_user.admin?,
++      ip: request.remote_ip,
++      user_agent: request.env["HTTP_USER_AGENT"],
++      referrer: request.env["HTTP_REFERER"]
++    )
++
++    if result.expired?
++      render template: "pushes/show_expired", layout: "naked"
++      return
++    end
++
++    @payload = result.payload
+     expires_now
+ 
+     # Optionally blur the text payload
+     @blur_css_class = @push.settings_for_kind.enable_blur ? "spoiler" : ""
+ 
+     if @push.kind == "url"
+-      # Redirect to the URL
+-      redirect_to @push.payload, allow_other_host: true, status: :see_other
++      redirect_to @payload, allow_other_host: true, status: :see_other
+     else
+       render layout: "bare"
+     end
+ 
+-    # If files are attached, we can't expire immediately as the viewer still needs
+-    # to download the files.  In the case of files, this push will be expired on the
+-    # next ExpirePushesJob run or next view attempt.  Whichever comes first.
+-    if !@push.files.attached? && !@push.views_remaining.positive?
+-      # Expire if this is the last view for this push
+-      @push.expire!
+-    end
++    # Expire after response so the last successful view still renders the payload
++    # with expired=false (legacy behavior). The view was already logged under lock.
++    @push.expire! if result.expire_after_response
+   end
+ 
+   # GET /p/:url_token/passphrase
+diff --git a/app/models/push.rb b/app/models/push.rb
+index 42d9e25b..9920d563 100644
+--- a/app/models/push.rb
++++ b/app/models/push.rb
+@@ -5,6 +5,15 @@ require "addressable/uri"
+ class Push < ApplicationRecord
+   include Pwpush::NotifiableByEmail
+ 
++  # Result of an atomic retrieval claim (see #claim_view!).
++  # +expire_after_response+ is true when the caller should expire the push after
++  # rendering (preserves legacy last-view JSON where expired is still false).
++  ViewClaim = Data.define(:status, :payload, :kind, :expire_after_response) do
++    def ok? = status == :ok
++
++    def expired? = status == :expired
++  end
++
+   enum :kind, [:text, :file, :url, :qr], validate: true
+ 
+   validate :check_enabled_push_kinds, on: :create
+@@ -56,17 +65,13 @@ class Push < ApplicationRecord
+     audit_logs.where(kind: :failed_view).order(:created_at)
+   end
+ 
+-  # Expire this push, delete the content and save the record
++  # Expire this push, delete the content and save the record.
++  # Active Storage purge runs after the DB save so callers holding a row lock
++  # can use #expire_record! and purge outside the lock instead.
+   def expire
+-    # Delete content
+-    self.payload = nil
+-    self.passphrase = nil
+-    files.purge
+-
+-    # Mark as expired
+-    self.expired = true
+-    self.expired_on = Time.current.utc
++    expire_record
+     save
++    files.purge
+   end
+ 
+   # Override to_json so that we can add in <days_remaining>, <views_remaining>
+@@ -164,11 +169,11 @@ class Push < ApplicationRecord
+ 
+     # MIGRATE - ask
+     # Are these assignments needed?
+-    unless self.expire_after_days.between?(settings_for_kind.expire_after_days_min, settings_for_kind.expire_after_days_max)
++    unless expire_after_days.between?(settings_for_kind.expire_after_days_min, settings_for_kind.expire_after_days_max)
+       self.expire_after_days = settings_for_kind.expire_after_days_default
+     end
+ 
+-    unless self.expire_after_views.between?(settings_for_kind.expire_after_views_min, settings_for_kind.expire_after_views_max)
++    unless expire_after_views.between?(settings_for_kind.expire_after_views_min, settings_for_kind.expire_after_views_max)
+       self.expire_after_views = settings_for_kind.expire_after_views_default
+     end
+   end
+@@ -181,18 +186,100 @@ class Push < ApplicationRecord
+     self.url_token = SecureRandom.urlsafe_base64(rand(8..14)).downcase
+   end
+ 
+-  def expire!
+-    # Delete content
++  # Clears secret fields and marks the push expired in memory (no save, no purge).
++  def expire_record
+     self.payload = nil
+     self.passphrase = nil
+-    files.purge
+-
+-    # Mark as expired
+     self.expired = true
+     self.expired_on = Time.current.utc
++  end
++
++  # Persists #expire_record without purging attachments.
++  def expire_record!
++    expire_record
+     save!
+   end
+ 
++  def expire!
++    expire_record!
++    files.purge
++  end
++
++  # Atomically check limits, log a view, and snapshot the payload. Serializes
++  # concurrent retrievals so expire_after_views cannot be bypassed by racing
++  # requests. When this counting view exhausts the limit for a non-file push,
++  # returns +expire_after_response+ so the caller can expire after render
++  # (legacy API shape: last successful view still reports expired=false).
++  #
++  # +viewer+ is the signed-in user (or nil). +admin+ must be true for admin
++  # non-counting views. Request metadata is stored on the audit log.
++  def claim_view!(viewer: nil, admin: false, ip: nil, user_agent: nil, referrer: nil)
++    should_purge_files = false
++    result = nil
++
++    with_lock do
++      reload
++
++      if !expired? && (!days_remaining.positive? || !views_remaining.positive?)
++        expire_record!
++        should_purge_files = true
++      end
++
++      if expired?
++        # Best-effort audit; payload is already gone
++        create_retrieval_audit_log!(kind: :failed_view, viewer:, ip:, user_agent:, referrer:)
++        result = ViewClaim.new(status: :expired, payload: nil, kind: :failed_view, expire_after_response: false)
++      else
++        kind = if admin
++          :admin_view
++        elsif owned_by?(viewer)
++          :owner_view
++        else
++          :view
++        end
++
++        logged = create_retrieval_audit_log!(kind:, viewer:, ip:, user_agent:, referrer:)
++
++        # Counting views must be persisted or expire_after_views can be bypassed
++        # once the per-push audit log cap is hit. Fail closed: clear the secret.
++        if kind == :view && !logged
++          expire_record!
++          should_purge_files = true
++          result = ViewClaim.new(status: :expired, payload: nil, kind: :view, expire_after_response: false)
++        else
++          audit_logs.reset if logged
++
++          # File pushes defer expire so the viewer can still download attachments.
++          expire_after_response = kind == :view && !views_remaining.positive? && !files.attached?
++
++          result = ViewClaim.new(
++            status: :ok,
++            payload: payload,
++            kind: kind,
++            expire_after_response: expire_after_response
++          )
++        end
++      end
++    end
++
++    files.purge if should_purge_files
++
++    result
++  end
++
++  # True when +user+ is the authenticated owner of this push.
++  # Require a real owner id on both sides so nil == nil (anonymous push /
++  # non-persisted User.new) never counts as ownership.
++  def owned_by?(user)
++    user_id.present? && user.present? && user_id == user.id
++  end
++
++  # True when +user+ is the authenticated owner, or when viewer deletion is
++  # explicitly enabled.
++  def deletable_by?(user)
++    owned_by?(user) || deletable_by_viewer == true
++  end
++
+   def settings_for_kind
+     if text?
+       Settings.pw
+@@ -238,9 +325,27 @@ class Push < ApplicationRecord
+ 
+   private
+ 
++  # Returns true when an audit log row was persisted; false when skipped (cap)
++  # or the insert did not persist.
++  def create_retrieval_audit_log!(kind:, viewer:, ip:, user_agent:, referrer:)
++    return false if retrieval_audit_log_limit_reached?
++
++    audit_logs.create(
++      kind: kind,
++      user: viewer,
++      ip: ip,
++      user_agent: user_agent.to_s[0, 255],
++      referrer: referrer.to_s[0, 255]
++    ).persisted?
++  end
++
++  def retrieval_audit_log_limit_reached?
++    audit_logs.reorder(nil).limit(1).offset(AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL - 1).exists?
++  end
++
+   def notify_by_email_custom_validations
+     if expired?
+-      errors.add(:notify_emails_to, _("is not available for expired pushes")) if notify_emails_to.present?
++      errors.add(:notify_emails_to, _("are not available for expired pushes")) if notify_emails_to.present?
+       errors.add(:notify_emails_to_locale, _("is not available for expired pushes")) if notify_emails_to_locale.present?
+     end
+   end
+diff --git a/test/models/push_claim_view_test.rb b/test/models/push_claim_view_test.rb
+new file mode 100644
+index 00000000..36dc33d2
+--- /dev/null
++++ b/test/models/push_claim_view_test.rb
+@@ -0,0 +1,177 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class PushClaimViewTest < ActiveSupport::TestCase
++  setup do
++    @owner = users(:luca)
++    @admin = users(:mr_admin)
++  end
++
++  test "claim_view! delivers payload and logs a counting view" do
++    push = Push.create!(kind: "text", payload: "secret-payload", expire_after_views: 2, expire_after_days: 7)
++
++    result = push.claim_view!(ip: "127.0.0.1", user_agent: "test", referrer: "")
++
++    assert result.ok?
++    assert_not result.expire_after_response
++    assert_equal "secret-payload", result.payload
++    assert_equal :view, result.kind
++    assert_equal 1, push.reload.view_count
++    assert_equal 1, push.views_remaining
++    assert_not push.expired?
++    assert_equal "secret-payload", push.payload
++  end
++
++  test "claim_view! flags expire_after_response on the last counting view" do
++    push = Push.create!(kind: "text", payload: "one-time-secret", expire_after_views: 1, expire_after_days: 7)
++
++    result = push.claim_view!(ip: "127.0.0.1")
++
++    assert result.ok?
++    assert result.expire_after_response
++    assert_equal "one-time-secret", result.payload
++    assert_equal 1, push.audit_logs.where(kind: :view).count
++
++    # Caller expires after response (controllers do this)
++    push.expire!
++    push.reload
++    assert push.expired?
++    assert_nil push.payload
++    assert_equal 0, push.views_remaining
++  end
++
++  test "claim_view! returns expired with nil payload when already exhausted" do
++    push = Push.create!(kind: "text", payload: "gone", expire_after_views: 1, expire_after_days: 7)
++    result = push.claim_view!(ip: "127.0.0.1")
++    push.expire! if result.expire_after_response
++
++    result = push.claim_view!(ip: "127.0.0.1")
++
++    assert result.expired?
++    assert_nil result.payload
++    assert_equal :failed_view, result.kind
++    assert_nil push.reload.payload
++  end
++
++  test "owner views do not burn view quota or expire the push" do
++    push = Push.create!(
++      kind: "text",
++      payload: "owner-secret",
++      expire_after_views: 1,
++      expire_after_days: 7,
++      user: @owner
++    )
++
++    result = push.claim_view!(viewer: @owner, ip: "127.0.0.1")
++
++    assert result.ok?
++    assert_equal :owner_view, result.kind
++    assert_equal "owner-secret", result.payload
++
++    push.reload
++    assert_not push.expired?
++    assert_equal 0, push.view_count
++    assert_equal 1, push.views_remaining
++    assert_equal 1, push.audit_logs.where(kind: :owner_view).count
++  end
++
++  test "admin views do not burn view quota" do
++    push = Push.create!(
++      kind: "text",
++      payload: "admin-secret",
++      expire_after_views: 1,
++      expire_after_days: 7,
++      user: @owner
++    )
++
++    result = push.claim_view!(viewer: @admin, admin: true, ip: "127.0.0.1")
++
++    assert result.ok?
++    assert_equal :admin_view, result.kind
++
++    push.reload
++    assert_not push.expired?
++    assert_equal 0, push.view_count
++    assert_equal 1, push.audit_logs.where(kind: :admin_view).count
++  end
++
++  test "claim_view! fails closed for counting views when audit log cap is reached" do
++    push = Push.create!(kind: "text", payload: "capped-secret", expire_after_views: 5, expire_after_days: 7)
++    push.audit_logs.create!(kind: :failed_passphrase, ip: "127.0.0.1")
++
++    old_max = AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL
++    silence_warnings { AuditLog.const_set(:MAX_AUDIT_LOGS_PER_PUSH_OR_PULL, 1) }
++
++    result = push.claim_view!(ip: "127.0.0.1")
++
++    assert result.expired?
++    assert_nil result.payload
++    assert_equal :view, result.kind
++    assert_not result.expire_after_response
++    assert push.reload.expired?
++    assert_nil push.payload
++    assert_equal 0, push.audit_logs.where(kind: :view).count
++  ensure
++    silence_warnings { AuditLog.const_set(:MAX_AUDIT_LOGS_PER_PUSH_OR_PULL, old_max) }
++  end
++
++  test "owner claim still delivers when audit log cap is reached" do
++    push = Push.create!(
++      kind: "text",
++      payload: "owner-capped",
++      expire_after_views: 1,
++      expire_after_days: 7,
++      user: @owner
++    )
++    push.audit_logs.create!(kind: :failed_passphrase, ip: "127.0.0.1")
++
++    old_max = AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL
++    silence_warnings { AuditLog.const_set(:MAX_AUDIT_LOGS_PER_PUSH_OR_PULL, 1) }
++
++    result = push.claim_view!(viewer: @owner, ip: "127.0.0.1")
++
++    assert result.ok?
++    assert_equal "owner-capped", result.payload
++    assert_equal :owner_view, result.kind
++    assert_not push.reload.expired?
++  ensure
++    silence_warnings { AuditLog.const_set(:MAX_AUDIT_LOGS_PER_PUSH_OR_PULL, old_max) }
++  end
++
++  test "concurrent claim_view! allows only one successful delivery for a one-time push" do
++    push = Push.create!(kind: "text", payload: "race-secret", expire_after_views: 1, expire_after_days: 7)
++    push_id = push.id
++    results = Queue.new
++    thread_count = 8
++
++    threads = thread_count.times.map do
++      Thread.new do
++        ActiveRecord::Base.connection_pool.with_connection do
++          attempts = 0
++          begin
++            attempts += 1
++            claimed = Push.find(push_id).claim_view!(ip: "127.0.0.1")
++            Push.find(push_id).expire! if claimed.expire_after_response
++            results << claimed
++          rescue ActiveRecord::StatementInvalid, SQLite3::BusyException
++            retry if attempts < 10
++            raise
++          end
++        end
++      end
++    end
++
++    threads.each(&:join)
++
++    claimed = Array.new(thread_count) { results.pop }
++    successful = claimed.select(&:ok?)
++    expired = claimed.select(&:expired?)
++
++    assert_equal 1, successful.size, "expected exactly one successful claim, got #{successful.size}"
++    assert_equal ["race-secret"], successful.map(&:payload).uniq
++    assert_equal thread_count - 1, expired.size
++    assert_nil Push.find(push_id).payload
++    assert Push.find(push_id).expired?
++  end
++end
