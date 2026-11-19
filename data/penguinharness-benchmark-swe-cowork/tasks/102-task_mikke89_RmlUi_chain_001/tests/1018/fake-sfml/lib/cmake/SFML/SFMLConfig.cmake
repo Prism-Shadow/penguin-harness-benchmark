@@ -1,0 +1,8 @@
+set(SFML_FOUND TRUE)
+set(SFML_VERSION "3.0.0")
+foreach(component Graphics Window System)
+  set(SFML_${component}_FOUND TRUE)
+  if(NOT TARGET SFML::${component})
+    add_library(SFML::${component} INTERFACE IMPORTED)
+  endif()
+endforeach()

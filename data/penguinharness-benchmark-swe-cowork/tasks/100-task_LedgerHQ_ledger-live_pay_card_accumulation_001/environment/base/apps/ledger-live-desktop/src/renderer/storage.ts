@@ -1,0 +1,227 @@
+import { useCallback } from "react";
+import { ipcRenderer } from "electron";
+import { getEnv } from "@shared/env";
+import { useDBRaw } from "@ledgerhq/live-common/hooks/useDBRaw";
+import { DiscoverDB } from "@ledgerhq/live-common/wallet-api/types";
+import accountModel from "~/helpers/accountModel";
+import memoize from "lodash/memoize";
+import debounce from "lodash/debounce";
+
+import { Account, AccountRaw, AccountUserData } from "@ledgerhq/types-live";
+import { DataModel } from "@ledgerhq/live-common/DataModel";
+import { CounterValuesStatus, RateMapRaw } from "@ledgerhq/live-countervalues/types";
+import { hubStateSelector } from "@ledgerhq/live-common/postOnboarding/reducer";
+import { settingsStoreSelector } from "./reducers/settings";
+import logger from "./logger";
+import { trustchainStoreSelector } from "@ledgerhq/ledger-key-ring-protocol/store";
+import { marketStoreSelector } from "./reducers/market";
+import { marketBannerStoreSelector } from "./reducers/marketBanner";
+import { knownDevicesStoreSelector } from "./reducers/knownDevices";
+import { ExportedWalletState } from "~/renderer/reducers/wallet";
+import type { PersistedCAL } from "@domain/api-currency-token";
+import type { PersistedIdentities } from "@domain/entity-client-identity";
+import type { FeatureFlagsState } from "@shared/feature-flags";
+import type { RestorableLargeScreenUpsellModalState } from "@features/flow-large-screen-upsell";
+
+/*
+  This file serve as an interface for the RPC binding to the main thread that now manage the config file.
+  Because only serialized json can be sent between processes, the transform system now live here.
+ */
+
+export type User = {
+  id: string;
+};
+
+export type Countervalues = Record<string, CounterValuesStatus | RateMapRaw> & {
+  status: CounterValuesStatus;
+};
+
+export type PostOnboarding = ReturnType<typeof hubStateSelector>;
+
+export type Settings = ReturnType<typeof settingsStoreSelector>;
+export type Market = ReturnType<typeof marketStoreSelector>;
+export type MarketBanner = ReturnType<typeof marketBannerStoreSelector>;
+export type KnownDevices = ReturnType<typeof knownDevicesStoreSelector>;
+
+export type TrustchainStore = ReturnType<typeof trustchainStoreSelector>;
+
+// The types seen from the user side.
+type DatabaseValues = {
+  accounts: Account[];
+  user: User;
+  countervalues: Countervalues;
+  postOnboarding: PostOnboarding;
+  settings: Settings;
+  trustchain: TrustchainStore;
+  wallet: ExportedWalletState;
+  market: Market;
+  marketBanner: MarketBanner;
+  knownDevices: KnownDevices;
+  cryptoAssets: PersistedCAL;
+  featureFlags: Pick<FeatureFlagsState, "overrides" | "bannerVisible">;
+  coinConfigOverrides: { overrides: Record<string, unknown> };
+  identities: PersistedIdentities;
+  history: { lastSeenOperationDate: string | null };
+  PLAYWRIGHT_RUN: {
+    localStorage?: Record<string, string>;
+  };
+  discover: DiscoverDB;
+  ptx: {
+    lastScreen: string;
+  };
+  largeScreenUpsellModal: RestorableLargeScreenUpsellModalState;
+};
+
+// Infers the type seen from the user side (non-raw).
+type DatabaseValue<
+  K extends keyof DatabaseValues,
+  T = K extends keyof Transforms ? Transforms[K] : unknown,
+  // This is needed to make the type inference work here.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  V = T extends Transform<any, any> ? Awaited<ReturnType<T["get"]>> : DatabaseValues[K],
+> = V;
+
+// A Transformer is a pair of functions to encode/decode the raw data.
+type Transform<R, M> = {
+  get: (
+    raws: Parameters<DataModel<R, M>["decode"]>[0][],
+  ) => Promise<Awaited<ReturnType<DataModel<R, M>["decode"]>>[] | null>;
+  set: (
+    raws: Parameters<DataModel<R, M>["encode"]>[0][],
+  ) => Promise<Awaited<ReturnType<DataModel<R, M>["encode"]>>[]>;
+};
+
+// A map of transformers.
+type Transforms = {
+  accounts: Transform<AccountRaw, [Account, AccountUserData]>;
+};
+
+const transforms: Transforms = {
+  accounts: {
+    get: async raws => {
+      // NB to prevent parsing encrypted string as JSON
+      if (typeof raws === "string") return null;
+      const accounts: Array<[Account, AccountUserData]> = [];
+      if (raws) {
+        for (const raw of raws) {
+          try {
+            accounts.push(await accountModel.decode(raw));
+          } catch (e) {
+            logger.critical(e);
+          }
+        }
+      }
+      return accounts;
+    },
+    set: async accounts =>
+      Promise.all((accounts || []).map(account => accountModel.encode(account))),
+  },
+};
+
+export const getKey = async <
+  K extends keyof DatabaseValues,
+  V = DatabaseValue<K>,
+  DV extends V = V,
+>(
+  ns: string,
+  keyPath: K,
+  defaultValue?: DV,
+): Promise<V> => {
+  let data = await ipcRenderer.invoke("getKey", {
+    ns,
+    keyPath,
+    defaultValue,
+  });
+  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+  const transform = transforms[keyPath as keyof Transforms];
+  if (transform) {
+    data = await transform.get(data);
+  }
+  return data;
+};
+
+let debounceToUse = debounce;
+if (getEnv("PLAYWRIGHT_RUN")) {
+  debounceToUse =
+    fn =>
+    (...args) =>
+      // @ts-expect-error This is specific to playwright, silence the error
+      setTimeout(() => fn(...args));
+}
+
+const debouncedSetKey = memoize(
+  <K extends keyof DatabaseValues, V = DatabaseValue<K>>(ns: string, keyPath: K) =>
+    debounceToUse(async (value: V) => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+        const transform = transforms[keyPath as keyof Transforms];
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+        const transformedValue = transform
+          ? await transform.set(value as Parameters<typeof transform.set>[0])
+          : value;
+        await ipcRenderer.invoke("setKey", {
+          ns,
+          keyPath,
+          value: transformedValue,
+        });
+      } catch (e) {
+        logger.error("debouncedSetKey failed", { ns, keyPath }, e);
+      }
+    }, 1000),
+  (ns: string, keyPath: string) => `${ns}:${keyPath}`,
+);
+
+export const setKey = <K extends keyof DatabaseValues, V = DatabaseValue<K>, Val extends V = V>(
+  ns: string,
+  keyPath: K,
+  value: Val,
+) => {
+  debouncedSetKey<K, V>(ns, keyPath)(value);
+};
+
+export const hasEncryptionKey = (ns: string, keyPath: keyof DatabaseValues) =>
+  ipcRenderer.invoke("hasEncryptionKey", {
+    ns,
+    keyPath,
+  });
+
+export const setEncryptionKey = (encryptionKey: string) =>
+  ipcRenderer.invoke("setEncryptionKey", { encryptionKey });
+
+export const removeEncryptionKey = () => ipcRenderer.invoke("removeEncryptionKey", {});
+
+export const isEncryptionKeyCorrect = (encryptionKey: string) =>
+  ipcRenderer.invoke("isEncryptionKeyCorrect", { encryptionKey });
+
+export const hasBeenDecrypted = () => ipcRenderer.invoke("hasBeenDecrypted", {});
+
+export const resetAll = () => ipcRenderer.invoke("resetAll");
+
+export const reload = () => ipcRenderer.invoke("reload");
+
+export const cleanCache = () => ipcRenderer.invoke("cleanCache");
+
+function identitySelector<V>(state: V): V {
+  return state;
+}
+
+export function useDB<
+  Selected,
+  K extends keyof DatabaseValues,
+  V = DatabaseValue<K>,
+  DV extends V = V,
+>(
+  ns: string,
+  keyPath: K,
+  initialState: DV,
+  // @ts-expect-error State !== Selected
+  selector: (state: V) => Selected = identitySelector,
+) {
+  return useDBRaw<V, Selected>({
+    initialState,
+    getter: useCallback(() => getKey(ns, keyPath, initialState), [ns, keyPath, initialState]),
+    // @ts-expect-error Todo: state doesn't fit
+    setter: useCallback(state => setKey(ns, keyPath, state), [ns, keyPath]),
+    selector,
+  });
+}

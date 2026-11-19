@@ -1,0 +1,5 @@
+set(glfw3_FOUND TRUE)
+set(glfw3_VERSION "3.3.8")
+if(NOT TARGET glfw)
+  add_library(glfw INTERFACE IMPORTED)
+endif()

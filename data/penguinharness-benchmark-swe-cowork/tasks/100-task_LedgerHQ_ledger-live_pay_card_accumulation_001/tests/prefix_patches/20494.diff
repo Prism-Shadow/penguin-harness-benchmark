@@ -1,0 +1,167 @@
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/DevTools/screens/DevToolsScreen/useDevToolsScreenViewModel.ts b/apps/ledger-live-desktop/src/mvvm/features/DevTools/screens/DevToolsScreen/useDevToolsScreenViewModel.ts
+index 8fc88d9..1511405 100644
+--- a/apps/ledger-live-desktop/src/mvvm/features/DevTools/screens/DevToolsScreen/useDevToolsScreenViewModel.ts
++++ b/apps/ledger-live-desktop/src/mvvm/features/DevTools/screens/DevToolsScreen/useDevToolsScreenViewModel.ts
+@@ -1,17 +1,21 @@
+ import { useCallback, useMemo } from "react";
+ import { useNavigate } from "react-router";
+-import { useFeatureFlagsToolProps } from "@devtools/bindings";
++import { useFeatureFlagsToolProps, usePayCardToolProps } from "@devtools/bindings";
+ import type { DevToolsConfig } from "@devtools/shell";
+ import { useDevToolsRelay } from "./useDevToolsRelay";
+ 
+ export function useDevToolsScreenViewModel() {
+   const navigate = useNavigate();
+   const featureFlagsToolProps = useFeatureFlagsToolProps();
++  const payCardToolProps = usePayCardToolProps();
+   const { wire, wireState } = useDevToolsRelay();
+ 
+   const config: DevToolsConfig = useMemo(
+-    () => [{ id: "feature-flags", config: featureFlagsToolProps }],
+-    [featureFlagsToolProps],
++    () => [
++      { id: "feature-flags", config: featureFlagsToolProps },
++      { id: "pay-card", config: payCardToolProps },
++    ],
++    [featureFlagsToolProps, payCardToolProps],
+   );
+ 
+   const onClose = useCallback(() => navigate(-1), [navigate]);
+diff --git a/apps/ledger-live-desktop/src/renderer/init.tsx b/apps/ledger-live-desktop/src/renderer/init.tsx
+index 6575255..e411d76 100644
+--- a/apps/ledger-live-desktop/src/renderer/init.tsx
++++ b/apps/ledger-live-desktop/src/renderer/init.tsx
+@@ -55,7 +55,8 @@ import { importMarketBannerState } from "./reducers/marketBanner";
+ import { importKnownDevices, mapPersistedKnownDeviceToKnownDevice } from "./reducers/knownDevices";
+ import { fetchWallet } from "./actions/wallet";
+ import { fetchTrustchain } from "./actions/trustchain";
+-import { setupRecentAddressesStore } from "./recentAddresses";
++import { connectRecentAddressesStore } from "@domain/entity-recent-addresses";
++import { recentAddressesSelector } from "~/renderer/reducers/wallet";
+ import { startAnalytics } from "./analytics/segment";
+ import { initIdentities } from "~/renderer/helpers/identities";
+ import {
+@@ -132,7 +133,7 @@ async function init() {
+   const dispatch: AppDispatch = store.dispatch;
+ 
+   setupListeners(store.dispatch);
+-  setupRecentAddressesStore(store);
++  connectRecentAddressesStore(store, recentAddressesSelector);
+   setupCryptoAssetsStore(store);
+   setSwapQuotesStore(store.dispatch);
+ 
+diff --git a/devtools/bindings/src/index.ts b/devtools/bindings/src/index.ts
+index 1d3a4d9..eb53341 100644
+--- a/devtools/bindings/src/index.ts
++++ b/devtools/bindings/src/index.ts
+@@ -1 +1,3 @@
+ export { useFeatureFlagsToolProps } from "./useFeatureFlagsToolProps";
++export { usePayCardToolProps } from "./usePayCardToolProps";
++export type { UsePayCardToolPropsOptions } from "./usePayCardToolProps";
+diff --git a/devtools/bindings/src/usePayCardToolProps.ts b/devtools/bindings/src/usePayCardToolProps.ts
+new file mode 100644
+index 0000000..c4af62c
+--- /dev/null
++++ b/devtools/bindings/src/usePayCardToolProps.ts
+@@ -0,0 +1,101 @@
++import { useCallback, useMemo, useState } from "react";
++import { useDispatch } from "react-redux";
++import { setOverride } from "@shared/feature-flags";
++import { useFeature } from "@features/platform-feature-flags";
++import type { DevToolsConfig } from "@devtools/registry";
++
++type PayCardToolProps = Extract<DevToolsConfig[number], { id: "pay-card" }>["config"];
++type OnboardingStep = PayCardToolProps["onboarding"]["steps"][number];
++
++export type UsePayCardToolPropsOptions = {
++  /** Pass `"native"` on mobile to include the `walletPay` onboarding step. */
++  readonly platform?: "web" | "native";
++};
++
++const LEADING_ONBOARDING_STEPS: readonly OnboardingStep[] = [
++  { id: "kyc", label: "Kyc", done: false },
++  { id: "claim", label: "Claim card", done: false },
++  { id: "topup", label: "Top up", done: false },
++];
++
++// Mobile-only, injected just before the final purchase step.
++const NATIVE_ONLY_STEP: OnboardingStep = {
++  id: "walletPay",
++  label: "Apple/Google Pay",
++  done: false,
++};
++
++const PURCHASE_STEP: OnboardingStep = { id: "purchase", label: "First Purchase", done: false };
++
++function initialSteps(platform: "web" | "native"): readonly OnboardingStep[] {
++  return platform === "native"
++    ? [...LEADING_ONBOARDING_STEPS, NATIVE_ONLY_STEP, PURCHASE_STEP]
++    : [...LEADING_ONBOARDING_STEPS, PURCHASE_STEP];
++}
++
++/**
++ * Builds the Card / Pay tool's props from the host's feature-flag overrides and
++ * a local onboarding-step debug state. Apps consume this instead of re-implementing
++ * the wiring in each host.
++ */
++export function usePayCardToolProps(options: UsePayCardToolPropsOptions = {}): PayCardToolProps {
++  const platform = options.platform ?? "web";
++  const dispatch = useDispatch();
++  const payTabKey = platform === "native" ? "lwmPayTab" : "lwdPayTab";
++  const payTab = useFeature(payTabKey);
++  const ptxCard = useFeature("ptxCard");
++
++  const [steps, setSteps] = useState<readonly OnboardingStep[]>(() => initialSteps(platform));
++
++  const payTabEnabled = !!payTab?.enabled;
++  const cardParam = !!payTab?.params?.card;
++  const ptxCardEnabled = !!ptxCard?.enabled;
++
++  const setPayTabEnabled = useCallback(
++    (enabled: boolean) => {
++      const params = { card: cardParam };
++      dispatch(setOverride({ key: payTabKey, value: { enabled, params } }));
++    },
++    [cardParam, dispatch, payTabKey],
++  );
++
++  const setCardParam = useCallback(
++    (card: boolean) => {
++      const params = { card };
++      dispatch(setOverride({ key: payTabKey, value: { enabled: payTabEnabled, params } }));
++    },
++    [dispatch, payTabEnabled, payTabKey],
++  );
++
++  const setPtxCardEnabled = useCallback(
++    (enabled: boolean) => {
++      dispatch(setOverride({ key: "ptxCard", value: { enabled } }));
++    },
++    [dispatch],
++  );
++
++  const setStepDone = useCallback((id: string, done: boolean) => {
++    setSteps(current => {
++      if (id === "all") {
++        return current.map(step => (step.done === done ? step : { ...step, done }));
++      }
++      return current.map(step => (step.id === id && step.done !== done ? { ...step, done } : step));
++    });
++  }, []);
++
++  const flags = useMemo(
++    () => ({
++      payTabEnabled,
++      cardParam,
++      ptxCardEnabled,
++      setPayTabEnabled,
++      setCardParam,
++      setPtxCardEnabled,
++    }),
++    [payTabEnabled, cardParam, ptxCardEnabled, setPayTabEnabled, setCardParam, setPtxCardEnabled],
++  );
++
++  const onboarding = useMemo(() => ({ steps, setStepDone }), [steps, setStepDone]);
++
++  return useMemo(() => ({ flags, onboarding }), [flags, onboarding]);
++}

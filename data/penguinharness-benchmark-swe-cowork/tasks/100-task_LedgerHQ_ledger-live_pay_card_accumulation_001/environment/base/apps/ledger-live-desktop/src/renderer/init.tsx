@@ -1,0 +1,441 @@
+import { createRoot } from "react-dom/client";
+import React from "react";
+import Transport from "@ledgerhq/hw-transport";
+import { getEnv } from "@shared/env";
+import { log } from "@ledgerhq/logs";
+import "../config/configInit";
+import { checkLibs } from "@ledgerhq/live-common/sanityChecks";
+import { importPostOnboardingState } from "@ledgerhq/live-common/postOnboarding/actions";
+import { backfillOnboardingDate } from "~/renderer/components/PostOnboardingHub/logic/backfillOnboardingDate";
+import {
+  LARGE_SCREEN_UPSELL_MODAL,
+  restoreLargeScreenUpsellModalState,
+} from "@features/flow-large-screen-upsell";
+import i18n from "i18next";
+import { webFrame, ipcRenderer } from "electron";
+import each from "lodash/each";
+import { reload, getKey } from "~/renderer/storage";
+import "~/renderer/styles/global";
+import { registerTransportModules } from "~/renderer/live-common-setup";
+import { getLocalStorageEnvs } from "~/renderer/experimental";
+import "~/renderer/i18n/init";
+import { hydrateCurrency } from "~/renderer/bridge/cache";
+import { setupCryptoAssetsStore } from "~/config/bridge-setup";
+import { setSwapQuotesStore } from "@ledgerhq/live-common/wallet-api/Exchange/quotes/state-manager/store";
+import { findCryptoCurrencyById } from "@domain/entity-currency-crypto";
+import { restoreTokensToCache, parsePersistedCAL } from "@domain/api-currency-token";
+import logger, { enableDebugLogger } from "./logger";
+import { enableGlobalTab, disableGlobalTab, isGlobalTabEnabled } from "~/config/global-tab";
+import { setEnvOnAllThreads } from "~/helpers/env";
+import dbMiddleware from "~/renderer/middlewares/db";
+import type { ReduxStore, AppDispatch } from "~/state-manager/configureStore";
+import createStore from "~/state-manager/configureStore";
+import { setupListeners } from "@reduxjs/toolkit/query";
+import events from "~/renderer/events";
+import { initAccounts } from "~/renderer/actions/accounts";
+import { fetchSettings, setDeepLinkUrl } from "~/renderer/actions/settings";
+import { lock, setOSDarkMode } from "~/renderer/actions/application";
+import {
+  languageSelector,
+  trackingEnabledSelector,
+  hideEmptyTokenAccountsSelector,
+  filterTokenOperationsZeroAmountSelector,
+  migrateLegacyCryptoCounterValue,
+} from "~/renderer/reducers/settings";
+import { liveBlindSigningReporter } from "@ledgerhq/live-dmk-shared";
+import ReactRoot from "~/renderer/ReactRoot";
+import AppError from "~/renderer/AppError";
+import { expectOperatingSystemSupportStatus } from "~/support/os";
+import { addDevice, removeDevice, resetDevices } from "~/renderer/actions/devices";
+import { Device } from "@ledgerhq/live-common/hw/actions/types";
+import { listCachedCurrencyIds } from "./bridge/cache";
+import { LogEntry } from "winston";
+import { importMarketState } from "./actions/market";
+import { importMarketBannerState } from "./reducers/marketBanner";
+import { importKnownDevices, mapPersistedKnownDeviceToKnownDevice } from "./reducers/knownDevices";
+import { fetchWallet } from "./actions/wallet";
+import { fetchTrustchain } from "./actions/trustchain";
+import { setupRecentAddressesStore } from "./recentAddresses";
+import { startAnalytics } from "./analytics/segment";
+import { initIdentities } from "~/renderer/helpers/identities";
+import {
+  setAllOverrides,
+  setBannerVisible,
+  selectFeature,
+  selectRemoteFlagsReady,
+  type FeatureId,
+} from "@shared/feature-flags";
+import {
+  setAllCoinConfigOverrides,
+  sanitizePersistedOverrides,
+} from "~/renderer/reducers/coinConfigOverrides";
+import { LiveConfig } from "@ledgerhq/live-config/LiveConfig";
+import { installLiveConfigProvider } from "~/firebase/remoteConfig";
+import { setAnalyticsFeatureFlagMethod } from "~/renderer/analytics/segment";
+import { initHistory } from "~/renderer/reducers/history";
+
+const rootNode = document.getElementById("react-root");
+
+async function init() {
+  // at this step. we know the app error handling will happen here. so we can unset the global onerror
+  window.onerror = null;
+
+  const logVerbose = getEnv("VERBOSE");
+
+  // Sets up a debug console printing of logs (from the renderer process)
+  //
+  // Usage: a filtering (only on console printing) on Ledger libs are possible:
+  // - VERBOSE="apdu,hw,transport,hid-verbose" : filtering on a list of log `type` separated by a `,`
+  // - VERBOSE=1 or VERBOSE=true : to print all logs
+  if (logVerbose) {
+    const everyLogs =
+      logVerbose.length === 1 && (logVerbose[0] === "true" || logVerbose[0] === "1");
+
+    const filters = everyLogs ? [] : logVerbose;
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `Logs console display setup (renderer process): ${JSON.stringify({
+        everyLogs,
+        filters,
+      })}`,
+    );
+    enableDebugLogger((log: LogEntry) => everyLogs || (log?.type && filters.includes(log.type)));
+  }
+
+  checkLibs({
+    React,
+    log,
+    Transport,
+  });
+
+  expectOperatingSystemSupportStatus();
+  if (getEnv("PLAYWRIGHT_RUN")) {
+    const spectronData = await getKey("app", "PLAYWRIGHT_RUN", {});
+    each(spectronData.localStorage, (value, key) => {
+      global.localStorage.setItem(key, value);
+    });
+    const envs = getLocalStorageEnvs();
+    for (const k in envs) setEnvOnAllThreads(k, envs[k]);
+    if (getEnv("MOCK")) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const timemachine = require("timemachine");
+      timemachine.config({
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        dateString: require("../../tests/time.js").default,
+      });
+    }
+  }
+  const store = createStore({
+    dbMiddleware,
+  });
+  const dispatch: AppDispatch = store.dispatch;
+
+  setupListeners(store.dispatch);
+  setupRecentAddressesStore(store);
+  setupCryptoAssetsStore(store);
+  setSwapQuotesStore(store.dispatch);
+
+  // Feature flags: install the LiveConfig provider (serves non-feature `config_*` keys) and
+  // point analytics at the Redux slice. The middleware (wired at store creation) drives the
+  // remote-flags fetch; boot waits on `selectRemoteFlagsReady` below.
+  installLiveConfigProvider();
+  setAnalyticsFeatureFlagMethod(
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+    ((key: FeatureId) => selectFeature(store.getState(), key) ?? null) as Parameters<
+      typeof setAnalyticsFeatureFlagMethod
+    >[0],
+  );
+
+  // Hydrate persisted crypto assets tokens from app.json
+  // Cross-caching is automatic: tokens are cached under both ID and address lookups
+  try {
+    // parsePersistedCAL validates version + schema; returns null for missing/corrupt/legacy blobs.
+    const persistedData = parsePersistedCAL(await getKey("app", "cryptoAssets"));
+
+    if (persistedData) {
+      const TOKEN_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+      await restoreTokensToCache(store.dispatch, persistedData, TOKEN_CACHE_TTL);
+    }
+  } catch (error) {
+    logger.error("Failed to load crypto assets tokens from app.json:", error);
+  }
+
+  if (getEnv("PLAYWRIGHT_RUN")) {
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+    (window as Window & { __STORE__?: ReduxStore }).__STORE__ = store;
+  }
+  await initIdentities(store);
+  let deepLinkUrl; // Nb In some cases `fetchSettings` runs after this, voiding the deep link.
+  if (process.env.LEDGER_LIVE_DEEPLINK) {
+    deepLinkUrl = process.env.LEDGER_LIVE_DEEPLINK;
+    store.dispatch(setDeepLinkUrl(deepLinkUrl));
+  }
+  ipcRenderer.once("deep-linking", (_, url: string) => {
+    store.dispatch(setDeepLinkUrl(url));
+    deepLinkUrl = url;
+  });
+  const initialSettings = (await getKey("app", "settings")) || {};
+
+  liveBlindSigningReporter.setConsentSource(() => trackingEnabledSelector(store.getState()));
+
+  const settingsToLoad = { ...initialSettings };
+
+  // Legacy crypto counter-values were persisted as ticker (BTC/ETH); migrate them to Ledger ids.
+  if (typeof settingsToLoad.counterValue === "string") {
+    settingsToLoad.counterValue = migrateLegacyCryptoCounterValue(settingsToLoad.counterValue);
+  }
+
+  // supportedCounterValues is now derived at runtime from @domain/entity-currency-fiat — strip stale persisted copy.
+  delete (settingsToLoad as Record<string, unknown>).supportedCounterValues;
+
+  // sentryLogs was renamed to crashReporting (LIVE-34932); migrate persisted value to avoid silent opt-in reset.
+  const legacySettings = settingsToLoad as Record<string, unknown>;
+  if (legacySettings.sentryLogs !== undefined && legacySettings.crashReporting === undefined) {
+    settingsToLoad.crashReporting = Boolean(legacySettings.sentryLogs);
+    delete legacySettings.sentryLogs;
+  }
+
+  if (deepLinkUrl) {
+    settingsToLoad.deepLinkUrl = deepLinkUrl;
+  }
+
+  // Hydrate persisted known devices before settings so the settings-based
+  // migration only seeds the store for first-time users (empty known devices).
+  const persistedKnownDevices = await getKey("app", "knownDevices");
+  if (persistedKnownDevices?.knownDevices?.length) {
+    store.dispatch(
+      importKnownDevices({
+        knownDevices: persistedKnownDevices.knownDevices.flatMap(device => {
+          const knownDevice = mapPersistedKnownDeviceToKnownDevice(device);
+          return knownDevice ? [knownDevice] : [];
+        }),
+      }),
+    );
+  }
+
+  fetchSettings(settingsToLoad)(store.dispatch);
+  startAnalytics(store);
+  const state = store.getState();
+  const language = languageSelector(state);
+
+  i18n.changeLanguage(language);
+
+  const hideEmptyTokenAccounts = hideEmptyTokenAccountsSelector(state);
+  setEnvOnAllThreads("HIDE_EMPTY_TOKEN_ACCOUNTS", hideEmptyTokenAccounts);
+  const filterTokenOperationsZeroAmount = filterTokenOperationsZeroAmountSelector(state);
+  setEnvOnAllThreads("FILTER_ZERO_AMOUNT_ERC20_EVENTS", filterTokenOperationsZeroAmount);
+
+  // hydrate the store with the bridge/cache
+  await Promise.allSettled(
+    listCachedCurrencyIds().map(id => {
+      const currency = findCryptoCurrencyById(id);
+      return currency ? hydrateCurrency(currency) : null;
+    }),
+  );
+  const accountData = await getKey("app", "accounts", []);
+  if (accountData) {
+    dispatch(initAccounts(accountData));
+  } else {
+    // if accountData is falsy, it's a lock case, we need to globally decrypted the app data, we use app.accounts as general safe guard for possible other app.* encrypted fields
+    store.dispatch(lock());
+  }
+
+  const persistedCoinConfigOverrides = await getKey("app", "coinConfigOverrides");
+  const safeOverrides = sanitizePersistedOverrides(persistedCoinConfigOverrides?.overrides);
+  if (safeOverrides) {
+    LiveConfig.setAllOverrides(safeOverrides);
+    store.dispatch(setAllCoinConfigOverrides(safeOverrides));
+  }
+
+  let lastCoinConfigOverrides = store.getState().coinConfigOverrides.overrides;
+  store.subscribe(() => {
+    const current = store.getState().coinConfigOverrides.overrides;
+    if (current !== lastCoinConfigOverrides) {
+      lastCoinConfigOverrides = current;
+      LiveConfig.setAllOverrides(current);
+    }
+  });
+
+  const persistedFeatureFlags = await getKey("app", "featureFlags");
+  if (persistedFeatureFlags) {
+    store.dispatch(setAllOverrides(persistedFeatureFlags.overrides));
+    store.dispatch(setBannerVisible(persistedFeatureFlags.bannerVisible));
+  } else if (initialSettings) {
+    // One-time migration from legacy settings fields.
+    // These fields have been removed from SettingsState but may still exist in old persisted payloads.
+    const rawOverrides =
+      "overriddenFeatureFlags" in initialSettings &&
+      typeof initialSettings["overriddenFeatureFlags"] === "object" &&
+      initialSettings["overriddenFeatureFlags"] !== null
+        ? (initialSettings["overriddenFeatureFlags"] as Record<string, unknown>)
+        : undefined;
+
+    if (rawOverrides && Object.keys(rawOverrides).length > 0) {
+      const filteredOverrides: Parameters<typeof setAllOverrides>[0] = Object.fromEntries(
+        Object.entries(rawOverrides).filter(
+          ([, v]) =>
+            v !== undefined &&
+            typeof v === "object" &&
+            v !== null &&
+            "enabled" in v &&
+            typeof (v as Record<string, unknown>)["enabled"] === "boolean",
+        ),
+      );
+      store.dispatch(setAllOverrides(filteredOverrides));
+    }
+
+    if (
+      "featureFlagsButtonVisible" in initialSettings &&
+      typeof initialSettings["featureFlagsButtonVisible"] === "boolean"
+    ) {
+      store.dispatch(setBannerVisible(initialSettings["featureFlagsButtonVisible"]));
+    }
+  }
+
+  const historyState = await getKey("app", "history");
+  if (historyState) {
+    store.dispatch(initHistory(historyState));
+  }
+
+  const initialCountervalues = await getKey("app", "countervalues");
+
+  // Gate the app on the feature-flags slice being ready. The middleware dispatches
+  // `remoteFlagsReady` after the first remote fetch settles AND its values are synced into the
+  // slice — and unconditionally, so a Firebase outage still releases the gate. This guarantees
+  // resolved flags are in the store before the first render.
+  await new Promise<void>(resolve => {
+    let unsubscribe = () => {};
+    const check = () => {
+      if (!selectRemoteFlagsReady(store.getState())) return;
+      unsubscribe();
+      resolve();
+    };
+    // Subscribe before the first check so a `remoteFlagsReady` dispatch can never slip through
+    // the gap between checking and subscribing.
+    unsubscribe = store.subscribe(check);
+    check();
+  });
+
+  const postOnboardingState = await getKey("app", "postOnboarding");
+  if (postOnboardingState) {
+    store.dispatch(
+      importPostOnboardingState({
+        newState: postOnboardingState,
+      }),
+    );
+  }
+
+  backfillOnboardingDate(store);
+
+  const largeScreenUpsellModalState = await getKey("app", LARGE_SCREEN_UPSELL_MODAL);
+  if (largeScreenUpsellModalState !== undefined) {
+    store.dispatch(restoreLargeScreenUpsellModalState(largeScreenUpsellModalState));
+  }
+
+  r(<ReactRoot store={store} language={language} initialCountervalues={initialCountervalues} />);
+
+  await dispatch(fetchTrustchain());
+  await dispatch(fetchWallet());
+
+  const marketState = await getKey("app", "market");
+  if (marketState) {
+    store.dispatch(importMarketState(marketState));
+  }
+
+  const marketBannerState = await getKey("app", "marketBanner");
+  if (marketBannerState) {
+    store.dispatch(importMarketBannerState(marketBannerState));
+  }
+
+  webFrame.setVisualZoomLevelLimits(1, 1);
+  const matcher = window.matchMedia("(prefers-color-scheme: dark)");
+  const updateOSTheme = () => store.dispatch(setOSDarkMode(matcher.matches));
+  matcher.addEventListener("change", updateOSTheme);
+  events({
+    store,
+  });
+  window.addEventListener("keydown", (e: KeyboardEvent) => {
+    if (e.key === "Tab") {
+      if (!isGlobalTabEnabled()) enableGlobalTab();
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      logger.onTabKey(document.activeElement as HTMLElement);
+    }
+  });
+  window.addEventListener("click", () => {
+    if (isGlobalTabEnabled()) disableGlobalTab();
+  });
+
+  window.addEventListener("beforeunload", () => {
+    // This event is triggered when we reload the app, we want it to forget what it knows
+    reload();
+  });
+
+  document.addEventListener(
+    "dragover",
+    (event: Event) => {
+      event.preventDefault();
+      return false;
+    },
+    false,
+  );
+  document.addEventListener(
+    "drop",
+    (event: Event) => {
+      event.preventDefault();
+      return false;
+    },
+    false,
+  );
+  if (document.body) {
+    const classes = document.body.classList;
+    let timer: NodeJS.Timeout | number | null = 0;
+    window.addEventListener("resize", () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      } else classes.add("stop-all-transition");
+      timer = setTimeout(() => {
+        classes.remove("stop-all-transition");
+        timer = null;
+      }, 500);
+    });
+  }
+
+  registerTransportModules(store);
+
+  // expose stuff in Windows for DEBUG purpose
+  window.ledger = {
+    store,
+    addDevice: (device: Device) => {
+      store.dispatch(addDevice(device));
+    },
+    removeDevice: (device: Device) => {
+      store.dispatch(removeDevice(device));
+    },
+    resetDevices: () => {
+      store.dispatch(resetDevices());
+    },
+  };
+}
+const root = rootNode ? createRoot(rootNode) : null;
+function r(Comp: React.JSX.Element) {
+  root?.render(Comp);
+}
+
+init()
+  .catch(e => {
+    logger.critical(e);
+    r(<AppError error={e} />);
+  })
+  .catch(error => {
+    const pre = document.createElement("pre");
+    pre.innerHTML = `Ledger Wallet crashed. Please contact Ledger support.
+  ${String(error)}
+  ${String((error && error.stack) || "no stacktrace")}`;
+    if (document.body) {
+      document.body.style.padding = "50px";
+      document.body.innerHTML = "";
+      document.body.appendChild(pre);
+    }
+  });

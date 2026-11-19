@@ -1,0 +1,13 @@
+import React from 'react';
+export const Box = (p: any) => React.createElement('div', p, p.children);
+export const Text = (p: any) => React.createElement('span', p, p.children);
+export const Switch = (p: any) => React.createElement('input', { type: 'checkbox', checked: p.checked ?? p.selected, onChange: () => { p.onChange?.(!p.checked); p.onCheckedChange?.(!p.checked); } });
+export const Button = (p: any) => React.createElement('button', { ...p, onClick: p.onPress ?? p.onClick }, p.children);
+export const BottomSheetHeader = (p: any) => React.createElement('header', p, p.children);
+export const BottomSheetView = (p: any) => React.createElement('div', p, p.children);
+export const ListItem = (p: any) => React.createElement('div', p, p.children);
+export const ListItemContent = (p: any) => React.createElement('div', p, p.children);
+export const ListItemDescription = (p: any) => React.createElement('span', p, p.children);
+export const ListItemLeading = (p: any) => React.createElement('div', p, p.children);
+export const ListItemTitle = (p: any) => React.createElement('span', p, p.children);
+export const QueuedBottomSheet = (p: any) => React.createElement('div', p, p.children);

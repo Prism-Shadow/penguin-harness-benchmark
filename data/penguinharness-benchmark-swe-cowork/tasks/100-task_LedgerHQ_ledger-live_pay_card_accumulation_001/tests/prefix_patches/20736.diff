@@ -1,0 +1,485 @@
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/buildBalanceFilterOptions.ts b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/buildBalanceFilterOptions.ts
+new file mode 100644
+index 0000000..2494328
+--- /dev/null
++++ b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/buildBalanceFilterOptions.ts
+@@ -0,0 +1,97 @@
++import BigNumber from "bignumber.js";
++import { formatCurrencyUnit } from "@ledgerhq/live-common/currencies/index";
++import type { Unit } from "@domain/entity-currency-unit";
++import { PAY_CARD_BALANCE_FILTER_ALL } from "@domain/entity-pay-card";
++import type { PayCardBalanceFilterOption } from "@features/flow-pay-card-balance";
++import type { CategorizedAssetItem } from "@ledgerhq/asset-aggregation/assetCategorization/index";
++import type { DefaultStablecoin } from "./usePayStablecoins";
++
++function formatCrypto(unit: Unit, balance: number, locale: string): string {
++  return formatCurrencyUnit(unit, new BigNumber(balance), { locale, showCode: true });
++}
++
++function assetOption(
++  id: string,
++  item: CategorizedAssetItem,
++  locale: string,
++  formatFiat: (value: number) => string,
++  override?: Pick<DefaultStablecoin, "name" | "ticker">,
++): PayCardBalanceFilterOption {
++  return {
++    id,
++    title: override?.name ?? item.currency.name,
++    ticker: override?.ticker ?? item.currency.ticker,
++    ledgerId: id,
++    countervalue: item.value,
++    countervalueLabel: formatFiat(item.value),
++    cryptoAmountLabel: formatCrypto(item.currency.units[0], item.balance, locale),
++  };
++}
++
++export function buildBalanceFilterOptions({
++  stablecoins,
++  defaultStablecoins,
++  allLabel,
++  locale,
++  counterValueUnit,
++}: Readonly<{
++  stablecoins: readonly CategorizedAssetItem[];
++  defaultStablecoins: readonly DefaultStablecoin[];
++  allLabel: string;
++  locale: string;
++  counterValueUnit: Unit;
++}>): PayCardBalanceFilterOption[] {
++  const formatFiat = (value: number): string =>
++    formatCurrencyUnit(counterValueUnit, new BigNumber(value), { locale, showCode: true });
++
++  const byTicker = new Map<string, CategorizedAssetItem>();
++  for (const item of stablecoins) {
++    byTicker.set(item.currency.ticker.toUpperCase(), item);
++  }
++
++  const unfilteredTotal = stablecoins.reduce((total, { value }) => total + value, 0);
++
++  const options: PayCardBalanceFilterOption[] = [
++    {
++      id: PAY_CARD_BALANCE_FILTER_ALL,
++      title: allLabel,
++      countervalue: unfilteredTotal,
++      countervalueLabel: formatFiat(unfilteredTotal),
++    },
++  ];
++
++  const defaultTickers = new Set(defaultStablecoins.map(coin => coin.ticker.toUpperCase()));
++  for (const coin of defaultStablecoins) {
++    const held = byTicker.get(coin.ticker.toUpperCase());
++    if (held) {
++      options.push(assetOption(coin.id, held, locale, formatFiat, coin));
++    } else {
++      const unit: Unit = { name: coin.name, code: coin.ticker, magnitude: coin.magnitude };
++      options.push({
++        id: coin.id,
++        title: coin.name,
++        ticker: coin.ticker,
++        ledgerId: coin.id,
++        countervalue: 0,
++        countervalueLabel: formatFiat(0),
++        cryptoAmountLabel: formatCrypto(unit, 0, locale),
++      });
++    }
++  }
++
++  const others = stablecoins
++    .filter(item => !defaultTickers.has(item.currency.ticker.toUpperCase()))
++    .sort((a, b) => b.value - a.value || a.currency.ticker.localeCompare(b.currency.ticker));
++  for (const item of others) {
++    options.push(assetOption(item.currency.id, item, locale, formatFiat));
++  }
++
++  return options;
++}
++
++export function tickerForFilter(
++  filter: string,
++  options: readonly PayCardBalanceFilterOption[],
++): string | undefined {
++  return options.find(option => option.id === filter)?.ticker;
++}
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+index 32a7799..be09cd6 100644
+--- a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
++++ b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+@@ -1,15 +1,12 @@
+-import { useCallback, useMemo } from "react";
++import { useCallback, useEffect, useMemo } from "react";
+ import BigNumber from "bignumber.js";
+ import { useTranslation } from "react-i18next";
+-import {
+-  formatCurrencyUnit,
+-  formatCurrencyUnitFragment,
+-} from "@ledgerhq/live-common/currencies/index";
++import { formatCurrencyUnitFragment } from "@ledgerhq/live-common/currencies/index";
+ import {
+   aggregatePayCardBalance,
++  resolveSelection,
+   type FormattedValue,
+   type PayCardBalanceData,
+-  type PayCardBalanceFilterOption,
+ } from "@features/flow-pay-card-balance";
+ import {
+   PAY_CARD_BALANCE_FILTER_ALL,
+@@ -18,8 +15,10 @@ import {
+   type PayCardBalanceFilter,
+ } from "@domain/entity-pay-card";
+ import { useDispatch, useSelector } from "LLD/hooks/redux";
+-import { useCategorizedAssetsFromPortfolio } from "LLD/hooks/useCategorizedAssets";
+ import { counterValueCurrencySelector, localeSelector } from "~/renderer/reducers/settings";
++import { track } from "~/renderer/analytics/segment";
++import { buildBalanceFilterOptions, tickerForFilter } from "./buildBalanceFilterOptions";
++import { usePayStablecoins } from "./usePayStablecoins";
+ 
+ export function usePayCardBalance(): PayCardBalanceData {
+   const dispatch = useDispatch();
+@@ -28,8 +27,50 @@ export function usePayCardBalance(): PayCardBalanceData {
+   const counterValueCurrency = useSelector(counterValueCurrencySelector);
+   const filter = useSelector(selectPayCardBalanceFilter);
+ 
+-  const { categorizedAssets, isLoadingStablecoinTickers, isStablecoinTickersError } =
+-    useCategorizedAssetsFromPortfolio();
++  const { stablecoins, defaultStablecoins, isLoading, isError } = usePayStablecoins();
++
++  const filterOptions = useMemo(
++    () =>
++      buildBalanceFilterOptions({
++        stablecoins,
++        defaultStablecoins,
++        allLabel: t("payTab.balance.filter.allStablecoins"),
++        locale,
++        counterValueUnit: counterValueCurrency.units[0],
++      }),
++    [stablecoins, defaultStablecoins, t, locale, counterValueCurrency],
++  );
++
++  const effectiveFilter = useMemo(
++    () =>
++      resolveSelection(
++        filter,
++        filterOptions.map(option => option.id),
++      ),
++    [filter, filterOptions],
++  );
++
++  // Heal a stale persisted selection once data is ready.
++  useEffect(() => {
++    if (!isLoading && !isError && effectiveFilter !== filter) {
++      dispatch(setPayCardBalanceFilter(PAY_CARD_BALANCE_FILTER_ALL));
++    }
++  }, [isLoading, isError, effectiveFilter, filter, dispatch]);
++
++  // Defaults (USDC/USDT) are keyed by market id; held rows may use a different currencyId.
++  // Match by ticker so the filtered total stays correct across those ids.
++  const stablecoinsForAggregate = useMemo(() => {
++    if (effectiveFilter === PAY_CARD_BALANCE_FILTER_ALL) {
++      return stablecoins;
++    }
++    const ticker = tickerForFilter(effectiveFilter, filterOptions);
++    if (ticker == null) {
++      return stablecoins.filter(({ currency }) => currency.id === effectiveFilter);
++    }
++    return stablecoins.filter(
++      ({ currency }) => currency.ticker.toUpperCase() === ticker.toUpperCase(),
++    );
++  }, [stablecoins, effectiveFilter, filterOptions]);
+ 
+   const unit = counterValueCurrency.units[0];
+ 
+@@ -42,30 +83,6 @@ export function usePayCardBalance(): PayCardBalanceData {
+     [unit, locale],
+   );
+ 
+-  // "all" plus one row per held stablecoin, so a currencyId filter resolves instead of falling back to "all".
+-  const filterOptions = useMemo<PayCardBalanceFilterOption[]>(
+-    () => [
+-      {
+-        id: PAY_CARD_BALANCE_FILTER_ALL,
+-        title: t("payTab.balance.filter.allStablecoins"),
+-        countervalue: 0,
+-        countervalueLabel: "",
+-      },
+-      ...categorizedAssets.stablecoins.map(({ currency, value }) => ({
+-        id: currency.id,
+-        title: currency.name,
+-        ticker: currency.ticker,
+-        ledgerId: currency.id,
+-        countervalue: value,
+-        countervalueLabel: formatCurrencyUnit(unit, new BigNumber(value), {
+-          locale,
+-          showCode: true,
+-        }),
+-      })),
+-    ],
+-    [categorizedAssets.stablecoins, t, unit, locale],
+-  );
+-
+   const onConfirmFilter = useCallback(
+     (next: PayCardBalanceFilter) => {
+       dispatch(setPayCardBalanceFilter(next));
+@@ -73,25 +90,39 @@ export function usePayCardBalance(): PayCardBalanceData {
+     [dispatch],
+   );
+ 
+-  return useMemo(
+-    () =>
+-      aggregatePayCardBalance({
+-        stablecoins: categorizedAssets.stablecoins,
+-        filter,
+-        isLoading: isLoadingStablecoinTickers,
+-        isError: isStablecoinTickersError,
+-        filterOptions,
+-        formatCountervalue,
+-        onConfirmFilter,
+-      }),
+-    [
+-      categorizedAssets.stablecoins,
+-      filter,
+-      isLoadingStablecoinTickers,
+-      isStablecoinTickersError,
++  const onTrackEvent = useCallback((event: string, params: Record<string, unknown>) => {
++    track(event, params);
++  }, []);
++
++  return useMemo(() => {
++    const aggregate = aggregatePayCardBalance({
++      // Pre-filtered by ticker/id; aggregate with "all" so it sums the prepared list.
++      stablecoins: stablecoinsForAggregate,
++      filter: PAY_CARD_BALANCE_FILTER_ALL,
++      isLoading,
++      isError,
+       filterOptions,
+       formatCountervalue,
+       onConfirmFilter,
+-    ],
+-  );
++      onTrackEvent,
++    });
++
++    return {
++      ...aggregate,
++      // Keep the resolved selection for the UI (not the "all" forced into aggregate).
++      filter: effectiveFilter,
++      // Funded vs empty depends on any held stablecoin, not the active filter slice.
++      hasBalance: stablecoins.some(({ value }) => value > 0),
++    };
++  }, [
++    stablecoinsForAggregate,
++    isLoading,
++    isError,
++    formatCountervalue,
++    effectiveFilter,
++    stablecoins,
++    filterOptions,
++    onConfirmFilter,
++    onTrackEvent,
++  ]);
+ }
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts
+new file mode 100644
+index 0000000..b7548a5
+--- /dev/null
++++ b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayStablecoins.ts
+@@ -0,0 +1,97 @@
++import { useMemo } from "react";
++import { useDistribution } from "~/renderer/actions/general";
++import {
++  useStablecoinTickers,
++  selectTopAssetsByCategory,
++} from "@features/platform-aggregated-assets";
++import {
++  useGetAssetsDataInfiniteQuery,
++  AssetCategory,
++  mergeAssetsDataPages,
++} from "@domain/api-aggregated-assets";
++import {
++  useCategorizedAssets,
++  type CategorizedAssetItem,
++} from "@ledgerhq/asset-aggregation/assetCategorization/index";
++import { useSelector } from "LLD/hooks/redux";
++import {
++  blacklistedTokenIdsSelector,
++  hideEmptyTokenAccountsSelector,
++} from "~/renderer/reducers/settings";
++
++const STABLECOIN_CATEGORIES = [AssetCategory.Stablecoins];
++
++// Always-offered rows, taken from the top of the market-cap-ordered stablecoins (USDC/USDT).
++const DEFAULT_STABLECOIN_COUNT = 2;
++
++export type DefaultStablecoin = Readonly<{
++  id: string;
++  ticker: string;
++  name: string;
++  magnitude: number;
++}>;
++
++export type PayStablecoins = Readonly<{
++  stablecoins: CategorizedAssetItem[];
++  defaultStablecoins: DefaultStablecoin[];
++  isLoading: boolean;
++  isError: boolean;
++}>;
++
++export function usePayStablecoins(): PayStablecoins {
++  const hideEmptyTokenAccount = useSelector(hideEmptyTokenAccountsSelector);
++  const blacklistedTokenIds = useSelector(blacklistedTokenIdsSelector);
++
++  // Force cross-chain asset grouping so each stablecoin is a single aggregated item,
++  // independent of the aggregatedAssets wallet flag.
++  const distribution = useDistribution({
++    showEmptyAccounts: true,
++    hideEmptyTokenAccount,
++    groupBy: "asset",
++  });
++
++  const {
++    tickers: stablecoinTickers,
++    isLoading: isLoadingStablecoinTickers,
++    isError: isStablecoinTickersError,
++  } = useStablecoinTickers("lld", __APP_VERSION__);
++
++  const {
++    data: stablecoinAssets,
++    isLoading: isLoadingStablecoinAssets,
++    isError: isStablecoinAssetsError,
++  } = useGetAssetsDataInfiniteQuery({
++    categories: STABLECOIN_CATEGORIES,
++    product: "lld",
++    version: __APP_VERSION__,
++  });
++
++  const categorized = useCategorizedAssets(distribution, stablecoinTickers);
++
++  const stablecoins = useMemo(() => {
++    const blacklist = new Set(blacklistedTokenIds ?? []);
++    return categorized.stablecoins.filter(({ currency }) => !blacklist.has(currency.id));
++  }, [categorized.stablecoins, blacklistedTokenIds]);
++
++  const defaultStablecoins = useMemo<DefaultStablecoin[]>(() => {
++    const merged = mergeAssetsDataPages(stablecoinAssets?.pages);
++    if (!merged) return [];
++    const { stablecoins: top } = selectTopAssetsByCategory(merged, stablecoinTickers, {
++      maxCryptos: 0,
++      maxStablecoins: DEFAULT_STABLECOIN_COUNT,
++    });
++    return top.map(({ currency }) => ({
++      id: currency.id,
++      ticker: currency.ticker,
++      name: currency.name,
++      magnitude: currency.units[0]?.magnitude ?? 0,
++    }));
++  }, [stablecoinAssets, stablecoinTickers]);
++
++  return {
++    stablecoins,
++    defaultStablecoins,
++    isLoading: isLoadingStablecoinTickers || isLoadingStablecoinAssets || distribution.isLoading,
++    isError: isStablecoinTickersError || isStablecoinAssetsError,
++  };
++}
+diff --git a/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts b/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+index 4415cfc..7ddb113 100644
+--- a/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
++++ b/apps/ledger-live-mobile/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+@@ -53,8 +53,8 @@ export function usePayCardBalance(): PayCardBalanceData {
+   const onConfirmFilter = useCallback((_next: PayCardBalanceFilter) => {}, []);
+ 
+   return useMemo(
+-    () =>
+-      aggregatePayCardBalance({
++    () => ({
++      ...aggregatePayCardBalance({
+         stablecoins: categorizedAssets.stablecoins,
+         filter,
+         isLoading: isLoadingStablecoinTickers,
+@@ -63,6 +63,9 @@ export function usePayCardBalance(): PayCardBalanceData {
+         formatCountervalue,
+         onConfirmFilter,
+       }),
++      filterOptions,
++      onConfirmFilter,
++    }),
+     [
+       categorizedAssets.stablecoins,
+       filter,
+diff --git a/features/flow/pay-card-balance/package.json b/features/flow/pay-card-balance/package.json
+index 75f23c2..2ba9ced 100644
+--- a/features/flow/pay-card-balance/package.json
++++ b/features/flow/pay-card-balance/package.json
+@@ -29,12 +29,12 @@
+   },
+   "dependencies": {
+     "@domain/entity-pay-card": "workspace:^",
+-    "@ledgerhq/lumen-utils-shared": "catalog:"
++    "@ledgerhq/lumen-utils-shared": "catalog:",
++    "@ledgerhq/crypto-icons": "catalog:"
+   },
+   "devDependencies": {
+     "@support/jest-features-flow": "workspace:*",
+     "@features/platform-style": "workspace:*",
+-    "@ledgerhq/crypto-icons": "catalog:",
+     "@ledgerhq/lumen-design-core": "catalog:",
+     "@ledgerhq/lumen-ui-react": "catalog:",
+     "@ledgerhq/lumen-ui-rnative": "catalog:",
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts b/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts
+index 3d76841..77325b2 100644
+--- a/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts
+@@ -36,26 +36,12 @@ export type PayCardBalanceFilterOption = Readonly<{
+   cryptoAmountLabel?: string;
+ }>;
+ 
+-/** Host props for `PayCardBalance`, produced via {@link aggregatePayCardBalance}. */
+-export type PayCardBalanceData = Readonly<{
+-  status: PayCardBalanceStatus;
+-  stableBalance: number;
+-  filter: PayCardBalanceFilter;
+-  /** Whether the user holds any stablecoin balance. Drives funded vs empty. */
+-  hasBalance: boolean;
+-  /** First entry is always the "all" option. */
+-  filterOptions: readonly PayCardBalanceFilterOption[];
+-  formatCountervalue: (value: number) => FormattedValue;
+-  onConfirmFilter: (filter: PayCardBalanceFilter) => void;
+-  onTrackEvent?: (event: string, params: Record<string, unknown>) => void;
+-}>;
+-
+ export type PayCardStablecoin = Readonly<{
+   currency: Readonly<{ id: string }>;
+   value: number;
+ }>;
+ 
+-// Platform-agnostic input for {@link aggregatePayCardBalance}
++/** Platform-agnostic input for {@link aggregatePayCardBalance}. */
+ export type PayCardPortfolioPort = Readonly<{
+   stablecoins: readonly PayCardStablecoin[];
+   filter: PayCardBalanceFilter;
+@@ -68,6 +54,25 @@ export type PayCardPortfolioPort = Readonly<{
+   onTrackEvent?: (event: string, params: Record<string, unknown>) => void;
+ }>;
+ 
++/** Result of {@link aggregatePayCardBalance}: filtered total + status. */
++export type PayCardBalanceAggregate = Readonly<{
++  status: PayCardBalanceStatus;
++  stableBalance: number;
++  filter: PayCardBalanceFilter;
++  /** Whether the user holds any stablecoin balance. Drives funded vs empty. */
++  hasBalance: boolean;
++  formatCountervalue: (value: number) => FormattedValue;
++}>;
++
++/** Full host props for `PayCardBalance` (= aggregate + filter UI wiring). */
++export type PayCardBalanceData = PayCardBalanceAggregate &
++  Readonly<{
++    /** First entry is always the "all" option. */
++    filterOptions: readonly PayCardBalanceFilterOption[];
++    onConfirmFilter: (filter: PayCardBalanceFilter) => void;
++    onTrackEvent?: (event: string, params: Record<string, unknown>) => void;
++  }>;
++
+ export type PayCardBalanceProps = PayCardBalanceData &
+   Readonly<{
+     labels: PayCardBalanceLabels;

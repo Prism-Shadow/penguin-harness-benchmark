@@ -1,0 +1,586 @@
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+new file mode 100644
+index 0000000..69f92aa
+--- /dev/null
++++ b/apps/ledger-live-desktop/src/mvvm/features/PayTab/hooks/usePayCardBalance.ts
+@@ -0,0 +1,48 @@
++import { useCallback, useMemo } from "react";
++import BigNumber from "bignumber.js";
++import { formatCurrencyUnitFragment } from "@ledgerhq/live-common/currencies/index";
++import type { FormattedValue } from "@ledgerhq/lumen-ui-react";
++import type { PayCardBalanceData, PayCardBalanceStatus } from "@features/flow-pay-card-balance";
++import { selectPayCardBalanceFilter } from "@domain/entity-pay-card";
++import { useSelector } from "LLD/hooks/redux";
++import { useCategorizedAssetsFromPortfolio } from "LLD/hooks/useCategorizedAssets";
++import { counterValueCurrencySelector, localeSelector } from "~/renderer/reducers/settings";
++
++export function usePayCardBalance(): PayCardBalanceData {
++  const locale = useSelector(localeSelector);
++  const counterValueCurrency = useSelector(counterValueCurrencySelector);
++  const filter = useSelector(selectPayCardBalanceFilter);
++
++  const { categorizedAssets, isLoadingStablecoinTickers, isStablecoinTickersError } =
++    useCategorizedAssetsFromPortfolio();
++
++  const stableBalance = useMemo(
++    () =>
++      categorizedAssets.stablecoins
++        .filter(({ currency }) => filter === "all" || currency.id === filter)
++        .reduce((total, { value }) => total + value, 0),
++    [categorizedAssets.stablecoins, filter],
++  );
++
++  const unit = counterValueCurrency.units[0];
++
++  const formatCountervalue = useCallback(
++    (value: number): FormattedValue =>
++      formatCurrencyUnitFragment(unit, new BigNumber(value), {
++        locale,
++        showCode: true,
++      }),
++    [unit, locale],
++  );
++
++  const status: PayCardBalanceStatus = isStablecoinTickersError
++    ? "error"
++    : isLoadingStablecoinTickers
++      ? "loading"
++      : "ready";
++
++  return useMemo(
++    () => ({ status, stableBalance, filter, formatCountervalue }),
++    [status, stableBalance, filter, formatCountervalue],
++  );
++}
+diff --git a/apps/ledger-live-desktop/src/mvvm/features/PayTab/index.tsx b/apps/ledger-live-desktop/src/mvvm/features/PayTab/index.tsx
+index d4f7275..f81cf28 100644
+--- a/apps/ledger-live-desktop/src/mvvm/features/PayTab/index.tsx
++++ b/apps/ledger-live-desktop/src/mvvm/features/PayTab/index.tsx
+@@ -1,16 +1,31 @@
+ import React from "react";
++import { useTranslation } from "react-i18next";
+ import { CardLogin } from "@features/flow-pay-card-auth";
++import { PayCardBalance } from "@features/flow-pay-card-balance";
++import TrackPage from "~/renderer/analytics/TrackPage";
+ import { openURL } from "~/renderer/linking";
+ import PayTabHeader from "./components/PayTabHeader";
++import { usePayCardBalance } from "./hooks/usePayCardBalance";
+ 
+ const openHostedLogin = (loginUrl: string) => openURL(loginUrl, "");
+ 
+ const PayTab = () => {
++  const { t } = useTranslation();
++  const balance = usePayCardBalance();
++
+   return (
+-    <>
++    <div className="flex flex-col gap-24">
++      <TrackPage category="Pay" balance_filter={balance.filter} />
+       <PayTabHeader />
++      <PayCardBalance
++        {...balance}
++        labels={{
++          emptyTitle: t("payTab.balance.emptyTitle"),
++          emptyDescription: t("payTab.balance.emptyDescription"),
++        }}
++      />
+       <CardLogin openHostedLogin={openHostedLogin} />
+-    </>
++    </div>
+   );
+ };
+ 
+diff --git a/devtools/bindings/package.json b/devtools/bindings/package.json
+index 3ec44c0..d114749 100644
+--- a/devtools/bindings/package.json
++++ b/devtools/bindings/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@devtools/bindings",
+-  "version": "0.2.2",
++  "version": "0.2.3",
+   "private": true,
+   "description": "App-specific builders that adapt Ledger Live state into @devtools tool props (one builder per tool)",
+   "main": "src/index.ts",
+diff --git a/devtools/registry/package.json b/devtools/registry/package.json
+index 697ac84..986ddad 100644
+--- a/devtools/registry/package.json
++++ b/devtools/registry/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@devtools/registry",
+-  "version": "0.1.8",
++  "version": "0.1.9",
+   "private": true,
+   "description": "Static registry of lazy-loaded DevTools modules",
+   "main": "src/index.ts",
+diff --git a/features/flow/pay-card-balance/.eslintrc.tailwind.js b/features/flow/pay-card-balance/.eslintrc.tailwind.js
+new file mode 100644
+index 0000000..151af29
+--- /dev/null
++++ b/features/flow/pay-card-balance/.eslintrc.tailwind.js
+@@ -0,0 +1,34 @@
++/**
++ * ESLint config for better-tailwindcss only (no oxlint equivalent).
++ * Run via: pnpm lint:tailwind
++ * Applies to *.web.{ts,tsx} files only.
++ */
++// eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
++const path = require("path");
++
++module.exports = {
++  root: true,
++  parser: "@typescript-eslint/parser",
++  parserOptions: {
++    ecmaVersion: 2020,
++    sourceType: "module",
++    ecmaFeatures: { jsx: true },
++  },
++  plugins: ["better-tailwindcss"],
++  extends: ["plugin:better-tailwindcss/recommended"],
++  ignorePatterns: ["*.js", "*.cjs", "*.mjs", "node_modules"],
++  rules: {
++    "better-tailwindcss/enforce-consistent-line-wrapping": "off",
++  },
++  settings: {
++    "better-tailwindcss": {
++      entryPoint: path.join(__dirname, "../../../apps/ledger-live-desktop/src/renderer/global.css"),
++      callees: ["cn"],
++    },
++  },
++  overrides: [
++    {
++      files: ["**/*.web.{ts,tsx}"],
++    },
++  ],
++};
+diff --git a/features/flow/pay-card-balance/.oxfmtrc.json b/features/flow/pay-card-balance/.oxfmtrc.json
+new file mode 100644
+index 0000000..c38a3d7
+--- /dev/null
++++ b/features/flow/pay-card-balance/.oxfmtrc.json
+@@ -0,0 +1,11 @@
++{
++  "$schema": "./node_modules/oxfmt/configuration_schema.json",
++  "printWidth": 100,
++  "trailingComma": "all",
++  "arrowParens": "avoid",
++  "sortPackageJson": false,
++  "ignorePatterns": [
++    "**/*.md",
++    "**/*.json"
++  ]
++}
+diff --git a/features/flow/pay-card-balance/.oxlintrc.json b/features/flow/pay-card-balance/.oxlintrc.json
+new file mode 100644
+index 0000000..6393e63
+--- /dev/null
++++ b/features/flow/pay-card-balance/.oxlintrc.json
+@@ -0,0 +1,87 @@
++{
++  "$schema": "./node_modules/oxlint/configuration_schema.json",
++  "env": {
++    "browser": true,
++    "es6": true,
++    "node": true
++  },
++  "plugins": [
++    "eslint",
++    "import",
++    "oxc",
++    "unicorn",
++    "typescript",
++    "react",
++    "jest",
++    "jsx-a11y"
++  ],
++  "ignorePatterns": ["*.js", "*.cjs", "*.mjs", "node_modules"],
++  "categories": {
++    "correctness": "error",
++    "suspicious": "warn",
++    "pedantic": "off"
++  },
++  "rules": {
++    "eslint/no-unused-vars": "warn",
++    "eslint/no-empty-pattern": "warn",
++    "eslint/no-constant-binary-expression": "warn",
++    "eslint/no-shadow": "off",
++    "eslint/no-unused-expressions": "warn",
++    "eslint/no-unsafe-optional-chaining": "off",
++    "eslint/no-useless-rename": "warn",
++    "eslint/no-console": ["error", { "allow": ["warn", "error"] }],
++    "eslint/no-restricted-imports": [
++      "error",
++      {
++        "paths": ["lodash"],
++        "patterns": [
++          {
++            "group": [
++              "@ledgerhq/live-common/lib/**",
++              "@ledgerhq/live-common/lib-es/**"
++            ],
++            "message": "Please remove the /lib import from live-common import."
++          }
++        ]
++      }
++    ],
++    "import/no-duplicates": "error",
++    "import/no-named-as-default": "off",
++    "typescript/no-explicit-any": "error",
++    "typescript/no-non-null-assertion": "off",
++    "typescript/no-deprecated": "error",
++    "react/no-did-mount-set-state": "warn",
++    "react/jsx-key": "warn",
++    "react/display-name": "off",
++    "react/prop-types": "off",
++    "react-hooks/rules-of-hooks": "error",
++    "react-hooks/exhaustive-deps": [
++      "error",
++      {
++        "additionalHooks": "(useInViewContext|useAnimatedStyle|useDerivedValue|useAnimatedProps)"
++      }
++    ],
++    "unicorn/no-useless-fallback-in-spread": "off",
++    "unicorn/no-useless-spread": "off",
++    "unicorn/no-new-array": "off",
++    "unicorn/no-array-sort": "off",
++    "jest/no-conditional-expect": "warn",
++    "jest/expect-expect": "warn",
++    "jest/require-to-throw-message": "warn",
++    "jest/valid-title": "warn",
++    "jest/no-disabled-tests": "warn",
++    "oxc/const-comparisons": "warn",
++    "jsx-a11y/no-autofocus": "off",
++    "jsx-a11y/anchor-is-valid": "off"
++  },
++  "overrides": [
++    {
++      "files": ["**/*.test.{ts,tsx}", "**/__tests__/**"],
++      "env": { "jest": true },
++      "plugins": ["jest"],
++      "rules": {
++        "typescript/no-explicit-any": "warn"
++      }
++    }
++  ]
++}
+diff --git a/features/flow/pay-card-balance/jest.config.js b/features/flow/pay-card-balance/jest.config.js
+new file mode 100644
+index 0000000..b60353f
+--- /dev/null
++++ b/features/flow/pay-card-balance/jest.config.js
+@@ -0,0 +1 @@
++module.exports = require("@support/jest-features-flow").createFlowJestConfig();
+diff --git a/features/flow/pay-card-balance/package.json b/features/flow/pay-card-balance/package.json
+new file mode 100644
+index 0000000..7855633
+--- /dev/null
++++ b/features/flow/pay-card-balance/package.json
+@@ -0,0 +1,73 @@
++{
++  "name": "@features/flow-pay-card-balance",
++  "version": "0.1.0",
++  "private": true,
++  "description": "Shared Pay Card balance hero (empty and funded states) for Ledger Wallet",
++  "main": "src/index.ts",
++  "types": "src/index.ts",
++  "exports": {
++    ".": "./src/index.ts",
++    "./package.json": "./package.json"
++  },
++  "sideEffects": false,
++  "scripts": {
++    "format": "oxfmt src",
++    "format:check": "oxfmt src --check",
++    "lint": "oxlint src && pnpm lint:tailwind",
++    "lint:ci": "oxlint src --quiet && pnpm lint:tailwind",
++    "lint:fix": "oxfmt src && oxlint src --fix --quiet && pnpm lint:tailwind",
++    "lint:tailwind": "eslint --no-eslintrc -c .eslintrc.tailwind.js --ext .ts,.tsx 'src/**/*.web.{ts,tsx}'",
++    "typecheck": "tsc --noEmit -p tsconfig.web.json",
++    "test": "jest",
++    "test:watch": "jest --watch",
++    "coverage": "jest --coverage",
++    "unimported": "pnpm knip --directory ../../.. -W features/flow/pay-card-balance"
++  },
++  "dependencies": {
++    "@domain/entity-pay-card": "workspace:^"
++  },
++  "devDependencies": {
++    "@support/jest-features-flow": "workspace:*",
++    "@features/platform-style": "workspace:*",
++    "@ledgerhq/lumen-design-core": "catalog:",
++    "@ledgerhq/lumen-ui-react": "catalog:",
++    "@swc/core": "catalog:",
++    "@swc/jest": "catalog:",
++    "@testing-library/dom": "catalog:",
++    "@testing-library/jest-dom": "catalog:",
++    "@testing-library/react": "catalog:",
++    "@types/jest": "catalog:",
++    "@types/node": "catalog:",
++    "@types/react": "catalog:",
++    "@typescript-eslint/parser": "catalog:",
++    "eslint": "8.57.0",
++    "eslint-plugin-better-tailwindcss": "catalog:",
++    "jest": "catalog:",
++    "jest-environment-jsdom": "catalog:",
++    "oxfmt": "catalog:",
++    "oxlint": "catalog:",
++    "react": "catalog:",
++    "react-dom": "catalog:",
++    "tailwindcss": "catalog:",
++    "typescript": "catalog:"
++  },
++  "optionalDependencies": {
++    "@oxlint/binding-darwin-arm64": "1.51.0",
++    "@oxlint/binding-darwin-x64": "1.51.0",
++    "@oxlint/binding-linux-x64-gnu": "1.51.0",
++    "@oxlint/binding-win32-x64-msvc": "1.51.0"
++  },
++  "peerDependencies": {
++    "@ledgerhq/lumen-design-core": "catalog:",
++    "@ledgerhq/lumen-ui-react": "catalog:",
++    "react": "catalog:"
++  },
++  "peerDependenciesMeta": {
++    "@ledgerhq/lumen-ui-react": {
++      "optional": true
++    },
++    "@ledgerhq/lumen-design-core": {
++      "optional": true
++    }
++  }
++}
+diff --git a/features/flow/pay-card-balance/project.json b/features/flow/pay-card-balance/project.json
+new file mode 100644
+index 0000000..149ab5a
+--- /dev/null
++++ b/features/flow/pay-card-balance/project.json
+@@ -0,0 +1,8 @@
++{
++  "name": "@features/flow-pay-card-balance",
++  "targets": {
++    "build": {
++      "executor": "nx:noop"
++    }
++  }
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalance.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalance.tsx
+new file mode 100644
+index 0000000..ef272ce
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalance.tsx
+@@ -0,0 +1,8 @@
++import React from "react";
++import { PayCardBalanceView } from "./PayCardBalanceView";
++import type { PayCardBalanceProps } from "./types";
++import { usePayCardBalanceViewModel } from "./usePayCardBalanceViewModel";
++
++export function PayCardBalance(props: PayCardBalanceProps) {
++  return <PayCardBalanceView {...usePayCardBalanceViewModel(props)} />;
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.web.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.web.tsx
+new file mode 100644
+index 0000000..5238b50
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceEmptyState.web.tsx
+@@ -0,0 +1,15 @@
++import React from "react";
++import type { PayCardBalanceLabels } from "./types";
++
++type PayCardBalanceEmptyStateProps = Readonly<{
++  labels: PayCardBalanceLabels;
++}>;
++
++export function PayCardBalanceEmptyState({ labels }: PayCardBalanceEmptyStateProps) {
++  return (
++    <div className="flex flex-col items-start gap-16" data-testid="pay-card-balance-empty-state">
++      <p className="heading-1-semi-bold text-base">{labels.emptyTitle}</p>
++      <p className="body-2 text-muted">{labels.emptyDescription}</p>
++    </div>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.web.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.web.tsx
+new file mode 100644
+index 0000000..d8f8c84
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceFundedState.web.tsx
+@@ -0,0 +1,26 @@
++import React from "react";
++import { AmountDisplay } from "@ledgerhq/lumen-ui-react";
++import type { FormattedValue } from "@ledgerhq/lumen-ui-react";
++
++type PayCardBalanceFundedStateProps = Readonly<{
++  balance: number;
++  formatCountervalue: (value: number) => FormattedValue;
++  isLoading: boolean;
++}>;
++
++export function PayCardBalanceFundedState({
++  balance,
++  formatCountervalue,
++  isLoading,
++}: PayCardBalanceFundedStateProps) {
++  return (
++    <div className="flex items-end gap-12" data-testid="pay-card-balance-funded-state">
++      <AmountDisplay
++        value={balance}
++        formatter={formatCountervalue}
++        loading={isLoading}
++        data-testid="pay-card-balance-amount"
++      />
++    </div>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.web.tsx b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.web.tsx
+new file mode 100644
+index 0000000..c1a3bd6
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/PayCardBalanceView.web.tsx
+@@ -0,0 +1,22 @@
++import React from "react";
++import { Divider } from "@ledgerhq/lumen-ui-react";
++import type { PayCardBalanceViewProps } from "./types";
++import { PayCardBalanceEmptyState } from "./PayCardBalanceEmptyState";
++import { PayCardBalanceFundedState } from "./PayCardBalanceFundedState";
++
++export function PayCardBalanceView(props: PayCardBalanceViewProps) {
++  return (
++    <div className="flex flex-col gap-24" data-testid="pay-card-balance">
++      {props.displayMode === "funded" ? (
++        <PayCardBalanceFundedState
++          balance={props.balance}
++          formatCountervalue={props.formatCountervalue}
++          isLoading={props.isLoading}
++        />
++      ) : (
++        <PayCardBalanceEmptyState labels={props.labels} />
++      )}
++      <Divider orientation="horizontal" />
++    </div>
++  );
++}
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/index.ts b/features/flow/pay-card-balance/src/components/PayCardBalance/index.ts
+new file mode 100644
+index 0000000..445a290
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/index.ts
+@@ -0,0 +1,2 @@
++export * from "./PayCardBalance";
++export * from "./types";
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts b/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts
+new file mode 100644
+index 0000000..7a2e13c
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/types.ts
+@@ -0,0 +1,40 @@
++import type { PayCardBalanceFilter } from "@domain/entity-pay-card";
++import type { FormattedValue } from "@ledgerhq/lumen-ui-react";
++
++export type PayCardBalanceStatus = "loading" | "error" | "ready";
++
++export type PayCardBalanceLabels = Readonly<{
++  emptyTitle: string;
++  emptyDescription: string;
++}>;
++
++/**
++ * Everything the host feeds the hero. The desktop app derives it from the portfolio; LIVE-34898
++ * will later provide a shared implementation.
++ */
++export type PayCardBalanceData = Readonly<{
++  status: PayCardBalanceStatus;
++  /** Aggregated stablecoin countervalue, in the user's counter currency. */
++  stableBalance: number;
++  /** Active balance filter (`"all"` or a single stablecoin currencyId). */
++  filter: PayCardBalanceFilter;
++  formatCountervalue: (value: number) => FormattedValue;
++}>;
++
++export type PayCardBalanceProps = PayCardBalanceData &
++  Readonly<{
++    labels: PayCardBalanceLabels;
++  }>;
++
++export type PayCardBalanceViewProps =
++  | Readonly<{
++      displayMode: "empty";
++      labels: PayCardBalanceLabels;
++    }>
++  | Readonly<{
++      displayMode: "funded";
++      balance: number;
++      formatCountervalue: (value: number) => FormattedValue;
++      filter: PayCardBalanceFilter;
++      isLoading: boolean;
++    }>;
+diff --git a/features/flow/pay-card-balance/src/components/PayCardBalance/usePayCardBalanceViewModel.ts b/features/flow/pay-card-balance/src/components/PayCardBalance/usePayCardBalanceViewModel.ts
+new file mode 100644
+index 0000000..1554b0a
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/components/PayCardBalance/usePayCardBalanceViewModel.ts
+@@ -0,0 +1,24 @@
++import type { PayCardBalanceProps, PayCardBalanceViewProps } from "./types";
++
++export function usePayCardBalanceViewModel({
++  status,
++  stableBalance,
++  filter,
++  formatCountervalue,
++  labels,
++}: PayCardBalanceProps): PayCardBalanceViewProps {
++  const isLoading = status === "loading";
++  const isFunded = isLoading || (status === "ready" && stableBalance > 0);
++
++  if (!isFunded) {
++    return { displayMode: "empty", labels };
++  }
++
++  return {
++    displayMode: "funded",
++    balance: stableBalance,
++    formatCountervalue,
++    filter,
++    isLoading,
++  };
++}
+diff --git a/features/flow/pay-card-balance/src/index.ts b/features/flow/pay-card-balance/src/index.ts
+new file mode 100644
+index 0000000..1d5c71f
+--- /dev/null
++++ b/features/flow/pay-card-balance/src/index.ts
+@@ -0,0 +1 @@
++export * from "./components/PayCardBalance";
+diff --git a/features/flow/pay-card-balance/tsconfig.json b/features/flow/pay-card-balance/tsconfig.json
+new file mode 100644
+index 0000000..e19ad9d
+--- /dev/null
++++ b/features/flow/pay-card-balance/tsconfig.json
+@@ -0,0 +1,14 @@
++{
++  "extends": "../../../tsconfig.base.json",
++  "compilerOptions": {
++    "lib": ["ES2022", "DOM"],
++    "target": "ES2022",
++    "module": "ESNext",
++    "moduleResolution": "bundler",
++    "jsx": "react-jsx",
++    "noEmit": true,
++    "types": ["jest", "node", "@testing-library/jest-dom"]
++  },
++  "files": [],
++  "references": [{ "path": "./tsconfig.web.json" }]
++}
+diff --git a/features/flow/pay-card-balance/tsconfig.web.json b/features/flow/pay-card-balance/tsconfig.web.json
+new file mode 100644
+index 0000000..6f90ee0
+--- /dev/null
++++ b/features/flow/pay-card-balance/tsconfig.web.json
+@@ -0,0 +1,8 @@
++{
++  "extends": "./tsconfig.json",
++  "compilerOptions": {
++    "moduleSuffixes": [".web", ""]
++  },
++  "include": ["src/**/*"],
++  "exclude": ["node_modules", "src/**/*.native.*"]
++}
