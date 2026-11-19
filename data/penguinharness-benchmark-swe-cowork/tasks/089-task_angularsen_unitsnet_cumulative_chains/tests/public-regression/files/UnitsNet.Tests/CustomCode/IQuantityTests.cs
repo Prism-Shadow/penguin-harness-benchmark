@@ -1,0 +1,141 @@
+﻿// Licensed under MIT No Attribution, see LICENSE file at the root.
+// Copyright 2013 Andreas Gullberg Larsen (andreas.larsen84@gmail.com). Maintained at https://github.com/angularsen/UnitsNet.
+
+namespace UnitsNet.Tests;
+
+// ReSharper disable once InconsistentNaming
+public partial class IQuantityTests
+{
+    [Fact]
+    public void As_GivenWrongUnitType_ThrowsUnitNotFoundException()
+    {
+        Assert.All(Quantity.Infos.Select(x => x.Zero), quantity => { Assert.Throws<UnitNotFoundException>(() => quantity.As(ComparisonType.Absolute)); });
+    }
+
+    [Fact]
+    public void ToUnit_GivenWrongUnitType_ThrowsUnitNotFoundException()
+    {
+        Assert.All(Quantity.Infos.Select(x => x.Zero), quantity => { Assert.Throws<UnitNotFoundException>(() => quantity.ToUnit(ComparisonType.Absolute)); });
+    }
+
+    [Fact]
+    public virtual void ToUnit_UnitSystem_SI_ReturnsQuantityInSIUnits()
+    {
+        var quantity = new Mass(1, Mass.BaseUnit);
+        MassUnit expectedUnit = Mass.Info.GetDefaultUnit(UnitSystem.SI);
+        var expectedValue = quantity.As(expectedUnit);
+
+        Assert.Multiple(() =>
+        {
+            IQuantity<MassUnit> quantityToConvert = quantity;
+
+            IQuantity<MassUnit> convertedQuantity = quantityToConvert.ToUnit(UnitSystem.SI);
+
+            Assert.Equal(expectedUnit, convertedQuantity.Unit);
+            Assert.Equal(expectedValue, convertedQuantity.Value);
+        }, () =>
+        {
+            IQuantity quantityToConvert = quantity;
+
+            IQuantity convertedQuantity = quantityToConvert.ToUnit(UnitSystem.SI);
+
+            Assert.Equal(expectedUnit, convertedQuantity.Unit);
+            Assert.Equal(expectedValue, convertedQuantity.Value);
+        });
+    }
+
+    [Fact]
+    public void ToUnit_UnitSystem_ThrowsArgumentNullExceptionIfNull()
+    {
+        UnitSystem nullUnitSystem = null!;
+        Assert.Multiple(() =>
+        {
+            IQuantity<MassUnit> quantity = new Mass(1, Mass.BaseUnit);
+            Assert.Throws<ArgumentNullException>(() => quantity.ToUnit(nullUnitSystem));
+        }, () =>
+        {
+            IQuantity quantity = new Mass(1, Mass.BaseUnit);
+            Assert.Throws<ArgumentNullException>(() => quantity.ToUnit(nullUnitSystem));
+        });
+    }
+
+    [Fact]
+    public void GetUnitInfo_ReturnsUnitInfoForQuantityUnit()
+    {
+        var length = new Length(3.0, LengthUnit.Centimeter);
+        IQuantity quantity = length;
+
+        UnitInfo unitInfo = quantity.GetUnitInfo();
+
+        Assert.Equal(nameof(LengthUnit.Centimeter), unitInfo.Name);
+        Assert.Equal(quantity.UnitKey, unitInfo.UnitKey);
+    }
+
+    [Fact]
+    public void GetUnitInfo_Zero_ReturnsBaseUnitInfo()
+    {
+        IQuantity quantity = Length.Info.Zero;
+
+        UnitInfo unitInfo = quantity.GetUnitInfo();
+
+        Assert.Equal(Length.Info.BaseUnitInfo.UnitKey, unitInfo.UnitKey);
+    }
+
+    [Fact]
+    public void GetUnitInfo_ConcreteQuantity_ReturnsFullyTypedUnitInfo()
+    {
+        var quantity = new Length(3.0, LengthUnit.Centimeter);
+
+        // Overload resolution picks GetUnitInfo<TQuantity, TUnit> for the concrete struct receiver,
+        // returning the most specific UnitInfo<Length, LengthUnit>.
+        UnitInfo<Length, LengthUnit> unitInfo = quantity.GetUnitInfo();
+
+        Assert.Equal(LengthUnit.Centimeter, unitInfo.Value);
+        Assert.Equal(nameof(LengthUnit.Centimeter), unitInfo.Name);
+    }
+
+    [Fact]
+    public void GetUnitInfo_TypedQuantityReference_FallsBackToNonGeneric()
+    {
+        IQuantity<LengthUnit> quantity = new Length(3.0, LengthUnit.Centimeter);
+
+        // The IQuantity<TUnit> reference does not satisfy the IQuantity<TSelf, TUnit> constraint
+        // (TSelf would be IQuantity<MassUnit>), so resolution falls back to GetUnitInfo(IQuantity).
+        UnitInfo unitInfo = quantity.GetUnitInfo();
+
+        Assert.Equal(LengthUnit.Centimeter, ((UnitInfo<LengthUnit>)unitInfo).Value);
+        Assert.Equal(nameof(LengthUnit.Centimeter), unitInfo.Name);
+    }
+
+    [Fact]
+    public void GetUnitInfo_MatchesUnit()
+    {
+        Assert.All(Quantity.Infos.Select(x => x.Zero), quantity =>
+        {
+            Assert.Equal(quantity.Unit, quantity.GetUnitInfo().Value);
+        });
+    }
+
+    [Fact]
+    public void ToUnit_UnitSystem_ThrowsArgumentExceptionIfNotSupported()
+    {
+        var unsupportedUnitSystem = new UnitSystem(new BaseUnits(
+            (LengthUnit)(-1),
+            (MassUnit)(-1),
+            (DurationUnit)(-1),
+            (ElectricCurrentUnit)(-1),
+            (TemperatureUnit)(-1),
+            (AmountOfSubstanceUnit)(-1),
+            (LuminousIntensityUnit)(-1)));
+
+        Assert.Multiple(() =>
+        {
+            IQuantity<MassUnit> quantity = new Mass(1, Mass.BaseUnit);
+            Assert.Throws<ArgumentException>(() => quantity.ToUnit(unsupportedUnitSystem));
+        }, () =>
+        {
+            IQuantity quantity = new Mass(1, Mass.BaseUnit);
+            Assert.Throws<ArgumentException>(() => quantity.ToUnit(unsupportedUnitSystem));
+        });
+    }
+}
