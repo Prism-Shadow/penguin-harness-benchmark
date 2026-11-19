@@ -1,0 +1,4968 @@
+diff --git a/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/MpqBurstCost.java b/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/MpqBurstCost.java
+index 860cf42..63980f5 100644
+--- a/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/MpqBurstCost.java
++++ b/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/MpqBurstCost.java
+@@ -15,10 +15,16 @@ package org.jctools.jmh.latency;
+ 
+ import org.jctools.queues.MessagePassingQueue;
+ import org.jctools.queues.MessagePassingQueueByTypeFactory;
++import org.jctools.util.PortableJvmInfo;
++import org.jctools.util.Pow2;
++import org.jctools.util.UnsafeAccess;
+ import org.openjdk.jmh.annotations.*;
++import org.openjdk.jmh.infra.Blackhole;
+ 
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ @State(Scope.Benchmark)
+ @BenchmarkMode(Mode.AverageTime)
+@@ -28,130 +34,259 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ @SuppressWarnings("serial")
+ public class MpqBurstCost
+ {
+-    static final Go GO = new Go();
++    private static final long DELAY_PRODUCER = Long.getLong("delay.p", 0L);
++    private static final long DELAY_CONSUMER = Long.getLong("delay.c", 0L);
+     @Param( {"SpscArrayQueue", "MpscArrayQueue", "SpmcArrayQueue", "MpmcArrayQueue"})
+-    String qType;
++    public String qType;
+     @Param( {"100"})
+-    int burstSize;
++    public int burstSize;
+     @Param("1")
+-    int consumerCount;
+-    MessagePassingQueue<AbstractEvent> q;
+-    private Thread[] consumerThreads;
+-    private Consumer consumer;
++    public int consumerCount;
++    @Param("true")
++    public boolean warmup;
++    @Param(value = {"132000"})
++    public String qCapacity;
++    MessagePassingQueue<Event> q;
++    private ExecutorService consumerExecutor;
++    private Consumer[] consumers;
++    private CountDownLatch stopped;
+ 
+     @Setup(Level.Trial)
+     public void setupQueueAndConsumers()
+     {
+-        q = MessagePassingQueueByTypeFactory.createQueue(qType, 128);
++        if (warmup)
++        {
++            q = MessagePassingQueueByTypeFactory.createQueue(qType, 128);
++
++            final Event event = new Event();
+ 
+-        // stretch the queue to the limit, working through resizing and full
+-        for (int i = 0; i < 128 + 100; i++)
++            // stretch the queue to the limit, working through resizing and full
++            for (int i = 0; i < 128 + 100; i++)
++            {
++                q.offer(event);
++            }
++            for (int i = 0; i < 128 + 100; i++)
++            {
++                q.poll();
++            }
++            // make sure the important common case is exercised
++            for (int i = 0; i < 20000; i++)
++            {
++                q.offer(event);
++                q.poll();
++            }
++        }
++        q = MessagePassingQueueByTypeFactory.buildQ(qType, qCapacity);
++        consumers = new Consumer[consumerCount];
++        for (int i = 0; i < consumerCount; i++)
+         {
+-            q.offer(GO);
++            consumers[i] = new Consumer(q, i);
+         }
+-        for (int i = 0; i < 128 + 100; i++)
++        consumerExecutor = Executors.newFixedThreadPool(consumerCount);
++    }
++
++    @Setup(Level.Iteration)
++    public void startConsumers() throws InterruptedException
++    {
++        stopped = new CountDownLatch(consumerCount);
++        final CountDownLatch started = new CountDownLatch(consumerCount);
++        final int consumerCount = this.consumerCount;
++        for (int i = 0; i < consumerCount; i++)
+         {
+-            q.poll();
++            consumers[i].isRunning = true;
++            consumers[i].stopped = stopped;
++            consumers[i].started = started;
+         }
+-        // make sure the important common case is exercised
+-        for (int i = 0; i < 20000; i++)
++        for (int i = 0; i < consumerCount; i++)
+         {
+-            q.offer(GO);
+-            q.poll();
++            consumerExecutor.execute(consumers[i]);
+         }
+-        q = MessagePassingQueueByTypeFactory.createQueue(qType, 128 * 1024);
+-        consumer = new Consumer(q);
+-        consumerThreads = new Thread[consumerCount];
++        started.await();
++    }
++
++    @TearDown(Level.Iteration)
++    public void stopConsumers() throws InterruptedException
++    {
++        final int consumerCount = this.consumerCount;
+         for (int i = 0; i < consumerCount; i++)
+         {
+-            consumerThreads[i] = new Thread(consumer);
+-            consumerThreads[i].start();
++            consumers[i].isRunning = false;
+         }
++        stopped.await();
++    }
++
++    @TearDown(Level.Trial)
++    public void stopExecutor()
++    {
++        consumerExecutor.shutdown();
+     }
+ 
+     @Benchmark
+-    public void burstCost(Stop stop)
++    @CompilerControl(CompilerControl.Mode.DONT_INLINE)
++    public void burstCost(Event event)
+     {
+         final int burst = burstSize;
+-        final MessagePassingQueue<AbstractEvent> q = this.q;
+-        final Go go = GO;
+-        stop.lazySet(false);
+-        for (int i = 0; i < burst - 1; i++)
++        final MessagePassingQueue<Event> q = this.q;
++        event.reset();
++        sendBurst(q, event, burst);
++        event.waitFor(burst);
++    }
++
++    private static void sendBurst(MessagePassingQueue<Event> q, Event event, int burst)
++    {
++        for (int i = 0; i < burst; i++)
+         {
+-            while (!q.offer(go))
++            while (!q.offer(event))
+             {
+                 ;
+             }
++            if (DELAY_PRODUCER != 0)
++            {
++                Blackhole.consumeCPU(DELAY_PRODUCER);
++            }
++        }
++    }
++
++    @State(Scope.Thread)
++    public static class Event
++    {
++        private static final long ARRAY_BASE;
++        private static final int ELEMENT_SHIFT;
++        private static final int LONG_PAD;
++
++        static
++        {
++            final int scale = UnsafeAccess.UNSAFE.arrayIndexScale(long[].class);
++            final int bytesPad = PortableJvmInfo.CACHE_LINE_SIZE * 2;
++            if (8 == scale)
++            {
++                if (bytesPad < 8 || Pow2.align(bytesPad, 8) != bytesPad)
++                {
++                    throw new IllegalStateException(bytesPad + " is not multiple of the scale (8)!");
++                }
++                ELEMENT_SHIFT = Integer.numberOfTrailingZeros(bytesPad);
++                LONG_PAD = bytesPad / 8;
++            }
++            else
++            {
++                throw new IllegalStateException("Unexpected long[] element size");
++            }
++            // Including the buffer pad in the array base offset
++            ARRAY_BASE = UnsafeAccess.UNSAFE.arrayBaseOffset(long[].class);
+         }
+ 
+-        while (!q.offer(stop))
++        private static long calcSequenceOffset(long index)
+         {
+-            ;
++            return ARRAY_BASE + (index << ELEMENT_SHIFT);
+         }
+ 
+-        while (!stop.get())
++        private long[] handledCount = null;
++        private int consumerCount;
++
++        @Setup
++        public void init(MpqBurstCost state)
+         {
+-            ;
++            //pad the array at the beginning
++            final int length = (state.consumerCount << ELEMENT_SHIFT) / 8 + LONG_PAD;
++            handledCount = new long[length];
++            consumerCount = state.consumerCount;
+         }
+-    }
+ 
+-    @TearDown
+-    public void killConsumer() throws InterruptedException
+-    {
+-        consumer.isRunning = false;
+-        for (int i = 0; i < consumerCount; i++)
++        void reset()
+         {
+-            consumerThreads[i].join();
++            final long[] values = this.handledCount;
++            final int consumerCount = this.consumerCount;
++            for (int i = 0; i < consumerCount; i++)
++            {
++                final long offset = calcSequenceOffset(i);
++                UnsafeAccess.UNSAFE.putLong(values, offset, 0);
++            }
++            UnsafeAccess.UNSAFE.storeFence();
+         }
+-    }
+ 
+-    abstract static class AbstractEvent extends AtomicBoolean
+-    {
+-        abstract void handle();
+-    }
++        void waitFor(int value)
++        {
++            final long[] values = this.handledCount;
++            final int consumerCount = this.consumerCount;
++            do
++            {
++                long total = 0;
++                for (int i = 0; i < consumerCount; i++)
++                {
++                    final long offset = calcSequenceOffset(i);
++                    total += UnsafeAccess.UNSAFE.getLongVolatile(values, offset);
++                    if (total == value)
++                    {
++                        return;
++                    }
++                }
++            }
++            while (true);
++        }
+ 
+-    static class Go extends AbstractEvent
+-    {
+-        @Override
+-        void handle()
++        void handle(int consumerId)
+         {
+-            // do nothing
++            final long[] values = this.handledCount;
++            final long offset = calcSequenceOffset(consumerId);
++            final long value = UnsafeAccess.UNSAFE.getLong(values, offset);
++            UnsafeAccess.UNSAFE.putOrderedLong(values, offset, value + 1);
+         }
+     }
+ 
+-    @State(Scope.Thread)
+-    public static class Stop extends AbstractEvent
++    static class ConsumerPad
+     {
+-        @Override
+-        void handle()
+-        {
+-            lazySet(true);
+-        }
++        public long p40, p41, p42, p43, p44, p45, p46;
++        public long p30, p31, p32, p33, p34, p35, p36, p37;
+     }
+ 
+-    static class Consumer implements Runnable
++    static class ConsumerFields extends ConsumerPad
+     {
+-        final MessagePassingQueue<AbstractEvent> q;
++        MessagePassingQueue<Event> q;
+         volatile boolean isRunning = true;
++        CountDownLatch stopped;
++        CountDownLatch started;
++    }
++
++    static class Consumer extends ConsumerFields implements Runnable
++    {
++        public long p40, p41, p42, p43, p44, p45, p46;
++        public long p30, p31, p32, p33, p34, p35, p36, p37;
++        private final int consumerId;
+ 
+-        public Consumer(MessagePassingQueue<AbstractEvent> q)
++        public Consumer(MessagePassingQueue<Event> q, int consumerId)
+         {
+             this.q = q;
++            this.consumerId = consumerId;
+         }
+ 
+         @Override
+         public void run()
+         {
+-            final MessagePassingQueue<AbstractEvent> q = this.q;
++            final CountDownLatch stopped = this.stopped;
++            final CountDownLatch started = this.started;
++            final int consumerId = this.consumerId;
++            final MessagePassingQueue<Event> q = this.q;
++            started.countDown();
+             while (isRunning)
+             {
+-                AbstractEvent e = null;
+-                if ((e = q.relaxedPoll()) == null)
+-                {
+-                    continue;
+-                }
+-                e.handle();
++                consume(q, consumerId);
++            }
++            stopped.countDown();
++        }
++
++        @CompilerControl(CompilerControl.Mode.DONT_INLINE)
++        private void consume(MessagePassingQueue<Event> q, int consumerId)
++        {
++            Event e = null;
++            if ((e = q.relaxedPoll()) == null)
++            {
++                return;
++            }
++            if (DELAY_CONSUMER != 0)
++            {
++                Blackhole.consumeCPU(DELAY_CONSUMER);
+             }
++            e.handle(consumerId);
+         }
+ 
+     }
+diff --git a/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/QueueBurstCost.java b/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/QueueBurstCost.java
+index 94acba0..627467f 100644
+--- a/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/QueueBurstCost.java
++++ b/jctools-benchmarks/src/main/java/org/jctools/jmh/latency/QueueBurstCost.java
+@@ -14,6 +14,9 @@
+ package org.jctools.jmh.latency;
+ 
+ import org.jctools.queues.QueueByTypeFactory;
++import org.jctools.util.PortableJvmInfo;
++import org.jctools.util.Pow2;
++import org.jctools.util.UnsafeAccess;
+ import org.openjdk.jmh.annotations.*;
+ import org.openjdk.jmh.infra.Blackhole;
+ 
+@@ -22,7 +25,6 @@ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ @State(Scope.Benchmark)
+ @BenchmarkMode(Mode.AverageTime)
+@@ -34,7 +36,6 @@ public class QueueBurstCost
+ {
+     private static final long DELAY_PRODUCER = Long.getLong("delay.p", 0L);
+     private static final long DELAY_CONSUMER = Long.getLong("delay.c", 0L);
+-    Go GO = new Go();
+     @Param( {"SpscArrayQueue", "MpscArrayQueue", "SpmcArrayQueue", "MpmcArrayQueue"})
+     String qType;
+     @Param( {"100"})
+@@ -45,21 +46,24 @@ public class QueueBurstCost
+     boolean warmup;
+     @Param(value = {"132000"})
+     String qCapacity;
+-    Queue<AbstractEvent> q;
++    Queue<Event> q;
+     private ExecutorService consumerExecutor;
+-    private Consumer consumer;
++    private Consumer[] consumers;
++    private CountDownLatch stopped;
+ 
+     @Setup(Level.Trial)
+-    public void setupQueue()
++    public void setupQueueAndConsumers()
+     {
+         if (warmup)
+         {
+             q = QueueByTypeFactory.createQueue(qType, 128);
+ 
++            final Event event = new Event();
++
+             // stretch the queue to the limit, working through resizing and full
+             for (int i = 0; i < 128 + 100; i++)
+             {
+-                q.offer(GO);
++                q.offer(event);
+             }
+             for (int i = 0; i < 128 + 100; i++)
+             {
+@@ -68,102 +72,164 @@ public class QueueBurstCost
+             // make sure the important common case is exercised
+             for (int i = 0; i < 20000; i++)
+             {
+-                q.offer(GO);
++                q.offer(event);
+                 q.poll();
+             }
+         }
+         q = QueueByTypeFactory.buildQ(qType, qCapacity);
+-        consumer = new Consumer(q);
++        consumers = new Consumer[consumerCount];
++        for (int i = 0; i < consumerCount; i++)
++        {
++            consumers[i] = new Consumer(q, i);
++        }
+         consumerExecutor = Executors.newFixedThreadPool(consumerCount);
+     }
+ 
+     @Setup(Level.Iteration)
+-    public void startConsumers()
++    public void startConsumers() throws InterruptedException
+     {
+-        consumer.isRunning = true;
+-        consumer.stopped = new CountDownLatch(consumerCount);
++        stopped = new CountDownLatch(consumerCount);
++        final CountDownLatch started = new CountDownLatch(consumerCount);
++        final int consumerCount = this.consumerCount;
+         for (int i = 0; i < consumerCount; i++)
+         {
+-            consumerExecutor.execute(consumer);
++            consumers[i].isRunning = true;
++            consumers[i].stopped = stopped;
++            consumers[i].started = started;
+         }
+-
++        for (int i = 0; i < consumerCount; i++)
++        {
++            consumerExecutor.execute(consumers[i]);
++        }
++        started.await();
+     }
+ 
+     @TearDown(Level.Iteration)
+     public void stopConsumers() throws InterruptedException
+     {
+-        consumer.isRunning = false;
+-        consumer.stopped.await();
++        final int consumerCount = this.consumerCount;
++        for (int i = 0; i < consumerCount; i++)
++        {
++            consumers[i].isRunning = false;
++        }
++        stopped.await();
+     }
+ 
+     @TearDown(Level.Trial)
+-    public void stopExecutor() throws InterruptedException
++    public void stopExecutor()
+     {
+         consumerExecutor.shutdown();
+     }
+ 
+     @Benchmark
+     @CompilerControl(CompilerControl.Mode.DONT_INLINE)
+-    public void burstCost(Stop stop)
++    public void burstCost(Event event)
+     {
+         final int burst = burstSize;
+-        final Queue<AbstractEvent> q = this.q;
+-        final Go go = GO;
+-        stop.lazySet(false);
+-        sendBurst(q, burst, go, stop);
+-
+-        waitForIt(stop);
++        final Queue<Event> q = this.q;
++        event.reset();
++        sendBurst(q, event, burst);
++        event.waitFor(burst);
+     }
+ 
+-    private void waitForIt(Stop stop)
++    private static void sendBurst(Queue<Event> q, Event event, int burst)
+     {
+-        while (!stop.get())
++        for (int i = 0; i < burst; i++)
+         {
+-            ;
++            while (!q.offer(event))
++            {
++                ;
++            }
++            if (DELAY_PRODUCER != 0)
++            {
++                Blackhole.consumeCPU(DELAY_PRODUCER);
++            }
+         }
+     }
+ 
+-    private void sendBurst(Queue<AbstractEvent> q, int burst, Go go, Stop stop)
++    @State(Scope.Thread)
++    public static class Event
+     {
+-        for (int i = 0; i < burst - 1; i++)
++        private static final long ARRAY_BASE;
++        private static final int ELEMENT_SHIFT;
++        private static final int LONG_PAD;
++
++        static
+         {
+-            while (!q.offer(go))
++            final int scale = UnsafeAccess.UNSAFE.arrayIndexScale(long[].class);
++            final int bytesPad = PortableJvmInfo.CACHE_LINE_SIZE * 2;
++            if (8 == scale)
+             {
+-                ;
++                if (bytesPad < 8 || Pow2.align(bytesPad, 8) != bytesPad)
++                {
++                    throw new IllegalStateException(bytesPad + " is not multiple of the scale (8)!");
++                }
++                ELEMENT_SHIFT = Integer.numberOfTrailingZeros(bytesPad);
++                LONG_PAD = bytesPad / 8;
+             }
+-            if (DELAY_PRODUCER != 0)
++            else
+             {
+-                Blackhole.consumeCPU(DELAY_PRODUCER);
++                throw new IllegalStateException("Unexpected long[] element size");
+             }
++            // Including the buffer pad in the array base offset
++            ARRAY_BASE = UnsafeAccess.UNSAFE.arrayBaseOffset(long[].class);
+         }
+ 
+-        while (!q.offer(stop))
++        private static long calcSequenceOffset(long index)
+         {
+-            ;
++            return ARRAY_BASE + (index << ELEMENT_SHIFT);
+         }
+-    }
+ 
+-    abstract static class AbstractEvent extends AtomicBoolean
+-    {
+-        abstract void handle();
+-    }
++        private long[] handledCount = null;
++        private int consumerCount;
+ 
+-    static class Go extends AbstractEvent
+-    {
+-        @Override
+-        void handle()
++        @Setup
++        public void init(QueueBurstCost state)
+         {
+-            // do nothing
++            //pad the array at the beginning
++            final int length = (state.consumerCount << ELEMENT_SHIFT) / 8 + LONG_PAD;
++            handledCount = new long[length];
++            consumerCount = state.consumerCount;
+         }
+-    }
+ 
+-    @State(Scope.Thread)
+-    public static class Stop extends AbstractEvent
+-    {
+-        @Override
+-        void handle()
++        void reset()
++        {
++            final long[] values = this.handledCount;
++            final int consumerCount = this.consumerCount;
++            for (int i = 0; i < consumerCount; i++)
++            {
++                final long offset = calcSequenceOffset(i);
++                UnsafeAccess.UNSAFE.putLong(values, offset, 0);
++            }
++            UnsafeAccess.UNSAFE.storeFence();
++        }
++
++        void waitFor(int value)
+         {
+-            lazySet(true);
++            final long[] values = this.handledCount;
++            final int consumerCount = this.consumerCount;
++            do
++            {
++                long total = 0;
++                for (int i = 0; i < consumerCount; i++)
++                {
++                    final long offset = calcSequenceOffset(i);
++                    total += UnsafeAccess.UNSAFE.getLongVolatile(values, offset);
++                    if (total == value)
++                    {
++                        return;
++                    }
++                }
++            }
++            while (true);
++        }
++
++        void handle(int consumerId)
++        {
++            final long[] values = this.handledCount;
++            final long offset = calcSequenceOffset(consumerId);
++            final long value = UnsafeAccess.UNSAFE.getLong(values, offset);
++            UnsafeAccess.UNSAFE.putOrderedLong(values, offset, value + 1);
+         }
+     }
+ 
+@@ -175,36 +241,43 @@ public class QueueBurstCost
+ 
+     static class ConsumerFields extends ConsumerPad
+     {
+-        Queue<AbstractEvent> q;
++        Queue<Event> q;
+         volatile boolean isRunning = true;
+         CountDownLatch stopped;
++        CountDownLatch started;
+     }
+ 
+     static class Consumer extends ConsumerFields implements Runnable
+     {
+         public long p40, p41, p42, p43, p44, p45, p46;
+         public long p30, p31, p32, p33, p34, p35, p36, p37;
++        private final int consumerId;
+ 
+-        public Consumer(Queue<AbstractEvent> q)
++        public Consumer(Queue<Event> q, int consumerId)
+         {
+             this.q = q;
++            this.consumerId = consumerId;
+         }
+ 
+         @Override
+         public void run()
+         {
+-            final Queue<AbstractEvent> q = this.q;
++            final CountDownLatch stopped = this.stopped;
++            final CountDownLatch started = this.started;
++            final int consumerId = this.consumerId;
++            final Queue<Event> q = this.q;
++            started.countDown();
+             while (isRunning)
+             {
+-                consume(q);
++                consume(q, consumerId);
+             }
+             stopped.countDown();
+         }
+ 
+         @CompilerControl(CompilerControl.Mode.DONT_INLINE)
+-        private void consume(Queue<AbstractEvent> q)
++        private void consume(Queue<Event> q, int consumerId)
+         {
+-            AbstractEvent e = null;
++            Event e = null;
+             if ((e = q.poll()) == null)
+             {
+                 return;
+@@ -213,10 +286,8 @@ public class QueueBurstCost
+             {
+                 Blackhole.consumeCPU(DELAY_CONSUMER);
+             }
+-            e.handle();
++            e.handle(consumerId);
+         }
+ 
+     }
+-
+-
+-}
++}
+\ No newline at end of file
+diff --git a/jctools-benchmarks/src/main/java/org/jctools/jmh/throughput/MpqDrainFillThroughputBackoffNone.java b/jctools-benchmarks/src/main/java/org/jctools/jmh/throughput/MpqDrainFillThroughputBackoffNone.java
+index dc59911..f7262e8 100644
+--- a/jctools-benchmarks/src/main/java/org/jctools/jmh/throughput/MpqDrainFillThroughputBackoffNone.java
++++ b/jctools-benchmarks/src/main/java/org/jctools/jmh/throughput/MpqDrainFillThroughputBackoffNone.java
+@@ -40,13 +40,11 @@ import org.openjdk.jmh.annotations.Warmup;
+ @Measurement(iterations = 10, time = 1)
+ public class MpqDrainFillThroughputBackoffNone {
+     static final Object TEST_ELEMENT = 1;
+-    Integer element = 1;
+-    Integer escape;
+     MessagePassingQueue<Integer> q;
+ 
+     @Param(value = { "SpscArrayQueue", "MpscArrayQueue", "SpmcArrayQueue", "MpmcArrayQueue" })
+     String qType;
+-    
++
+     @Param(value = { "132000" })
+     int qCapacity;
+ 
+@@ -57,27 +55,41 @@ public class MpqDrainFillThroughputBackoffNone {
+ 
+     @AuxCounters
+     @State(Scope.Thread)
+-    public static class PollCounters {
++    public static class PollCounters implements MessagePassingQueue.Consumer<Integer>{
+         public long pollsFailed;
+         public long pollsMade;
++        private Integer escape;
++
++        @Override
++        public void accept(Integer e)
++        {
++            if (TEST_ELEMENT.equals(e)) {
++                pollsMade++;
++            } else {
++                escape = e;
++            }
++        }
+     }
+ 
+     @AuxCounters
+     @State(Scope.Thread)
+-    public static class OfferCounters {
++    public static class OfferCounters implements MessagePassingQueue.Supplier<Integer>{
+         public long offersFailed;
+         public long offersMade;
++        private Integer element = 1;
++
++        @Override
++        public Integer get()
++        {
++            offersMade++;
++            return element;
++        }
+     }
+ 
+     @Benchmark
+     @Group("normal")
+     public void fill(final OfferCounters counters) {
+-        long filled = q.fill(new MessagePassingQueue.Supplier<Integer>() {
+-            public Integer get() {
+-                counters.offersMade++;
+-                return element;
+-            }
+-        });
++        long filled = q.fill(counters);
+         if (filled == 0) {
+             counters.offersFailed++;
+             backoff();
+@@ -87,68 +99,13 @@ public class MpqDrainFillThroughputBackoffNone {
+     @Benchmark
+     @Group("normal")
+     public void drain(final PollCounters counters) {
+-        long drained = q.drain(new MessagePassingQueue.Consumer<Integer>() {
+-            public void accept(Integer e) {
+-                if (e == TEST_ELEMENT) {
+-                    counters.pollsMade++;
+-                } else {
+-                    escape = e;
+-                }
+-            }
+-        });
++        long drained = q.drain(counters);
+         if (drained == 0) {
+             counters.pollsFailed++;
+             backoff();
+         }
+     }
+-//
+-//    @Benchmark
+-//    @Group("prepetual")
+-//    public void fill(final OfferCounters counters, final Control ctl) {
+-//        WaitStrategy w = new WaitStrategy(){
+-//            public int idle(int idleCounter) {
+-//                backoff();
+-//                return idleCounter++;
+-//            }
+-//        };
+-//        ExitCondition e = new ExitCondition() {
+-//            public boolean keepRunning() {
+-//                return !ctl.stopMeasurement;
+-//            }
+-//        };
+-//        q.fill(new MessagePassingQueue.Supplier<Integer>() {
+-//            public Integer get() {
+-//                counters.offersMade++;
+-//                return element;
+-//            }
+-//        }, w, e);
+-//    }
+-//
+-//    @Benchmark
+-//    @Group("prepetual")
+-//    public void drain(final PollCounters counters, final Control ctl) {
+-//        WaitStrategy w = new WaitStrategy(){
+-//            public int idle(int idleCounter) {
+-//                backoff();
+-//                return idleCounter++;
+-//            }
+-//        };
+-//        ExitCondition e = new ExitCondition() {
+-//            public boolean keepRunning() {
+-//                return !ctl.stopMeasurement;
+-//            }
+-//        };
+-//        q.drain(new MessagePassingQueue.Consumer<Integer>() {
+-//            public void accept(Integer e) {
+-//                if (e == element) {
+-//                    counters.pollsMade++;
+-//                } else {
+-//                    escape = e;
+-//                }
+-//            }
+-//        }, w, e);
+-//    }
+-    
++
+     @TearDown(Level.Iteration)
+     public void emptyQ() {
+         synchronized (q)
+diff --git a/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicArrayQueueGenerator.java b/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicArrayQueueGenerator.java
+index 4723db4..bd6037a 100644
+--- a/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicArrayQueueGenerator.java
++++ b/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicArrayQueueGenerator.java
+@@ -1,69 +1,46 @@
+ package org.jctools.queues.atomic;
+ 
+-import java.io.File;
+-import java.io.FileWriter;
+ import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.EnumSet;
+ import java.util.List;
+-import java.util.Optional;
+ 
+-import com.github.javaparser.JavaParser;
+ import com.github.javaparser.ast.CompilationUnit;
+ import com.github.javaparser.ast.ImportDeclaration;
+ import com.github.javaparser.ast.Modifier;
+-import com.github.javaparser.ast.Node;
+-import com.github.javaparser.ast.NodeList;
+-import com.github.javaparser.ast.PackageDeclaration;
+ import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+ import com.github.javaparser.ast.body.ConstructorDeclaration;
+ import com.github.javaparser.ast.body.FieldDeclaration;
+-import com.github.javaparser.ast.body.InitializerDeclaration;
+ import com.github.javaparser.ast.body.MethodDeclaration;
+ import com.github.javaparser.ast.body.Parameter;
+ import com.github.javaparser.ast.body.VariableDeclarator;
+-import com.github.javaparser.ast.comments.Comment;
+ import com.github.javaparser.ast.comments.JavadocComment;
+-import com.github.javaparser.ast.expr.AssignExpr;
+-import com.github.javaparser.ast.expr.AssignExpr.Operator;
+-import com.github.javaparser.ast.expr.ClassExpr;
+-import com.github.javaparser.ast.expr.Expression;
+-import com.github.javaparser.ast.expr.FieldAccessExpr;
+ import com.github.javaparser.ast.expr.MarkerAnnotationExpr;
+ import com.github.javaparser.ast.expr.MethodCallExpr;
+-import com.github.javaparser.ast.expr.Name;
+ import com.github.javaparser.ast.expr.NameExpr;
+-import com.github.javaparser.ast.expr.SimpleName;
+-import com.github.javaparser.ast.expr.StringLiteralExpr;
+-import com.github.javaparser.ast.expr.ThisExpr;
+ import com.github.javaparser.ast.nodeTypes.NodeWithType;
+ import com.github.javaparser.ast.stmt.BlockStmt;
+-import com.github.javaparser.ast.stmt.ExpressionStmt;
+ import com.github.javaparser.ast.stmt.ReturnStmt;
+ import com.github.javaparser.ast.type.ArrayType;
+ import com.github.javaparser.ast.type.ClassOrInterfaceType;
+ import com.github.javaparser.ast.type.PrimitiveType;
+ import com.github.javaparser.ast.type.Type;
+-import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+ 
+-public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapter<Void> {
++public final class JavaParsingAtomicArrayQueueGenerator extends JavaParsingAtomicQueueGenerator {
+     private static final String GEN_DIRECTIVE_CLASS_CONTAINS_ORDERED_FIELD_ACCESSORS = "$gen:ordered-fields";
+     private static final String GEN_DIRECTIVE_METHOD_IGNORE = "$gen:ignore";
+-    private static final String INDENT_LEVEL = "    ";
+-    private final String sourceFileName;
+ 
+-    public JavaParsingAtomicArrayQueueGenerator(String sourceFileName) {
+-        super();
+-        this.sourceFileName = sourceFileName;
++    public static void main(String[] args) throws Exception {
++        main(JavaParsingAtomicArrayQueueGenerator.class, args);
++    }
++    
++    JavaParsingAtomicArrayQueueGenerator(String sourceFileName) {
++        super(sourceFileName);
+     }
+ 
+     @Override
+-    public void visit(FieldAccessExpr n, Void arg) {
++    public void visit(ConstructorDeclaration n, Void arg) {
+         super.visit(n, arg);
+-        if (n.getScope() instanceof NameExpr) {
+-            NameExpr name = (NameExpr) n.getScope();
+-            name.setName(translateQueueName(name.getNameAsString()));
+-        }
++        // Update the ctor to match the class name
++        n.setName(translateQueueName(n.getNameAsString()));
+     }
+ 
+     @Override
+@@ -88,7 +65,7 @@ public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapt
+ 
+         if (!node.getMethodsByName("failFastOffer").isEmpty()) {
+             MethodDeclaration deprecatedMethodRedirect = node.addMethod("weakOffer", Modifier.PUBLIC);
+-            patchMethodAsDepreciatedRedirector(deprecatedMethodRedirect, "failFastOffer", PrimitiveType.intType(),
++            patchMethodAsDeprecatedRedirector(deprecatedMethodRedirect, "failFastOffer", PrimitiveType.intType(),
+                     new Parameter(classType("E"), "e"));
+         }
+ 
+@@ -99,57 +76,73 @@ public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapt
+                 + node.getJavadocComment().orElse(new JavadocComment("")).getContent());
+     }
+ 
+-    @Override
+-    public void visit(ConstructorDeclaration n, Void arg) {
+-        super.visit(n, arg);
+-        // Update the ctor to match the class name
+-        n.setName(translateQueueName(n.getNameAsString()));
+-    }
++    String translateQueueName(String originalQueueName) {
++        if (originalQueueName.length() < 5) {
++            return originalQueueName;
++        }
+ 
+-    @Override
+-    public void visit(PackageDeclaration n, Void arg) {
+-        super.visit(n, arg);
+-        // Change the package of the output
+-        n.setName("org.jctools.queues.atomic");
+-    }
++        String start = originalQueueName.substring(0, 4);
++        String end = originalQueueName.substring(4);
++        if ((start.equals("Spsc") || start.equals("Spmc") || start.equals("Mpsc") || start.equals("Mpmc"))
++                && end.startsWith("ArrayQueue")) {
++            return start + "Atomic" + end;
++        }
+ 
+-    @Override
+-    public void visit(Parameter n, Void arg) {
+-        super.visit(n, arg);
+-        // Process parameters to methods and ctors
+-        processSpecialNodeTypes(n);
++        return originalQueueName;
+     }
+ 
+-    @Override
+-    public void visit(VariableDeclarator n, Void arg) {
+-        super.visit(n, arg);
+-        // Replace declared variables with altered types
+-        processSpecialNodeTypes(n);
++    String fieldUpdaterFieldName(String fieldName) {
++        switch (fieldName) {
++        case "producerIndex":
++            return "P_INDEX_UPDATER";
++        case "consumerIndex":
++            return "C_INDEX_UPDATER";
++        case "producerLimit":
++            return "P_LIMIT_UPDATER";
++        default:
++            throw new IllegalArgumentException("Unhandled field: " + fieldName);
++        }
+     }
+ 
+-    private static boolean isCommentPresent(Node node, String wanted) {
+-        Optional<Comment> maybeComment = node.getComment();
+-        if (maybeComment.isPresent()) {
+-            Comment comment = maybeComment.get();
+-            String content = comment.getContent().trim();
+-            if (wanted.equals(content)) {
+-                return true;
++    void organiseImports(CompilationUnit cu) {
++        List<ImportDeclaration> importDecls = new ArrayList<>();
++        for (ImportDeclaration importDeclaration : cu.getImports()) {
++            if (importDeclaration.getNameAsString().startsWith("org.jctools.util.Unsafe")) {
++                continue;
+             }
++            importDecls.add(importDeclaration);
+         }
+-        return false;
+-    }
+-
+-    private static void removeStaticFieldsAndInitialisers(ClassOrInterfaceDeclaration node) {
+-        // Remove all the static initialisers
+-        for (InitializerDeclaration child : node.getChildNodesByType(InitializerDeclaration.class)) {
+-            child.remove();
++        cu.getImports().clear();
++        for (ImportDeclaration importDecl : importDecls) {
++            cu.addImport(importDecl);
+         }
++        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicLongFieldUpdater"));
++        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicReferenceArray"));
++        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicLongArray"));
++    }
+ 
+-        // Remove all static fields
+-        for (FieldDeclaration field : node.getFields()) {
+-            if (field.getModifiers().contains(Modifier.STATIC)) {
+-                field.remove();
+-                continue;
++    /**
++     * Given a variable declaration of some sort, check it's name and type and
++     * if it looks like any of the key type changes between unsafe and atomic
++     * queues, perform the conversion to change it's type.
++     * 
++     * @param node
++     * @param name
++     */
++    void processSpecialNodeTypes(NodeWithType<?, Type> node, String name) {
++        Type type = node.getType();
++        if ("buffer".equals(name) && isRefArray(type, "E")) {
++            node.setType(atomicRefArrayType((ArrayType) type));
++        } else if ("sBuffer".equals(name) && isLongArray(type)) {
++            node.setType(atomicLongArrayType());
++        } else if (PrimitiveType.longType().equals(type)) {
++            switch(name) {
++            case "mask":
++            case "offset":
++            case "seqOffset":
++            case "lookAheadSeqOffset":
++            case "lookAheadElementOffset":
++                node.setType(PrimitiveType.intType());
+             }
+         }
+     }
+@@ -161,7 +154,7 @@ public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapt
+      * 
+      * @param n
+      */
+-    private static void replaceParentClassesForAtomics(ClassOrInterfaceDeclaration n) {
++    private void replaceParentClassesForAtomics(ClassOrInterfaceDeclaration n) {
+         for (ClassOrInterfaceType parent : n.getExtendedTypes()) {
+             if ("ConcurrentCircularArrayQueue".equals(parent.getNameAsString())) {
+                 parent.setName("AtomicReferenceArrayQueue");
+@@ -186,7 +179,7 @@ public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapt
+      * @param returnType
+      * @param parameters
+      */
+-    private static void patchMethodAsDepreciatedRedirector(MethodDeclaration methodToPatch, String toMethodName,
++    private void patchMethodAsDeprecatedRedirector(MethodDeclaration methodToPatch, String toMethodName,
+             Type returnType, Parameter... parameters) {
+         methodToPatch.setType(returnType);
+         for (Parameter parameter : parameters) {
+@@ -217,7 +210,7 @@ public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapt
+      * @param n
+      *            the AST node for the containing class
+      */
+-    private static void patchAtomicFieldUpdaterAccessorMethods(ClassOrInterfaceDeclaration n) {
++    private void patchAtomicFieldUpdaterAccessorMethods(ClassOrInterfaceDeclaration n) {
+         String className = n.getNameAsString();
+ 
+         for (FieldDeclaration field : n.getFields()) {
+@@ -271,141 +264,7 @@ public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapt
+         }
+     }
+ 
+-    private static String capitalise(String s) {
+-        return s.substring(0, 1).toUpperCase() + s.substring(1);
+-    }
+-
+-    private static String formatMultilineJavadoc(int indent, String... lines) {
+-        String indentation = "";
+-        for (int i = 0; i < indent; i++) {
+-            indentation += INDENT_LEVEL;
+-        }
+-
+-        String out = "\n";
+-        for (String line : lines) {
+-            out += indentation + " * " + line + "\n";
+-        }
+-        out += indentation + " ";
+-        return out;
+-    }
+-
+-    /**
+-     * Generates something like
+-     * <code>P_INDEX_UPDATER.lazySet(this, newValue)</code>
+-     * 
+-     * @param fieldUpdaterFieldName
+-     * @param newValueName
+-     * @return
+-     */
+-    private static BlockStmt fieldUpdaterLazySet(String fieldUpdaterFieldName, String newValueName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(new ExpressionStmt(
+-                methodCallExpr(fieldUpdaterFieldName, "lazySet", new ThisExpr(), new NameExpr(newValueName))));
+-        return body;
+-    }
+-
+-    /**
+-     * Generates something like
+-     * <code>return P_INDEX_UPDATER.compareAndSet(this, expectedValue, newValue)</code>
+-     * 
+-     * @param fieldUpdaterFieldName
+-     * @param expectedValueName
+-     * @param newValueName
+-     * @return
+-     */
+-    private static BlockStmt fieldUpdaterCompareAndSet(String fieldUpdaterFieldName, String expectedValueName,
+-            String newValueName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(new ReturnStmt(methodCallExpr(fieldUpdaterFieldName, "compareAndSet", new ThisExpr(),
+-                new NameExpr(expectedValueName), new NameExpr(newValueName))));
+-        return body;
+-    }
+-
+-    /**
+-     * Generates something like <code>field = newValue</code>
+-     * 
+-     * @param fieldName
+-     * @param valueName
+-     * @return
+-     */
+-    private static BlockStmt fieldAssignment(String fieldName, String valueName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(
+-                new ExpressionStmt(new AssignExpr(new NameExpr(fieldName), new NameExpr(valueName), Operator.ASSIGN)));
+-        return body;
+-    }
+-
+-    /**
+-     * Generates something like
+-     * <code>private static final AtomicLongFieldUpdater<MpmcAtomicArrayQueueProducerIndexField> P_INDEX_UPDATER = AtomicLongFieldUpdater.newUpdater(MpmcAtomicArrayQueueProducerIndexField.class, "producerIndex");</code>
+-     * 
+-     * @param type
+-     * @param name
+-     * @param initializer
+-     * @param modifiers
+-     * @return
+-     */
+-    private static FieldDeclaration fieldDeclarationWithInitialiser(Type type, String name, Expression initializer,
+-            Modifier... modifiers) {
+-        FieldDeclaration fieldDeclaration = new FieldDeclaration();
+-        VariableDeclarator variable = new VariableDeclarator(type, name, initializer);
+-        fieldDeclaration.getVariables().add(variable);
+-        EnumSet<Modifier> modifierSet = EnumSet.copyOf(Arrays.asList(modifiers));
+-        fieldDeclaration.setModifiers(modifierSet);
+-        return fieldDeclaration;
+-    }
+-
+-    /**
+-     * Generates something like
+-     * <code>private static final AtomicLongFieldUpdater<MpmcAtomicArrayQueueProducerIndexField> P_INDEX_UPDATER = AtomicLongFieldUpdater.newUpdater(MpmcAtomicArrayQueueProducerIndexField.class, "producerIndex");</code>
+-     * 
+-     * @param className
+-     * @param variableName
+-     * @return
+-     */
+-    private static FieldDeclaration declareLongFieldUpdater(String className, String variableName) {
+-        MethodCallExpr initializer = newAtomicLongFieldUpdater(className, variableName);
+-
+-        ClassOrInterfaceType type = simpleParametricType("AtomicLongFieldUpdater", className);
+-        FieldDeclaration newField = fieldDeclarationWithInitialiser(type, fieldUpdaterFieldName(variableName),
+-                initializer, Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL);
+-        return newField;
+-    }
+-
+-    private static MethodCallExpr newAtomicLongFieldUpdater(String className, String variableName) {
+-        return methodCallExpr("AtomicLongFieldUpdater", "newUpdater", new ClassExpr(classType(className)),
+-                new StringLiteralExpr(variableName));
+-    }
+-
+-    /**
+-     * Generates something like <code>return field</code>
+-     * 
+-     * @param fieldName
+-     * @return
+-     */
+-    private static BlockStmt returnField(String fieldName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(new ReturnStmt(fieldName));
+-        return body;
+-    }
+-
+-    private static boolean isRefArray(Type in, String refClassName) {
+-        if (in instanceof ArrayType) {
+-            ArrayType aType = (ArrayType) in;
+-            return isRefType(aType.getComponentType(), refClassName);
+-        }
+-        return false;
+-    }
+-
+-    private static boolean isRefType(Type in, String className) {
+-        // Does not check type parameters
+-        if (in instanceof ClassOrInterfaceType) {
+-            return (className.equals(((ClassOrInterfaceType) in).getNameAsString()));
+-        }
+-        return false;
+-    }
+-
+-    private static boolean isLongArray(Type in) {
++    private boolean isLongArray(Type in) {
+         if (in instanceof ArrayType) {
+             ArrayType aType = (ArrayType) in;
+             return PrimitiveType.longType().equals(aType.getComponentType());
+@@ -413,153 +272,14 @@ public final class JavaParsingAtomicArrayQueueGenerator extends VoidVisitorAdapt
+         return false;
+     }
+ 
+-    private static ClassOrInterfaceType atomicRefArrayType(ArrayType in) {
++    private ClassOrInterfaceType atomicRefArrayType(ArrayType in) {
+         ClassOrInterfaceType out = new ClassOrInterfaceType(null, "AtomicReferenceArray");
+         out.setTypeArguments(in.getComponentType());
+         return out;
+     }
+ 
+-    private static ClassOrInterfaceType atomicLongArrayType() {
++    private ClassOrInterfaceType atomicLongArrayType() {
+         return new ClassOrInterfaceType(null, "AtomicLongArray");
+     }
+ 
+-    private static MethodCallExpr methodCallExpr(String owner, String method, Expression... args) {
+-        MethodCallExpr methodCallExpr = new MethodCallExpr(new NameExpr(owner), method);
+-        for (Expression expr : args) {
+-            methodCallExpr.addArgument(expr);
+-        }
+-        return methodCallExpr;
+-    }
+-
+-    private static ClassOrInterfaceType simpleParametricType(String className, String... typeArgs) {
+-        NodeList<Type> typeArguments = new NodeList<Type>();
+-        for (String typeArg : typeArgs) {
+-            typeArguments.add(classType(typeArg));
+-        }
+-        return new ClassOrInterfaceType(null, new SimpleName(className), typeArguments);
+-    }
+-
+-    private static ClassOrInterfaceType classType(String className) {
+-        return new ClassOrInterfaceType(null, className);
+-    }
+-
+-    private static ImportDeclaration importDeclaration(String name) {
+-        return new ImportDeclaration(new Name(name), false, false);
+-    }
+-
+-    private static String translateQueueName(String originalQueueName) {
+-        if (originalQueueName.length() < 5) {
+-            return originalQueueName;
+-        }
+-
+-        String start = originalQueueName.substring(0, 4);
+-        String end = originalQueueName.substring(4);
+-        if ((start.equals("Spsc") || start.equals("Spmc") || start.equals("Mpsc") || start.equals("Mpmc"))
+-                && end.startsWith("ArrayQueue")) {
+-            return start + "Atomic" + end;
+-        }
+-
+-        return originalQueueName;
+-    }
+-
+-    private static String fieldUpdaterFieldName(String fieldName) {
+-        switch (fieldName) {
+-        case "producerIndex":
+-            return "P_INDEX_UPDATER";
+-        case "consumerIndex":
+-            return "C_INDEX_UPDATER";
+-        case "producerLimit":
+-            return "P_LIMIT_UPDATER";
+-        default:
+-            throw new IllegalArgumentException("Unhandled field: " + fieldName);
+-        }
+-    }
+-
+-    private static void organiseImports(CompilationUnit cu) {
+-        List<ImportDeclaration> importDecls = new ArrayList<>();
+-        for (ImportDeclaration importDeclaration : cu.getImports()) {
+-            if (importDeclaration.getNameAsString().startsWith("org.jctools.util.Unsafe")) {
+-                continue;
+-            }
+-            importDecls.add(importDeclaration);
+-        }
+-        cu.getImports().clear();
+-        for (ImportDeclaration importDecl : importDecls) {
+-            cu.addImport(importDecl);
+-        }
+-        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicLongFieldUpdater"));
+-        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicReferenceArray"));
+-        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicLongArray"));
+-    }
+-
+-    private static void processSpecialNodeTypes(Parameter node) {
+-        processSpecialNodeTypes(node, node.getNameAsString());
+-    }
+-
+-    private static void processSpecialNodeTypes(VariableDeclarator node) {
+-        processSpecialNodeTypes(node, node.getNameAsString());
+-    }
+-
+-    /**
+-     * Given a variable declaration of some sort, check it's name and type and
+-     * if it looks like any of the key type changes between unsafe and atomic
+-     * queues, perform the conversion to change it's type.
+-     * 
+-     * @param node
+-     * @param name
+-     */
+-    private static void processSpecialNodeTypes(NodeWithType<?, Type> node, String name) {
+-        Type type = node.getType();
+-        if ("buffer".equals(name) && isRefArray(type, "E")) {
+-            node.setType(atomicRefArrayType((ArrayType) type));
+-        } else if ("sBuffer".equals(name) && isLongArray(type)) {
+-            node.setType(atomicLongArrayType());
+-        } else if (PrimitiveType.longType().equals(type)) {
+-            switch(name) {
+-            case "mask":
+-            case "offset":
+-            case "seqOffset":
+-            case "lookAheadSeqOffset":
+-            case "lookAheadElementOffset":
+-                node.setType(PrimitiveType.intType());
+-            }
+-        }
+-    }
+-
+-    public static void main(String[] args) throws Exception {
+-
+-        if (args.length < 2) {
+-            throw new IllegalArgumentException("Usage: outputDirectory inputSourceFiles");
+-        }
+-
+-        File outputDirectory = new File(args[0]);
+-
+-        for (int i = 1; i < args.length; i++) {
+-            File file = new File(args[i]);
+-            System.out.println("Processing " + file);
+-            CompilationUnit cu = JavaParser.parse(file);
+-            new JavaParsingAtomicArrayQueueGenerator(file.getName()).visit(cu, null);
+-
+-            organiseImports(cu);
+-            FileWriter writer = null;
+-
+-            String outputFileName = file.getName();
+-            if (outputFileName.endsWith(".java")) {
+-                outputFileName = translateQueueName(outputFileName.replace(".java", ""));
+-            } else {
+-                outputFileName = translateQueueName(outputFileName);
+-            }
+-            outputFileName += ".java";
+-
+-            try {
+-                writer = new FileWriter(new File(outputDirectory, outputFileName));
+-                writer.write(cu.toString());
+-            } finally {
+-                if (writer != null) {
+-                    writer.close();
+-                }
+-            }
+-        }
+-    }
+-
+ }
+diff --git a/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicLinkedQueueGenerator.java b/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicLinkedQueueGenerator.java
+index 1a195b4..34722c6 100644
+--- a/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicLinkedQueueGenerator.java
++++ b/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicLinkedQueueGenerator.java
+@@ -1,79 +1,56 @@
+ package org.jctools.queues.atomic;
+ 
+-import java.io.File;
+-import java.io.FileWriter;
+ import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.EnumSet;
+ import java.util.List;
+-import java.util.Optional;
+ 
+-import com.github.javaparser.JavaParser;
+ import com.github.javaparser.ast.CompilationUnit;
+ import com.github.javaparser.ast.ImportDeclaration;
+ import com.github.javaparser.ast.Modifier;
+-import com.github.javaparser.ast.Node;
+ import com.github.javaparser.ast.NodeList;
+-import com.github.javaparser.ast.PackageDeclaration;
+ import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+ import com.github.javaparser.ast.body.ConstructorDeclaration;
+ import com.github.javaparser.ast.body.FieldDeclaration;
+-import com.github.javaparser.ast.body.InitializerDeclaration;
+ import com.github.javaparser.ast.body.MethodDeclaration;
+-import com.github.javaparser.ast.body.Parameter;
+ import com.github.javaparser.ast.body.VariableDeclarator;
+-import com.github.javaparser.ast.comments.Comment;
+ import com.github.javaparser.ast.comments.JavadocComment;
+-import com.github.javaparser.ast.expr.AssignExpr;
+-import com.github.javaparser.ast.expr.AssignExpr.Operator;
+ import com.github.javaparser.ast.expr.CastExpr;
+ import com.github.javaparser.ast.expr.ClassExpr;
+-import com.github.javaparser.ast.expr.Expression;
+-import com.github.javaparser.ast.expr.FieldAccessExpr;
+ import com.github.javaparser.ast.expr.MethodCallExpr;
+ import com.github.javaparser.ast.expr.Name;
+ import com.github.javaparser.ast.expr.NameExpr;
+ import com.github.javaparser.ast.expr.ObjectCreationExpr;
+-import com.github.javaparser.ast.expr.SimpleName;
+ import com.github.javaparser.ast.expr.StringLiteralExpr;
+ import com.github.javaparser.ast.expr.ThisExpr;
+ import com.github.javaparser.ast.nodeTypes.NodeWithType;
+ import com.github.javaparser.ast.stmt.BlockStmt;
+-import com.github.javaparser.ast.stmt.ExpressionStmt;
+ import com.github.javaparser.ast.stmt.ReturnStmt;
+ import com.github.javaparser.ast.type.ArrayType;
+ import com.github.javaparser.ast.type.ClassOrInterfaceType;
+ import com.github.javaparser.ast.type.PrimitiveType;
+ import com.github.javaparser.ast.type.Type;
+-import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+ 
+-public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdapter<Void> {
++public final class JavaParsingAtomicLinkedQueueGenerator extends JavaParsingAtomicQueueGenerator {
+     private static final String GEN_DIRECTIVE_CLASS_CONTAINS_ORDERED_FIELD_ACCESSORS = "$gen:ordered-fields";
+     private static final String GEN_DIRECTIVE_METHOD_IGNORE = "$gen:ignore";
+     private static final String MPSC_LINKED_ATOMIC_QUEUE_NAME = "MpscLinkedAtomicQueue";
+-    private static final String INDENT_LEVEL = "    ";
+-    private final String sourceFileName;
+ 
+-    public JavaParsingAtomicLinkedQueueGenerator(String sourceFileName) {
+-        super();
+-        this.sourceFileName = sourceFileName;
++    public static void main(String[] args) throws Exception {
++        main(JavaParsingAtomicLinkedQueueGenerator.class, args);
+     }
+ 
+-    @Override
+-    public void visit(FieldAccessExpr n, Void arg) {
+-        super.visit(n, arg);
+-        if (n.getScope() instanceof NameExpr) {
+-            NameExpr name = (NameExpr) n.getScope();
+-            name.setName(translateQueueName(name.getNameAsString()));
+-        }
++    JavaParsingAtomicLinkedQueueGenerator(String sourceFileName) {
++        super(sourceFileName);
+     }
+-    
++
+     @Override
+-    public void visit(CastExpr n, Void arg) {
++    public void visit(ConstructorDeclaration n, Void arg) {
+         super.visit(n, arg);
+-        
+-        if (isRefArray(n.getType(), "E")) {
+-            n.setType(atomicRefArrayType((ArrayType) n.getType()));
++        // Update the ctor to match the class name
++        n.setName(translateQueueName(n.getNameAsString()));
++        if (MPSC_LINKED_ATOMIC_QUEUE_NAME.equals(n.getNameAsString())) {
++            // Special case for MPSC because the Unsafe variant has a static factory method and a protected constructor.
++            n.setModifier(Modifier.PROTECTED, false);
++            n.setModifier(Modifier.PUBLIC, true);
+         }
+     }
+ 
+@@ -89,7 +66,6 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+              * Special case for MPSC
+              */
+             node.removeModifier(Modifier.ABSTRACT);
+-            node.addModifier(Modifier.FINAL);
+         }
+ 
+         if (isCommentPresent(node, GEN_DIRECTIVE_CLASS_CONTAINS_ORDERED_FIELD_ACCESSORS)) {
+@@ -112,38 +88,14 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+     }
+ 
+     @Override
+-    public void visit(ConstructorDeclaration n, Void arg) {
++    public void visit(CastExpr n, Void arg) {
+         super.visit(n, arg);
+-        // Update the ctor to match the class name
+-        n.setName(translateQueueName(n.getNameAsString()));
+-        if (MPSC_LINKED_ATOMIC_QUEUE_NAME.equals(n.getNameAsString())) {
+-            // Special case for MPSC because the Unsafe variant has a static factory method and a protected constructor.
+-            n.setModifier(Modifier.PROTECTED, false);
+-            n.setModifier(Modifier.PUBLIC, true);
++        
++        if (isRefArray(n.getType(), "E")) {
++            n.setType(atomicRefArrayType((ArrayType) n.getType()));
+         }
+     }
+ 
+-    @Override
+-    public void visit(PackageDeclaration n, Void arg) {
+-        super.visit(n, arg);
+-        // Change the package of the output
+-        n.setName("org.jctools.queues.atomic");
+-    }
+-
+-    @Override
+-    public void visit(Parameter n, Void arg) {
+-        super.visit(n, arg);
+-        // Process parameters to methods and ctors
+-        processSpecialNodeTypes(n);
+-    }
+-
+-    @Override
+-    public void visit(VariableDeclarator n, Void arg) {
+-        super.visit(n, arg);
+-        // Replace declared variables with altered types
+-        processSpecialNodeTypes(n);
+-    }
+-
+     @Override
+     public void visit(MethodDeclaration n, Void arg) {
+         super.visit(n, arg);
+@@ -157,30 +109,96 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+         processSpecialNodeTypes(n);
+     }
+ 
+-    private static boolean isCommentPresent(Node node, String wanted) {
+-        Optional<Comment> maybeComment = node.getComment();
+-        if (maybeComment.isPresent()) {
+-            Comment comment = maybeComment.get();
+-            String content = comment.getContent().trim();
+-            if (wanted.equals(content)) {
+-                return true;
+-            }
++    String translateQueueName(String originalQueueName) {
++        if (originalQueueName.length() < 5) {
++            return originalQueueName;
++        }
++        
++        if (originalQueueName.contains("LinkedQueue") || originalQueueName.contains("LinkedArrayQueue")) {
++            return originalQueueName.replace("Linked", "LinkedAtomic");
++        }
++        
++        if (originalQueueName.contains("ArrayQueue")) {
++            return originalQueueName.replace("ArrayQueue", "AtomicArrayQueue");
+         }
+-        return false;
++
++        return originalQueueName;
+     }
+ 
+-    private static void removeStaticFieldsAndInitialisers(ClassOrInterfaceDeclaration node) {
+-        // Remove all the static initialisers
+-        for (InitializerDeclaration child : node.getChildNodesByType(InitializerDeclaration.class)) {
+-            child.remove();
++    String fieldUpdaterFieldName(String fieldName) {
++        switch (fieldName) {
++        case "producerNode":
++            return "P_NODE_UPDATER";
++        case "consumerNode":
++            return "C_NODE_UPDATER";
++        case "consumerIndex":
++            return "C_INDEX_UPDATER";
++        case "producerIndex":
++            return "P_INDEX_UPDATER";
++        case "producerLimit":
++            return "P_LIMIT_UPDATER";
++        default:
++            throw new IllegalArgumentException("Unhandled field: " + fieldName);
+         }
++    }
+ 
+-        // Remove all static fields
+-        for (FieldDeclaration field : node.getFields()) {
+-            if (field.getModifiers().contains(Modifier.STATIC)) {
+-                field.remove();
++    void organiseImports(CompilationUnit cu) {
++        List<ImportDeclaration> importDecls = new ArrayList<>();
++        for (ImportDeclaration importDeclaration : cu.getImports()) {
++            String name = importDeclaration.getNameAsString();
++            if (name.startsWith("org.jctools.util.Unsafe")) {
+                 continue;
+             }
++            if (name.startsWith("org.jctools.queues.CircularArrayOffsetCalculator")) {
++                continue;
++            }
++            
++            if (name.startsWith("org.jctools.queues.LinkedArrayQueueUtil")) {
++                importDeclaration.setName(name.replace("org.jctools.queues.LinkedArrayQueueUtil", "org.jctools.queues.atomic.LinkedAtomicArrayQueueUtil"));
++            }
++            
++            importDecls.add(importDeclaration);
++        }
++        cu.getImports().clear();
++        for (ImportDeclaration importDecl : importDecls) {
++            cu.addImport(importDecl);
++        }
++        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicReferenceFieldUpdater"));
++        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicLongFieldUpdater"));
++        cu.addImport(importDeclaration("org.jctools.queues.MessagePassingQueue"));
++        cu.addImport(importDeclaration("org.jctools.queues.MessagePassingQueue.Supplier"));
++        cu.addImport(importDeclaration("org.jctools.queues.MessagePassingQueueUtil"));
++        cu.addImport(importDeclaration("org.jctools.queues.QueueProgressIndicators"));
++        cu.addImport(importDeclaration("org.jctools.queues.IndexedQueueSizeUtil"));
++        cu.addImport(staticImportDeclaration("org.jctools.queues.atomic.LinkedAtomicArrayQueueUtil.*"));
++        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicReferenceArray"));
++        cu.addImport(importDeclaration("org.jctools.queues.MpmcArrayQueue"));
++    }
++
++    /**
++     * Given a variable declaration of some sort, check it's name and type and
++     * if it looks like any of the key type changes between unsafe and atomic
++     * queues, perform the conversion to change it's type.
++     * 
++     * @param node
++     * @param name
++     */
++    void processSpecialNodeTypes(NodeWithType<?, Type> node, String name) {
++        Type type = node.getType();
++        if (node instanceof MethodDeclaration && ("newBufferAndOffset".equals(name) || "nextArrayOffset".equals(name))) {
++            node.setType(PrimitiveType.intType());
++        } else if (PrimitiveType.longType().equals(type)) {
++            switch(name) {
++            case "offset":
++            case "offsetInNew":
++            case "offsetInOld":
++            case "lookAheadElementOffset":
++                node.setType(PrimitiveType.intType());
++            }
++        } else if (isRefType(type, "LinkedQueueNode")) {
++            node.setType(simpleParametricType("LinkedQueueAtomicNode", "E"));
++        } else if (isRefArray(type, "E")) {
++            node.setType(atomicRefArrayType((ArrayType) type));
+         }
+     }
+ 
+@@ -191,12 +209,12 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+      * 
+      * @param n
+      */
+-    private static void replaceParentClassesForAtomics(ClassOrInterfaceDeclaration n) {
++    private void replaceParentClassesForAtomics(ClassOrInterfaceDeclaration n) {
+         replaceParentClassesForAtomics(n.getExtendedTypes());
+         replaceParentClassesForAtomics(n.getImplementedTypes());
+     }
+ 
+-    private static void replaceParentClassesForAtomics(NodeList<ClassOrInterfaceType> types) {
++    private void replaceParentClassesForAtomics(NodeList<ClassOrInterfaceType> types) {
+         for (ClassOrInterfaceType parent : types) {
+             if ("BaseLinkedQueue".equals(parent.getNameAsString())) {
+                 parent.setName("BaseLinkedAtomicQueue");
+@@ -218,7 +236,7 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+      * @param n
+      *            the AST node for the containing class
+      */
+-    private static void patchAtomicFieldUpdaterAccessorMethods(ClassOrInterfaceDeclaration n) {
++    private void patchAtomicFieldUpdaterAccessorMethods(ClassOrInterfaceDeclaration n) {
+         String className = n.getNameAsString();
+ 
+         for (FieldDeclaration field : n.getFields()) {
+@@ -290,56 +308,6 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+         }
+     }
+ 
+-    private static String capitalise(String s) {
+-        return s.substring(0, 1).toUpperCase() + s.substring(1);
+-    }
+-
+-    private static String formatMultilineJavadoc(int indent, String... lines) {
+-        String indentation = "";
+-        for (int i = 0; i < indent; i++) {
+-            indentation += INDENT_LEVEL;
+-        }
+-
+-        String out = "\n";
+-        for (String line : lines) {
+-            out += indentation + " * " + line + "\n";
+-        }
+-        out += indentation + " ";
+-        return out;
+-    }
+-
+-    /**
+-     * Generates something like
+-     * <code>P_INDEX_UPDATER.lazySet(this, newValue)</code>
+-     * 
+-     * @param fieldUpdaterFieldName
+-     * @param newValueName
+-     * @return
+-     */
+-    private static BlockStmt fieldUpdaterLazySet(String fieldUpdaterFieldName, String newValueName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(new ExpressionStmt(
+-                methodCallExpr(fieldUpdaterFieldName, "lazySet", new ThisExpr(), new NameExpr(newValueName))));
+-        return body;
+-    }
+-
+-    /**
+-     * Generates something like
+-     * <code>return P_INDEX_UPDATER.compareAndSet(this, expectedValue, newValue)</code>
+-     * 
+-     * @param fieldUpdaterFieldName
+-     * @param expectedValueName
+-     * @param newValueName
+-     * @return
+-     */
+-    private static BlockStmt fieldUpdaterCompareAndSet(String fieldUpdaterFieldName, String expectedValueName,
+-            String newValueName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(new ReturnStmt(methodCallExpr(fieldUpdaterFieldName, "compareAndSet", new ThisExpr(),
+-                new NameExpr(expectedValueName), new NameExpr(newValueName))));
+-        return body;
+-    }
+-
+     /**
+      * Generates something like
+      * <code>return P_INDEX_UPDATER.getAndSet(this, newValue)</code>
+@@ -348,47 +316,13 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+      * @param newValueName
+      * @return
+      */
+-    private static BlockStmt fieldUpdaterGetAndSet(String fieldUpdaterFieldName, String newValueName) {
++    private BlockStmt fieldUpdaterGetAndSet(String fieldUpdaterFieldName, String newValueName) {
+         BlockStmt body = new BlockStmt();
+         body.addStatement(new ReturnStmt(
+                 methodCallExpr(fieldUpdaterFieldName, "getAndSet", new ThisExpr(), new NameExpr(newValueName))));
+         return body;
+     }
+ 
+-    /**
+-     * Generates something like <code>field = newValue</code>
+-     * 
+-     * @param fieldName
+-     * @param valueName
+-     * @return
+-     */
+-    private static BlockStmt fieldAssignment(String fieldName, String valueName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(
+-                new ExpressionStmt(new AssignExpr(new NameExpr(fieldName), new NameExpr(valueName), Operator.ASSIGN)));
+-        return body;
+-    }
+-
+-    /**
+-     * Generates something like
+-     * <code>private static final AtomicLongFieldUpdater<MpmcAtomicArrayQueueProducerIndexField> P_INDEX_UPDATER = AtomicLongFieldUpdater.newUpdater(MpmcAtomicArrayQueueProducerIndexField.class, "producerIndex");</code>
+-     * 
+-     * @param type
+-     * @param name
+-     * @param initializer
+-     * @param modifiers
+-     * @return
+-     */
+-    private static FieldDeclaration fieldDeclarationWithInitialiser(Type type, String name, Expression initializer,
+-            Modifier... modifiers) {
+-        FieldDeclaration fieldDeclaration = new FieldDeclaration();
+-        VariableDeclarator variable = new VariableDeclarator(type, name, initializer);
+-        fieldDeclaration.getVariables().add(variable);
+-        EnumSet<Modifier> modifierSet = EnumSet.copyOf(Arrays.asList(modifiers));
+-        fieldDeclaration.setModifiers(modifierSet);
+-        return fieldDeclaration;
+-    }
+-
+     /**
+      * Generates something like
+      * <code>private static final AtomicReferenceFieldUpdater<MpmcAtomicArrayQueueProducerNodeField> P_NODE_UPDATER = AtomicReferenceFieldUpdater.newUpdater(MpmcAtomicArrayQueueProducerNodeField.class, "producerNode");</code>
+@@ -397,7 +331,7 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+      * @param variableName
+      * @return
+      */
+-    private static FieldDeclaration declareRefFieldUpdater(String className, String variableName) {
++    private FieldDeclaration declareRefFieldUpdater(String className, String variableName) {
+         MethodCallExpr initializer = newAtomicRefFieldUpdater(className, variableName);
+ 
+         ClassOrInterfaceType type = simpleParametricType("AtomicReferenceFieldUpdater", className,
+@@ -407,174 +341,26 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+         return newField;
+     }
+ 
+-    private static MethodCallExpr newAtomicRefFieldUpdater(String className, String variableName) {
++    private MethodCallExpr newAtomicRefFieldUpdater(String className, String variableName) {
+         return methodCallExpr("AtomicReferenceFieldUpdater", "newUpdater", new ClassExpr(classType(className)),
+                 new ClassExpr(classType("LinkedQueueAtomicNode")), new StringLiteralExpr(variableName));
+     }
+ 
+-    /**
+-     * Generates something like
+-     * <code>private static final AtomicLongFieldUpdater<MpmcAtomicArrayQueueProducerIndexField> P_INDEX_UPDATER = AtomicLongFieldUpdater.newUpdater(MpmcAtomicArrayQueueProducerIndexField.class, "producerIndex");</code>
+-     * 
+-     * @param className
+-     * @param variableName
+-     * @return
+-     */
+-    private static FieldDeclaration declareLongFieldUpdater(String className, String variableName) {
+-        MethodCallExpr initializer = newAtomicLongFieldUpdater(className, variableName);
+-
+-        ClassOrInterfaceType type = simpleParametricType("AtomicLongFieldUpdater", className);
+-        FieldDeclaration newField = fieldDeclarationWithInitialiser(type, fieldUpdaterFieldName(variableName),
+-                initializer, Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL);
+-        return newField;
+-    }
+-
+-    private static MethodCallExpr newAtomicLongFieldUpdater(String className, String variableName) {
+-        return methodCallExpr("AtomicLongFieldUpdater", "newUpdater", new ClassExpr(classType(className)),
+-                new StringLiteralExpr(variableName));
+-    }
+-
+-    /**
+-     * Generates something like <code>return field</code>
+-     * 
+-     * @param fieldName
+-     * @return
+-     */
+-    private static BlockStmt returnField(String fieldName) {
+-        BlockStmt body = new BlockStmt();
+-        body.addStatement(new ReturnStmt(fieldName));
+-        return body;
+-    }
+-
+-    private static boolean isRefArray(Type in, String refClassName) {
+-        if (in instanceof ArrayType) {
+-            ArrayType aType = (ArrayType) in;
+-            return isRefType(aType.getComponentType(), refClassName);
+-        }
+-        return false;
+-    }
+-
+-    private static boolean isRefType(Type in, String className) {
+-        // Does not check type parameters
+-        if (in instanceof ClassOrInterfaceType) {
+-            return (className.equals(((ClassOrInterfaceType) in).getNameAsString()));
+-        }
+-        return false;
+-    }
+-
+-    private static ClassOrInterfaceType atomicRefArrayType(ArrayType in) {
++    private ClassOrInterfaceType atomicRefArrayType(ArrayType in) {
+         ClassOrInterfaceType out = new ClassOrInterfaceType(null, "AtomicReferenceArray");
+         out.setTypeArguments(in.getComponentType());
+         return out;
+     }
+ 
+-    private static MethodCallExpr methodCallExpr(String owner, String method, Expression... args) {
+-        MethodCallExpr methodCallExpr = new MethodCallExpr(new NameExpr(owner), method);
+-        for (Expression expr : args) {
+-            methodCallExpr.addArgument(expr);
+-        }
+-        return methodCallExpr;
+-    }
+-
+-    private static ClassOrInterfaceType simpleParametricType(String className, String... typeArgs) {
+-        NodeList<Type> typeArguments = new NodeList<Type>();
+-        for (String typeArg : typeArgs) {
+-            typeArguments.add(classType(typeArg));
+-        }
+-        return new ClassOrInterfaceType(null, new SimpleName(className), typeArguments);
+-    }
+-
+-    private static ClassOrInterfaceType classType(String className) {
+-        return new ClassOrInterfaceType(null, className);
+-    }
+-
+-    private static ImportDeclaration importDeclaration(String name) {
+-        return new ImportDeclaration(new Name(name), false, false);
+-    }
+-
+-    private static ImportDeclaration staticImportDeclaration(String name) {
++    private ImportDeclaration staticImportDeclaration(String name) {
+         return new ImportDeclaration(new Name(name), true, false);
+     }
+ 
+-    private static String translateQueueName(String originalQueueName) {
+-        if (originalQueueName.length() < 5) {
+-            return originalQueueName;
+-        }
+-        
+-        if (originalQueueName.contains("LinkedQueue") || originalQueueName.contains("LinkedArrayQueue")) {
+-            return originalQueueName.replace("Linked", "LinkedAtomic");
+-        }
+-        
+-        if (originalQueueName.contains("ArrayQueue")) {
+-            return originalQueueName.replace("ArrayQueue", "AtomicArrayQueue");
+-        }
+-
+-        return originalQueueName;
+-    }
+-
+-    private static String fieldUpdaterFieldName(String fieldName) {
+-        switch (fieldName) {
+-        case "producerNode":
+-            return "P_NODE_UPDATER";
+-        case "consumerNode":
+-            return "C_NODE_UPDATER";
+-        case "consumerIndex":
+-            return "C_INDEX_UPDATER";
+-        case "producerIndex":
+-            return "P_INDEX_UPDATER";
+-        case "producerLimit":
+-            return "P_LIMIT_UPDATER";
+-        default:
+-            throw new IllegalArgumentException("Unhandled field: " + fieldName);
+-        }
+-    }
+-
+-    private static void organiseImports(CompilationUnit cu) {
+-        List<ImportDeclaration> importDecls = new ArrayList<>();
+-        for (ImportDeclaration importDeclaration : cu.getImports()) {
+-            String name = importDeclaration.getNameAsString();
+-            if (name.startsWith("org.jctools.util.Unsafe")) {
+-                continue;
+-            }
+-            if (name.startsWith("org.jctools.queues.CircularArrayOffsetCalculator")) {
+-                continue;
+-            }
+-            
+-            if (name.startsWith("org.jctools.queues.LinkedArrayQueueUtil")) {
+-                importDeclaration.setName(name.replace("org.jctools.queues.LinkedArrayQueueUtil", "org.jctools.queues.atomic.LinkedAtomicArrayQueueUtil"));
+-            }
+-            
+-            importDecls.add(importDeclaration);
+-        }
+-        cu.getImports().clear();
+-        for (ImportDeclaration importDecl : importDecls) {
+-            cu.addImport(importDecl);
+-        }
+-        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicReferenceFieldUpdater"));
+-        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicLongFieldUpdater"));
+-        cu.addImport(importDeclaration("org.jctools.queues.MessagePassingQueue"));
+-        cu.addImport(importDeclaration("org.jctools.queues.MessagePassingQueue.Supplier"));
+-        cu.addImport(importDeclaration("org.jctools.queues.MessagePassingQueueUtil"));
+-        cu.addImport(importDeclaration("org.jctools.queues.QueueProgressIndicators"));
+-        cu.addImport(importDeclaration("org.jctools.queues.IndexedQueueSizeUtil"));
+-        cu.addImport(staticImportDeclaration("org.jctools.queues.atomic.LinkedAtomicArrayQueueUtil.*"));
+-        cu.addImport(importDeclaration("java.util.concurrent.atomic.AtomicReferenceArray"));
+-        cu.addImport(importDeclaration("org.jctools.queues.MpmcArrayQueue"));
+-    }
+-
+-    private static void processSpecialNodeTypes(Parameter node) {
+-        processSpecialNodeTypes(node, node.getNameAsString());
+-    }
+-
+-    private static void processSpecialNodeTypes(VariableDeclarator node) {
++    private void processSpecialNodeTypes(MethodDeclaration node) {
+         processSpecialNodeTypes(node, node.getNameAsString());
+     }
+ 
+-    private static void processSpecialNodeTypes(MethodDeclaration node) {
+-        processSpecialNodeTypes(node, node.getNameAsString());
+-    }
+-
+-    private static void processSpecialNodeTypes(ObjectCreationExpr node) {
++    private void processSpecialNodeTypes(ObjectCreationExpr node) {
+         Type type = node.getType();
+         if (isRefType(type, "LinkedQueueNode")) {
+             node.setType(simpleParametricType("LinkedQueueAtomicNode", "E"));
+@@ -583,69 +369,4 @@ public final class JavaParsingAtomicLinkedQueueGenerator extends VoidVisitorAdap
+         }
+     }
+ 
+-    /**
+-     * Given a variable declaration of some sort, check it's name and type and
+-     * if it looks like any of the key type changes between unsafe and atomic
+-     * queues, perform the conversion to change it's type.
+-     * 
+-     * @param node
+-     * @param name
+-     */
+-    private static void processSpecialNodeTypes(NodeWithType<?, Type> node, String name) {
+-        Type type = node.getType();
+-        if (node instanceof MethodDeclaration && ("newBufferAndOffset".equals(name) || "nextArrayOffset".equals(name))) {
+-            node.setType(PrimitiveType.intType());
+-        } else if (PrimitiveType.longType().equals(type)) {
+-            switch(name) {
+-            case "offset":
+-            case "offsetInNew":
+-            case "offsetInOld":
+-            case "lookAheadElementOffset":
+-                node.setType(PrimitiveType.intType());
+-            }
+-        } else if (isRefType(type, "LinkedQueueNode")) {
+-            node.setType(simpleParametricType("LinkedQueueAtomicNode", "E"));
+-        } else if (isRefArray(type, "E")) {
+-            node.setType(atomicRefArrayType((ArrayType) type));
+-        }
+-    }
+-
+-    public static void main(String[] args) throws Exception {
+-
+-        if (args.length < 2) {
+-            throw new IllegalArgumentException("Usage: outputDirectory inputSourceFiles");
+-        }
+-
+-        File outputDirectory = new File(args[0]);
+-
+-        for (int i = 1; i < args.length; i++) {
+-            File file = new File(args[i]);
+-            System.out.println("Processing " + file);
+-            CompilationUnit cu = JavaParser.parse(file);
+-            new JavaParsingAtomicLinkedQueueGenerator(file.getName()).visit(cu, null);
+-
+-            organiseImports(cu);
+-            FileWriter writer = null;
+-
+-            String outputFileName = file.getName();
+-            if (outputFileName.endsWith(".java")) {
+-                outputFileName = translateQueueName(outputFileName.replace(".java", ""));
+-            } else {
+-                outputFileName = translateQueueName(outputFileName);
+-            }
+-            outputFileName += ".java";
+-
+-            File outputFile = new File(outputDirectory, outputFileName);
+-            try {
+-                writer = new FileWriter(outputFile);
+-                writer.write(cu.toString());
+-            } finally {
+-                if (writer != null) {
+-                    writer.close();
+-                }
+-            }
+-            System.out.println("Saved to " + outputFile);
+-        }
+-    }
+-
+ }
+diff --git a/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicQueueGenerator.java b/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicQueueGenerator.java
+new file mode 100644
+index 0000000..649bb4a
+--- /dev/null
++++ b/jctools-build/src/main/java/org/jctools/queues/atomic/JavaParsingAtomicQueueGenerator.java
+@@ -0,0 +1,308 @@
++package org.jctools.queues.atomic;
++
++import java.io.File;
++import java.io.FileWriter;
++import java.util.Arrays;
++import java.util.EnumSet;
++import java.util.Optional;
++
++import com.github.javaparser.JavaParser;
++import com.github.javaparser.ast.CompilationUnit;
++import com.github.javaparser.ast.ImportDeclaration;
++import com.github.javaparser.ast.Modifier;
++import com.github.javaparser.ast.Node;
++import com.github.javaparser.ast.NodeList;
++import com.github.javaparser.ast.PackageDeclaration;
++import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
++import com.github.javaparser.ast.body.FieldDeclaration;
++import com.github.javaparser.ast.body.InitializerDeclaration;
++import com.github.javaparser.ast.body.Parameter;
++import com.github.javaparser.ast.body.VariableDeclarator;
++import com.github.javaparser.ast.comments.Comment;
++import com.github.javaparser.ast.expr.AssignExpr;
++import com.github.javaparser.ast.expr.AssignExpr.Operator;
++import com.github.javaparser.ast.expr.ClassExpr;
++import com.github.javaparser.ast.expr.Expression;
++import com.github.javaparser.ast.expr.FieldAccessExpr;
++import com.github.javaparser.ast.expr.MethodCallExpr;
++import com.github.javaparser.ast.expr.Name;
++import com.github.javaparser.ast.expr.NameExpr;
++import com.github.javaparser.ast.expr.SimpleName;
++import com.github.javaparser.ast.expr.StringLiteralExpr;
++import com.github.javaparser.ast.expr.ThisExpr;
++import com.github.javaparser.ast.nodeTypes.NodeWithType;
++import com.github.javaparser.ast.stmt.BlockStmt;
++import com.github.javaparser.ast.stmt.ExpressionStmt;
++import com.github.javaparser.ast.stmt.ReturnStmt;
++import com.github.javaparser.ast.type.ArrayType;
++import com.github.javaparser.ast.type.ClassOrInterfaceType;
++import com.github.javaparser.ast.type.Type;
++import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
++
++abstract class JavaParsingAtomicQueueGenerator extends VoidVisitorAdapter<Void> {
++    protected static final String INDENT_LEVEL = "    ";
++    protected final String sourceFileName;
++
++    static void main(Class<? extends JavaParsingAtomicQueueGenerator> generatorClass, String[] args) throws Exception {
++
++        if (args.length < 2) {
++            throw new IllegalArgumentException("Usage: outputDirectory inputSourceFiles");
++        }
++
++        File outputDirectory = new File(args[0]);
++
++        for (int i = 1; i < args.length; i++) {
++            File file = new File(args[i]);
++            CompilationUnit cu = JavaParser.parse(file);
++            JavaParsingAtomicQueueGenerator generator = buildGenerator(generatorClass, file.getName());
++            generator.visit(cu, null);
++
++            generator.organiseImports(cu);
++
++            String outputFileName = generator.translateQueueName(file.getName().replace(".java", "")) + ".java";
++
++            try (FileWriter writer = new FileWriter(new File(outputDirectory, outputFileName))) {
++                writer.write(cu.toString());
++            }
++
++            System.out.println("Saved to " + outputFileName);
++        }
++    }
++
++    JavaParsingAtomicQueueGenerator(String sourceFileName) {
++        this.sourceFileName = sourceFileName;
++    }
++
++    abstract void organiseImports(CompilationUnit cu);
++    abstract String translateQueueName(String fileName);
++    abstract void processSpecialNodeTypes(NodeWithType<?, Type> node, String name);
++    abstract String fieldUpdaterFieldName(String fieldName);
++    
++    @Override
++    public void visit(FieldAccessExpr n, Void arg) {
++        super.visit(n, arg);
++        if (n.getScope() instanceof NameExpr) {
++            NameExpr name = (NameExpr) n.getScope();
++            name.setName(translateQueueName(name.getNameAsString()));
++        }
++    }
++    
++    @Override
++    public void visit(PackageDeclaration n, Void arg) {
++        super.visit(n, arg);
++        // Change the package of the output
++        n.setName("org.jctools.queues.atomic");
++    }
++
++    @Override
++    public void visit(Parameter n, Void arg) {
++        super.visit(n, arg);
++        // Process parameters to methods and ctors
++        processSpecialNodeTypes(n);
++    }
++
++    @Override
++    public void visit(VariableDeclarator n, Void arg) {
++        super.visit(n, arg);
++        // Replace declared variables with altered types
++        processSpecialNodeTypes(n);
++    }
++
++    private void processSpecialNodeTypes(Parameter node) {
++        processSpecialNodeTypes(node, node.getNameAsString());
++    }
++
++    private void processSpecialNodeTypes(VariableDeclarator node) {
++        processSpecialNodeTypes(node, node.getNameAsString());
++    }
++
++    protected boolean isCommentPresent(Node node, String wanted) {
++        Optional<Comment> maybeComment = node.getComment();
++        if (maybeComment.isPresent()) {
++            Comment comment = maybeComment.get();
++            String content = comment.getContent().trim();
++            if (wanted.equals(content)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    protected void removeStaticFieldsAndInitialisers(ClassOrInterfaceDeclaration node) {
++        // Remove all the static initialisers
++        for (InitializerDeclaration child : node.getChildNodesByType(InitializerDeclaration.class)) {
++            child.remove();
++        }
++
++        // Remove all static fields
++        for (FieldDeclaration field : node.getFields()) {
++            if (field.getModifiers().contains(Modifier.STATIC)) {
++                field.remove();
++                continue;
++            }
++        }
++    }
++
++    protected String capitalise(String s) {
++        return s.substring(0, 1).toUpperCase() + s.substring(1);
++    }
++
++    protected String formatMultilineJavadoc(int indent, String... lines) {
++        String indentation = "";
++        for (int i = 0; i < indent; i++) {
++            indentation += INDENT_LEVEL;
++        }
++
++        String out = "\n";
++        for (String line : lines) {
++            out += indentation + " * " + line + "\n";
++        }
++        out += indentation + " ";
++        return out;
++    }
++
++    /**
++     * Generates something like
++     * <code>P_INDEX_UPDATER.lazySet(this, newValue)</code>
++     * 
++     * @param fieldUpdaterFieldName
++     * @param newValueName
++     * @return
++     */
++    protected BlockStmt fieldUpdaterLazySet(String fieldUpdaterFieldName, String newValueName) {
++        BlockStmt body = new BlockStmt();
++        body.addStatement(new ExpressionStmt(
++                methodCallExpr(fieldUpdaterFieldName, "lazySet", new ThisExpr(), new NameExpr(newValueName))));
++        return body;
++    }
++
++    /**
++     * Generates something like
++     * <code>return P_INDEX_UPDATER.compareAndSet(this, expectedValue, newValue)</code>
++     * 
++     * @param fieldUpdaterFieldName
++     * @param expectedValueName
++     * @param newValueName
++     * @return
++     */
++    protected BlockStmt fieldUpdaterCompareAndSet(String fieldUpdaterFieldName, String expectedValueName,
++            String newValueName) {
++        BlockStmt body = new BlockStmt();
++        body.addStatement(new ReturnStmt(methodCallExpr(fieldUpdaterFieldName, "compareAndSet", new ThisExpr(),
++                new NameExpr(expectedValueName), new NameExpr(newValueName))));
++        return body;
++    }
++
++    protected MethodCallExpr methodCallExpr(String owner, String method, Expression... args) {
++        MethodCallExpr methodCallExpr = new MethodCallExpr(new NameExpr(owner), method);
++        for (Expression expr : args) {
++            methodCallExpr.addArgument(expr);
++        }
++        return methodCallExpr;
++    }
++
++    /**
++     * Generates something like <code>field = newValue</code>
++     * 
++     * @param fieldName
++     * @param valueName
++     * @return
++     */
++    protected BlockStmt fieldAssignment(String fieldName, String valueName) {
++        BlockStmt body = new BlockStmt();
++        body.addStatement(
++                new ExpressionStmt(new AssignExpr(new NameExpr(fieldName), new NameExpr(valueName), Operator.ASSIGN)));
++        return body;
++    }
++
++    /**
++     * Generates something like
++     * <code>private static final AtomicLongFieldUpdater<MpmcAtomicArrayQueueProducerIndexField> P_INDEX_UPDATER = AtomicLongFieldUpdater.newUpdater(MpmcAtomicArrayQueueProducerIndexField.class, "producerIndex");</code>
++     * 
++     * @param type
++     * @param name
++     * @param initializer
++     * @param modifiers
++     * @return
++     */
++    protected FieldDeclaration fieldDeclarationWithInitialiser(Type type, String name, Expression initializer,
++            Modifier... modifiers) {
++        FieldDeclaration fieldDeclaration = new FieldDeclaration();
++        VariableDeclarator variable = new VariableDeclarator(type, name, initializer);
++        fieldDeclaration.getVariables().add(variable);
++        EnumSet<Modifier> modifierSet = EnumSet.copyOf(Arrays.asList(modifiers));
++        fieldDeclaration.setModifiers(modifierSet);
++        return fieldDeclaration;
++    }
++
++    /**
++     * Generates something like
++     * <code>private static final AtomicLongFieldUpdater<MpmcAtomicArrayQueueProducerIndexField> P_INDEX_UPDATER = AtomicLongFieldUpdater.newUpdater(MpmcAtomicArrayQueueProducerIndexField.class, "producerIndex");</code>
++     * 
++     * @param className
++     * @param variableName
++     * @return
++     */
++    protected FieldDeclaration declareLongFieldUpdater(String className, String variableName) {
++        MethodCallExpr initializer = newAtomicLongFieldUpdater(className, variableName);
++
++        ClassOrInterfaceType type = simpleParametricType("AtomicLongFieldUpdater", className);
++        FieldDeclaration newField = fieldDeclarationWithInitialiser(type, fieldUpdaterFieldName(variableName),
++                initializer, Modifier.PRIVATE, Modifier.STATIC, Modifier.FINAL);
++        return newField;
++    }
++
++    protected MethodCallExpr newAtomicLongFieldUpdater(String className, String variableName) {
++        return methodCallExpr("AtomicLongFieldUpdater", "newUpdater", new ClassExpr(classType(className)),
++                new StringLiteralExpr(variableName));
++    }
++
++    protected ClassOrInterfaceType simpleParametricType(String className, String... typeArgs) {
++        NodeList<Type> typeArguments = new NodeList<Type>();
++        for (String typeArg : typeArgs) {
++            typeArguments.add(classType(typeArg));
++        }
++        return new ClassOrInterfaceType(null, new SimpleName(className), typeArguments);
++    }
++
++    protected ClassOrInterfaceType classType(String className) {
++        return new ClassOrInterfaceType(null, className);
++    }
++
++    protected ImportDeclaration importDeclaration(String name) {
++        return new ImportDeclaration(new Name(name), false, false);
++    }
++
++    /**
++     * Generates something like <code>return field</code>
++     * 
++     * @param fieldName
++     * @return
++     */
++    protected BlockStmt returnField(String fieldName) {
++        BlockStmt body = new BlockStmt();
++        body.addStatement(new ReturnStmt(fieldName));
++        return body;
++    }
++
++    protected boolean isRefArray(Type in, String refClassName) {
++        if (in instanceof ArrayType) {
++            ArrayType aType = (ArrayType) in;
++            return isRefType(aType.getComponentType(), refClassName);
++        }
++        return false;
++    }
++
++    protected boolean isRefType(Type in, String className) {
++        // Does not check type parameters
++        if (in instanceof ClassOrInterfaceType) {
++            return (className.equals(((ClassOrInterfaceType) in).getNameAsString()));
++        }
++        return false;
++    }
++
++    private static <T> T buildGenerator(Class<? extends T> generatorClass, String fileName) throws Exception {
++        return generatorClass.getDeclaredConstructor(String.class).newInstance(fileName);
++    }
++
++}
+diff --git a/jctools-core/pom.xml b/jctools-core/pom.xml
+index 2c4bba7..188b69e 100644
+--- a/jctools-core/pom.xml
++++ b/jctools-core/pom.xml
+@@ -49,7 +49,7 @@
+ 			<plugin>
+ 				<groupId>org.apache.felix</groupId>
+ 				<artifactId>maven-bundle-plugin</artifactId>
+-				<version>2.5.4</version>
++				<version>4.1.0</version>
+ 				<extensions>true</extensions>
+ 				<configuration>
+ 					<instructions>
+diff --git a/jctools-core/src/main/java/org/jctools/queues/BaseMpscLinkedArrayQueue.java b/jctools-core/src/main/java/org/jctools/queues/BaseMpscLinkedArrayQueue.java
+index 962d61f..5db1e8a 100644
+--- a/jctools-core/src/main/java/org/jctools/queues/BaseMpscLinkedArrayQueue.java
++++ b/jctools-core/src/main/java/org/jctools/queues/BaseMpscLinkedArrayQueue.java
+@@ -26,9 +26,11 @@ import static org.jctools.queues.LinkedArrayQueueUtil.length;
+ import static org.jctools.queues.LinkedArrayQueueUtil.modifiedCalcElementOffset;
+ import static org.jctools.util.UnsafeAccess.UNSAFE;
+ import static org.jctools.util.UnsafeAccess.fieldOffset;
++import static org.jctools.util.UnsafeRefArrayAccess.calcElementOffset;
+ import static org.jctools.util.UnsafeRefArrayAccess.lvElement;
+ import static org.jctools.util.UnsafeRefArrayAccess.soElement;
+ 
++
+ abstract class BaseMpscLinkedArrayQueuePad1<E> extends AbstractQueue<E> implements IndexedQueue
+ {
+     long p01, p02, p03, p04, p05, p06, p07;
+@@ -135,6 +137,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+ {
+     // No post padding here, subclasses must add
+     private static final Object JUMP = new Object();
++    private static final Object BUFFER_CONSUMED = new Object();
+     private static final int CONTINUE_TO_P_INDEX_CAS = 0;
+     private static final int RETRY = 1;
+     private static final int QUEUE_FULL = 2;
+@@ -161,12 +164,6 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+         soProducerLimit(mask); // we know it's all empty to start with
+     }
+ 
+-    @Override
+-    public final Iterator<E> iterator()
+-    {
+-        throw new UnsupportedOperationException();
+-    }
+-
+     @Override
+     public final int size()
+     {
+@@ -260,7 +257,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+                     case QUEUE_FULL:
+                         return false;
+                     case QUEUE_RESIZE:
+-                        resize(mask, buffer, pIndex, e);
++                        resize(mask, buffer, pIndex, e, null);
+                         return true;
+                 }
+             }
+@@ -312,7 +309,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+ 
+         if (e == JUMP)
+         {
+-            final E[] nextBuffer = getNextBuffer(buffer, mask);
++            final E[] nextBuffer = nextBuffer(buffer, mask);
+             return newBufferPoll(nextBuffer, index);
+         }
+ 
+@@ -348,7 +345,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+         }
+         if (e == JUMP)
+         {
+-            return newBufferPeek(getNextBuffer(buffer, mask), index);
++            return newBufferPeek(nextBuffer(buffer, mask), index);
+         }
+         return (E) e;
+     }
+@@ -399,11 +396,13 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+     protected abstract long availableInQueue(long pIndex, long cIndex);
+ 
+     @SuppressWarnings("unchecked")
+-    private E[] getNextBuffer(final E[] buffer, final long mask)
++    private E[] nextBuffer(final E[] buffer, final long mask)
+     {
+         final long offset = nextArrayOffset(mask);
+         final E[] nextBuffer = (E[]) lvElement(buffer, offset);
+-        soElement(buffer, offset, null);
++        consumerBuffer = nextBuffer;
++        consumerMask = (length(nextBuffer) - 2) << 1;
++        soElement(buffer, offset, BUFFER_CONSUMED);
+         return nextBuffer;
+     }
+ 
+@@ -414,7 +413,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+ 
+     private E newBufferPoll(E[] nextBuffer, long index)
+     {
+-        final long offset = newBufferAndOffset(nextBuffer, index);
++        final long offset = modifiedCalcElementOffset(index, consumerMask);
+         final E n = lvElement(nextBuffer, offset);// LoadLoad
+         if (n == null)
+         {
+@@ -427,7 +426,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+ 
+     private E newBufferPeek(E[] nextBuffer, long index)
+     {
+-        final long offset = newBufferAndOffset(nextBuffer, index);
++        final long offset = modifiedCalcElementOffset(index, consumerMask);
+         final E n = lvElement(nextBuffer, offset);// LoadLoad
+         if (null == n)
+         {
+@@ -436,13 +435,6 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+         return n;
+     }
+ 
+-    private long newBufferAndOffset(E[] nextBuffer, long index)
+-    {
+-        consumerBuffer = nextBuffer;
+-        consumerMask = (length(nextBuffer) - 2) << 1;
+-        return modifiedCalcElementOffset(index, consumerMask);
+-    }
+-
+     @Override
+     public long currentProducerIndex()
+     {
+@@ -480,7 +472,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+         }
+         if (e == JUMP)
+         {
+-            final E[] nextBuffer = getNextBuffer(buffer, mask);
++            final E[] nextBuffer = nextBuffer(buffer, mask);
+             return newBufferPoll(nextBuffer, index);
+         }
+         soElement(buffer, offset, null);
+@@ -500,7 +492,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+         Object e = lvElement(buffer, offset);// LoadLoad
+         if (e == JUMP)
+         {
+-            return newBufferPeek(getNextBuffer(buffer, mask), index);
++            return newBufferPeek(nextBuffer(buffer, mask), index);
+         }
+         return (E) e;
+     }
+@@ -563,7 +555,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+                     case QUEUE_FULL:
+                         return 0;
+                     case QUEUE_RESIZE:
+-                        resize(mask, buffer, pIndex, s.get());
++                        resize(mask, buffer, pIndex, null, s);
+                         return 1;
+                 }
+             }
+@@ -640,11 +632,93 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+             c.accept(e);
+         }
+     }
++    
++    /**
++     * Get an iterator for this queue. This method is thread safe.
++     * <p>
++     * The iterator provides a best-effort snapshot of the elements in the queue.
++     * The returned iterator is not guaranteed to return elements in queue order,
++     * and races with the consumer thread may cause gaps in the sequence of returned elements.
++     * Like {link #relaxedPoll}, the iterator may not immediately return newly inserted elements.
++     * 
++     * @return The iterator.
++     */
++    @Override
++    public Iterator<E> iterator() {
++        return new WeakIterator();
++    }
++    
++    private final class WeakIterator implements Iterator<E> {
+ 
+-    private void resize(long oldMask, E[] oldBuffer, long pIndex, E e)
++        private long nextIndex;
++        private E nextElement;
++        private E[] currentBuffer;
++        private int currentBufferLength;
++
++        WeakIterator() {
++            setBuffer(consumerBuffer);
++            nextElement = getNext();
++        }
++
++        @Override
++        public boolean hasNext() {
++            return nextElement != null;
++        }
++
++        @Override
++        public E next() {
++            if (nextElement == null) {
++                throw new java.util.NoSuchElementException();
++            }
++            E e = nextElement;
++            nextElement = getNext();
++            return e;
++        }
++
++        private void setBuffer(E[] buffer) {
++            this.currentBuffer = buffer;
++            this.currentBufferLength = length(buffer);
++            this.nextIndex = 0;
++        }
++        
++        private E getNext() {
++            while (true) {
++                while (nextIndex < currentBufferLength - 1) {
++                    long offset = calcElementOffset(nextIndex++);
++                    E e = lvElement(currentBuffer, offset);
++                    if (e != null && e != JUMP) {
++                        return e;
++                    }
++                }
++                long offset = calcElementOffset(currentBufferLength - 1);
++                Object nextArray = lvElement(currentBuffer, offset);
++                if (nextArray == BUFFER_CONSUMED) {
++                    //Consumer may have passed us, just jump to the current consumer buffer
++                    setBuffer(consumerBuffer);
++                } else if (nextArray != null) {
++                    setBuffer((E[]) nextArray);
++                } else {
++                    return null;
++                }
++            }
++        }
++    }
++
++    private void resize(long oldMask, E[] oldBuffer, long pIndex, E e, Supplier<E> s)
+     {
++        assert (e != null && s == null) || (e == null || s != null);
+         int newBufferLength = getNextBufferSize(oldBuffer);
+-        final E[] newBuffer = allocate(newBufferLength);
++        final E[] newBuffer;
++        try
++        {
++            newBuffer = allocate(newBufferLength);
++        }
++        catch (OutOfMemoryError oom)
++        {
++            assert lvProducerIndex() == pIndex + 1;
++            soProducerIndex(pIndex);
++            throw oom;
++        }
+ 
+         producerBuffer = newBuffer;
+         final int newMask = (newBufferLength - 2) << 1;
+@@ -653,7 +727,7 @@ public abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQue
+         final long offsetInOld = modifiedCalcElementOffset(pIndex, oldMask);
+         final long offsetInNew = modifiedCalcElementOffset(pIndex, newMask);
+ 
+-        soElement(newBuffer, offsetInNew, e);// element in new array
++        soElement(newBuffer, offsetInNew, e == null ? s.get() : e);// element in new array
+         soElement(oldBuffer, nextArrayOffset(oldMask), newBuffer);// buffer linked
+ 
+         // ASSERT code
+diff --git a/jctools-core/src/main/java/org/jctools/queues/MpmcUnboundedXaddArrayQueue.java b/jctools-core/src/main/java/org/jctools/queues/MpmcUnboundedXaddArrayQueue.java
+new file mode 100644
+index 0000000..37035bd
+--- /dev/null
++++ b/jctools-core/src/main/java/org/jctools/queues/MpmcUnboundedXaddArrayQueue.java
+@@ -0,0 +1,909 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.jctools.queues;
++
++import org.jctools.queues.IndexedQueueSizeUtil.IndexedQueue;
++import org.jctools.util.PortableJvmInfo;
++import org.jctools.util.Pow2;
++import org.jctools.util.UnsafeAccess;
++import org.jctools.util.UnsafeRefArrayAccess;
++
++import java.util.AbstractQueue;
++import java.util.Arrays;
++import java.util.Iterator;
++
++import static org.jctools.util.UnsafeAccess.UNSAFE;
++import static org.jctools.util.UnsafeAccess.fieldOffset;
++import static org.jctools.util.UnsafeRefArrayAccess.lpElement;
++
++
++abstract class MpmcProgressiveChunkedQueuePad1<E> extends AbstractQueue<E> implements IndexedQueue
++{
++    long p01, p02, p03, p04, p05, p06, p07;
++    long p10, p11, p12, p13, p14, p15, p16, p17;
++
++    static final class AtomicChunk<E>
++    {
++        private static final long ARRAY_BASE;
++        private static final int ELEMENT_SHIFT;
++
++        static
++        {
++            final int scale = UnsafeAccess.UNSAFE.arrayIndexScale(long[].class);
++            if (8 == scale)
++            {
++                ELEMENT_SHIFT = 3;
++            }
++            else
++            {
++                throw new IllegalStateException("Unexpected long[] element size");
++            }
++            // Including the buffer pad in the array base offset
++            ARRAY_BASE = UnsafeAccess.UNSAFE.arrayBaseOffset(long[].class);
++        }
++
++        final static int NIL_CHUNK_INDEX = -1;
++        private static final long PREV_OFFSET = fieldOffset(AtomicChunk.class, "prev");
++        private static final long NEXT_OFFSET = fieldOffset(AtomicChunk.class, "next");
++        private static final long INDEX_OFFSET = fieldOffset(AtomicChunk.class, "index");
++        private volatile AtomicChunk<E> prev;
++        private volatile long index;
++        private volatile AtomicChunk<E> next;
++        private final long[] sequence;
++        private final E[] buffer;
++
++        AtomicChunk(long index, AtomicChunk<E> prev, int size, boolean pooled)
++        {
++            buffer = CircularArrayOffsetCalculator.allocate(size);
++            spNext(null);
++            spPrev(prev);
++            spIndex(index);
++            if (pooled)
++            {
++                sequence = new long[size];
++                Arrays.fill(sequence, AtomicChunk.NIL_CHUNK_INDEX);
++            }
++            else
++            {
++                sequence = null;
++            }
++        }
++
++        final boolean isPooled()
++        {
++            return sequence != null;
++        }
++
++        private static long calcSequenceOffset(long index)
++        {
++            return ARRAY_BASE + (index << ELEMENT_SHIFT);
++        }
++
++        final void soSequence(int index, long e)
++        {
++            UNSAFE.putOrderedLong(sequence, calcSequenceOffset(index), e);
++        }
++
++        final long lvSequence(int index)
++        {
++            return UNSAFE.getLongVolatile(sequence, calcSequenceOffset(index));
++        }
++
++        final AtomicChunk<E> lvNext()
++        {
++            return next;
++        }
++
++        final AtomicChunk<E> lpPrev()
++        {
++            return (AtomicChunk<E>) UNSAFE.getObject(this, PREV_OFFSET);
++        }
++
++        final long lvIndex()
++        {
++            return index;
++        }
++
++        final void soIndex(long index)
++        {
++            UNSAFE.putOrderedLong(this, INDEX_OFFSET, index);
++        }
++
++        final void spIndex(long index)
++        {
++            UNSAFE.putLong(this, INDEX_OFFSET, index);
++        }
++
++        final void soNext(AtomicChunk<E> value)
++        {
++            UNSAFE.putOrderedObject(this, NEXT_OFFSET, value);
++        }
++
++        final void spNext(AtomicChunk<E> value)
++        {
++            UNSAFE.putObject(this, NEXT_OFFSET, value);
++        }
++
++        final void spPrev(AtomicChunk<E> value)
++        {
++            UNSAFE.putObject(this, PREV_OFFSET, value);
++        }
++
++        final void soElement(int index, E e)
++        {
++            UnsafeRefArrayAccess.soElement(buffer, UnsafeRefArrayAccess.calcElementOffset(index), e);
++        }
++
++        final void spElement(int index, E e)
++        {
++            UnsafeRefArrayAccess.spElement(buffer, UnsafeRefArrayAccess.calcElementOffset(index), e);
++        }
++
++        final E lvElement(int index)
++        {
++            return UnsafeRefArrayAccess.lvElement(buffer, UnsafeRefArrayAccess.calcElementOffset(index));
++        }
++
++    }
++}
++
++// $gen:ordered-fields
++abstract class MpmcProgressiveChunkedQueueProducerFields<E> extends MpmcProgressiveChunkedQueuePad1<E>
++{
++    private final static long P_INDEX_OFFSET =
++        fieldOffset(MpmcProgressiveChunkedQueueProducerFields.class, "producerIndex");
++    private volatile long producerIndex;
++
++    @Override
++    public final long lvProducerIndex()
++    {
++        return producerIndex;
++    }
++
++    final long getAndIncrementProducerIndex()
++    {
++        return UNSAFE.getAndAddLong(this, P_INDEX_OFFSET, 1);
++    }
++
++    final long getAndAddProducerIndex(long delta)
++    {
++        return UNSAFE.getAndAddLong(this, P_INDEX_OFFSET, delta);
++    }
++}
++
++abstract class MpmcProgressiveChunkedQueuePad2<E> extends MpmcProgressiveChunkedQueueProducerFields<E>
++{
++    long p01, p02, p03, p04, p05, p06, p07, p08;
++    long p10, p11, p12, p13, p14, p15, p16;
++}
++
++// $gen:ordered-fields
++abstract class MpmcProgressiveChunkedQueueProducerBuffer<E> extends MpmcProgressiveChunkedQueuePad2<E>
++{
++    private static final long P_BUFFER_OFFSET =
++        fieldOffset(MpmcProgressiveChunkedQueueProducerBuffer.class, "producerBuffer");
++    private static final long P_CHUNK_INDEX_OFFSET =
++        fieldOffset(MpmcProgressiveChunkedQueueProducerBuffer.class, "producerChunkIndex");
++
++    private volatile AtomicChunk<E> producerBuffer;
++    private volatile long producerChunkIndex;
++
++
++    final long lvProducerChunkIndex()
++    {
++        return producerChunkIndex;
++    }
++
++    final boolean casProducerChunkIndex(long expected, long value)
++    {
++        return UNSAFE.compareAndSwapLong(this, P_CHUNK_INDEX_OFFSET, expected, value);
++    }
++
++    final void soProducerChunkIndex(long value)
++    {
++        UNSAFE.putOrderedLong(this, P_CHUNK_INDEX_OFFSET, value);
++    }
++
++    final AtomicChunk<E> lvProducerBuffer()
++    {
++        return this.producerBuffer;
++    }
++
++    final void soProducerBuffer(AtomicChunk<E> buffer)
++    {
++        UNSAFE.putOrderedObject(this, P_BUFFER_OFFSET, buffer);
++    }
++}
++
++abstract class MpmcProgressiveChunkedQueuePad3<E> extends MpmcProgressiveChunkedQueueProducerBuffer<E>
++{
++    long p0, p1, p2, p3, p4, p5, p6, p7;
++    long p10, p11, p12, p13, p14, p15, p16;
++}
++
++// $gen:ordered-fields
++abstract class MpmcProgressiveChunkedQueueConsumerFields<E> extends MpmcProgressiveChunkedQueuePad3<E>
++{
++    private final static long C_INDEX_OFFSET =
++        fieldOffset(MpmcProgressiveChunkedQueueConsumerFields.class, "consumerIndex");
++    private final static long C_BUFFER_OFFSET =
++        fieldOffset(MpmcProgressiveChunkedQueueConsumerFields.class, "consumerBuffer");
++
++    private volatile long consumerIndex;
++    private volatile AtomicChunk<E> consumerBuffer;
++
++    @Override
++    public final long lvConsumerIndex()
++    {
++        return consumerIndex;
++    }
++
++    final boolean casConsumerIndex(long expect, long newValue)
++    {
++        return UNSAFE.compareAndSwapLong(this, C_INDEX_OFFSET, expect, newValue);
++    }
++
++    final AtomicChunk<E> lvConsumerBuffer()
++    {
++        return this.consumerBuffer;
++    }
++
++    final void soConsumerBuffer(AtomicChunk<E> newValue)
++    {
++        UNSAFE.putOrderedObject(this, C_BUFFER_OFFSET, newValue);
++    }
++
++}
++
++abstract class MpmcProgressiveChunkedQueuePad5<E> extends MpmcProgressiveChunkedQueueConsumerFields<E>
++{
++    long p0, p1, p2, p3, p4, p5, p6, p7;
++    long p10, p11, p12, p13, p14, p15, p16;
++}
++
++/**
++ * An MPMC array queue which starts at <i>initialCapacity</i> and grows unbounded in linked chunks.<br>
++ * Differently from {@link MpmcArrayQueue} it is designed to provide a better scaling when more
++ * producers are concurrently offering.
++ *
++ * @param <E>
++ * @author https://github.com/franz1981
++ */
++public class MpmcUnboundedXaddArrayQueue<E> extends MpmcProgressiveChunkedQueuePad5<E>
++    implements MessagePassingQueue<E>, QueueProgressIndicators
++{
++    private static final long ROTATION = -2;
++    private final int chunkMask;
++    private final int chunkShift;
++    private final SpscArrayQueue<AtomicChunk<E>> freeBuffer;
++
++    public MpmcUnboundedXaddArrayQueue(int chunkSize, int maxPooledChunks)
++    {
++        chunkSize = Pow2.roundToPowerOfTwo(chunkSize);
++        final AtomicChunk<E> first = new AtomicChunk(0, null, chunkSize, true);
++        soProducerBuffer(first);
++        soProducerChunkIndex(0);
++        soConsumerBuffer(first);
++        chunkMask = chunkSize - 1;
++        chunkShift = Integer.numberOfTrailingZeros(chunkSize);
++        freeBuffer = new SpscArrayQueue<AtomicChunk<E>>(maxPooledChunks + 1);
++        for (int i = 0; i < maxPooledChunks; i++)
++        {
++            freeBuffer.offer(new AtomicChunk(AtomicChunk.NIL_CHUNK_INDEX, null, chunkSize, true));
++        }
++    }
++
++    public MpmcUnboundedXaddArrayQueue(int chunkSize)
++    {
++        this(chunkSize, 1);
++    }
++
++    private AtomicChunk<E> producerBufferOf(AtomicChunk<E> producerBuffer, long expectedChunkIndex)
++    {
++        long jumpBackward;
++        while (true)
++        {
++            if (producerBuffer == null)
++            {
++                producerBuffer = lvProducerBuffer();
++            }
++            final long producerChunkIndex = producerBuffer.lvIndex();
++            if (producerChunkIndex == AtomicChunk.NIL_CHUNK_INDEX)
++            {
++                //force an attempt to fetch it another time
++                producerBuffer = null;
++                continue;
++            }
++            jumpBackward = producerChunkIndex - expectedChunkIndex;
++            if (jumpBackward >= 0)
++            {
++                break;
++            }
++            //try validate against the last producer chunk index
++            if (lvProducerChunkIndex() == producerChunkIndex)
++            {
++                producerBuffer = appendNextChunks(producerBuffer, producerChunkIndex, chunkMask + 1, -jumpBackward);
++            }
++            else
++            {
++                producerBuffer = null;
++            }
++        }
++        for (long i = 0; i < jumpBackward; i++)
++        {
++            //prev cannot be null, because is being released by index
++            producerBuffer = producerBuffer.lpPrev();
++            assert producerBuffer != null;
++        }
++        assert producerBuffer.lvIndex() == expectedChunkIndex;
++        return producerBuffer;
++    }
++
++    private AtomicChunk<E> appendNextChunks(AtomicChunk<E> producerBuffer, long chunkIndex, int chunkSize, long chunks)
++    {
++        assert chunkIndex != AtomicChunk.NIL_CHUNK_INDEX;
++        //prevent other concurrent attempts on appendNextChunk
++        if (!casProducerChunkIndex(chunkIndex, ROTATION))
++        {
++            return null;
++        }
++        AtomicChunk<E> newChunk = null;
++        for (long i = 1; i <= chunks; i++)
++        {
++            final long nextChunkIndex = chunkIndex + i;
++            newChunk = freeBuffer.poll();
++            if (newChunk != null)
++            {
++                //single-writer: producerBuffer::index == nextChunkIndex is protecting it
++                assert newChunk.lvIndex() < producerBuffer.lvIndex();
++                newChunk.spPrev(producerBuffer);
++                //index set is releasing prev, allowing other pending offers to continue
++                newChunk.soIndex(nextChunkIndex);
++            }
++            else
++            {
++                newChunk = new AtomicChunk<E>(nextChunkIndex, producerBuffer, chunkSize, false);
++            }
++            soProducerBuffer(newChunk);
++            //link the next chunk only when finished
++            producerBuffer.soNext(newChunk);
++            producerBuffer = newChunk;
++        }
++        soProducerChunkIndex(chunkIndex + chunks);
++        return newChunk;
++    }
++
++    @Override
++    public long currentProducerIndex()
++    {
++        return lvProducerIndex();
++    }
++
++    @Override
++    public long currentConsumerIndex()
++    {
++        return lvConsumerIndex();
++    }
++
++    protected void onProducerReservation(long index)
++    {
++    }
++
++    @Override
++    public boolean offer(E e)
++    {
++        if (null == e)
++        {
++            throw new NullPointerException();
++        }
++        final int chunkMask = this.chunkMask;
++        final int chunkShift = this.chunkShift;
++        final long producerSeq = getAndIncrementProducerIndex();
++        onProducerReservation(producerSeq);
++        final int pOffset = (int) (producerSeq & chunkMask);
++        final long chunkIndex = producerSeq >> chunkShift;
++        AtomicChunk<E> producerBuffer = lvProducerBuffer();
++        if (producerBuffer.lvIndex() != chunkIndex)
++        {
++            producerBuffer = producerBufferOf(producerBuffer, chunkIndex);
++        }
++        final boolean isPooled = producerBuffer.isPooled();
++        if (isPooled)
++        {
++            //wait any previous consumer to finish its job
++            while (producerBuffer.lvElement(pOffset) != null)
++            {
++
++            }
++        }
++        producerBuffer.soElement(pOffset, e);
++        if (isPooled)
++        {
++            producerBuffer.soSequence(pOffset, chunkIndex);
++        }
++        return true;
++    }
++
++    private static <E> E spinForElement(AtomicChunk<E> chunk, int offset)
++    {
++        E e;
++        while ((e = chunk.lvElement(offset)) == null)
++        {
++
++        }
++        return e;
++    }
++
++    private E rotateConsumerBuffer(AtomicChunk<E> consumerBuffer, AtomicChunk<E> next, int consumerOffset, long expectedChunkIndex)
++    {
++        while (next == null)
++        {
++            next = consumerBuffer.lvNext();
++        }
++        //we can freely spin awaiting producer, because we are the only one in charge to
++        //rotate the consumer buffer and use next
++        final E e = spinForElement(next, consumerOffset);
++        final boolean pooled = next.isPooled();
++        if (pooled)
++        {
++            while (next.lvSequence(consumerOffset) != expectedChunkIndex)
++            {
++
++            }
++        }
++        next.soElement(consumerOffset, null);
++        next.spPrev(null);
++        //save from nepotism
++        consumerBuffer.soNext(null);
++        if (consumerBuffer.isPooled())
++        {
++            final boolean offered = freeBuffer.offer(consumerBuffer);
++            assert offered;
++        }
++        //expose next to the other consumers
++        soConsumerBuffer(next);
++        return e;
++    }
++
++    @Override
++    public E poll()
++    {
++        final int chunkMask = this.chunkMask;
++        final int chunkShift = this.chunkShift;
++        long consumerIndex;
++        AtomicChunk<E> consumerBuffer;
++        int consumerOffset;
++        final int chunkSize = chunkMask + 1;
++        boolean firstElementOfNewChunk;
++        E e = null;
++        AtomicChunk<E> next = null;
++        long pIndex = -1; // start with bogus value, hope we don't need it
++        long chunkIndex;
++        do
++        {
++            consumerIndex = this.lvConsumerIndex();
++            consumerBuffer = this.lvConsumerBuffer();
++            consumerOffset = (int) (consumerIndex & chunkMask);
++            chunkIndex = consumerIndex >> chunkShift;
++            firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++            if (firstElementOfNewChunk)
++            {
++                //we don't care about < or >, because if:
++                //- consumerBuffer::index < expectedChunkIndex: another consumer has rotated consumerBuffer,
++                //  but not reused (yet, if possible)
++                //- consumerBuffer::index > expectedChunkIndex: another consumer has rotated consumerBuffer,
++                // that has been pooled and reused again
++                //in both cases we have a stale view of the world with a not reliable next value.
++                final long expectedChunkIndex = chunkIndex - 1;
++                if (expectedChunkIndex != consumerBuffer.lvIndex())
++                {
++                    continue;
++                }
++                next = consumerBuffer.lvNext();
++                //next could have been modified by another consumer, but:
++                //- if null: it still needs to check q empty + casConsumerIndex
++                //- if !null: it will fail on casConsumerIndex
++                if (next == null)
++                {
++                    if (consumerIndex >= pIndex && // test against cached pIndex
++                        consumerIndex == (pIndex = lvProducerIndex()))
++                    { // update pIndex if we must
++                        // strict empty check, this ensures [Queue.poll() == null iff isEmpty()]
++                        return null;
++                    }
++                    //not empty: can attempt the cas
++                }
++            }
++            else
++            {
++                final boolean pooled = consumerBuffer.isPooled();
++                if (pooled) {
++                    final long sequence = consumerBuffer.lvSequence(consumerOffset);
++                    if (sequence != chunkIndex) {
++                        if (sequence > chunkIndex) {
++                            //stale view of the world
++                            continue;
++                        }
++                        final long index = consumerBuffer.lvIndex();
++                        if (index > chunkIndex)
++                        {
++                            //stale view of the world
++                            continue;
++                        }
++                        //it cover both cases:
++                        //- right chunk, awaiting element to be set
++                        //- old chunk, awaiting rotation
++                        //it allows to fail fast if the q is empty after the first element on the new chunk.
++                        if (consumerIndex >= pIndex && // test against cached pIndex
++                            consumerIndex == (pIndex = lvProducerIndex()))
++                        { // update pIndex if we must
++                            // strict empty check, this ensures [Queue.poll() == null iff isEmpty()]
++                            return null;
++                        }
++                        continue;
++                    }
++                } else {
++                    final long index = consumerBuffer.lvIndex();
++                    if (index != chunkIndex || (e = consumerBuffer.lvElement(consumerOffset)) == null)
++                    {
++                        if (index > chunkIndex)
++                        {
++                            //stale view of the world
++                            continue;
++                        }
++                        //it cover both cases:
++                        //- right chunk, awaiting element to be set
++                        //- old chunk, awaiting rotation
++                        //it allows to fail fast if the q is empty after the first element on the new chunk.
++                        if (consumerIndex >= pIndex && // test against cached pIndex
++                            consumerIndex == (pIndex = lvProducerIndex()))
++                        { // update pIndex if we must
++                            // strict empty check, this ensures [Queue.poll() == null iff isEmpty()]
++                            return null;
++                        }
++                        continue;
++                    }
++                }
++            }
++            if (casConsumerIndex(consumerIndex, consumerIndex + 1))
++            {
++                break;
++            }
++        }
++        while (true);
++        //if we are the firstElementOfNewChunk we need to rotate the consumer buffer
++        if (firstElementOfNewChunk)
++        {
++            e = rotateConsumerBuffer(consumerBuffer, next, consumerOffset, chunkIndex);
++        }
++        else
++        {
++            if (consumerBuffer.isPooled()) {
++                e = consumerBuffer.lvElement(consumerOffset);
++                assert e != null;
++            }
++            assert !consumerBuffer.isPooled() ||
++                (consumerBuffer.isPooled() && consumerBuffer.lvSequence(consumerOffset) == chunkIndex);
++            consumerBuffer.soElement(consumerOffset, null);
++        }
++        return e;
++    }
++
++    @Override
++    public E peek()
++    {
++        final int chunkMask = this.chunkMask;
++        final int chunkShift = this.chunkShift;
++        final int chunkSize = chunkMask + 1;
++        long consumerIndex;
++        E e;
++        do
++        {
++            e = null;
++            consumerIndex = this.lvConsumerIndex();
++            AtomicChunk<E> consumerBuffer = this.lvConsumerBuffer();
++            final int consumerOffset = (int) (consumerIndex & chunkMask);
++            final long chunkIndex = consumerIndex >> chunkShift;
++            final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++            if (firstElementOfNewChunk)
++            {
++                final long expectedChunkIndex = chunkIndex - 1;
++                if (expectedChunkIndex != consumerBuffer.lvIndex())
++                {
++                    continue;
++                }
++                final AtomicChunk<E> next = consumerBuffer.lvNext();
++                if (next == null)
++                {
++                    continue;
++                }
++                consumerBuffer = next;
++            }
++            if (consumerBuffer.isPooled())
++            {
++                if (consumerBuffer.lvSequence(consumerOffset) != chunkIndex)
++                {
++                    continue;
++                }
++            } else {
++                if (consumerBuffer.lvIndex() != chunkIndex)
++                {
++                    continue;
++                }
++            }
++            e = consumerBuffer.lvElement(consumerOffset);
++        }
++        while (e == null && consumerIndex != lvProducerIndex());
++        return e;
++    }
++
++    @Override
++    public Iterator<E> iterator()
++    {
++        throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int size()
++    {
++        return IndexedQueueSizeUtil.size(this);
++    }
++
++    @Override
++    public int capacity()
++    {
++        return MessagePassingQueue.UNBOUNDED_CAPACITY;
++    }
++
++    @Override
++    public boolean relaxedOffer(E e)
++    {
++        return offer(e);
++    }
++
++    @Override
++    public E relaxedPoll()
++    {
++        final int chunkMask = this.chunkMask;
++        final int chunkShift = this.chunkShift;
++        final int chunkSize = chunkMask + 1;
++        final long consumerIndex = this.lvConsumerIndex();
++        final AtomicChunk<E> consumerBuffer = this.lvConsumerBuffer();
++        final int consumerOffset = (int) (consumerIndex & chunkMask);
++        final long chunkIndex = consumerIndex >> chunkShift;
++        final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++        if (firstElementOfNewChunk)
++        {
++            final long expectedChunkIndex = chunkIndex - 1;
++            final AtomicChunk<E> next;
++            if (expectedChunkIndex != consumerBuffer.lvIndex() || (next = consumerBuffer.lvNext()) == null)
++            {
++                return null;
++            }
++            E e = null;
++            final boolean pooled = next.isPooled();
++            if (pooled)
++            {
++                if (next.lvSequence(consumerOffset) != chunkIndex)
++                {
++                    return null;
++                }
++            }
++            else
++            {
++                e = next.lvElement(consumerOffset);
++                if (e == null)
++                {
++                    return null;
++                }
++            }
++            if (!casConsumerIndex(consumerIndex, consumerIndex + 1))
++            {
++                return null;
++            }
++            if (pooled)
++            {
++                e = next.lvElement(consumerOffset);
++            }
++            assert e != null;
++            //perform the rotation
++            next.soElement(consumerOffset, null);
++            next.spPrev(null);
++            //save from nepotism
++            consumerBuffer.soNext(null);
++            if (consumerBuffer.isPooled())
++            {
++                final boolean offered = freeBuffer.offer(consumerBuffer);
++                assert offered;
++            }
++            //expose next to the other consumers
++            soConsumerBuffer(next);
++            return e;
++        }
++        else
++        {
++            final boolean pooled = consumerBuffer.isPooled();
++            E e = null;
++            if (pooled)
++            {
++                final long sequence = consumerBuffer.lvSequence(consumerOffset);
++                if (sequence != chunkIndex)
++                {
++                    return null;
++                }
++            }
++            else
++            {
++                final long index = consumerBuffer.lvIndex();
++                if (index != chunkIndex || (e = consumerBuffer.lvElement(consumerOffset)) == null)
++                {
++                    return null;
++                }
++            }
++            if (!casConsumerIndex(consumerIndex, consumerIndex + 1))
++            {
++                return null;
++            }
++            if (pooled)
++            {
++                e = consumerBuffer.lvElement(consumerOffset);
++                assert e != null;
++            }
++            assert !pooled ||
++                (pooled && consumerBuffer.lvSequence(consumerOffset) == chunkIndex);
++            consumerBuffer.soElement(consumerOffset, null);
++            return e;
++        }
++    }
++
++    @Override
++    public E relaxedPeek()
++    {
++        final int chunkMask = this.chunkMask;
++        final int chunkShift = this.chunkShift;
++        final int chunkSize = chunkMask + 1;
++        final long consumerIndex = this.lvConsumerIndex();
++        AtomicChunk<E> consumerBuffer = this.lvConsumerBuffer();
++        final int consumerOffset = (int) (consumerIndex & chunkMask);
++        final long chunkIndex = consumerIndex >> chunkShift;
++        final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++        if (firstElementOfNewChunk)
++        {
++            final long expectedChunkIndex = chunkIndex - 1;
++            if (expectedChunkIndex != consumerBuffer.lvIndex())
++            {
++                return null;
++            }
++            final AtomicChunk<E> next = consumerBuffer.lvNext();
++            if (next == null)
++            {
++                return null;
++            }
++            consumerBuffer = next;
++        }
++        if (consumerBuffer.isPooled())
++        {
++            if (consumerBuffer.lvSequence(consumerOffset) != chunkIndex)
++            {
++                return null;
++            }
++        }
++        else
++        {
++            if (consumerBuffer.lvIndex() != chunkIndex)
++            {
++                return null;
++            }
++        }
++        return consumerBuffer.lvElement(consumerOffset);
++    }
++
++    @Override
++    public int drain(Consumer<E> c)
++    {
++        return drain(c, chunkMask + 1);
++    }
++
++    @Override
++    public int fill(Supplier<E> s)
++    {
++        long result = 0;// result is a long because we want to have a safepoint check at regular intervals
++        final int capacity = chunkMask + 1;
++        final int offerBatch = Math.min(PortableJvmInfo.RECOMENDED_OFFER_BATCH, capacity);
++        do
++        {
++            final int filled = fill(s, offerBatch);
++            if (filled == 0)
++            {
++                return (int) result;
++            }
++            result += filled;
++        }
++        while (result <= capacity);
++        return (int) result;
++    }
++
++    @Override
++    public int drain(Consumer<E> c, int limit)
++    {
++        for (int i = 0; i < limit; i++)
++        {
++            final E e = relaxedPoll();
++            if (e == null)
++            {
++                return i;
++            }
++            c.accept(e);
++        }
++        return limit;
++    }
++
++    @Override
++    public int fill(Supplier<E> s, int limit)
++    {
++        final int chunkShift = this.chunkShift;
++        final int chunkMask = this.chunkMask;
++        long producerSeq = getAndAddProducerIndex(limit);
++        AtomicChunk<E> producerBuffer = null;
++        for (int i = 0; i < limit; i++)
++        {
++            final int pOffset = (int) (producerSeq & chunkMask);
++            long chunkIndex = producerSeq >> chunkShift;
++            if (producerBuffer == null || producerBuffer.lvIndex() != chunkIndex)
++            {
++                producerBuffer = producerBufferOf(producerBuffer, chunkIndex);
++                if (producerBuffer.isPooled())
++                {
++                    chunkIndex = producerBuffer.lvIndex();
++                }
++            }
++            if (producerBuffer.isPooled())
++            {
++                while (producerBuffer.lvElement(pOffset) != null)
++                {
++
++                }
++            }
++            producerBuffer.soElement(pOffset, s.get());
++            if (producerBuffer.isPooled())
++            {
++                producerBuffer.soSequence(pOffset, chunkIndex);
++            }
++            producerSeq++;
++        }
++        return limit;
++    }
++
++    @Override
++    public void drain(Consumer<E> c, WaitStrategy wait, ExitCondition exit)
++    {
++        MessagePassingQueueUtil.drain(this, c, wait, exit);
++    }
++
++    @Override
++    public void fill(Supplier<E> s, WaitStrategy wait, ExitCondition exit)
++    {
++        while (exit.keepRunning())
++        {
++            fill(s, PortableJvmInfo.RECOMENDED_OFFER_BATCH);
++        }
++    }
++
++    @Override
++    public String toString()
++    {
++        return this.getClass().getName();
++    }
++
++}
+diff --git a/jctools-core/src/main/java/org/jctools/queues/MpscArrayQueue.java b/jctools-core/src/main/java/org/jctools/queues/MpscArrayQueue.java
+index 6c62d2f..b580961 100755
+--- a/jctools-core/src/main/java/org/jctools/queues/MpscArrayQueue.java
++++ b/jctools-core/src/main/java/org/jctools/queues/MpscArrayQueue.java
+@@ -19,6 +19,8 @@ import static org.jctools.util.UnsafeAccess.UNSAFE;
+ import static org.jctools.util.UnsafeAccess.fieldOffset;
+ import static org.jctools.util.UnsafeRefArrayAccess.*;
+ 
++import java.util.Iterator;
++
+ abstract class MpscArrayQueueL1Pad<E> extends ConcurrentCircularArrayQueue<E>
+ {
+     long p00, p01, p02, p03, p04, p05, p06, p07;
+@@ -562,4 +564,61 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
+             idleCounter = 0;
+         }
+     }
++    
++    /**
++     * Get an iterator for this queue. This method is thread safe.
++     * <p>
++     * The iterator provides a best-effort snapshot of the elements in the queue.
++     * The returned iterator is not guaranteed to return elements in queue order,
++     * and races with the consumer thread may cause gaps in the sequence of returned elements.
++     * Like {link #relaxedPoll}, the iterator may not immediately return newly inserted elements.
++     * 
++     * @return The iterator.
++     */
++    @Override
++    public final Iterator<E> iterator() {
++        final long cIndex = lvConsumerIndex();
++        final long pIndex = lvProducerIndex();
++        
++        return new WeakIterator(cIndex, pIndex);
++    }
++    
++    private final class WeakIterator implements Iterator<E> {
++
++        private final long pIndex;
++        private long nextIndex;
++        private E nextElement;
++
++        WeakIterator(long cIndex, long pIndex) {
++            this.nextIndex = cIndex;
++            this.pIndex = pIndex;
++            nextElement = getNext();
++        }
++
++        @Override
++        public boolean hasNext() {
++            return nextElement != null;
++        }
++
++        @Override
++        public E next() {
++            if (nextElement == null) {
++                throw new java.util.NoSuchElementException();
++            }
++            E e = nextElement;
++            nextElement = getNext();
++            return e;
++        }
++
++        private E getNext() {
++            while (nextIndex < pIndex) {
++                long offset = calcElementOffset(nextIndex++);
++                E e = lvElement(buffer, offset);
++                if (e != null) {
++                    return e;
++                }
++            }
++            return null;
++        }
++    }
+ }
+diff --git a/jctools-core/src/main/java/org/jctools/queues/MpscBlockingConsumerArrayQueue.java b/jctools-core/src/main/java/org/jctools/queues/MpscBlockingConsumerArrayQueue.java
+index 41a55be..d95f88b 100644
+--- a/jctools-core/src/main/java/org/jctools/queues/MpscBlockingConsumerArrayQueue.java
++++ b/jctools-core/src/main/java/org/jctools/queues/MpscBlockingConsumerArrayQueue.java
+@@ -14,7 +14,10 @@
+ package org.jctools.queues;
+ 
+ import java.util.AbstractQueue;
++import java.util.Collection;
+ import java.util.Iterator;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.locks.LockSupport;
+ 
+ import org.jctools.queues.IndexedQueueSizeUtil.IndexedQueue;
+@@ -163,11 +166,12 @@ abstract class MpscBlockingConsumerArrayQueueConsumerFields<E> extends MpscBlock
+ 
+ 
+ /**
+- *
+- * @param <E>
++ * This is a partial implementation of the {@link java.util.concurrent.BlockingQueue} on the consumer side only on top
++ * of the mechanics described in {@link BaseMpscLinkedArrayQueue}, but with the reservation bit used for blocking rather
++ * than resizing in this instance.
+  */
+ public class MpscBlockingConsumerArrayQueue<E> extends MpscBlockingConsumerArrayQueueConsumerFields<E>
+-    implements MessagePassingQueue<E>, QueueProgressIndicators
++    implements MessagePassingQueue<E>, QueueProgressIndicators, BlockingQueue<E>
+ {
+     long p0, p1, p2, p3, p4, p5, p6, p7;
+     long p10, p11, p12, p13, p14, p15, p16, p17;
+@@ -290,6 +294,21 @@ public class MpscBlockingConsumerArrayQueue<E> extends MpscBlockingConsumerArray
+         return true;
+     }
+ 
++    @Override
++    public void put(E e) throws InterruptedException
++    {
++        if (!offer(e))
++            throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public boolean offer(E e, long timeout, TimeUnit unit) throws InterruptedException
++    {
++        if (offer(e))
++            return true;
++        throw new UnsupportedOperationException();
++    }
++
+     private boolean offerAndWakeup(E[] buffer, long mask, long pIndex, E e)
+     {
+         final long offset = modifiedCalcElementOffset(pIndex, mask);
+@@ -361,20 +380,35 @@ public class MpscBlockingConsumerArrayQueue<E> extends MpscBlockingConsumerArray
+         Object e = lvElement(buffer, offset);// LoadLoad
+         if (e == null)
+         {
+-            long pIndex = lvProducerIndex();
++            final long pIndex = lvProducerIndex();
+             if (cIndex == pIndex && casProducerIndex(pIndex, pIndex + 1))
+             {
+-                // producers only try a wakeup when both the index and the blocked thread are visible
+-                soBlocked(Thread.currentThread());
+-                do
++                boolean unblocked = false;
++                try
+                 {
+-                    LockSupport.park();
+-                    if (Thread.currentThread().isInterrupted())
++                    // producers only try a wakeup when both the index and the blocked thread are visible
++                    soBlocked(Thread.currentThread());
++                    do
+                     {
+-                        throw new InterruptedException();
++                        LockSupport.park();
++                        if (Thread.interrupted())
++                        {
++                            throw new InterruptedException();
++                        }
++                    }
++                    while (lvBlocked() != null);
++                    unblocked = true;
++                }
++                finally
++                {
++                    if (!unblocked) {
++                        // revert blocking state
++                        if (casProducerIndex(pIndex + 1, pIndex))
++                        {
++                            soBlocked(null);
++                        }
+                     }
+                 }
+-                while (lvBlocked() != null);
+             }
+             // producer index is visible before element, so if we wake up between the index moving and the element
+             // store we could see a null.
+@@ -386,7 +420,97 @@ public class MpscBlockingConsumerArrayQueue<E> extends MpscBlockingConsumerArray
+         
+         return (E) e;
+     }
+-    
++
++    /**
++     * {@inheritDoc}
++     * <p>
++     * This implementation is correct for single consumer thread use only.
++     */
++    @SuppressWarnings("unchecked")
++    public E poll(long timeout, TimeUnit unit) throws InterruptedException
++    {
++        long remainingNanos = unit.toNanos(timeout);
++        final E[] buffer = consumerBuffer;
++        final long mask = consumerMask;
++        
++        final long cIndex = lpConsumerIndex();
++        final long offset = modifiedCalcElementOffset(cIndex, mask);
++        Object e = lvElement(buffer, offset);// LoadLoad
++        if (e == null)
++        {
++            if (remainingNanos <= 0)
++            {
++                return null;
++            }
++            final long pIndex = lvProducerIndex();
++            if (cIndex == pIndex && casProducerIndex(pIndex, pIndex + 1))
++            {
++                boolean unblocked = false;
++                try
++                {
++                    // producers only try a wakeup when both the index and the blocked thread are visible
++                    soBlocked(Thread.currentThread());
++                    final long deadlineNanos = System.nanoTime() + remainingNanos;
++                    while (true)
++                    {
++                        LockSupport.parkNanos(this, remainingNanos);
++                        if (Thread.interrupted())
++                        {
++                            throw new InterruptedException();
++                        }
++                        if (lvBlocked() == null)
++                        {
++                            break;
++                        }
++                        remainingNanos = deadlineNanos - System.nanoTime();
++                        if (remainingNanos <= 0)
++                        {
++                            return null;
++                        }
++                    }
++                    unblocked = true;
++                }
++                finally
++                {
++                    if (!unblocked)
++                    {
++                        // revert blocking state
++                        if (casProducerIndex(pIndex + 1, pIndex))
++                        {
++                            soBlocked(null);
++                        }
++                    }
++                }
++            }
++            // producer index is visible before element, so if we wake up between the index moving and the element
++            // store we could see a null.
++            e = spinWaitForElement(buffer, offset);
++        }
++
++        soElement(buffer, offset, null); // release element null
++        soConsumerIndex(cIndex + 2); // release cIndex
++        
++        return (E) e;
++    }
++
++    @Override
++    public int remainingCapacity()
++    {
++        return capacity() - size();
++    }
++
++    @Override
++    public int drainTo(Collection<? super E> c)
++    {
++        throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int drainTo(Collection<? super E> c, int maxElements)
++    {
++        throw new UnsupportedOperationException();
++    }
++
+     /**
+      * {@inheritDoc}
+      * <p>
+diff --git a/jctools-core/src/main/java/org/jctools/queues/MpscUnboundedXaddArrayQueue.java b/jctools-core/src/main/java/org/jctools/queues/MpscUnboundedXaddArrayQueue.java
+new file mode 100644
+index 0000000..8023c07
+--- /dev/null
++++ b/jctools-core/src/main/java/org/jctools/queues/MpscUnboundedXaddArrayQueue.java
+@@ -0,0 +1,699 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.jctools.queues;
++
++import org.jctools.queues.IndexedQueueSizeUtil.IndexedQueue;
++import org.jctools.util.PortableJvmInfo;
++import org.jctools.util.Pow2;
++import org.jctools.util.UnsafeRefArrayAccess;
++
++import java.util.AbstractQueue;
++import java.util.Iterator;
++
++import static org.jctools.util.UnsafeAccess.UNSAFE;
++import static org.jctools.util.UnsafeAccess.fieldOffset;
++
++
++abstract class MpscProgressiveChunkedQueuePad1<E> extends AbstractQueue<E> implements IndexedQueue
++{
++    long p01, p02, p03, p04, p05, p06, p07;
++    long p10, p11, p12, p13, p14, p15, p16, p17;
++
++    static final class AtomicChunk<E>
++    {
++        final static int NIL_CHUNK_INDEX = -1;
++        private static final long PREV_OFFSET = fieldOffset(AtomicChunk.class, "prev");
++        private static final long NEXT_OFFSET = fieldOffset(AtomicChunk.class, "next");
++        private static final long INDEX_OFFSET = fieldOffset(AtomicChunk.class, "index");
++        private volatile AtomicChunk<E> prev;
++        private volatile long index;
++        private volatile AtomicChunk<E> next;
++        private final E[] buffer;
++        private final boolean pooled;
++
++        AtomicChunk(long index, AtomicChunk<E> prev, int size, boolean pooled)
++        {
++            buffer = CircularArrayOffsetCalculator.allocate(size);
++            spNext(null);
++            spPrev(prev);
++            spIndex(index);
++            this.pooled = pooled;
++        }
++
++        final AtomicChunk<E> lvNext()
++        {
++            return next;
++        }
++
++        final AtomicChunk<E> lpPrev()
++        {
++            return (AtomicChunk<E>) UNSAFE.getObject(this, PREV_OFFSET);
++        }
++
++        final long lvIndex()
++        {
++            return index;
++        }
++
++        final void soIndex(long index)
++        {
++            UNSAFE.putOrderedLong(this, INDEX_OFFSET, index);
++        }
++
++        final void spIndex(long index)
++        {
++            UNSAFE.putLong(this, INDEX_OFFSET, index);
++        }
++
++        final void soNext(AtomicChunk<E> value)
++        {
++            UNSAFE.putOrderedObject(this, NEXT_OFFSET, value);
++        }
++
++        final void spNext(AtomicChunk<E> value)
++        {
++            UNSAFE.putObject(this, NEXT_OFFSET, value);
++        }
++
++        final void spPrev(AtomicChunk<E> value)
++        {
++            UNSAFE.putObject(this, PREV_OFFSET, value);
++        }
++
++        final void soElement(int index, E e)
++        {
++            UnsafeRefArrayAccess.soElement(buffer, UnsafeRefArrayAccess.calcElementOffset(index), e);
++        }
++
++        final void spElement(int index, E e)
++        {
++            UnsafeRefArrayAccess.spElement(buffer, UnsafeRefArrayAccess.calcElementOffset(index), e);
++        }
++
++        final E lvElement(int index)
++        {
++            return UnsafeRefArrayAccess.lvElement(buffer, UnsafeRefArrayAccess.calcElementOffset(index));
++        }
++
++        public boolean isPooled()
++        {
++            return pooled;
++        }
++    }
++}
++
++// $gen:ordered-fields
++abstract class MpscProgressiveChunkedQueueProducerFields<E> extends MpscProgressiveChunkedQueuePad1<E>
++{
++    private final static long P_INDEX_OFFSET =
++        fieldOffset(MpscProgressiveChunkedQueueProducerFields.class, "producerIndex");
++    private volatile long producerIndex;
++
++    @Override
++    public final long lvProducerIndex()
++    {
++        return producerIndex;
++    }
++
++    final long getAndIncrementProducerIndex()
++    {
++        return UNSAFE.getAndAddLong(this, P_INDEX_OFFSET, 1);
++    }
++
++    final long getAndAddProducerIndex(long delta)
++    {
++        return UNSAFE.getAndAddLong(this, P_INDEX_OFFSET, delta);
++    }
++}
++
++abstract class MpscProgressiveChunkedQueuePad2<E> extends MpscProgressiveChunkedQueueProducerFields<E>
++{
++    long p01, p02, p03, p04, p05, p06, p07, p08;
++    long p10, p11, p12, p13, p14, p15, p16;
++}
++
++// $gen:ordered-fields
++abstract class MpscProgressiveChunkedQueueProducerBuffer<E> extends MpscProgressiveChunkedQueuePad2<E>
++{
++    private static final long P_BUFFER_OFFSET =
++        fieldOffset(MpscProgressiveChunkedQueueProducerBuffer.class, "producerBuffer");
++    private static final long P_CHUNK_INDEX_OFFSET =
++        fieldOffset(MpscProgressiveChunkedQueueProducerBuffer.class, "producerChunkIndex");
++
++    private volatile AtomicChunk<E> producerBuffer;
++    private volatile long producerChunkIndex;
++
++
++    final long lvProducerChunkIndex()
++    {
++        return producerChunkIndex;
++    }
++
++    final boolean casProducerChunkIndex(long expected, long value)
++    {
++        return UNSAFE.compareAndSwapLong(this, P_CHUNK_INDEX_OFFSET, expected, value);
++    }
++
++    final void soProducerChunkIndex(long value)
++    {
++        UNSAFE.putOrderedLong(this, P_CHUNK_INDEX_OFFSET, value);
++    }
++
++    final AtomicChunk<E> lvProducerBuffer()
++    {
++        return this.producerBuffer;
++    }
++
++    final void soProducerBuffer(AtomicChunk<E> buffer)
++    {
++        UNSAFE.putOrderedObject(this, P_BUFFER_OFFSET, buffer);
++    }
++}
++
++abstract class MpscProgressiveChunkedQueuePad3<E> extends MpscProgressiveChunkedQueueProducerBuffer<E>
++{
++    long p0, p1, p2, p3, p4, p5, p6, p7;
++    long p10, p11, p12, p13, p14, p15, p16;
++}
++
++// $gen:ordered-fields
++abstract class MpscProgressiveChunkedQueueConsumerFields<E> extends MpscProgressiveChunkedQueuePad3<E>
++{
++    private final static long C_INDEX_OFFSET =
++        fieldOffset(MpscProgressiveChunkedQueueConsumerFields.class, "consumerIndex");
++
++    private volatile long consumerIndex;
++    protected AtomicChunk<E> consumerBuffer;
++
++    @Override
++    public final long lvConsumerIndex()
++    {
++        return consumerIndex;
++    }
++
++    final long lpConsumerIndex()
++    {
++        return UNSAFE.getLong(this, C_INDEX_OFFSET);
++    }
++
++    final void soConsumerIndex(long newValue)
++    {
++        UNSAFE.putOrderedLong(this, C_INDEX_OFFSET, newValue);
++    }
++}
++
++abstract class MpscProgressiveChunkedQueuePad4<E> extends MpscProgressiveChunkedQueueConsumerFields<E>
++{
++    long p0, p1, p2, p3, p4, p5, p6, p7;
++    long p10, p11, p12, p13, p14, p15, p16;
++}
++
++/**
++ * An MPSC array queue which starts at <i>initialCapacity</i> and grows unbounded in linked chunks.<br>
++ * Differently from {@link MpscUnboundedArrayQueue} it is designed to provide a better scaling when more
++ * producers are concurrently offering.
++ *
++ * @param <E>
++ * @author https://github.com/franz1981
++ */
++public class MpscUnboundedXaddArrayQueue<E> extends MpscProgressiveChunkedQueuePad4<E>
++    implements MessagePassingQueue<E>, QueueProgressIndicators
++{
++    private static final long ROTATION = -2;
++    private final int chunkMask;
++    private final int chunkShift;
++    private final SpscArrayQueue<AtomicChunk<E>> freeBuffer;
++
++    public MpscUnboundedXaddArrayQueue(int chunkSize, int maxPooledChunks)
++    {
++        chunkSize = Pow2.roundToPowerOfTwo(chunkSize);
++        final AtomicChunk<E> first = new AtomicChunk(0, null, chunkSize, true);
++        soProducerBuffer(first);
++        soProducerChunkIndex(0);
++        consumerBuffer = first;
++        chunkMask = chunkSize - 1;
++        chunkShift = Integer.numberOfTrailingZeros(chunkSize);
++        freeBuffer = new SpscArrayQueue<AtomicChunk<E>>(maxPooledChunks + 1);
++        for (int i = 0; i < maxPooledChunks; i++)
++        {
++            freeBuffer.offer(new AtomicChunk(AtomicChunk.NIL_CHUNK_INDEX, null, chunkSize, true));
++        }
++    }
++
++    public MpscUnboundedXaddArrayQueue(int chunkSize)
++    {
++        this(chunkSize, 1);
++    }
++
++    private AtomicChunk<E> producerBufferOf(AtomicChunk<E> producerBuffer, long expectedChunkIndex)
++    {
++        long jumpBackward;
++        while (true)
++        {
++            if (producerBuffer == null)
++            {
++                producerBuffer = lvProducerBuffer();
++            }
++            final long producerChunkIndex = producerBuffer.lvIndex();
++            if (producerChunkIndex == AtomicChunk.NIL_CHUNK_INDEX)
++            {
++                //force an attempt to fetch it another time
++                producerBuffer = null;
++                continue;
++            }
++            jumpBackward = producerChunkIndex - expectedChunkIndex;
++            if (jumpBackward >= 0)
++            {
++                break;
++            }
++            //try validate against the last producer chunk index
++            if (lvProducerChunkIndex() == producerChunkIndex)
++            {
++                producerBuffer = appendNextChunks(producerBuffer, producerChunkIndex, chunkMask + 1, -jumpBackward);
++            }
++            else
++            {
++                producerBuffer = null;
++            }
++        }
++        for (long i = 0; i < jumpBackward; i++)
++        {
++            //prev cannot be null, because is being released by index
++            producerBuffer = producerBuffer.lpPrev();
++            assert producerBuffer != null;
++        }
++        assert producerBuffer.lvIndex() == expectedChunkIndex;
++        return producerBuffer;
++    }
++
++    private AtomicChunk<E> appendNextChunks(AtomicChunk<E> producerBuffer, long chunkIndex, int chunkSize, long chunks)
++    {
++        assert chunkIndex != AtomicChunk.NIL_CHUNK_INDEX;
++        //prevent other concurrent attempts on appendNextChunk
++        if (!casProducerChunkIndex(chunkIndex, ROTATION))
++        {
++            return null;
++        }
++        AtomicChunk<E> newChunk = null;
++        for (long i = 1; i <= chunks; i++)
++        {
++            final long nextChunkIndex = chunkIndex + i;
++            newChunk = freeBuffer.poll();
++            if (newChunk != null)
++            {
++                //single-writer: producerBuffer::index == nextChunkIndex is protecting it
++                assert newChunk.lvIndex() == AtomicChunk.NIL_CHUNK_INDEX;
++                newChunk.spPrev(producerBuffer);
++                //index set is releasing prev, allowing other pending offers to continue
++                newChunk.soIndex(nextChunkIndex);
++            }
++            else
++            {
++                newChunk = new AtomicChunk<E>(nextChunkIndex, producerBuffer, chunkSize, false);
++            }
++            soProducerBuffer(newChunk);
++            //link the next chunk only when finished
++            producerBuffer.soNext(newChunk);
++            producerBuffer = newChunk;
++        }
++        soProducerChunkIndex(chunkIndex + chunks);
++        return newChunk;
++    }
++
++    @Override
++    public long currentProducerIndex()
++    {
++        return lvProducerIndex();
++    }
++
++    @Override
++    public long currentConsumerIndex()
++    {
++        return lvConsumerIndex();
++    }
++
++    protected void onProducerReservation(long index)
++    {
++    }
++
++    @Override
++    public boolean offer(E e)
++    {
++        if (null == e)
++        {
++            throw new NullPointerException();
++        }
++        final int chunkMask = this.chunkMask;
++        final int chunkShift = this.chunkShift;
++        final long producerSeq = getAndIncrementProducerIndex();
++        onProducerReservation(producerSeq);
++        final int pOffset = (int) (producerSeq & chunkMask);
++        final long chunkIndex = producerSeq >> chunkShift;
++        AtomicChunk<E> producerBuffer = lvProducerBuffer();
++        if (producerBuffer.lvIndex() != chunkIndex)
++        {
++            producerBuffer = producerBufferOf(producerBuffer, chunkIndex);
++        }
++        producerBuffer.soElement(pOffset, e);
++        return true;
++    }
++
++    private static <E> E spinForElement(AtomicChunk<E> chunk, int offset)
++    {
++        E e;
++        while ((e = chunk.lvElement(offset)) == null)
++        {
++
++        }
++        return e;
++    }
++
++    private AtomicChunk<E> spinForNextIfNotEmpty(AtomicChunk<E> consumerBuffer, long consumerIndex)
++    {
++        AtomicChunk<E> next = consumerBuffer.lvNext();
++        if (next == null)
++        {
++            if (lvProducerIndex() == consumerIndex)
++            {
++                return null;
++            }
++            while ((next = consumerBuffer.lvNext()) == null)
++            {
++
++            }
++        }
++        return next;
++    }
++
++
++    private AtomicChunk<E> pollNextBuffer(AtomicChunk<E> consumerBuffer, long consumerIndex)
++    {
++        final AtomicChunk<E> next = spinForNextIfNotEmpty(consumerBuffer, consumerIndex);
++        if (next == null)
++        {
++            return null;
++        }
++        //save from nepotism
++        consumerBuffer.spNext(null);
++        //change the chunkIndex to a non valid value
++        //to stop offering threads to use this buffer
++        consumerBuffer.soIndex(AtomicChunk.NIL_CHUNK_INDEX);
++        if (consumerBuffer.isPooled())
++        {
++            final boolean pooled = freeBuffer.offer(consumerBuffer);
++            assert pooled;
++        }
++        next.spPrev(null);
++        return next;
++    }
++
++    @Override
++    public E poll()
++    {
++        final int chunkMask = this.chunkMask;
++        final long consumerIndex = this.lpConsumerIndex();
++        AtomicChunk<E> consumerBuffer = this.consumerBuffer;
++        final int consumerOffset = (int) (consumerIndex & chunkMask);
++        final int chunkSize = chunkMask + 1;
++        final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++        if (firstElementOfNewChunk)
++        {
++            consumerBuffer = pollNextBuffer(consumerBuffer, consumerIndex);
++            if (consumerBuffer == null)
++            {
++                return null;
++            }
++            this.consumerBuffer = consumerBuffer;
++        }
++        else
++        {
++            final E e = consumerBuffer.lvElement(consumerOffset);
++            if (e != null)
++            {
++                consumerBuffer.spElement(consumerOffset, null);
++                soConsumerIndex(consumerIndex + 1);
++                return e;
++            }
++            if (lvProducerIndex() == consumerIndex)
++            {
++                return null;
++            }
++        }
++        final E e = spinForElement(consumerBuffer, consumerOffset);
++        consumerBuffer.spElement(consumerOffset, null);
++        soConsumerIndex(consumerIndex + 1);
++        return e;
++    }
++
++    @Override
++    public E peek()
++    {
++        final int chunkMask = this.chunkMask;
++        final long consumerIndex = this.lpConsumerIndex();
++        AtomicChunk<E> consumerBuffer = this.consumerBuffer;
++        final int consumerOffset = (int) (consumerIndex & chunkMask);
++        final int chunkSize = chunkMask + 1;
++        final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++        if (firstElementOfNewChunk)
++        {
++            final AtomicChunk<E> next = spinForNextIfNotEmpty(consumerBuffer, consumerIndex);
++            if (next == null)
++            {
++                return null;
++            }
++            consumerBuffer = next;
++        }
++        else
++        {
++            final E e = consumerBuffer.lvElement(consumerOffset);
++            if (e != null)
++            {
++                return e;
++            }
++            if (lvProducerIndex() == consumerIndex)
++            {
++                return null;
++            }
++        }
++        return spinForElement(consumerBuffer, consumerOffset);
++    }
++
++    @Override
++    public Iterator<E> iterator()
++    {
++        throw new UnsupportedOperationException();
++    }
++
++    @Override
++    public int size()
++    {
++        return IndexedQueueSizeUtil.size(this);
++    }
++
++    @Override
++    public int capacity()
++    {
++        return MessagePassingQueue.UNBOUNDED_CAPACITY;
++    }
++
++    @Override
++    public boolean relaxedOffer(E e)
++    {
++        return offer(e);
++    }
++
++    private AtomicChunk<E> relaxedPollNextBuffer(AtomicChunk<E> consumerBuffer)
++    {
++        final AtomicChunk<E> next = consumerBuffer.lvNext();
++        if (next == null)
++        {
++            return null;
++        }
++        //save from nepotism
++        consumerBuffer.spNext(null);
++        //change the chunkIndex to a non valid value
++        //to stop offering threads to use this buffer
++        consumerBuffer.soIndex(AtomicChunk.NIL_CHUNK_INDEX);
++        if (consumerBuffer.isPooled())
++        {
++            final boolean pooled = freeBuffer.offer(consumerBuffer);
++            assert pooled;
++        }
++        next.spPrev(null);
++        return next;
++    }
++
++    @Override
++    public E relaxedPoll()
++    {
++        final int chunkMask = this.chunkMask;
++        final long consumerIndex = this.lpConsumerIndex();
++        AtomicChunk<E> consumerBuffer = this.consumerBuffer;
++        final int consumerOffset = (int) (consumerIndex & chunkMask);
++        final int chunkSize = chunkMask + 1;
++        final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++        E e;
++        if (firstElementOfNewChunk)
++        {
++            consumerBuffer = relaxedPollNextBuffer(consumerBuffer);
++            if (consumerBuffer == null)
++            {
++                return null;
++            }
++            this.consumerBuffer = consumerBuffer;
++            //the element can't be null from now on
++            e = spinForElement(consumerBuffer, 0);
++        }
++        else
++        {
++            e = consumerBuffer.lvElement(consumerOffset);
++            if (e == null)
++            {
++                return null;
++            }
++        }
++        consumerBuffer.spElement(consumerOffset, null);
++        soConsumerIndex(consumerIndex + 1);
++        return e;
++    }
++
++    @Override
++    public E relaxedPeek()
++    {
++        final int chunkMask = this.chunkMask;
++        final long consumerIndex = this.lpConsumerIndex();
++        AtomicChunk<E> consumerBuffer = this.consumerBuffer;
++        final int consumerOffset = (int) (consumerIndex & chunkMask);
++        final int chunkSize = chunkMask + 1;
++        final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++        if (firstElementOfNewChunk)
++        {
++            final AtomicChunk<E> next = consumerBuffer.lvNext();
++            if (next == null)
++            {
++                return null;
++            }
++            consumerBuffer = next;
++        }
++        return consumerBuffer.lvElement(consumerOffset);
++    }
++
++    @Override
++    public int drain(Consumer<E> c)
++    {
++        return drain(c, chunkMask + 1);
++    }
++
++    @Override
++    public int fill(Supplier<E> s)
++    {
++        long result = 0;// result is a long because we want to have a safepoint check at regular intervals
++        final int capacity = chunkMask + 1;
++        final int offerBatch = Math.min(PortableJvmInfo.RECOMENDED_OFFER_BATCH, capacity);
++        do
++        {
++            final int filled = fill(s, offerBatch);
++            if (filled == 0)
++            {
++                return (int) result;
++            }
++            result += filled;
++        }
++        while (result <= capacity);
++        return (int) result;
++    }
++
++    @Override
++    public int drain(Consumer<E> c, int limit)
++    {
++        final int chunkMask = this.chunkMask;
++        final int chunkSize = chunkMask + 1;
++        long consumerIndex = this.lpConsumerIndex();
++        AtomicChunk<E> consumerBuffer = this.consumerBuffer;
++
++        for (int i = 0; i < limit; i++)
++        {
++            final int consumerOffset = (int) (consumerIndex & chunkMask);
++            final boolean firstElementOfNewChunk = consumerOffset == 0 && consumerIndex >= chunkSize;
++            E e;
++            if (firstElementOfNewChunk)
++            {
++                consumerBuffer = relaxedPollNextBuffer(consumerBuffer);
++                if (consumerBuffer == null)
++                {
++                    return i;
++                }
++                this.consumerBuffer = consumerBuffer;
++                e = spinForElement(consumerBuffer, 0);
++            }
++            else
++            {
++                e = consumerBuffer.lvElement(consumerOffset);
++                if (e == null)
++                {
++                    return i;
++                }
++            }
++            consumerBuffer.spElement(consumerOffset, null);
++            final long nextConsumerIndex = consumerIndex + 1;
++            soConsumerIndex(nextConsumerIndex);
++            c.accept(e);
++            consumerIndex = nextConsumerIndex;
++        }
++        return limit;
++    }
++
++    @Override
++    public int fill(Supplier<E> s, int limit)
++    {
++        final int chunkShift = this.chunkShift;
++        final int chunkMask = this.chunkMask;
++        long producerSeq = getAndAddProducerIndex(limit);
++        AtomicChunk<E> producerBuffer = null;
++        for (int i = 0; i < limit; i++)
++        {
++            final int pOffset = (int) (producerSeq & chunkMask);
++            final long chunkIndex = producerSeq >> chunkShift;
++            if (producerBuffer == null || producerBuffer.lvIndex() != chunkIndex)
++            {
++                producerBuffer = producerBufferOf(producerBuffer, chunkIndex);
++            }
++            producerBuffer.soElement(pOffset, s.get());
++            producerSeq++;
++        }
++        return limit;
++    }
++
++    @Override
++    public void drain(Consumer<E> c, WaitStrategy wait, ExitCondition exit)
++    {
++        MessagePassingQueueUtil.drain(this, c, wait, exit);
++    }
++
++    @Override
++    public void fill(Supplier<E> s, WaitStrategy wait, ExitCondition exit)
++    {
++        while (exit.keepRunning())
++        {
++            fill(s, PortableJvmInfo.RECOMENDED_OFFER_BATCH);
++        }
++    }
++
++    @Override
++    public String toString()
++    {
++        return this.getClass().getName();
++    }
++
++}
+diff --git a/jctools-core/src/main/java/org/jctools/queues/atomic/BaseMpscLinkedAtomicArrayQueue.java b/jctools-core/src/main/java/org/jctools/queues/atomic/BaseMpscLinkedAtomicArrayQueue.java
+index 7edf95e..f687df1 100644
+--- a/jctools-core/src/main/java/org/jctools/queues/atomic/BaseMpscLinkedAtomicArrayQueue.java
++++ b/jctools-core/src/main/java/org/jctools/queues/atomic/BaseMpscLinkedAtomicArrayQueue.java
+@@ -159,6 +159,8 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+     // No post padding here, subclasses must add
+     private static final Object JUMP = new Object();
+ 
++    private static final Object BUFFER_CONSUMED = new Object();
++
+     private static final int CONTINUE_TO_P_INDEX_CAS = 0;
+ 
+     private static final int RETRY = 1;
+@@ -186,11 +188,6 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+         soProducerLimit(mask);
+     }
+ 
+-    @Override
+-    public final Iterator<E> iterator() {
+-        throw new UnsupportedOperationException();
+-    }
+-
+     @Override
+     public final int size() {
+         // NOTE: because indices are on even numbers we cannot use the size util.
+@@ -260,7 +257,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+                     case QUEUE_FULL:
+                         return false;
+                     case QUEUE_RESIZE:
+-                        resize(mask, buffer, pIndex, e);
++                        resize(mask, buffer, pIndex, e, null);
+                         return true;
+                 }
+             }
+@@ -300,7 +297,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+             }
+         }
+         if (e == JUMP) {
+-            final AtomicReferenceArray<E> nextBuffer = getNextBuffer(buffer, mask);
++            final AtomicReferenceArray<E> nextBuffer = nextBuffer(buffer, mask);
+             return newBufferPoll(nextBuffer, index);
+         }
+         // release element null
+@@ -331,7 +328,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+             } while (e == null);
+         }
+         if (e == JUMP) {
+-            return newBufferPeek(getNextBuffer(buffer, mask), index);
++            return newBufferPeek(nextBuffer(buffer, mask), index);
+         }
+         return (E) e;
+     }
+@@ -370,10 +367,12 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+     protected abstract long availableInQueue(long pIndex, long cIndex);
+ 
+     @SuppressWarnings("unchecked")
+-    private AtomicReferenceArray<E> getNextBuffer(final AtomicReferenceArray<E> buffer, final long mask) {
++    private AtomicReferenceArray<E> nextBuffer(final AtomicReferenceArray<E> buffer, final long mask) {
+         final int offset = nextArrayOffset(mask);
+         final AtomicReferenceArray<E> nextBuffer = (AtomicReferenceArray<E>) lvElement(buffer, offset);
+-        soElement(buffer, offset, null);
++        consumerBuffer = nextBuffer;
++        consumerMask = (length(nextBuffer) - 2) << 1;
++        soElement(buffer, offset, BUFFER_CONSUMED);
+         return nextBuffer;
+     }
+ 
+@@ -382,7 +381,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+     }
+ 
+     private E newBufferPoll(AtomicReferenceArray<E> nextBuffer, long index) {
+-        final int offset = newBufferAndOffset(nextBuffer, index);
++        final int offset = modifiedCalcElementOffset(index, consumerMask);
+         // LoadLoad
+         final E n = lvElement(nextBuffer, offset);
+         if (n == null) {
+@@ -395,7 +394,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+     }
+ 
+     private E newBufferPeek(AtomicReferenceArray<E> nextBuffer, long index) {
+-        final int offset = newBufferAndOffset(nextBuffer, index);
++        final int offset = modifiedCalcElementOffset(index, consumerMask);
+         // LoadLoad
+         final E n = lvElement(nextBuffer, offset);
+         if (null == n) {
+@@ -404,12 +403,6 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+         return n;
+     }
+ 
+-    private int newBufferAndOffset(AtomicReferenceArray<E> nextBuffer, long index) {
+-        consumerBuffer = nextBuffer;
+-        consumerMask = (length(nextBuffer) - 2) << 1;
+-        return modifiedCalcElementOffset(index, consumerMask);
+-    }
+-
+     @Override
+     public long currentProducerIndex() {
+         return lvProducerIndex() / 2;
+@@ -441,7 +434,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+             return null;
+         }
+         if (e == JUMP) {
+-            final AtomicReferenceArray<E> nextBuffer = getNextBuffer(buffer, mask);
++            final AtomicReferenceArray<E> nextBuffer = nextBuffer(buffer, mask);
+             return newBufferPoll(nextBuffer, index);
+         }
+         soElement(buffer, offset, null);
+@@ -459,7 +452,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+         // LoadLoad
+         Object e = lvElement(buffer, offset);
+         if (e == JUMP) {
+-            return newBufferPeek(getNextBuffer(buffer, mask), index);
++            return newBufferPeek(nextBuffer(buffer, mask), index);
+         }
+         return (E) e;
+     }
+@@ -511,7 +504,7 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+                     case QUEUE_FULL:
+                         return 0;
+                     case QUEUE_RESIZE:
+-                        resize(mask, buffer, pIndex, s.get());
++                        resize(mask, buffer, pIndex, null, s);
+                         return 1;
+                 }
+             }
+@@ -571,16 +564,102 @@ public abstract class BaseMpscLinkedAtomicArrayQueue<E> extends BaseMpscLinkedAt
+         }
+     }
+ 
+-    private void resize(long oldMask, AtomicReferenceArray<E> oldBuffer, long pIndex, E e) {
++    /**
++     * Get an iterator for this queue. This method is thread safe.
++     * <p>
++     * The iterator provides a best-effort snapshot of the elements in the queue.
++     * The returned iterator is not guaranteed to return elements in queue order,
++     * and races with the consumer thread may cause gaps in the sequence of returned elements.
++     * Like {link #relaxedPoll}, the iterator may not immediately return newly inserted elements.
++     * 
++     * @return The iterator.
++     */
++    @Override
++    public Iterator<E> iterator() {
++        return new WeakIterator();
++    }
++
++    /**
++ * NOTE: This class was automatically generated by org.jctools.queues.atomic.JavaParsingAtomicLinkedQueueGenerator
++ * which can found in the jctools-build module. The original source file is BaseMpscLinkedArrayQueue.java.
++ */
++    private final class WeakIterator implements Iterator<E> {
++
++        private long nextIndex;
++
++        private E nextElement;
++
++        private AtomicReferenceArray<E> currentBuffer;
++
++        private int currentBufferLength;
++
++        WeakIterator() {
++            setBuffer(consumerBuffer);
++            nextElement = getNext();
++        }
++
++        @Override
++        public boolean hasNext() {
++            return nextElement != null;
++        }
++
++        @Override
++        public E next() {
++            if (nextElement == null) {
++                throw new java.util.NoSuchElementException();
++            }
++            E e = nextElement;
++            nextElement = getNext();
++            return e;
++        }
++
++        private void setBuffer(AtomicReferenceArray<E> buffer) {
++            this.currentBuffer = buffer;
++            this.currentBufferLength = length(buffer);
++            this.nextIndex = 0;
++        }
++
++        private E getNext() {
++            while (true) {
++                while (nextIndex < currentBufferLength - 1) {
++                    int offset = calcElementOffset(nextIndex++);
++                    E e = lvElement(currentBuffer, offset);
++                    if (e != null && e != JUMP) {
++                        return e;
++                    }
++                }
++                int offset = calcElementOffset(currentBufferLength - 1);
++                Object nextArray = lvElement(currentBuffer, offset);
++                if (nextArray == BUFFER_CONSUMED) {
++                    //Consumer may have passed us, just jump to the current consumer buffer
++                    setBuffer(consumerBuffer);
++                } else if (nextArray != null) {
++                    setBuffer((AtomicReferenceArray<E>) nextArray);
++                } else {
++                    return null;
++                }
++            }
++        }
++    }
++
++    private void resize(long oldMask, AtomicReferenceArray<E> oldBuffer, long pIndex, E e, Supplier<E> s) {
++        assert (e != null && s == null) || (e == null || s != null);
+         int newBufferLength = getNextBufferSize(oldBuffer);
+-        final AtomicReferenceArray<E> newBuffer = allocate(newBufferLength);
++        final AtomicReferenceArray<E> newBuffer;
++        try {
++            newBuffer = allocate(newBufferLength);
++        } catch (OutOfMemoryError oom) {
++            assert lvProducerIndex() == pIndex + 1;
++            soProducerIndex(pIndex);
++            throw oom;
++        }
+         producerBuffer = newBuffer;
+         final int newMask = (newBufferLength - 2) << 1;
+         producerMask = newMask;
+         final int offsetInOld = modifiedCalcElementOffset(pIndex, oldMask);
+         final int offsetInNew = modifiedCalcElementOffset(pIndex, newMask);
+         // element in new array
+-        soElement(newBuffer, offsetInNew, e);
++        soElement(newBuffer, offsetInNew, e == null ? s.get() : e);
+         // buffer linked
+         soElement(oldBuffer, nextArrayOffset(oldMask), newBuffer);
+         // ASSERT code
+diff --git a/jctools-core/src/main/java/org/jctools/queues/atomic/LinkedAtomicArrayQueueUtil.java b/jctools-core/src/main/java/org/jctools/queues/atomic/LinkedAtomicArrayQueueUtil.java
+index c606b98..2ff01de 100644
+--- a/jctools-core/src/main/java/org/jctools/queues/atomic/LinkedAtomicArrayQueueUtil.java
++++ b/jctools-core/src/main/java/org/jctools/queues/atomic/LinkedAtomicArrayQueueUtil.java
+@@ -55,6 +55,11 @@ final class LinkedAtomicArrayQueueUtil
+     {
+         return (int) (index & mask) >> 1;
+     }
++    
++    static int calcElementOffset(long index)
++    {
++        return (int) index;
++    }
+ 
+     static int nextArrayOffset(AtomicReferenceArray<?> curr)
+     {
+diff --git a/jctools-core/src/main/java/org/jctools/queues/atomic/MpscAtomicArrayQueue.java b/jctools-core/src/main/java/org/jctools/queues/atomic/MpscAtomicArrayQueue.java
+index 0bb5cc3..712fbea 100644
+--- a/jctools-core/src/main/java/org/jctools/queues/atomic/MpscAtomicArrayQueue.java
++++ b/jctools-core/src/main/java/org/jctools/queues/atomic/MpscAtomicArrayQueue.java
+@@ -14,6 +14,7 @@
+ package org.jctools.queues.atomic;
+ 
+ import org.jctools.util.PortableJvmInfo;
++import java.util.Iterator;
+ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+ import java.util.concurrent.atomic.AtomicReferenceArray;
+ import java.util.concurrent.atomic.AtomicLongArray;
+@@ -533,6 +534,68 @@ public class MpscAtomicArrayQueue<E> extends MpscAtomicArrayQueueL3Pad<E> {
+         }
+     }
+ 
++    /**
++     * Get an iterator for this queue. This method is thread safe.
++     * <p>
++     * The iterator provides a best-effort snapshot of the elements in the queue.
++     * The returned iterator is not guaranteed to return elements in queue order,
++     * and races with the consumer thread may cause gaps in the sequence of returned elements.
++     * Like {link #relaxedPoll}, the iterator may not immediately return newly inserted elements.
++     * 
++     * @return The iterator.
++     */
++    @Override
++    public final Iterator<E> iterator() {
++        final long cIndex = lvConsumerIndex();
++        final long pIndex = lvProducerIndex();
++        return new WeakIterator(cIndex, pIndex);
++    }
++
++    /**
++ * NOTE: This class was automatically generated by org.jctools.queues.atomic.JavaParsingAtomicArrayQueueGenerator
++ * which can found in the jctools-build module. The original source file is MpscArrayQueue.java.
++ */
++    private final class WeakIterator implements Iterator<E> {
++
++        private final long pIndex;
++
++        private long nextIndex;
++
++        private E nextElement;
++
++        WeakIterator(long cIndex, long pIndex) {
++            this.nextIndex = cIndex;
++            this.pIndex = pIndex;
++            nextElement = getNext();
++        }
++
++        @Override
++        public boolean hasNext() {
++            return nextElement != null;
++        }
++
++        @Override
++        public E next() {
++            if (nextElement == null) {
++                throw new java.util.NoSuchElementException();
++            }
++            E e = nextElement;
++            nextElement = getNext();
++            return e;
++        }
++
++        private E getNext() {
++            while (nextIndex < pIndex) {
++                int offset = calcElementOffset(nextIndex++);
++                E e = lvElement(buffer, offset);
++                if (e != null) {
++                    return e;
++                }
++            }
++            return null;
++        }
++    }
++
+     /**
+      * @deprecated This was renamed to failFastOffer please migrate
+      */
+diff --git a/jctools-core/src/main/java/org/jctools/queues/atomic/MpscLinkedAtomicQueue.java b/jctools-core/src/main/java/org/jctools/queues/atomic/MpscLinkedAtomicQueue.java
+index 3fdf98c..4a8e9d9 100644
+--- a/jctools-core/src/main/java/org/jctools/queues/atomic/MpscLinkedAtomicQueue.java
++++ b/jctools-core/src/main/java/org/jctools/queues/atomic/MpscLinkedAtomicQueue.java
+@@ -42,7 +42,7 @@ import org.jctools.queues.MpmcArrayQueue;
+  * @param <E> the type of elements in this queue
+  * @author nitsanw
+  */
+-public final class MpscLinkedAtomicQueue<E> extends BaseLinkedAtomicQueue<E> {
++public class MpscLinkedAtomicQueue<E> extends BaseLinkedAtomicQueue<E> {
+ 
+     public MpscLinkedAtomicQueue() {
+         LinkedQueueAtomicNode<E> node = newNode();
+diff --git a/jctools-core/src/main/java/org/jctools/queues/package-info.java b/jctools-core/src/main/java/org/jctools/queues/package-info.java
+index ac89277..6697859 100644
+--- a/jctools-core/src/main/java/org/jctools/queues/package-info.java
++++ b/jctools-core/src/main/java/org/jctools/queues/package-info.java
+@@ -29,7 +29,7 @@
+  * <br>
+  * <b>Limited Queue methods support:</b><br>
+  * The queues implement a subset of the {@link java.util.Queue} interface which is documented under the
+- * {@link org.jctools.queues.MessagePassingQueue} interface. In particular {@link java.util.Queue#iterator()} is not
++ * {@link org.jctools.queues.MessagePassingQueue} interface. In particular {@link java.util.Queue#iterator()} is usually not
+  * supported and dependent methods from {@link java.util.AbstractQueue} are also not supported such as:
+  * <ol>
+  * <li>{@link java.util.Queue#remove(Object)}
+@@ -38,6 +38,7 @@
+  * <li>{@link java.util.Queue#contains(Object)}
+  * <li>{@link java.util.Queue#containsAll(java.util.Collection)}
+  * </ol>
++ * A few queues do support a limited form of iteration. This support is documented in the Javadoc of the relevant queues.
+  * <p>
+  * <br>
+  * <b>Memory layout controls and False Sharing:</b><br>
+diff --git a/jctools-core/src/main/java/org/jctools/util/UnsafeRefArrayAccess.java b/jctools-core/src/main/java/org/jctools/util/UnsafeRefArrayAccess.java
+index e9f2671..b959d34 100644
+--- a/jctools-core/src/main/java/org/jctools/util/UnsafeRefArrayAccess.java
++++ b/jctools-core/src/main/java/org/jctools/util/UnsafeRefArrayAccess.java
+@@ -48,7 +48,7 @@ public final class UnsafeRefArrayAccess
+         }
+         else
+         {
+-            throw new IllegalStateException("Unknown pointer size");
++            throw new IllegalStateException("Unknown pointer size: " + scale);
+         }
+         REF_ARRAY_BASE = UnsafeAccess.UNSAFE.arrayBaseOffset(Object[].class);
+     }
+diff --git a/jctools-experimental/src/main/java/org/jctools/queues/blocking/McParkTakeStrategy.java b/jctools-experimental/src/main/java/org/jctools/queues/blocking/McParkTakeStrategy.java
+index 6bcd3fb..7844300 100644
+--- a/jctools-experimental/src/main/java/org/jctools/queues/blocking/McParkTakeStrategy.java
++++ b/jctools-experimental/src/main/java/org/jctools/queues/blocking/McParkTakeStrategy.java
+@@ -3,32 +3,27 @@ package org.jctools.queues.blocking;
+ import org.jctools.queues.spec.ConcurrentQueueSpec;
+ 
+ import java.util.Queue;
+-import java.util.concurrent.locks.Condition;
+-import java.util.concurrent.locks.ReentrantLock;
++import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+ 
+ public final class McParkTakeStrategy<E> implements TakeStrategy<E>
+ {
+-    private final ReentrantLock lock = new ReentrantLock();
+-    private final Condition cond = lock.newCondition();
+-
+-    private int waiters = 0;
++    private static final AtomicLongFieldUpdater<McParkTakeStrategy> WAITERS_UPDATER = AtomicLongFieldUpdater.newUpdater(McParkTakeStrategy.class, "waiters");
++    private volatile long waiters = 0;
++    private final Object obj = new Object();
+ 
+     @Override
+     public void signal()
+     {
+-        ReentrantLock l = lock;
+-        l.lock();
+-        try
++        if (waiters > 0)
+         {
+-            if (waiters>0)
++            synchronized (obj)
+             {
+-                cond.signal();
++                if (waiters > 0)
++                {
++                    obj.notify();
++                }
+             }
+         }
+-        finally
+-        {
+-            l.unlock();
+-        }
+     }
+ 
+     @Override
+@@ -40,20 +35,14 @@ public final class McParkTakeStrategy<E> implements TakeStrategy<E>
+             return e;
+         }
+ 
+-        ReentrantLock l = lock;
+-        l.lock();
+-        try
++        WAITERS_UPDATER.incrementAndGet(this);
++        synchronized (obj)
+         {
+-            while((e = q.poll())==null)
++            while ((e = q.poll()) == null)
+             {
+-                waiters++;
+-                cond.await();
+-                waiters--;
++                obj.wait();
+             }
+-        }
+-        finally
+-        {
+-            l.unlock();
++            WAITERS_UPDATER.decrementAndGet(this);
+         }
+ 
+         return e;
+diff --git a/jctools-experimental/src/main/java/org/jctools/queues/blocking/ScParkTakeStrategy.java b/jctools-experimental/src/main/java/org/jctools/queues/blocking/ScParkTakeStrategy.java
+index 8fd3290..0b7c037 100644
+--- a/jctools-experimental/src/main/java/org/jctools/queues/blocking/ScParkTakeStrategy.java
++++ b/jctools-experimental/src/main/java/org/jctools/queues/blocking/ScParkTakeStrategy.java
+@@ -3,21 +3,25 @@ package org.jctools.queues.blocking;
+ import org.jctools.queues.spec.ConcurrentQueueSpec;
+ 
+ import java.util.Queue;
+-import java.util.concurrent.atomic.AtomicReference;
++import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+ import java.util.concurrent.locks.LockSupport;
+ 
+ public final class ScParkTakeStrategy<E> implements TakeStrategy<E> {
+ 
++    private static final AtomicReferenceFieldUpdater<ScParkTakeStrategy, Thread> WAITING_UPDATER =
++        AtomicReferenceFieldUpdater.newUpdater(ScParkTakeStrategy.class, Thread.class, "waiting");
++
+     public volatile int storeFence = 0;
+ 
+-    private AtomicReference<Thread> t = new AtomicReference<Thread>(null);
++    private volatile Thread waiting = null;
+ 
+     @Override
+-    public void signal() {
++    public void signal()
++    {
+         // Make sure the offer is visible before unpark
+         storeFence = 1; // store load barrier
+ 
+-        LockSupport.unpark(t.get()); // t.get() load barrier
++        LockSupport.unpark(waiting); // t.get() load barrier
+     }
+ 
+     @Override
+@@ -28,7 +32,7 @@ public final class ScParkTakeStrategy<E> implements TakeStrategy<E> {
+         }
+ 
+         Thread currentThread = Thread.currentThread();
+-        t.set(currentThread);
++        waiting = currentThread;
+ 
+         while ((e = q.poll()) == null) {
+             LockSupport.park();
+@@ -38,7 +42,7 @@ public final class ScParkTakeStrategy<E> implements TakeStrategy<E> {
+             }
+         }
+ 
+-        t.lazySet(null);
++        WAITING_UPDATER.lazySet(this, null);
+ 
+         return e;
+     }
