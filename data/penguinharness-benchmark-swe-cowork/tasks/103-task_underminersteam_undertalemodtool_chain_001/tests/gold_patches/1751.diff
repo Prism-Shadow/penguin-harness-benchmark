@@ -1,0 +1,108 @@
+diff --git a/UndertaleModLib/Decompiler/Assembler.cs b/UndertaleModLib/Decompiler/Assembler.cs
+index d936ca1f64a07fbfc80a662719e49de5c15a3f32..9c22dda6d47045c961e8a7065247d626495b0730 100644
+--- a/UndertaleModLib/Decompiler/Assembler.cs
++++ b/UndertaleModLib/Decompiler/Assembler.cs
+@@ -227,8 +227,19 @@ namespace UndertaleModLib.Decompiler
+                         instr.Value = breakId;
+                         if (breakId == -11) // pushref
+                         {
+-                            // parse additional int argument
+-                            instr.IntArgument = Int32.Parse(line);
++                            // Parse additional int argument
++                            if (Int32.TryParse(line, out int intArgument))
++                            {
++                                instr.IntArgument = intArgument;
++                            }
++                            else
++                            {
++                                // Or alternatively parse function!
++                                var f = data.Functions.ByName(line);
++                                if (f == null)
++                                    throw new Exception("Function in pushref not found: " + line);
++                                instr.Function = new UndertaleInstruction.Reference<UndertaleFunction>(f);
++                            }
+                         }
+                     }
+                     else
+diff --git a/UndertaleModLib/Decompiler/Decompiler.cs b/UndertaleModLib/Decompiler/Decompiler.cs
+index 58f6cb6e29c813527689e96b5d056d031a61c9c5..debb704fe1b7c551e1fb84c4de9747f5f1c2fec9 100644
+--- a/UndertaleModLib/Decompiler/Decompiler.cs
++++ b/UndertaleModLib/Decompiler/Decompiler.cs
+@@ -706,6 +706,11 @@ namespace UndertaleModLib.Decompiler
+                                     // Note that this operator peeks from the stack, it does not pop directly.
+                                     break;
+                                 case -11: // GM 2023.8+, pushref
++                                    if (instr.Function != null)
++                                    {
++                                        stack.Push(new ExpressionConstant(UndertaleInstruction.DataType.Int32, instr.Function));
++                                        break;
++                                    }
+                                     stack.Push(new ExpressionAssetRef(instr.IntArgument));
+                                     break;
+                             }
+diff --git a/UndertaleModLib/Decompiler/Disassembler.cs b/UndertaleModLib/Decompiler/Disassembler.cs
+index 5017c6718da0655892498896ed4a97d8feca6873..7d5d63c40015e06dd42cbaa4cf940dc738bef7c3 100644
+--- a/UndertaleModLib/Decompiler/Disassembler.cs
++++ b/UndertaleModLib/Decompiler/Disassembler.cs
+@@ -11,7 +11,7 @@ namespace UndertaleModLib.Decompiler
+     {
+         private static void AppendLocalVarDefinitionsToStringBuilder(StringBuilder sb, UndertaleCode code, IList<UndertaleVariable> vars, UndertaleCodeLocals locals)
+         {
+-            if (code.WeirdLocalFlag)
++            if (code.WeirdLocalFlag && locals is null)
+             {
+                 return;
+             }
+diff --git a/UndertaleModLib/Models/UndertaleCode.cs b/UndertaleModLib/Models/UndertaleCode.cs
+index 0be02a78b9a5567f16203a5a2245b24879bcc89b..8b15b11ea55fb8fc26d8ebdc9cb78e67927e1493 100644
+--- a/UndertaleModLib/Models/UndertaleCode.cs
++++ b/UndertaleModLib/Models/UndertaleCode.cs
+@@ -363,10 +363,18 @@ public class UndertaleInstruction : UndertaleObject
+     public Reference<T> GetReference<T>(bool allowResolve = false) where T : class, UndertaleObject, ReferencedObject
+     {
+         Reference<T> res = (Destination as Reference<T>) ?? (Function as Reference<T>) ?? (Value as Reference<T>);
+-        if (allowResolve && res == null && Value is int val)
++        if (allowResolve && res == null)
+         {
+-            Value = new Reference<T>(val);
+-            return (Reference<T>)Value;
++            if (Kind == Opcode.Break && Value is short breakType && breakType == -11 /* pushref */)
++            {
++                Function = new Reference<UndertaleFunction>(IntArgument);
++                return Function as Reference<T>;
++            }
++            if (Value is int val)
++            {
++                Value = new Reference<T>(val);
++                return (Reference<T>)Value;
++            }
+         }
+         return res;
+     }
+@@ -563,7 +571,13 @@ public class UndertaleInstruction : UndertaleObject
+                 writer.Write((short)Value);
+                 writer.Write((byte)Type1);
+                 writer.Write((byte)Kind);
+-                if (Type1 == DataType.Int32) writer.Write(IntArgument);
++                if (Type1 == DataType.Int32)
++                {
++                    if (Function != null)
++                        writer.WriteUndertaleObject(Function);
++                    else
++                        writer.Write(IntArgument);
++                }
+             }
+                 break;
+ 
+@@ -1008,7 +1022,10 @@ public class UndertaleInstruction : UndertaleObject
+                 if (Type1 == DataType.Int32)
+                 {
+                     sbh.Append(stringBuilder, ' ');
+-                    sbh.Append(stringBuilder, IntArgument);
++                    if (Function != null)
++                        sbh.Append(stringBuilder, Function);
++                    else
++                        sbh.Append(stringBuilder, IntArgument);
+                 }
+                 break;
+         }

@@ -1,0 +1,310 @@
+diff --git a/UndertaleModLib/Models/UndertaleRoom.cs b/UndertaleModLib/Models/UndertaleRoom.cs
+index 4b0c1a97229a80b6751f462e075dd2701e3785e2..3730d0a48e61facb91cc3f80ab9468fcf8e49821 100644
+--- a/UndertaleModLib/Models/UndertaleRoom.cs
++++ b/UndertaleModLib/Models/UndertaleRoom.cs
+@@ -1799,10 +1799,15 @@ public class UndertaleRoom : UndertaleNamedResource, INotifyPropertyChanged, IDi
+ 
+                     // sanity check: run of 2 empty tiles
+                     if (length != 0x81) 
+-                        throw new IOException("Expected 0x81, got " + length.ToString("X2"));
++                        throw new IOException("Expected 0x81, got 0x" + length.ToString("X2"));
+                     if (tile != unchecked((uint)-1))
+                         throw new IOException("Expected -1, got " + tile + " (0x" + tile.ToString("X8") + ")");
+                 }
++
++                if (reader.undertaleData.IsVersionAtLeast(2024, 4))
++                {
++                    reader.Align(4);
++                }
+             }
+ 
+             /// <summary>
+@@ -1811,122 +1816,88 @@ public class UndertaleRoom : UndertaleNamedResource, INotifyPropertyChanged, IDi
+             /// <param name="writer">Where to serialize to.</param>
+             public void WriteCompressedTileData(UndertaleWriter writer)
+             {
+-                List<uint> run = new();
+-                run.EnsureCapacity(128);
+-                bool runIsVerbatim = false;
+-                Action EndRun = () =>
+-                {
+-                    if (run.Count == 0)
+-                        return;
+-
+-                    if (runIsVerbatim || run.Count == 1)
+-                    {
+-                        if (run.Count > 127)
+-                            throw new IndexOutOfRangeException("Attempted to encode verbatim tile run size " + run.Count + " larger than maximum 127");
+-                        writer.Write((byte)run.Count);
+-                        foreach (uint tile in run)
+-                            writer.Write(tile);
+-                    }
+-                    else
+-                    {
+-                        if (run.Count > 128)
+-                            throw new IndexOutOfRangeException("Attempted to encode repeat tile run size " + run.Count + " larger than maximum 128");
+-                        writer.Write((byte)(run.Count + 127));
+-                        writer.Write(run[0]);
+-                    }
+-                    run.Clear();
+-                };
++                if (TilesX * TilesY <= 0)
++                    return;
+ 
+-                for (int y = 0; y < TileData.Length; y++)
++                // Perform run-length encoding using process identical to GameMaker's logic.
++                // This only serializes data when outputting a repeat run, upon which the
++                // previous verbatim run is serialized first.
++                // We also iterate in 1D, which requires some division and modulo to work with
++                // the 2D array we have for representation here.
++                uint tileCount = TilesX * TilesY;
++                uint lastTile = TileData[0][0];
++                int numVerbatim = 0;
++                int verbatimStart = 0;
++                int i = 1;
++                while (i <= tileCount + 1) // note: we go out of bounds to ensure a repeat run at the end
+                 {
+-                    uint[] row = TileData[y];
+-                    if (row.Length != TilesX)
+-                        throw new Exception("Invalid TileData row length");
+-                    for (int x = 0; x < row.Length; x++)
++                    uint currTile = (i >= tileCount) ? unchecked((uint)-1) : TileData[i / TilesX][i % TilesX];
++                    i++;
++
++                    if (currTile == lastTile)
+                     {
+-                        uint tile = row[x];
+-                        if (!runIsVerbatim)
++                        // We have two tiles in a row - construct a repeating run.
++                        // Figure out how far this repeat goes, first.
++                        int numRepeats = 2;
++                        while (i < tileCount)
+                         {
+-                            if (run.Count > 0 && tile != run[0])
++                            uint nextTile = TileData[i / TilesX][i % TilesX];
++                            if (nextTile != currTile)
+                             {
+-                                if (run.Count == 1)
+-                                {
+-                                    runIsVerbatim = true;
+-                                    run.Add(tile);
+-                                    continue;
+-                                }
+-                                EndRun();
++                                break;
+                             }
+-                            else if (run.Count >= 128)
+-                                // Split the run
+-                                EndRun();
+-                            run.Add(tile);
++
++                            numRepeats++;
++                            i++;
+                         }
+-                        else
++
++                        // Serialize the preceding verbatim run, splitting into 127-length chunks
++                        while (numVerbatim > 0)
+                         {
++                            int numToWrite = Math.Min(127, numVerbatim);
++                            writer.Write((byte)numToWrite);
+ 
+-                            if ((x + 1) <= TilesX || (y + 1) <= TilesY)
++                            for (int j = 0; j < numToWrite; j++)
+                             {
+-                                // Check the next tile for repeat runs
+-                                int nextX = x + 1;
+-                                int nextY = y;
+-                                if (nextX >= TilesX)
+-                                {
+-                                    nextX = 0;
+-                                    nextY++;
+-                                }
+-                                if (nextY < TilesY && TileData[nextY][nextX] == tile)
+-                                {
+-                                    EndRun();
+-                                    runIsVerbatim = false;
+-                                }
++                                int tileIndex = verbatimStart + j;
++                                writer.Write(TileData[tileIndex / TilesX][tileIndex % TilesX]);
+                             }
+-                            if (run.Count >= 127)
+-                                // Split the run
+-                                EndRun();
+-                            run.Add(tile);
+-                        }
+-                    }
+-                }
+ 
+-                EndRun();
++                            numVerbatim -= numToWrite;
++                            verbatimStart += numToWrite;
++                        }
+ 
+-                // Append 2 blank tiles if the last 2 tiles on the layer don't match.
+-                // This is important for writing an identical file as the Gamemaker IDE
+-                // does it at compile time to work around a GMAC bug.
++                        // Serialize this repeat run, splitting into 128-length chunks
++                        while (numRepeats > 0)
++                        {
++                            int numToWrite = Math.Min(128, numRepeats);
++                            writer.Write((byte)(0x80 | (numToWrite - 1)));
++                            writer.Write(lastTile);
+ 
+-                // As far as I know empty layers are not affected
+-                if (TilesX == 0 && TilesY == 0)
+-                    return;
++                            numRepeats -= numToWrite;
++                        }
+ 
+-                int prevX = (int)TilesX - 2;
+-                int prevY = (int)TilesY - 1;
++                        // Update our current tile to be the one after the run
++                        currTile = (i >= tileCount) ? 0 : TileData[i / TilesX][i % TilesX];
+ 
+-                if (prevX < 0)
+-                {
+-                    prevY--;
+-                    prevX = (int)TilesX - 1;
+-                }
+-                bool writeBlanks = false;
++                        // Update the start of our next verbatim run, and move on
++                        verbatimStart = i;
++                        numVerbatim = 0;
++                        i++;
++                    }
++                    else
++                    {
++                        // We have different tiles, so just increase the number of tiles in this verbatim run
++                        numVerbatim++;
++                    }
+ 
+-                
+-                if (prevY < 0)
+-                    writeBlanks = true; // Single tile on layer, affected
+-                else
+-                {
+-                    // Run of 1 with blank tile (-1) is considered as 2 matching tiles
+-                    // so we shouldn't need to append blanks in that case (I think).
+-                    int lastX = (int)TilesX - 1;
+-                    int lastY = (int)TilesY - 1;
+-                    writeBlanks = TileData[lastY][lastX] != TileData[prevY][prevX];
++                    // Update lastTile for the next iteration
++                    lastTile = currTile;
+                 }
+ 
+-                if (writeBlanks)
++                if (writer.undertaleData.IsVersionAtLeast(2024, 4))
+                 {
+-                    runIsVerbatim = false;
+-                    run.Add(0xffffffff);
+-                    run.Add(0xffffffff);
+-                    EndRun();
++                    writer.Align(4);
+                 }
+             }
+ 
+diff --git a/UndertaleModLib/UndertaleChunks.cs b/UndertaleModLib/UndertaleChunks.cs
+index 626d8432c00589a978bdc96f22156185e7d6acb9..756f686a7e99b98047568c0f7dd45ad9b16f7dd9 100644
+--- a/UndertaleModLib/UndertaleChunks.cs
++++ b/UndertaleModLib/UndertaleChunks.cs
+@@ -698,6 +698,7 @@ namespace UndertaleModLib
+         {
+             checkedFor2022_1 = false;
+             checkedFor2024_2 = false;
++            checkedFor2024_4 = false;
+             checkedForGMS2_2_2_302 = false;
+ 
+             CheckForTileCompression(reader);
+@@ -864,19 +865,26 @@ namespace UndertaleModLib
+         }
+ 
+         private static bool checkedFor2024_2;
++        private static bool checkedFor2024_4;
+         private void CheckForTileCompression(UndertaleReader reader)
+         {
+-            if (!reader.undertaleData.IsVersionAtLeast(2023, 2) || reader.undertaleData.IsVersionAtLeast(2024, 2))
++            if (!reader.undertaleData.IsVersionAtLeast(2023, 2) || reader.undertaleData.IsVersionAtLeast(2024, 4))
+             {
+                 checkedFor2024_2 = true;
++                checkedFor2024_4 = true;
+                 return;
+             }
++            if (reader.undertaleData.IsVersionAtLeast(2024, 2))
++            {
++                checkedFor2024_2 = true;
++            }
+ 
+             // Do a length check on room layers to see if this is 2024.2 or higher
+             long returnTo = reader.Position;
+ 
+-            // Iterate over all rooms until a length check is performed
++            // Iterate over all rooms
+             int roomCount = reader.ReadInt32();
++            bool foundAnyNonAlignedLayers = false;
+             for (uint roomIndex = 0; roomIndex < roomCount; roomIndex++)
+             {
+                 // Advance to room data we're interested in (and grab pointer for next room)
+@@ -895,11 +903,18 @@ namespace UndertaleModLib
+                     continue;
+                 }
+ 
++                bool checkNextLayerOffset = false;
+                 for (int layerNum = 0; layerNum < layerCount; layerNum++)
+                 {
+-                    reader.AbsPosition = layerListPtr + (4 * layerNum) + 4;
++                    long layerPtr = layerListPtr + (4 * layerNum);
++                    if (checkNextLayerOffset && layerPtr % 4 != 0)
++                    {
++                        foundAnyNonAlignedLayers = true;
++                    }
++
++                    reader.AbsPosition = layerPtr + 4;
+ 
+-                    // Get pointer into the individual layer data (plus 8 bytes) for the first layer in the room
++                    // Get pointer into the individual layer data (plus 8 bytes)
+                     int jumpOffset = reader.ReadInt32() + 8;
+ 
+                     // Find the offset for the end of this layer
+@@ -914,24 +929,37 @@ namespace UndertaleModLib
+ 
+                     LayerType layerType = (LayerType)reader.ReadInt32();
+                     if (layerType != LayerType.Tiles)
++                    {
++                        checkNextLayerOffset = false;
+                         continue;
++                    }
++                    checkNextLayerOffset = true;
++
++                    reader.Position += 32;
++                    int effectCount = reader.ReadInt32();
++                    reader.Position += effectCount * 12 + 4;
+ 
+-                    reader.Position += 10 * 4;
+                     int tileMapWidth = reader.ReadInt32();
+                     int tileMapHeight = reader.ReadInt32();
+-                    if (nextOffset - reader.AbsPosition != (tileMapWidth * tileMapHeight * 4))
++                    if (!checkedFor2024_2 && nextOffset - reader.AbsPosition != (tileMapWidth * tileMapHeight * 4))
+                     {
+                         // Check complete, found and tested a layer.
+                         reader.undertaleData.SetGMS2Version(2024, 2);
+-                        reader.Position = returnTo;
+                         checkedFor2024_2 = true;
+-                        return;
+                     }
+                 }
+             }
+ 
++            if (!checkedFor2024_4 && reader.undertaleData.IsVersionAtLeast(2024, 2) && !foundAnyNonAlignedLayers)
++            {
++                // We found no layer that suggests we're not using 2024.4
++                // This can rarely lead to false positives, though (in which case it's just 2024.2)
++                reader.undertaleData.SetGMS2Version(2024, 4);
++            }
++
+             reader.Position = returnTo;
+             checkedFor2024_2 = true;
++            checkedFor2024_4 = true;
+         }
+     }
+ 
