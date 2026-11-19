@@ -1,0 +1,19 @@
+"""This is part of the MSS Python's module.
+Source: https://github.com/BoboTiG/python-mss.
+"""
+
+import os
+import os.path
+
+import pytest
+
+from mss import mss
+
+np = pytest.importorskip("numpy", reason="Numpy module not available.")
+
+
+def test_numpy() -> None:
+    box = {"top": 0, "left": 0, "width": 10, "height": 10}
+    with mss(display=os.getenv("DISPLAY")) as sct:
+        img = np.array(sct.grab(box))
+    assert len(img) == 10
