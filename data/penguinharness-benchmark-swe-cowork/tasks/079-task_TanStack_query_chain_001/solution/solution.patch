@@ -1,0 +1,4758 @@
+diff --git a/packages/angular-query-devtools-experimental/src/angular-query-devtools.component.ts b/packages/angular-query-devtools-experimental/src/angular-query-devtools.component.ts
+index ba04a7298b3f789329f77b49eb6e06031c645af9..5b038e4052e4958d5b67555103e1dccb7d57f760 100644
+--- a/packages/angular-query-devtools-experimental/src/angular-query-devtools.component.ts
++++ b/packages/angular-query-devtools-experimental/src/angular-query-devtools.component.ts
+@@ -39,7 +39,9 @@ export class AngularQueryDevtools
+   /*
+    * It is intentional that there are no default values on inputs.
+    * Core devtools will set defaults when values are undefined.
+-   * */
++   *
++   * Signal inputs are not used to remain compatible with previous Angular versions.
++   */
+ 
+   /**
+    * Add this attribute if you want the dev tools to default to being open
+diff --git a/packages/angular-query-experimental/src/create-base-query.ts b/packages/angular-query-experimental/src/create-base-query.ts
+index a6685da626cbfea5247c9347c2aff5f68adbf570..1af05227aa63016001a03d7a615844cc0d9e5f98 100644
+--- a/packages/angular-query-experimental/src/create-base-query.ts
++++ b/packages/angular-query-experimental/src/create-base-query.ts
+@@ -1,6 +1,7 @@
+ import {
+   DestroyRef,
+   Injector,
++  NgZone,
+   computed,
+   effect,
+   inject,
+@@ -10,8 +11,15 @@ import {
+ } from '@angular/core'
+ import { notifyManager } from '@tanstack/query-core'
+ import { signalProxy } from './signal-proxy'
+-import { lazyInit } from './lazy-init'
+-import type { QueryClient, QueryKey, QueryObserver } from '@tanstack/query-core'
++import { shouldThrowError } from './util'
++import { lazyInit } from './util/lazy-init/lazy-init'
++import { injectQueryClient } from './inject-query-client'
++import type {
++  QueryClient,
++  QueryKey,
++  QueryObserver,
++  QueryObserverResult,
++} from '@tanstack/query-core'
+ import type { CreateBaseQueryOptions, CreateBaseQueryResult } from './types'
+ 
+ /**
+@@ -24,7 +32,7 @@ export function createBaseQuery<
+   TQueryData,
+   TQueryKey extends QueryKey,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+   ) => CreateBaseQueryOptions<
+     TQueryFnData,
+@@ -34,61 +42,78 @@ export function createBaseQuery<
+     TQueryKey
+   >,
+   Observer: typeof QueryObserver,
+-  queryClient: QueryClient,
+ ): CreateBaseQueryResult<TData, TError> {
+   const injector = inject(Injector)
+-
+   return lazyInit(() => {
+-    return runInInjectionContext(injector, () => {
+-      const destroyRef = inject(DestroyRef)
+-      /**
+-       * Signal that has the default options from query client applied
+-       * computed() is used so signals can be inserted into the options
+-       * making it reactive. Wrapping options in a function ensures embedded expressions
+-       * are preserved and can keep being applied after signal changes
+-       */
+-      const defaultedOptionsSignal = computed(() => {
+-        const defaultedOptions = queryClient.defaultQueryOptions(
+-          options(queryClient),
+-        )
+-        defaultedOptions._optimisticResults = 'optimistic'
+-        return defaultedOptions
+-      })
+-
+-      const observer = new Observer<
+-        TQueryFnData,
+-        TError,
+-        TData,
+-        TQueryData,
+-        TQueryKey
+-      >(queryClient, defaultedOptionsSignal())
++    const ngZone = injector.get(NgZone)
++    const destroyRef = injector.get(DestroyRef)
++    const queryClient = injectQueryClient({ injector })
+ 
+-      const resultSignal = signal(
+-        observer.getOptimisticResult(defaultedOptionsSignal()),
++    /**
++     * Signal that has the default options from query client applied
++     * computed() is used so signals can be inserted into the options
++     * making it reactive. Wrapping options in a function ensures embedded expressions
++     * are preserved and can keep being applied after signal changes
++     */
++    const defaultedOptionsSignal = computed(() => {
++      const options = runInInjectionContext(injector, () =>
++        optionsFn(queryClient),
+       )
++      const defaultedOptions = queryClient.defaultQueryOptions(options)
++      defaultedOptions._optimisticResults = 'optimistic'
++      return defaultedOptions
++    })
+ 
+-      // Effects should not be called inside reactive contexts
+-      untracked(() =>
+-        effect(() => {
+-          const defaultedOptions = defaultedOptionsSignal()
+-          observer.setOptions(defaultedOptions, {
+-            // Do not notify on updates because of changes in the options because
+-            // these changes should already be reflected in the optimistic result.
+-            listeners: false,
+-          })
+-          untracked(() => {
+-            resultSignal.set(observer.getOptimisticResult(defaultedOptions))
+-          })
+-        }),
+-      )
++    const observer = new Observer<
++      TQueryFnData,
++      TError,
++      TData,
++      TQueryData,
++      TQueryKey
++    >(queryClient, defaultedOptionsSignal())
+ 
+-      // observer.trackResult is not used as this optimization is not needed for Angular
+-      const unsubscribe = observer.subscribe(
+-        notifyManager.batchCalls((val) => resultSignal.set(val)),
+-      )
+-      destroyRef.onDestroy(unsubscribe)
++    const resultSignal = signal(
++      observer.getOptimisticResult(defaultedOptionsSignal()),
++    )
+ 
+-      return signalProxy(resultSignal) as CreateBaseQueryResult<TData, TError>
+-    })
++    effect(
++      () => {
++        const defaultedOptions = defaultedOptionsSignal()
++        observer.setOptions(defaultedOptions, {
++          // Do not notify on updates because of changes in the options because
++          // these changes should already be reflected in the optimistic result.
++          listeners: false,
++        })
++        untracked(() => {
++          resultSignal.set(observer.getOptimisticResult(defaultedOptions))
++        })
++      },
++      {
++        injector,
++      },
++    )
++
++    // observer.trackResult is not used as this optimization is not needed for Angular
++    const unsubscribe = observer.subscribe(
++      notifyManager.batchCalls((state: QueryObserverResult<TData, TError>) => {
++        ngZone.run(() => {
++          if (
++            state.isError &&
++            !state.isFetching &&
++            // !isRestoring() && // todo: enable when client persistence is implemented
++            shouldThrowError(observer.options.throwOnError, [
++              state.error,
++              observer.getCurrentQuery(),
++            ])
++          ) {
++            throw state.error
++          }
++          resultSignal.set(state)
++        })
++      }),
++    )
++    destroyRef.onDestroy(unsubscribe)
++
++    return signalProxy(resultSignal) as CreateBaseQueryResult<TData, TError>
+   })
+ }
+diff --git a/packages/angular-query-experimental/src/index.ts b/packages/angular-query-experimental/src/index.ts
+index d56be2adba68a6749ba32030d7a06c4dea9066e2..7f87c5a684035deaf00185face1c960d75bcc28e 100644
+--- a/packages/angular-query-experimental/src/index.ts
++++ b/packages/angular-query-experimental/src/index.ts
+@@ -20,9 +20,5 @@ export * from './inject-mutation'
+ export * from './inject-mutation-state'
+ export * from './inject-queries'
+ export * from './inject-query'
+-export {
+-  injectQueryClient,
+-  provideQueryClient,
+-  QUERY_CLIENT,
+-} from './inject-query-client'
++export { injectQueryClient, provideQueryClient } from './inject-query-client'
+ export { provideAngularQuery } from './providers'
+diff --git a/packages/angular-query-experimental/src/infinite-query-options.ts b/packages/angular-query-experimental/src/infinite-query-options.ts
+index dae1cdd8488ac497f948e10828254e830e8c598e..1680e5d408c7d9f315c3041cf446776d565fe1b9 100644
+--- a/packages/angular-query-experimental/src/infinite-query-options.ts
++++ b/packages/angular-query-experimental/src/infinite-query-options.ts
+@@ -41,6 +41,14 @@ export type DefinedInitialDataInfiniteOptions<
+     | (() => NonUndefinedGuard<InfiniteData<TQueryFnData, TPageParam>>)
+ }
+ 
++/**
++ * Allows to share and re-use infinite query options in a type-safe way.
++ *
++ * The `queryKey` will be tagged with the type from `queryFn`.
++ * @param options - The infinite query options to tag with the type from `queryFn`.
++ * @returns The tagged infinite query options.
++ * @public
++ */
+ export function infiniteQueryOptions<
+   TQueryFnData,
+   TError = DefaultError,
+@@ -65,6 +73,14 @@ export function infiniteQueryOptions<
+   queryKey: DataTag<TQueryKey, InfiniteData<TQueryFnData>>
+ }
+ 
++/**
++ * Allows to share and re-use infinite query options in a type-safe way.
++ *
++ * The `queryKey` will be tagged with the type from `queryFn`.
++ * @param options - The infinite query options to tag with the type from `queryFn`.
++ * @returns The tagged infinite query options.
++ * @public
++ */
+ export function infiniteQueryOptions<
+   TQueryFnData,
+   TError = DefaultError,
+@@ -89,6 +105,14 @@ export function infiniteQueryOptions<
+   queryKey: DataTag<TQueryKey, InfiniteData<TQueryFnData>>
+ }
+ 
++/**
++ * Allows to share and re-use infinite query options in a type-safe way.
++ *
++ * The `queryKey` will be tagged with the type from `queryFn`.
++ * @param options - The infinite query options to tag with the type from `queryFn`.
++ * @returns The tagged infinite query options.
++ * @public
++ */
+ export function infiniteQueryOptions(options: unknown) {
+   return options
+ }
+diff --git a/packages/angular-query-experimental/src/inject-infinite-query.ts b/packages/angular-query-experimental/src/inject-infinite-query.ts
+index 42a0f643813e9e90e4d12e32a538d02aa9ce162d..85dd0c7b3568d123176189f15e34d5297fddf51f 100644
+--- a/packages/angular-query-experimental/src/inject-infinite-query.ts
++++ b/packages/angular-query-experimental/src/inject-infinite-query.ts
+@@ -1,6 +1,5 @@
+ import { InfiniteQueryObserver } from '@tanstack/query-core'
+ import { createBaseQuery } from './create-base-query'
+-import { injectQueryClient } from './inject-query-client'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import type { Injector } from '@angular/core'
+ import type {
+@@ -20,6 +19,14 @@ import type {
+   UndefinedInitialDataInfiniteOptions,
+ } from './infinite-query-options'
+ 
++/**
++ * Injects an infinite query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ * Infinite queries can additively "load more" data onto an existing set of data or "infinite scroll"
++ * @param optionsFn - A function that returns infinite query options.
++ * @param injector - The Angular injector to use.
++ * @returns The infinite query result.
++ * @public
++ */
+ export function injectInfiniteQuery<
+   TQueryFnData,
+   TError = DefaultError,
+@@ -27,7 +34,7 @@ export function injectInfiniteQuery<
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+   ) => UndefinedInitialDataInfiniteOptions<
+     TQueryFnData,
+@@ -39,6 +46,14 @@ export function injectInfiniteQuery<
+   injector?: Injector,
+ ): CreateInfiniteQueryResult<TData, TError>
+ 
++/**
++ * Injects an infinite query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ * Infinite queries can additively "load more" data onto an existing set of data or "infinite scroll"
++ * @param optionsFn - A function that returns infinite query options.
++ * @param injector - The Angular injector to use.
++ * @returns The infinite query result.
++ * @public
++ */
+ export function injectInfiniteQuery<
+   TQueryFnData,
+   TError = DefaultError,
+@@ -46,7 +61,7 @@ export function injectInfiniteQuery<
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+   ) => DefinedInitialDataInfiniteOptions<
+     TQueryFnData,
+@@ -58,6 +73,14 @@ export function injectInfiniteQuery<
+   injector?: Injector,
+ ): DefinedCreateInfiniteQueryResult<TData, TError>
+ 
++/**
++ * Injects an infinite query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ * Infinite queries can additively "load more" data onto an existing set of data or "infinite scroll"
++ * @param optionsFn - A function that returns infinite query options.
++ * @param injector - The Angular injector to use.
++ * @returns The infinite query result.
++ * @public
++ */
+ export function injectInfiniteQuery<
+   TQueryFnData,
+   TError = DefaultError,
+@@ -65,7 +88,7 @@ export function injectInfiniteQuery<
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+   ) => CreateInfiniteQueryOptions<
+     TQueryFnData,
+@@ -78,16 +101,19 @@ export function injectInfiniteQuery<
+   injector?: Injector,
+ ): CreateInfiniteQueryResult<TData, TError>
+ 
++/**
++ * Injects an infinite query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ * Infinite queries can additively "load more" data onto an existing set of data or "infinite scroll"
++ * @param optionsFn - A function that returns infinite query options.
++ * @param injector - The Angular injector to use.
++ * @returns The infinite query result.
++ * @public
++ */
+ export function injectInfiniteQuery(
+-  options: (client: QueryClient) => CreateInfiniteQueryOptions,
++  optionsFn: (client: QueryClient) => CreateInfiniteQueryOptions,
+   injector?: Injector,
+ ) {
+-  return assertInjector(injectInfiniteQuery, injector, () => {
+-    const queryClient = injectQueryClient()
+-    return createBaseQuery(
+-      options,
+-      InfiniteQueryObserver as typeof QueryObserver,
+-      queryClient,
+-    )
+-  })
++  return assertInjector(injectInfiniteQuery, injector, () =>
++    createBaseQuery(optionsFn, InfiniteQueryObserver as typeof QueryObserver),
++  )
+ }
+diff --git a/packages/angular-query-experimental/src/inject-is-fetching.ts b/packages/angular-query-experimental/src/inject-is-fetching.ts
+index b285a7f4dbd90d2b34c1b00af2c58b2de4a5065d..2e7765af9273a93a4c36ecfe8205a7557a208750 100644
+--- a/packages/angular-query-experimental/src/inject-is-fetching.ts
++++ b/packages/angular-query-experimental/src/inject-is-fetching.ts
+@@ -1,9 +1,19 @@
+-import { DestroyRef, inject, signal } from '@angular/core'
++import { DestroyRef, NgZone, inject, signal } from '@angular/core'
+ import { type QueryFilters, notifyManager } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import { injectQueryClient } from './inject-query-client'
+ import type { Injector, Signal } from '@angular/core'
+ 
++/**
++ * Injects a signal that tracks the number of queries that your application is loading or
++ * fetching in the background.
++ *
++ * Can be used for app-wide loading indicators
++ * @param filters - The filters to apply to the query.
++ * @param injector - The Angular injector to use.
++ * @returns signal with number of loading or fetching queries.
++ * @public
++ */
+ export function injectIsFetching(
+   filters?: QueryFilters,
+   injector?: Injector,
+@@ -11,6 +21,7 @@ export function injectIsFetching(
+   return assertInjector(injectIsFetching, injector, () => {
+     const queryClient = injectQueryClient()
+     const destroyRef = inject(DestroyRef)
++    const ngZone = inject(NgZone)
+ 
+     const cache = queryClient.getQueryCache()
+     // isFetching is the prev value initialized on mount *
+@@ -24,7 +35,9 @@ export function injectIsFetching(
+         if (isFetching !== newIsFetching) {
+           // * and update with each change
+           isFetching = newIsFetching
+-          result.set(isFetching)
++          ngZone.run(() => {
++            result.set(isFetching)
++          })
+         }
+       }),
+     )
+diff --git a/packages/angular-query-experimental/src/inject-is-mutating.ts b/packages/angular-query-experimental/src/inject-is-mutating.ts
+index f1d50ff8574acd5e7ed4f951f6da0b41590fd1bf..833515654b62d8d466f0a11d99e95259f8c0ee1f 100644
+--- a/packages/angular-query-experimental/src/inject-is-mutating.ts
++++ b/packages/angular-query-experimental/src/inject-is-mutating.ts
+@@ -1,9 +1,18 @@
+-import { DestroyRef, inject, signal } from '@angular/core'
++import { DestroyRef, NgZone, inject, signal } from '@angular/core'
+ import { type MutationFilters, notifyManager } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import { injectQueryClient } from './inject-query-client'
+ import type { Injector, Signal } from '@angular/core'
+ 
++/**
++ * Injects a signal that tracks the number of mutations that your application is fetching.
++ *
++ * Can be used for app-wide loading indicators
++ * @param filters - The filters to apply to the query.
++ * @param injector - The Angular injector to use.
++ * @returns signal with number of fetching mutations.
++ * @public
++ */
+ export function injectIsMutating(
+   filters?: MutationFilters,
+   injector?: Injector,
+@@ -11,6 +20,7 @@ export function injectIsMutating(
+   return assertInjector(injectIsMutating, injector, () => {
+     const queryClient = injectQueryClient()
+     const destroyRef = inject(DestroyRef)
++    const ngZone = inject(NgZone)
+ 
+     const cache = queryClient.getMutationCache()
+     // isMutating is the prev value initialized on mount *
+@@ -24,7 +34,9 @@ export function injectIsMutating(
+         if (isMutating !== newIsMutating) {
+           // * and update with each change
+           isMutating = newIsMutating
+-          result.set(isMutating)
++          ngZone.run(() => {
++            result.set(isMutating)
++          })
+         }
+       }),
+     )
+diff --git a/packages/angular-query-experimental/src/inject-mutation-state.ts b/packages/angular-query-experimental/src/inject-mutation-state.ts
+index 94fd80458f1105330373bfeeb0af5d3ce948df23..ea46ff3ac52eb750f0983f31bf9039f90d23359c 100644
+--- a/packages/angular-query-experimental/src/inject-mutation-state.ts
++++ b/packages/angular-query-experimental/src/inject-mutation-state.ts
+@@ -1,6 +1,12 @@
+-import { DestroyRef, effect, inject, signal, untracked } from '@angular/core'
+ import {
+-  type DefaultError,
++  DestroyRef,
++  NgZone,
++  effect,
++  inject,
++  signal,
++  untracked,
++} from '@angular/core'
++import {
+   type Mutation,
+   type MutationCache,
+   type MutationFilters,
+@@ -10,13 +16,12 @@ import {
+ } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import { injectQueryClient } from './inject-query-client'
++import { lazySignalInitializer } from './util/lazy-signal-initializer/lazy-signal-initializer'
+ import type { Injector, Signal } from '@angular/core'
+ 
+ type MutationStateOptions<TResult = MutationState> = {
+   filters?: MutationFilters
+-  select?: (
+-    mutation: Mutation<unknown, DefaultError, unknown, unknown>,
+-  ) => TResult
++  select?: (mutation: Mutation) => TResult
+ }
+ 
+ function getResult<TResult = MutationState>(
+@@ -27,18 +32,24 @@ function getResult<TResult = MutationState>(
+     .findAll(options.filters)
+     .map(
+       (mutation): TResult =>
+-        (options.select
+-          ? options.select(
+-              mutation as Mutation<unknown, DefaultError, unknown, unknown>,
+-            )
+-          : mutation.state) as TResult,
++        (options.select ? options.select(mutation) : mutation.state) as TResult,
+     )
+ }
+ 
++/**
++ * @public
++ */
+ export interface InjectMutationStateOptions {
+   injector?: Injector
+ }
+ 
++/**
++ * Injects a signal that tracks the state of all mutations.
++ * @param mutationStateOptionsFn - A function that returns mutation state options.
++ * @param options - The Angular injector to use.
++ * @returns The signal that tracks the state of all mutations.
++ * @public
++ */
+ export function injectMutationState<TResult = MutationState>(
+   mutationStateOptionsFn: () => MutationStateOptions<TResult> = () => ({}),
+   options?: InjectMutationStateOptions,
+@@ -46,36 +57,44 @@ export function injectMutationState<TResult = MutationState>(
+   return assertInjector(injectMutationState, options?.injector, () => {
+     const destroyRef = inject(DestroyRef)
+     const queryClient = injectQueryClient()
++    const ngZone = inject(NgZone)
+ 
+     const mutationCache = queryClient.getMutationCache()
+ 
+-    const result = signal<Array<TResult>>(
+-      getResult(mutationCache, mutationStateOptionsFn()),
+-    )
++    return lazySignalInitializer((injector) => {
++      const result = signal<Array<TResult>>(
++        getResult(mutationCache, mutationStateOptionsFn()),
++      )
+ 
+-    effect(() => {
+-      const mutationStateOptions = mutationStateOptionsFn()
+-      untracked(() => {
+-        // Setting the signal from an effect because it's both 'computed' from options()
+-        // and needs to be set imperatively in the mutationCache listener.
+-        result.set(getResult(mutationCache, mutationStateOptions))
+-      })
+-    })
++      effect(
++        () => {
++          const mutationStateOptions = mutationStateOptionsFn()
++          untracked(() => {
++            // Setting the signal from an effect because it's both 'computed' from options()
++            // and needs to be set imperatively in the mutationCache listener.
++            result.set(getResult(mutationCache, mutationStateOptions))
++          })
++        },
++        { injector },
++      )
+ 
+-    const unsubscribe = mutationCache.subscribe(
+-      notifyManager.batchCalls(() => {
+-        const nextResult = replaceEqualDeep(
+-          result(),
+-          getResult(mutationCache, mutationStateOptionsFn()),
+-        )
+-        if (result() !== nextResult) {
+-          result.set(nextResult)
+-        }
+-      }),
+-    )
++      const unsubscribe = mutationCache.subscribe(
++        notifyManager.batchCalls(() => {
++          const nextResult = replaceEqualDeep(
++            result(),
++            getResult(mutationCache, mutationStateOptionsFn()),
++          )
++          if (result() !== nextResult) {
++            ngZone.run(() => {
++              result.set(nextResult)
++            })
++          }
++        }),
++      )
+ 
+-    destroyRef.onDestroy(unsubscribe)
++      destroyRef.onDestroy(unsubscribe)
+ 
+-    return result
++      return result
++    })
+   })
+ }
+diff --git a/packages/angular-query-experimental/src/inject-mutation.ts b/packages/angular-query-experimental/src/inject-mutation.ts
+index f4e23340133c7117195a4d0e2140d3ddae2acae9..f7948df617a50078f35188bc720f9cc8eba4685d 100644
+--- a/packages/angular-query-experimental/src/inject-mutation.ts
++++ b/packages/angular-query-experimental/src/inject-mutation.ts
+@@ -1,67 +1,118 @@
+-import { DestroyRef, computed, effect, inject, signal } from '@angular/core'
++import {
++  DestroyRef,
++  Injector,
++  NgZone,
++  computed,
++  effect,
++  inject,
++  runInInjectionContext,
++  signal,
++} from '@angular/core'
+ import { MutationObserver, notifyManager } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import { signalProxy } from './signal-proxy'
+ import { injectQueryClient } from './inject-query-client'
+-import { noop } from './util'
+-import type { DefaultError, QueryClient } from '@tanstack/query-core'
+-import type { Injector } from '@angular/core'
++import { noop, shouldThrowError } from './util'
+ 
++import { lazyInit } from './util/lazy-init/lazy-init'
++import type {
++  DefaultError,
++  MutationObserverResult,
++  QueryClient,
++} from '@tanstack/query-core'
+ import type {
+   CreateMutateFunction,
+   CreateMutationOptions,
+   CreateMutationResult,
+ } from './types'
+ 
++/**
++ * Injects a mutation: an imperative function that can be invoked which typically performs server side effects.
++ *
++ * Unlike queries, mutations are not run automatically.
++ * @param optionsFn - A function that returns mutation options.
++ * @param injector - The Angular injector to use.
++ * @returns The mutation.
++ * @public
++ */
+ export function injectMutation<
+   TData = unknown,
+   TError = DefaultError,
+   TVariables = void,
+   TContext = unknown,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+   ) => CreateMutationOptions<TData, TError, TVariables, TContext>,
+   injector?: Injector,
+ ): CreateMutationResult<TData, TError, TVariables, TContext> {
+   return assertInjector(injectMutation, injector, () => {
+     const queryClient = injectQueryClient()
++    const currentInjector = inject(Injector)
+     const destroyRef = inject(DestroyRef)
++    const ngZone = inject(NgZone)
+ 
+-    const observer = new MutationObserver<TData, TError, TVariables, TContext>(
+-      queryClient,
+-      options(queryClient),
+-    )
+-    const mutate: CreateMutateFunction<TData, TError, TVariables, TContext> = (
+-      variables,
+-      mutateOptions,
+-    ) => {
+-      observer.mutate(variables, mutateOptions).catch(noop)
+-    }
++    return lazyInit(() =>
++      runInInjectionContext(currentInjector, () => {
++        const observer = new MutationObserver<
++          TData,
++          TError,
++          TVariables,
++          TContext
++        >(queryClient, optionsFn(queryClient))
++        const mutate: CreateMutateFunction<
++          TData,
++          TError,
++          TVariables,
++          TContext
++        > = (variables, mutateOptions) => {
++          observer.mutate(variables, mutateOptions).catch(noop)
++        }
+ 
+-    effect(() => {
+-      observer.setOptions(options(queryClient))
+-    })
++        effect(() => {
++          observer.setOptions(optionsFn(queryClient))
++        })
+ 
+-    const result = signal(observer.getCurrentResult())
++        const result = signal(observer.getCurrentResult())
+ 
+-    const unsubscribe = observer.subscribe(
+-      notifyManager.batchCalls((val) => result.set(val)),
+-    )
++        const unsubscribe = observer.subscribe(
++          notifyManager.batchCalls(
++            (
++              state: MutationObserverResult<
++                TData,
++                TError,
++                TVariables,
++                TContext
++              >,
++            ) => {
++              ngZone.run(() => {
++                if (
++                  state.isError &&
++                  shouldThrowError(observer.options.throwOnError, [state.error])
++                ) {
++                  throw state.error
++                }
++                result.set(state)
++              })
++            },
++          ),
++        )
+ 
+-    destroyRef.onDestroy(unsubscribe)
++        destroyRef.onDestroy(unsubscribe)
+ 
+-    const resultSignal = computed(() => ({
+-      ...result(),
+-      mutate,
+-      mutateAsync: result().mutate,
+-    }))
++        const resultSignal = computed(() => ({
++          ...result(),
++          mutate,
++          mutateAsync: result().mutate,
++        }))
+ 
+-    return signalProxy(resultSignal) as unknown as CreateMutationResult<
+-      TData,
+-      TError,
+-      TVariables,
+-      TContext
+-    >
++        return signalProxy(resultSignal) as unknown as CreateMutationResult<
++          TData,
++          TError,
++          TVariables,
++          TContext
++        >
++      }),
++    )
+   })
+ }
+diff --git a/packages/angular-query-experimental/src/inject-queries.ts b/packages/angular-query-experimental/src/inject-queries.ts
+index f5f722f2701783f784a8d40b88d9875517b50bbb..1e415e93074b5199fc24a0d2647d55fdb9e5f2f8 100644
+--- a/packages/angular-query-experimental/src/inject-queries.ts
++++ b/packages/angular-query-experimental/src/inject-queries.ts
+@@ -5,12 +5,14 @@ import { injectQueryClient } from './inject-query-client'
+ import type { Injector, Signal } from '@angular/core'
+ import type {
+   DefaultError,
++  OmitKeyof,
+   QueriesObserverOptions,
+   QueriesPlaceholderDataFunction,
+   QueryFunction,
+   QueryKey,
+   QueryObserverOptions,
+   QueryObserverResult,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -21,7 +23,7 @@ type QueryObserverOptionsForCreateQueries<
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+-> = Omit<
++> = OmitKeyof<
+   QueryObserverOptions<TQueryFnData, TError, TData, TQueryFnData, TQueryKey>,
+   'placeholderData'
+ > & {
+@@ -52,7 +54,9 @@ type GetOptions<T> =
+               ? QueryObserverOptionsForCreateQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -63,10 +67,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? QueryObserverOptionsForCreateQueries<
+@@ -116,6 +119,7 @@ type GetResults<T> =
+ 
+ /**
+  * QueriesOptions reducer recursively unwraps function arguments to infer/enforce type param
++ * @public
+  */
+ export type QueriesOptions<
+   T extends Array<any>,
+@@ -158,6 +162,7 @@ export type QueriesOptions<
+ 
+ /**
+  * QueriesResults reducer recursively maps type param to results
++ * @public
+  */
+ export type QueriesResults<
+   T extends Array<any>,
+@@ -193,6 +198,9 @@ export type QueriesResults<
+           : // Fallback
+             Array<QueryObserverResult>
+ 
++/**
++ * @public
++ */
+ export function injectQueries<
+   T extends Array<any>,
+   TCombinedResult = QueriesResults<T>,
+diff --git a/packages/angular-query-experimental/src/inject-query-client.ts b/packages/angular-query-experimental/src/inject-query-client.ts
+index f72b446a5481ae28c36606faca1c459fd74db62b..e570782038b7c2154c5f573954215ef758c171f6 100644
+--- a/packages/angular-query-experimental/src/inject-query-client.ts
++++ b/packages/angular-query-experimental/src/inject-query-client.ts
+@@ -1,7 +1,25 @@
+ import { createNoopInjectionToken } from './util/create-injection-token/create-injection-token'
+ import type { QueryClient } from '@tanstack/query-core'
+ 
+-const [injectQueryClient, provideQueryClient, QUERY_CLIENT] =
+-  createNoopInjectionToken<QueryClient>('QueryClientToken')
++const tokens = createNoopInjectionToken<QueryClient>('QueryClientToken')
+ 
+-export { injectQueryClient, provideQueryClient, QUERY_CLIENT }
++/**
++ * Injects the `QueryClient` instance into the component or service.
++ *
++ * **Example**
++ * ```ts
++ * const queryClient = injectQueryClient();
++ * ```
++ * @returns The `QueryClient` instance.
++ * @public
++ */
++export const injectQueryClient = tokens[0]
++
++/**
++ * Usually {@link provideAngularQuery} is used once to set up TanStack Query and the
++ * {@link https://tanstack.com/query/latest/docs/reference/QueryClient|QueryClient}
++ * for the entire application. You can use `provideQueryClient` to provide a
++ * different `QueryClient` instance for a part of the application.
++ * @public
++ */
++export const provideQueryClient = tokens[1]
+diff --git a/packages/angular-query-experimental/src/inject-query.ts b/packages/angular-query-experimental/src/inject-query.ts
+index 81df496fc9b8eb176a112c4225454a36925b4b8f..f6fdb45d0b8a8eae46e58417cc76d1f5593d640c 100644
+--- a/packages/angular-query-experimental/src/inject-query.ts
++++ b/packages/angular-query-experimental/src/inject-query.ts
+@@ -1,9 +1,8 @@
+ import { QueryObserver } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+-import { injectQueryClient } from './inject-query-client'
+ import { createBaseQuery } from './create-base-query'
+-import type { DefaultError, QueryClient, QueryKey } from '@tanstack/query-core'
+ import type { Injector } from '@angular/core'
++import type { DefaultError, QueryClient, QueryKey } from '@tanstack/query-core'
+ import type {
+   CreateQueryOptions,
+   CreateQueryResult,
+@@ -14,48 +13,195 @@ import type {
+   UndefinedInitialDataOptions,
+ } from './query-options'
+ 
++/**
++ * Injects a query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ *
++ * **Basic example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   query = injectQuery(() => ({
++ *     queryKey: ['repoData'],
++ *     queryFn: () =>
++ *       this.#http.get<Response>('https://api.github.com/repos/tanstack/query'),
++ *   }))
++ * }
++ * ```
++ *
++ * Similar to `computed` from Angular, the function passed to `injectQuery` will be run in the reactive context.
++ * In the example below, the query will be automatically enabled and executed when the filter signal changes
++ * to a truthy value. When the filter signal changes back to a falsy value, the query will be disabled.
++ *
++ * **Reactive example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   filter = signal('')
++ *
++ *   todosQuery = injectQuery(() => ({
++ *     queryKey: ['todos', this.filter()],
++ *     queryFn: () => fetchTodos(this.filter()),
++ *     // Signals can be combined with expressions
++ *     enabled: !!this.filter(),
++ *   }))
++ * }
++ * ```
++ * @param optionsFn - A function that returns query options.
++ * @param injector - The Angular injector to use.
++ * @returns The query result.
++ * @public
++ * @see https://tanstack.com/query/latest/docs/framework/angular/guides/queries
++ */
+ export function injectQuery<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+-  ) => UndefinedInitialDataOptions<TQueryFnData, TError, TData, TQueryKey>,
++  ) => DefinedInitialDataOptions<TQueryFnData, TError, TData, TQueryKey>,
+   injector?: Injector,
+-): CreateQueryResult<TData, TError>
++): DefinedCreateQueryResult<TData, TError>
+ 
++/**
++ * Injects a query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ *
++ * **Basic example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   query = injectQuery(() => ({
++ *     queryKey: ['repoData'],
++ *     queryFn: () =>
++ *       this.#http.get<Response>('https://api.github.com/repos/tanstack/query'),
++ *   }))
++ * }
++ * ```
++ *
++ * Similar to `computed` from Angular, the function passed to `injectQuery` will be run in the reactive context.
++ * In the example below, the query will be automatically enabled and executed when the filter signal changes
++ * to a truthy value. When the filter signal changes back to a falsy value, the query will be disabled.
++ *
++ * **Reactive example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   filter = signal('')
++ *
++ *   todosQuery = injectQuery(() => ({
++ *     queryKey: ['todos', this.filter()],
++ *     queryFn: () => fetchTodos(this.filter()),
++ *     // Signals can be combined with expressions
++ *     enabled: !!this.filter(),
++ *   }))
++ * }
++ * ```
++ * @param optionsFn - A function that returns query options.
++ * @param injector - The Angular injector to use.
++ * @returns The query result.
++ * @public
++ * @see https://tanstack.com/query/latest/docs/framework/angular/guides/queries
++ */
+ export function injectQuery<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+-  ) => DefinedInitialDataOptions<TQueryFnData, TError, TData, TQueryKey>,
++  ) => UndefinedInitialDataOptions<TQueryFnData, TError, TData, TQueryKey>,
+   injector?: Injector,
+-): DefinedCreateQueryResult<TData, TError>
++): CreateQueryResult<TData, TError>
+ 
++/**
++ * Injects a query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ *
++ * **Basic example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   query = injectQuery(() => ({
++ *     queryKey: ['repoData'],
++ *     queryFn: () =>
++ *       this.#http.get<Response>('https://api.github.com/repos/tanstack/query'),
++ *   }))
++ * }
++ * ```
++ *
++ * Similar to `computed` from Angular, the function passed to `injectQuery` will be run in the reactive context.
++ * In the example below, the query will be automatically enabled and executed when the filter signal changes
++ * to a truthy value. When the filter signal changes back to a falsy value, the query will be disabled.
++ *
++ * **Reactive example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   filter = signal('')
++ *
++ *   todosQuery = injectQuery(() => ({
++ *     queryKey: ['todos', this.filter()],
++ *     queryFn: () => fetchTodos(this.filter()),
++ *     // Signals can be combined with expressions
++ *     enabled: !!this.filter(),
++ *   }))
++ * }
++ * ```
++ * @param optionsFn - A function that returns query options.
++ * @param injector - The Angular injector to use.
++ * @returns The query result.
++ * @public
++ * @see https://tanstack.com/query/latest/docs/framework/angular/guides/queries
++ */
+ export function injectQuery<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+ >(
+-  options: (
++  optionsFn: (
+     client: QueryClient,
+   ) => CreateQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+   injector?: Injector,
+ ): CreateQueryResult<TData, TError>
+ 
++/**
++ * Injects a query: a declarative dependency on an asynchronous source of data that is tied to a unique key.
++ *
++ * **Basic example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   query = injectQuery(() => ({
++ *     queryKey: ['repoData'],
++ *     queryFn: () =>
++ *       this.#http.get<Response>('https://api.github.com/repos/tanstack/query'),
++ *   }))
++ * }
++ * ```
++ *
++ * Similar to `computed` from Angular, the function passed to `injectQuery` will be run in the reactive context.
++ * In the example below, the query will be automatically enabled and executed when the filter signal changes
++ * to a truthy value. When the filter signal changes back to a falsy value, the query will be disabled.
++ *
++ * **Reactive example**
++ * ```ts
++ * class ServiceOrComponent {
++ *   filter = signal('')
++ *
++ *   todosQuery = injectQuery(() => ({
++ *     queryKey: ['todos', this.filter()],
++ *     queryFn: () => fetchTodos(this.filter()),
++ *     // Signals can be combined with expressions
++ *     enabled: !!this.filter(),
++ *   }))
++ * }
++ * ```
++ * @param optionsFn - A function that returns query options.
++ * @param injector - The Angular injector to use.
++ * @returns The query result.
++ * @public
++ * @see https://tanstack.com/query/latest/docs/framework/angular/guides/queries
++ */
+ export function injectQuery(
+-  options: (client: QueryClient) => CreateQueryOptions,
++  optionsFn: (client: QueryClient) => CreateQueryOptions,
+   injector?: Injector,
+ ) {
+-  return assertInjector(injectQuery, injector, () => {
+-    const queryClient = injectQueryClient()
+-    return createBaseQuery(options, QueryObserver, queryClient)
+-  })
++  return assertInjector(injectQuery, injector, () =>
++    createBaseQuery(optionsFn, QueryObserver),
++  )
+ }
+diff --git a/packages/angular-query-experimental/src/providers.ts b/packages/angular-query-experimental/src/providers.ts
+index 115d4c3ad2ca5cd1b91f95da3f7e74f5ddf77909..6b5c3cf94ace7e8d409724e89b3ff846ffc9d050 100644
+--- a/packages/angular-query-experimental/src/providers.ts
++++ b/packages/angular-query-experimental/src/providers.ts
+@@ -8,6 +8,45 @@ import { provideQueryClient } from './inject-query-client'
+ import type { EnvironmentProviders } from '@angular/core'
+ import type { QueryClient } from '@tanstack/query-core'
+ 
++/**
++ * Sets up providers necessary to enable TanStack Query functionality for Angular applications.
++ *
++ * Allows to configure a `QueryClient`.
++ *
++ * **Example - standalone**
++ *
++ * ```ts
++ * import {
++ *   provideAngularQuery,
++ *   QueryClient,
++ * } from '@tanstack/angular-query-experimental'
++ *
++ * bootstrapApplication(AppComponent, {
++ *   providers: [provideAngularQuery(new QueryClient())],
++ * })
++ * ```
++ *
++ * **Example - NgModule-based**
++ *
++ * ```ts
++ * import {
++ *   provideAngularQuery,
++ *   QueryClient,
++ * } from '@tanstack/angular-query-experimental'
++ *
++ * @NgModule({
++ *   declarations: [AppComponent],
++ *   imports: [BrowserModule],
++ *   providers: [provideAngularQuery(new QueryClient())],
++ *   bootstrap: [AppComponent],
++ * })
++ * export class AppModule {}
++ * ```
++ * @param queryClient - A `QueryClient` instance.
++ * @returns A set of providers to set up TanStack Query.
++ * @public
++ * @see https://tanstack.com/query/v5/docs/framework/angular/quick-start
++ */
+ export function provideAngularQuery(
+   queryClient: QueryClient,
+ ): EnvironmentProviders {
+diff --git a/packages/angular-query-experimental/src/query-options.ts b/packages/angular-query-experimental/src/query-options.ts
+index 7e958f3df78930bbdae989657cd155f3e0305824..dbc3b324606179013baab3707d1b932fe235052e 100644
+--- a/packages/angular-query-experimental/src/query-options.ts
++++ b/packages/angular-query-experimental/src/query-options.ts
+@@ -1,6 +1,9 @@
+ import type { DataTag, DefaultError, QueryKey } from '@tanstack/query-core'
+ import type { CreateQueryOptions } from './types'
+ 
++/**
++ * @public
++ */
+ export type UndefinedInitialDataOptions<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+@@ -12,6 +15,9 @@ export type UndefinedInitialDataOptions<
+ 
+ type NonUndefinedGuard<T> = T extends undefined ? never : T
+ 
++/**
++ * @public
++ */
+ export type DefinedInitialDataOptions<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+@@ -23,6 +29,28 @@ export type DefinedInitialDataOptions<
+     | (() => NonUndefinedGuard<TQueryFnData>)
+ }
+ 
++/**
++ * Allows to share and re-use query options in a type-safe way.
++ *
++ * The `queryKey` will be tagged with the type from `queryFn`.
++ *
++ * **Example**
++ *
++ * ```ts
++ *  const { queryKey } = queryOptions({
++ *     queryKey: ['key'],
++ *     queryFn: () => Promise.resolve(5),
++ *     //  ^?  Promise<number>
++ *   })
++ *
++ *   const queryClient = new QueryClient()
++ *   const data = queryClient.getQueryData(queryKey)
++ *   //    ^?  number | undefined
++ * ```
++ * @param options - The query options to tag with the type from `queryFn`.
++ * @returns The tagged query options.
++ * @public
++ */
+ export function queryOptions<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+@@ -34,6 +62,28 @@ export function queryOptions<
+   queryKey: DataTag<TQueryKey, TQueryFnData>
+ }
+ 
++/**
++ * Allows to share and re-use query options in a type-safe way.
++ *
++ * The `queryKey` will be tagged with the type from `queryFn`.
++ *
++ * **Example**
++ *
++ * ```ts
++ *  const { queryKey } = queryOptions({
++ *     queryKey: ['key'],
++ *     queryFn: () => Promise.resolve(5),
++ *     //  ^?  Promise<number>
++ *   })
++ *
++ *   const queryClient = new QueryClient()
++ *   const data = queryClient.getQueryData(queryKey)
++ *   //    ^?  number | undefined
++ * ```
++ * @param options - The query options to tag with the type from `queryFn`.
++ * @returns The tagged query options.
++ * @public
++ */
+ export function queryOptions<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+@@ -45,6 +95,28 @@ export function queryOptions<
+   queryKey: DataTag<TQueryKey, TQueryFnData>
+ }
+ 
++/**
++ * Allows to share and re-use query options in a type-safe way.
++ *
++ * The `queryKey` will be tagged with the type from `queryFn`.
++ *
++ * **Example**
++ *
++ * ```ts
++ *  const { queryKey } = queryOptions({
++ *     queryKey: ['key'],
++ *     queryFn: () => Promise.resolve(5),
++ *     //  ^?  Promise<number>
++ *   })
++ *
++ *   const queryClient = new QueryClient()
++ *   const data = queryClient.getQueryData(queryKey)
++ *   //    ^?  number | undefined
++ * ```
++ * @param options - The query options to tag with the type from `queryFn`.
++ * @returns The tagged query options.
++ * @public
++ */
+ export function queryOptions(options: unknown) {
+   return options
+ }
+diff --git a/packages/angular-query-experimental/src/signal-proxy.ts b/packages/angular-query-experimental/src/signal-proxy.ts
+index 30f3a909d4ddcbd81c7cc94dd51735b166e48b36..e2a9de345f63d0e8ed912a39cebeca0d5ffa14c4 100644
+--- a/packages/angular-query-experimental/src/signal-proxy.ts
++++ b/packages/angular-query-experimental/src/signal-proxy.ts
+@@ -7,11 +7,9 @@ export type MapToSignals<T> = {
+ 
+ /**
+  * Exposes fields of an object passed via an Angular `Signal` as `Computed` signals.
+- *
+  * Functions on the object are passed through as-is.
+- *
+  * @param inputSignal - `Signal` that must return an object.
+- *
++ * @returns A proxy object with the same fields as the input object, but with each field wrapped in a `Computed` signal.
+  */
+ export function signalProxy<TInput extends Record<string | symbol, any>>(
+   inputSignal: Signal<TInput>,
+diff --git a/packages/angular-query-experimental/src/types.ts b/packages/angular-query-experimental/src/types.ts
+index 67038fe1f08372c21bb5a882157462361220d831..7eb8491951ee3d3c3d44d22d35f759c900dcf4b8 100644
+--- a/packages/angular-query-experimental/src/types.ts
++++ b/packages/angular-query-experimental/src/types.ts
+@@ -9,12 +9,16 @@ import type {
+   MutateFunction,
+   MutationObserverOptions,
+   MutationObserverResult,
++  OmitKeyof,
+   QueryKey,
+   QueryObserverOptions,
+   QueryObserverResult,
+ } from '@tanstack/query-core'
+ import type { MapToSignals } from './signal-proxy'
+ 
++/**
++ * @public
++ */
+ export interface CreateBaseQueryOptions<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+@@ -29,12 +33,15 @@ export interface CreateBaseQueryOptions<
+     TQueryKey
+   > {}
+ 
++/**
++ * @public
++ */
+ export interface CreateQueryOptions<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+-> extends Omit<
++> extends OmitKeyof<
+     CreateBaseQueryOptions<
+       TQueryFnData,
+       TError,
+@@ -45,12 +52,18 @@ export interface CreateQueryOptions<
+     'suspense'
+   > {}
+ 
++/**
++ * @public
++ */
+ type CreateStatusBasedQueryResult<
+   TStatus extends QueryObserverResult['status'],
+   TData = unknown,
+   TError = DefaultError,
+ > = Extract<QueryObserverResult<TData, TError>, { status: TStatus }>
+ 
++/**
++ * @public
++ */
+ export interface BaseQueryNarrowing<TData = unknown, TError = DefaultError> {
+   isSuccess: (
+     this: CreateBaseQueryResult<TData, TError>,
+@@ -75,6 +88,9 @@ export interface BaseQueryNarrowing<TData = unknown, TError = DefaultError> {
+   >
+ }
+ 
++/**
++ * @public
++ */
+ export interface CreateInfiniteQueryOptions<
+   TQueryFnData = unknown,
+   TError = DefaultError,
+@@ -82,7 +98,7 @@ export interface CreateInfiniteQueryOptions<
+   TQueryData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     InfiniteQueryObserverOptions<
+       TQueryFnData,
+       TError,
+@@ -94,29 +110,44 @@ export interface CreateInfiniteQueryOptions<
+     'suspense'
+   > {}
+ 
++/**
++ * @public
++ */
+ export type CreateBaseQueryResult<
+   TData = unknown,
+   TError = DefaultError,
+   TState = QueryObserverResult<TData, TError>,
+ > = BaseQueryNarrowing<TData, TError> &
+-  MapToSignals<Omit<TState, keyof BaseQueryNarrowing>>
++  MapToSignals<OmitKeyof<TState, keyof BaseQueryNarrowing, 'safely'>>
+ 
++/**
++ * @public
++ */
+ export type CreateQueryResult<
+   TData = unknown,
+   TError = DefaultError,
+ > = CreateBaseQueryResult<TData, TError>
+ 
++/**
++ * @public
++ */
+ export type DefinedCreateQueryResult<
+   TData = unknown,
+   TError = DefaultError,
+   TDefinedQueryObserver = DefinedQueryObserverResult<TData, TError>,
+ > = MapToSignals<TDefinedQueryObserver>
+ 
++/**
++ * @public
++ */
+ export type CreateInfiniteQueryResult<
+   TData = unknown,
+   TError = DefaultError,
+ > = MapToSignals<InfiniteQueryObserverResult<TData, TError>>
+ 
++/**
++ * @public
++ */
+ export type DefinedCreateInfiniteQueryResult<
+   TData = unknown,
+   TError = DefaultError,
+@@ -126,16 +157,22 @@ export type DefinedCreateInfiniteQueryResult<
+   >,
+ > = MapToSignals<TDefinedInfiniteQueryObserver>
+ 
++/**
++ * @public
++ */
+ export interface CreateMutationOptions<
+   TData = unknown,
+   TError = DefaultError,
+   TVariables = void,
+   TContext = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     MutationObserverOptions<TData, TError, TVariables, TContext>,
+     '_defaulted'
+   > {}
+ 
++/**
++ * @public
++ */
+ export type CreateMutateFunction<
+   TData = unknown,
+   TError = DefaultError,
+@@ -145,6 +182,9 @@ export type CreateMutateFunction<
+   ...args: Parameters<MutateFunction<TData, TError, TVariables, TContext>>
+ ) => void
+ 
++/**
++ * @public
++ */
+ export type CreateMutateAsyncFunction<
+   TData = unknown,
+   TError = DefaultError,
+@@ -152,6 +192,9 @@ export type CreateMutateAsyncFunction<
+   TContext = unknown,
+ > = MutateFunction<TData, TError, TVariables, TContext>
+ 
++/**
++ * @public
++ */
+ export type CreateBaseMutationResult<
+   TData = unknown,
+   TError = DefaultError,
+@@ -164,6 +207,9 @@ export type CreateBaseMutationResult<
+   mutateAsync: CreateMutateAsyncFunction<TData, TError, TVariables, TContext>
+ }
+ 
++/**
++ * @public
++ */
+ type CreateStatusBasedMutationResult<
+   TStatus extends CreateBaseMutationResult['status'],
+   TData = unknown,
+@@ -175,6 +221,9 @@ type CreateStatusBasedMutationResult<
+   { status: TStatus }
+ >
+ 
++/**
++ * @public
++ */
+ export interface BaseMutationNarrowing<
+   TData = unknown,
+   TError = DefaultError,
+@@ -237,6 +286,9 @@ export interface BaseMutationNarrowing<
+   >
+ }
+ 
++/**
++ * @public
++ */
+ export type CreateMutationResult<
+   TData = unknown,
+   TError = DefaultError,
+@@ -250,7 +302,7 @@ export type CreateMutationResult<
+     TContext
+   >,
+ > = BaseMutationNarrowing<TData, TError, TVariables, TContext> &
+-  MapToSignals<Omit<TState, keyof BaseMutationNarrowing>>
++  MapToSignals<OmitKeyof<TState, keyof BaseMutationNarrowing, 'safely'>>
+ 
+ type Override<TTargetA, TTargetB> = {
+   [AKey in keyof TTargetA]: AKey extends keyof TTargetB
+diff --git a/packages/angular-query-experimental/src/util/index.ts b/packages/angular-query-experimental/src/util/index.ts
+index 177804c7aba909945e5a7a1f7f40ffd6f7cda81e..d07a9316fe9bcb35a7d7d528f65ef6d3a5360a4e 100644
+--- a/packages/angular-query-experimental/src/util/index.ts
++++ b/packages/angular-query-experimental/src/util/index.ts
+@@ -1 +1,13 @@
++export function shouldThrowError<T extends (...args: Array<any>) => boolean>(
++  throwError: boolean | T | undefined,
++  params: Parameters<T>,
++): boolean {
++  // Allow throwError function to override throwing behavior on a per-error basis
++  if (typeof throwError === 'function') {
++    return throwError(...params)
++  }
++
++  return !!throwError
++}
++
+ export function noop() {}
+diff --git a/packages/angular-query-experimental/src/util/lazy-init/lazy-init.ts b/packages/angular-query-experimental/src/util/lazy-init/lazy-init.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..16c58429c38e3abd368b86f2a5af8b5737f52f95
+--- /dev/null
++++ b/packages/angular-query-experimental/src/util/lazy-init/lazy-init.ts
+@@ -0,0 +1,34 @@
++import { untracked } from '@angular/core'
++
++export function lazyInit<T extends object>(initializer: () => T): T {
++  let object: T | null = null
++
++  const initializeObject = () => {
++    if (!object) {
++      object = untracked(() => initializer())
++    }
++  }
++
++  queueMicrotask(() => initializeObject())
++
++  return new Proxy<T>({} as T, {
++    get(_, prop, receiver) {
++      initializeObject()
++      return Reflect.get(object as T, prop, receiver)
++    },
++    has(_, prop) {
++      initializeObject()
++      return Reflect.has(object as T, prop)
++    },
++    ownKeys() {
++      initializeObject()
++      return Reflect.ownKeys(object as T)
++    },
++    getOwnPropertyDescriptor() {
++      return {
++        enumerable: true,
++        configurable: true,
++      }
++    },
++  })
++}
+diff --git a/packages/angular-query-experimental/src/util/lazy-signal-initializer/lazy-signal-initializer.ts b/packages/angular-query-experimental/src/util/lazy-signal-initializer/lazy-signal-initializer.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb33083aab97e1a929902ad571012ab95fe9a067
+--- /dev/null
++++ b/packages/angular-query-experimental/src/util/lazy-signal-initializer/lazy-signal-initializer.ts
+@@ -0,0 +1,28 @@
++import {
++  Injector,
++  type Signal,
++  computed,
++  inject,
++  untracked,
++} from '@angular/core'
++
++type SignalInitializerFn<T> = (injector: Injector) => Signal<T>
++
++export function lazySignalInitializer<T>(
++  initializerFn: SignalInitializerFn<T>,
++) {
++  const injector = inject(Injector)
++
++  let source: Signal<T> | null = null
++
++  const unwrapSignal = () => {
++    if (!source) {
++      source = untracked(() => initializerFn(injector))
++    }
++    return source()
++  }
++
++  queueMicrotask(() => unwrapSignal())
++
++  return computed(unwrapSignal)
++}
+diff --git a/packages/query-core/src/focusManager.ts b/packages/query-core/src/focusManager.ts
+index 4ea3c74d8fd5209f09719856751d8c83fc9fbe8e..cb0d8598713f072f0792bbe035cb8b68bca24d75 100644
+--- a/packages/query-core/src/focusManager.ts
++++ b/packages/query-core/src/focusManager.ts
+@@ -1,11 +1,13 @@
+ import { Subscribable } from './subscribable'
+ import { isServer } from './utils'
+ 
++type Listener = (focused: boolean) => void
++
+ type SetupFn = (
+   setFocused: (focused?: boolean) => void,
+ ) => (() => void) | undefined
+ 
+-export class FocusManager extends Subscribable {
++export class FocusManager extends Subscribable<Listener> {
+   #focused?: boolean
+   #cleanup?: () => void
+ 
+@@ -64,8 +66,9 @@ export class FocusManager extends Subscribable {
+   }
+ 
+   onFocus(): void {
++    const isFocused = this.isFocused()
+     this.listeners.forEach((listener) => {
+-      listener()
++      listener(isFocused)
+     })
+   }
+ 
+diff --git a/packages/query-core/src/hydration.ts b/packages/query-core/src/hydration.ts
+index 4e6b58e4f04ef87f19ff6d424ed84bd6728dc67d..8bcb2c6579328575805adbb9d90cdf900a66de35 100644
+--- a/packages/query-core/src/hydration.ts
++++ b/packages/query-core/src/hydration.ts
+@@ -1,26 +1,35 @@
+-import type { QueryClient } from './queryClient'
+-import type { Query, QueryState } from './query'
+ import type {
++  DefaultError,
+   MutationKey,
+   MutationMeta,
+   MutationOptions,
++  MutationScope,
+   QueryKey,
+   QueryMeta,
+   QueryOptions,
+ } from './types'
++import type { QueryClient } from './queryClient'
++import type { Query, QueryState } from './query'
+ import type { Mutation, MutationState } from './mutation'
+ 
+ // TYPES
++type TransformerFn = (data: any) => any
++function defaultTransformerFn(data: any): any {
++  return data
++}
+ 
+ export interface DehydrateOptions {
++  serializeData?: TransformerFn
+   shouldDehydrateMutation?: (mutation: Mutation) => boolean
+   shouldDehydrateQuery?: (query: Query) => boolean
+ }
+ 
+ export interface HydrateOptions {
+   defaultOptions?: {
++    transformPromise?: (promise: Promise<any>) => Promise<any>
++    deserializeData?: TransformerFn
+     queries?: QueryOptions
+-    mutations?: MutationOptions
++    mutations?: MutationOptions<unknown, DefaultError, unknown, unknown>
+   }
+ }
+ 
+@@ -28,12 +37,14 @@ interface DehydratedMutation {
+   mutationKey?: MutationKey
+   state: MutationState
+   meta?: MutationMeta
++  scope?: MutationScope
+ }
+ 
+ interface DehydratedQuery {
+   queryHash: string
+   queryKey: QueryKey
+   state: QueryState
++  promise?: Promise<unknown>
+   meta?: QueryMeta
+ }
+ 
+@@ -48,6 +59,7 @@ function dehydrateMutation(mutation: Mutation): DehydratedMutation {
+   return {
+     mutationKey: mutation.options.mutationKey,
+     state: mutation.state,
++    ...(mutation.options.scope && { scope: mutation.options.scope }),
+     ...(mutation.meta && { meta: mutation.meta }),
+   }
+ }
+@@ -56,11 +68,29 @@ function dehydrateMutation(mutation: Mutation): DehydratedMutation {
+ // consuming the de/rehydrated data, typically with useQuery on the client.
+ // Sometimes it might make sense to prefetch data on the server and include
+ // in the html-payload, but not consume it on the initial render.
+-function dehydrateQuery(query: Query): DehydratedQuery {
++function dehydrateQuery(
++  query: Query,
++  serializeData: TransformerFn,
++): DehydratedQuery {
+   return {
+-    state: query.state,
++    state: {
++      ...query.state,
++      ...(query.state.data !== undefined && {
++        data: serializeData(query.state.data),
++      }),
++    },
+     queryKey: query.queryKey,
+     queryHash: query.queryHash,
++    ...(query.state.status === 'pending' && {
++      promise: query.promise?.then(serializeData).catch((error) => {
++        if (process.env.NODE_ENV !== 'production') {
++          console.error(
++            `A query that was dehydrated as pending ended up rejecting. [${query.queryHash}]: ${error}; The error will be redacted in production builds`,
++          )
++        }
++        return Promise.reject(new Error('redacted'))
++      }),
++    }),
+     ...(query.meta && { meta: query.meta }),
+   }
+ }
+@@ -78,7 +108,9 @@ export function dehydrate(
+   options: DehydrateOptions = {},
+ ): DehydratedState {
+   const filterMutation =
+-    options.shouldDehydrateMutation ?? defaultShouldDehydrateMutation
++    options.shouldDehydrateMutation ??
++    client.getDefaultOptions().dehydrate?.shouldDehydrateMutation ??
++    defaultShouldDehydrateMutation
+ 
+   const mutations = client
+     .getMutationCache()
+@@ -88,12 +120,21 @@ export function dehydrate(
+     )
+ 
+   const filterQuery =
+-    options.shouldDehydrateQuery ?? defaultShouldDehydrateQuery
++    options.shouldDehydrateQuery ??
++    client.getDefaultOptions().dehydrate?.shouldDehydrateQuery ??
++    defaultShouldDehydrateQuery
++
++  const serializeData =
++    options.serializeData ??
++    client.getDefaultOptions().dehydrate?.serializeData ??
++    defaultTransformerFn
+ 
+   const queries = client
+     .getQueryCache()
+     .getAll()
+-    .flatMap((query) => (filterQuery(query) ? [dehydrateQuery(query)] : []))
++    .flatMap((query) =>
++      filterQuery(query) ? [dehydrateQuery(query, serializeData)] : [],
++    )
+ 
+   return { mutations, queries }
+ }
+@@ -109,53 +150,80 @@ export function hydrate(
+ 
+   const mutationCache = client.getMutationCache()
+   const queryCache = client.getQueryCache()
++  const transformPromise =
++    options?.defaultOptions?.transformPromise ??
++    client.getDefaultOptions().hydrate?.transformPromise
++  const deserializeData =
++    options?.defaultOptions?.deserializeData ??
++    client.getDefaultOptions().hydrate?.deserializeData ??
++    defaultTransformerFn
+ 
+   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+   const mutations = (dehydratedState as DehydratedState).mutations || []
+   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+   const queries = (dehydratedState as DehydratedState).queries || []
+ 
+-  mutations.forEach((dehydratedMutation) => {
++  mutations.forEach(({ state, ...mutationOptions }) => {
+     mutationCache.build(
+       client,
+       {
++        ...client.getDefaultOptions().hydrate?.mutations,
+         ...options?.defaultOptions?.mutations,
+-        mutationKey: dehydratedMutation.mutationKey,
+-        meta: dehydratedMutation.meta,
++        ...mutationOptions,
+       },
+-      dehydratedMutation.state,
++      state,
+     )
+   })
+ 
+-  queries.forEach(({ queryKey, state, queryHash, meta }) => {
+-    const query = queryCache.get(queryHash)
++  queries.forEach(({ queryKey, state, queryHash, meta, promise }) => {
++    let query = queryCache.get(queryHash)
++
++    const data =
++      state.data === undefined ? state.data : deserializeData(state.data)
+ 
+     // Do not hydrate if an existing query exists with newer data
+     if (query) {
+       if (query.state.dataUpdatedAt < state.dataUpdatedAt) {
+         // omit fetchStatus from dehydrated state
+         // so that query stays in its current fetchStatus
+-        const { fetchStatus: _ignored, ...dehydratedQueryState } = state
+-        query.setState(dehydratedQueryState)
++        const { fetchStatus: _ignored, ...serializedState } = state
++        query.setState({
++          ...serializedState,
++          data,
++        })
+       }
+-      return
++    } else {
++      // Restore query
++      query = queryCache.build(
++        client,
++        {
++          ...client.getDefaultOptions().hydrate?.queries,
++          ...options?.defaultOptions?.queries,
++          queryKey,
++          queryHash,
++          meta,
++        },
++        // Reset fetch status to idle to avoid
++        // query being stuck in fetching state upon hydration
++        {
++          ...state,
++          data,
++          fetchStatus: 'idle',
++        },
++      )
+     }
+ 
+-    // Restore query
+-    queryCache.build(
+-      client,
+-      {
+-        ...options?.defaultOptions?.queries,
+-        queryKey,
+-        queryHash,
+-        meta,
+-      },
+-      // Reset fetch status to idle to avoid
+-      // query being stuck in fetching state upon hydration
+-      {
+-        ...state,
+-        fetchStatus: 'idle',
+-      },
+-    )
++    if (promise) {
++      // Note: `Promise.resolve` required cause
++      // RSC transformed promises are not thenable
++      const normalizedPromise = Promise.resolve(promise)
++      const initialPromise = (
++        transformPromise?.(normalizedPromise) ?? normalizedPromise
++      ).then(deserializeData)
++
++      // this doesn't actually fetch - it just creates a retryer
++      // which will re-use the passed `initialPromise`
++      void query.fetch(undefined, { initialPromise })
++    }
+   })
+ }
+diff --git a/packages/query-core/src/index.ts b/packages/query-core/src/index.ts
+index 830a49f6007336403c343ef5a2a7a842797dfe97..0d6dd2f264b0bd47d57b1f551c7dbc9057bbf4dd 100644
+--- a/packages/query-core/src/index.ts
++++ b/packages/query-core/src/index.ts
+@@ -20,8 +20,9 @@ export {
+   matchQuery,
+   matchMutation,
+   keepPreviousData,
++  skipToken,
+ } from './utils'
+-export type { MutationFilters, QueryFilters, Updater } from './utils'
++export type { MutationFilters, QueryFilters, Updater, SkipToken } from './utils'
+ export { isCancelledError } from './retryer'
+ export {
+   dehydrate,
+diff --git a/packages/query-core/src/infiniteQueryBehavior.ts b/packages/query-core/src/infiniteQueryBehavior.ts
+index 73ddd9e51eff5b86d4057cd5726df2003422e4f7..5db6e34ba1a976556b94b5dddf79911bca28437b 100644
+--- a/packages/query-core/src/infiniteQueryBehavior.ts
++++ b/packages/query-core/src/infiniteQueryBehavior.ts
+@@ -1,8 +1,9 @@
+-import { addToEnd, addToStart } from './utils'
++import { addToEnd, addToStart, ensureQueryFn } from './utils'
+ import type { QueryBehavior } from './query'
+ import type {
+   InfiniteData,
+   InfiniteQueryPageParamsOptions,
++  OmitKeyof,
+   QueryFunctionContext,
+   QueryKey,
+ } from './types'
+@@ -36,13 +37,7 @@ export function infiniteQueryBehavior<TQueryFnData, TError, TData, TPageParam>(
+           })
+         }
+ 
+-        // Get query function
+-        const queryFn =
+-          context.options.queryFn ||
+-          (() =>
+-            Promise.reject(
+-              new Error(`Missing queryFn: '${context.options.queryHash}'`),
+-            ))
++        const queryFn = ensureQueryFn(context.options, context.fetchOptions)
+ 
+         // Create function to fetch a page
+         const fetchPage = async (
+@@ -58,7 +53,7 @@ export function infiniteQueryBehavior<TQueryFnData, TError, TData, TPageParam>(
+             return Promise.resolve(data)
+           }
+ 
+-          const queryFnContext: Omit<
++          const queryFnContext: OmitKeyof<
+             QueryFunctionContext<QueryKey, unknown>,
+             'signal'
+           > = {
+@@ -108,6 +103,9 @@ export function infiniteQueryBehavior<TQueryFnData, TError, TData, TPageParam>(
+           // Fetch remaining pages
+           for (let i = 1; i < remainingPages; i++) {
+             const param = getNextPageParam(options, result)
++            if (param == null) {
++              break
++            }
+             result = await fetchPage(result, param)
+           }
+         }
+@@ -138,24 +136,23 @@ function getNextPageParam(
+   { pages, pageParams }: InfiniteData<unknown>,
+ ): unknown | undefined {
+   const lastIndex = pages.length - 1
+-  return options.getNextPageParam(
+-    pages[lastIndex],
+-    pages,
+-    pageParams[lastIndex],
+-    pageParams,
+-  )
++  return pages.length > 0
++    ? options.getNextPageParam(
++        pages[lastIndex],
++        pages,
++        pageParams[lastIndex],
++        pageParams,
++      )
++    : undefined
+ }
+ 
+ function getPreviousPageParam(
+   options: InfiniteQueryPageParamsOptions<any>,
+   { pages, pageParams }: InfiniteData<unknown>,
+ ): unknown | undefined {
+-  return options.getPreviousPageParam?.(
+-    pages[0],
+-    pages,
+-    pageParams[0],
+-    pageParams,
+-  )
++  return pages.length > 0
++    ? options.getPreviousPageParam?.(pages[0], pages, pageParams[0], pageParams)
++    : undefined
+ }
+ 
+ /**
+diff --git a/packages/query-core/src/infiniteQueryObserver.ts b/packages/query-core/src/infiniteQueryObserver.ts
+index 4f8ac1e38c21e1aebe4823f664fb2d60e50b7671..59d6efa259ddb293f9cbac16f93367e37e54275f 100644
+--- a/packages/query-core/src/infiniteQueryObserver.ts
++++ b/packages/query-core/src/infiniteQueryObserver.ts
+@@ -10,6 +10,7 @@ import type {
+   FetchNextPageOptions,
+   FetchPreviousPageOptions,
+   InfiniteData,
++  InfiniteQueryObserverBaseResult,
+   InfiniteQueryObserverOptions,
+   InfiniteQueryObserverResult,
+   QueryKey,
+@@ -145,26 +146,33 @@ export class InfiniteQueryObserver<
+     >,
+   ): InfiniteQueryObserverResult<TData, TError> {
+     const { state } = query
+-    const result = super.createResult(query, options)
++    const parentResult = super.createResult(query, options)
+ 
+-    const { isFetching, isRefetching } = result
++    const { isFetching, isRefetching, isError, isRefetchError } = parentResult
++    const fetchDirection = state.fetchMeta?.fetchMore?.direction
+ 
+-    const isFetchingNextPage =
+-      isFetching && state.fetchMeta?.fetchMore?.direction === 'forward'
++    const isFetchNextPageError = isError && fetchDirection === 'forward'
++    const isFetchingNextPage = isFetching && fetchDirection === 'forward'
+ 
+-    const isFetchingPreviousPage =
+-      isFetching && state.fetchMeta?.fetchMore?.direction === 'backward'
++    const isFetchPreviousPageError = isError && fetchDirection === 'backward'
++    const isFetchingPreviousPage = isFetching && fetchDirection === 'backward'
+ 
+-    return {
+-      ...result,
++    const result: InfiniteQueryObserverBaseResult<TData, TError> = {
++      ...parentResult,
+       fetchNextPage: this.fetchNextPage,
+       fetchPreviousPage: this.fetchPreviousPage,
+       hasNextPage: hasNextPage(options, state.data),
+       hasPreviousPage: hasPreviousPage(options, state.data),
++      isFetchNextPageError,
+       isFetchingNextPage,
++      isFetchPreviousPageError,
+       isFetchingPreviousPage,
++      isRefetchError:
++        isRefetchError && !isFetchNextPageError && !isFetchPreviousPageError,
+       isRefetching:
+         isRefetching && !isFetchingNextPage && !isFetchingPreviousPage,
+     }
++
++    return result as InfiniteQueryObserverResult<TData, TError>
+   }
+ }
+diff --git a/packages/query-core/src/mutation.ts b/packages/query-core/src/mutation.ts
+index 79d87c0d730744144a9cbbf057fbf9169009a477..e2e2afd600ff5501ba32fe19b5d62714a4d74607 100644
+--- a/packages/query-core/src/mutation.ts
++++ b/packages/query-core/src/mutation.ts
+@@ -1,6 +1,6 @@
+ import { notifyManager } from './notifyManager'
+ import { Removable } from './removable'
+-import { canFetch, createRetryer } from './retryer'
++import { createRetryer } from './retryer'
+ import type {
+   DefaultError,
+   MutationMeta,
+@@ -17,14 +17,13 @@ interface MutationConfig<TData, TError, TVariables, TContext> {
+   mutationId: number
+   mutationCache: MutationCache
+   options: MutationOptions<TData, TError, TVariables, TContext>
+-  defaultOptions?: MutationOptions<TData, TError, TVariables, TContext>
+   state?: MutationState<TData, TError, TVariables, TContext>
+ }
+ 
+ export interface MutationState<
+   TData = unknown,
+   TError = DefaultError,
+-  TVariables = void,
++  TVariables = unknown,
+   TContext = unknown,
+ > {
+   context: TContext | undefined
+@@ -46,6 +45,7 @@ interface FailedAction<TError> {
+ 
+ interface PendingAction<TVariables, TContext> {
+   type: 'pending'
++  isPaused: boolean
+   variables?: TVariables
+   context?: TContext
+ }
+@@ -81,7 +81,7 @@ export type Action<TData, TError, TVariables, TContext> =
+ export class Mutation<
+   TData = unknown,
+   TError = DefaultError,
+-  TVariables = void,
++  TVariables = unknown,
+   TContext = unknown,
+ > extends Removable {
+   state: MutationState<TData, TError, TVariables, TContext>
+@@ -89,7 +89,6 @@ export class Mutation<
+   readonly mutationId: number
+ 
+   #observers: Array<MutationObserver<TData, TError, TVariables, TContext>>
+-  #defaultOptions?: MutationOptions<TData, TError, TVariables, TContext>
+   #mutationCache: MutationCache
+   #retryer?: Retryer<TData>
+ 
+@@ -97,7 +96,6 @@ export class Mutation<
+     super()
+ 
+     this.mutationId = config.mutationId
+-    this.#defaultOptions = config.defaultOptions
+     this.#mutationCache = config.mutationCache
+     this.#observers = []
+     this.state = config.state || getDefaultState()
+@@ -107,9 +105,9 @@ export class Mutation<
+   }
+ 
+   setOptions(
+-    options?: MutationOptions<TData, TError, TVariables, TContext>,
++    options: MutationOptions<TData, TError, TVariables, TContext>,
+   ): void {
+-    this.options = { ...this.#defaultOptions, ...options }
++    this.options = options
+ 
+     this.updateGcTime(this.options.gcTime)
+   }
+@@ -164,36 +162,34 @@ export class Mutation<
+   }
+ 
+   async execute(variables: TVariables): Promise<TData> {
+-    const executeMutation = () => {
+-      this.#retryer = createRetryer({
+-        fn: () => {
+-          if (!this.options.mutationFn) {
+-            return Promise.reject(new Error('No mutationFn found'))
+-          }
+-          return this.options.mutationFn(variables)
+-        },
+-        onFail: (failureCount, error) => {
+-          this.#dispatch({ type: 'failed', failureCount, error })
+-        },
+-        onPause: () => {
+-          this.#dispatch({ type: 'pause' })
+-        },
+-        onContinue: () => {
+-          this.#dispatch({ type: 'continue' })
+-        },
+-        retry: this.options.retry ?? 0,
+-        retryDelay: this.options.retryDelay,
+-        networkMode: this.options.networkMode,
+-      })
+-
+-      return this.#retryer.promise
+-    }
++    this.#retryer = createRetryer({
++      fn: () => {
++        if (!this.options.mutationFn) {
++          return Promise.reject(new Error('No mutationFn found'))
++        }
++        return this.options.mutationFn(variables)
++      },
++      onFail: (failureCount, error) => {
++        this.#dispatch({ type: 'failed', failureCount, error })
++      },
++      onPause: () => {
++        this.#dispatch({ type: 'pause' })
++      },
++      onContinue: () => {
++        this.#dispatch({ type: 'continue' })
++      },
++      retry: this.options.retry ?? 0,
++      retryDelay: this.options.retryDelay,
++      networkMode: this.options.networkMode,
++      canRun: () => this.#mutationCache.canRun(this),
++    })
+ 
+     const restored = this.state.status === 'pending'
++    const isPaused = !this.#retryer.canStart()
+ 
+     try {
+       if (!restored) {
+-        this.#dispatch({ type: 'pending', variables })
++        this.#dispatch({ type: 'pending', variables, isPaused })
+         // Notify cache callback
+         await this.#mutationCache.config.onMutate?.(
+           variables,
+@@ -205,10 +201,11 @@ export class Mutation<
+             type: 'pending',
+             context,
+             variables,
++            isPaused,
+           })
+         }
+       }
+-      const data = await executeMutation()
++      const data = await this.#retryer.start()
+ 
+       // Notify cache callback
+       await this.#mutationCache.config.onSuccess?.(
+@@ -268,6 +265,8 @@ export class Mutation<
+       } finally {
+         this.#dispatch({ type: 'error', error: error as TError })
+       }
++    } finally {
++      this.#mutationCache.runNext(this)
+     }
+   }
+ 
+@@ -300,7 +299,7 @@ export class Mutation<
+             failureCount: 0,
+             failureReason: null,
+             error: null,
+-            isPaused: !canFetch(this.options.networkMode),
++            isPaused: action.isPaused,
+             status: 'pending',
+             variables: action.variables,
+             submittedAt: Date.now(),
+diff --git a/packages/query-core/src/mutationCache.ts b/packages/query-core/src/mutationCache.ts
+index 628b63e1ed4def3944c3ab61467ed8528f359e05..1663b50cef3053a6143c529f21cef378c8493dc7 100644
+--- a/packages/query-core/src/mutationCache.ts
++++ b/packages/query-core/src/mutationCache.ts
+@@ -82,14 +82,13 @@ type MutationCacheListener = (event: MutationCacheNotifyEvent) => void
+ // CLASS
+ 
+ export class MutationCache extends Subscribable<MutationCacheListener> {
+-  #mutations: Array<Mutation<any, any, any, any>>
++  #mutations: Map<string, Array<Mutation<any, any, any, any>>>
+   #mutationId: number
+-  #resuming: Promise<unknown> | undefined
+ 
+   constructor(public config: MutationCacheConfig = {}) {
+     super()
+-    this.#mutations = []
+-    this.#mutationId = 0
++    this.#mutations = new Map()
++    this.#mutationId = Date.now()
+   }
+ 
+   build<TData, TError, TVariables, TContext>(
+@@ -110,25 +109,59 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+   }
+ 
+   add(mutation: Mutation<any, any, any, any>): void {
+-    this.#mutations.push(mutation)
++    const scope = scopeFor(mutation)
++    const mutations = this.#mutations.get(scope) ?? []
++    mutations.push(mutation)
++    this.#mutations.set(scope, mutations)
+     this.notify({ type: 'added', mutation })
+   }
+ 
+   remove(mutation: Mutation<any, any, any, any>): void {
+-    this.#mutations = this.#mutations.filter((x) => x !== mutation)
++    const scope = scopeFor(mutation)
++    if (this.#mutations.has(scope)) {
++      const mutations = this.#mutations
++        .get(scope)
++        ?.filter((x) => x !== mutation)
++      if (mutations) {
++        if (mutations.length === 0) {
++          this.#mutations.delete(scope)
++        } else {
++          this.#mutations.set(scope, mutations)
++        }
++      }
++    }
++
+     this.notify({ type: 'removed', mutation })
+   }
+ 
++  canRun(mutation: Mutation<any, any, any, any>): boolean {
++    const firstPendingMutation = this.#mutations
++      .get(scopeFor(mutation))
++      ?.find((m) => m.state.status === 'pending')
++
++    // we can run if there is no current pending mutation (start use-case)
++    // or if WE are the first pending mutation (continue use-case)
++    return !firstPendingMutation || firstPendingMutation === mutation
++  }
++
++  runNext(mutation: Mutation<any, any, any, any>): Promise<unknown> {
++    const foundMutation = this.#mutations
++      .get(scopeFor(mutation))
++      ?.find((m) => m !== mutation && m.state.isPaused)
++
++    return foundMutation?.continue() ?? Promise.resolve()
++  }
++
+   clear(): void {
+     notifyManager.batch(() => {
+-      this.#mutations.forEach((mutation) => {
++      this.getAll().forEach((mutation) => {
+         this.remove(mutation)
+       })
+     })
+   }
+ 
+   getAll(): Array<Mutation> {
+-    return this.#mutations
++    return [...this.#mutations.values()].flat()
+   }
+ 
+   find<
+@@ -141,15 +174,13 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+   ): Mutation<TData, TError, TVariables, TContext> | undefined {
+     const defaultedFilters = { exact: true, ...filters }
+ 
+-    return this.#mutations.find((mutation) =>
++    return this.getAll().find((mutation) =>
+       matchMutation(defaultedFilters, mutation),
+-    )
++    ) as Mutation<TData, TError, TVariables, TContext> | undefined
+   }
+ 
+   findAll(filters: MutationFilters = {}): Array<Mutation> {
+-    return this.#mutations.filter((mutation) =>
+-      matchMutation(filters, mutation),
+-    )
++    return this.getAll().filter((mutation) => matchMutation(filters, mutation))
+   }
+ 
+   notify(event: MutationCacheNotifyEvent) {
+@@ -161,21 +192,16 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
+   }
+ 
+   resumePausedMutations(): Promise<unknown> {
+-    this.#resuming = (this.#resuming ?? Promise.resolve())
+-      .then(() => {
+-        const pausedMutations = this.#mutations.filter((x) => x.state.isPaused)
+-        return notifyManager.batch(() =>
+-          pausedMutations.reduce(
+-            (promise, mutation) =>
+-              promise.then(() => mutation.continue().catch(noop)),
+-            Promise.resolve() as Promise<unknown>,
+-          ),
+-        )
+-      })
+-      .then(() => {
+-        this.#resuming = undefined
+-      })
++    const pausedMutations = this.getAll().filter((x) => x.state.isPaused)
+ 
+-    return this.#resuming
++    return notifyManager.batch(() =>
++      Promise.all(
++        pausedMutations.map((mutation) => mutation.continue().catch(noop)),
++      ),
++    )
+   }
+ }
++
++function scopeFor(mutation: Mutation<any, any, any, any>) {
++  return mutation.options.scope?.id ?? String(mutation.mutationId)
++}
+diff --git a/packages/query-core/src/queriesObserver.ts b/packages/query-core/src/queriesObserver.ts
+index 2439e2a504cc53a5eb23bf115a421aeceace4711..98872234be460aa54d621713b46b6b4c63aefbf7 100644
+--- a/packages/query-core/src/queriesObserver.ts
++++ b/packages/query-core/src/queriesObserver.ts
+@@ -1,7 +1,7 @@
+ import { notifyManager } from './notifyManager'
+ import { QueryObserver } from './queryObserver'
+ import { Subscribable } from './subscribable'
+-import { replaceEqualDeep } from './utils'
++import { replaceEqualDeep, shallowEqualObjects } from './utils'
+ import type {
+   DefaultedQueryObserverOptions,
+   QueryObserverOptions,
+@@ -39,27 +39,23 @@ export class QueriesObserver<
+   #result!: Array<QueryObserverResult>
+   #queries: Array<QueryObserverOptions>
+   #observers: Array<QueryObserver>
+-  #options?: QueriesObserverOptions<TCombinedResult>
+   #combinedResult!: TCombinedResult
++  #lastCombine?: CombineFn<TCombinedResult>
++  #lastResult?: Array<QueryObserverResult>
+ 
+   constructor(
+     client: QueryClient,
+     queries: Array<QueryObserverOptions>,
+-    options?: QueriesObserverOptions<TCombinedResult>,
++    _options?: QueriesObserverOptions<TCombinedResult>,
+   ) {
+     super()
+ 
+     this.#client = client
+     this.#queries = []
+     this.#observers = []
++    this.#result = []
+ 
+-    this.#setResult([])
+-    this.setQueries(queries, options)
+-  }
+-
+-  #setResult(value: Array<QueryObserverResult>) {
+-    this.#result = value
+-    this.#combinedResult = this.#combineResult(value, this.#options?.combine)
++    this.setQueries(queries)
+   }
+ 
+   protected onSubscribe(): void {
+@@ -87,11 +83,10 @@ export class QueriesObserver<
+ 
+   setQueries(
+     queries: Array<QueryObserverOptions>,
+-    options?: QueriesObserverOptions<TCombinedResult>,
++    _options?: QueriesObserverOptions<TCombinedResult>,
+     notifyOptions?: NotifyOptions,
+   ): void {
+     this.#queries = queries
+-    this.#options = options
+ 
+     notifyManager.batch(() => {
+       const prevObservers = this.#observers
+@@ -117,7 +112,7 @@ export class QueriesObserver<
+       }
+ 
+       this.#observers = newObservers
+-      this.#setResult(newResult)
++      this.#result = newResult
+ 
+       if (!this.hasListeners()) {
+         return
+@@ -137,8 +132,8 @@ export class QueriesObserver<
+     })
+   }
+ 
+-  getCurrentResult(): TCombinedResult {
+-    return this.#combinedResult
++  getCurrentResult(): Array<QueryObserverResult> {
++    return this.#result
+   }
+ 
+   getQueries() {
+@@ -165,13 +160,18 @@ export class QueriesObserver<
+     return [
+       result,
+       (r?: Array<QueryObserverResult>) => {
+-        return this.#combineResult(r ?? result, combine)
++        return this.#combineResult(r ?? result, combine, result)
+       },
+       () => {
+         return matches.map((match, index) => {
+           const observerResult = result[index]!
+           return !match.defaultedQueryOptions.notifyOnChangeProps
+-            ? match.observer.trackResult(observerResult)
++            ? match.observer.trackResult(observerResult, (accessedProp) => {
++                // track property on all observers to ensure proper (synchronized) tracking (#7000)
++                matches.forEach((m) => {
++                  m.observer.trackProp(accessedProp)
++                })
++              })
+             : observerResult
+         })
+       },
+@@ -181,9 +181,26 @@ export class QueriesObserver<
+   #combineResult(
+     input: Array<QueryObserverResult>,
+     combine: CombineFn<TCombinedResult> | undefined,
++    results: Array<QueryObserverResult> = input,
+   ): TCombinedResult {
+     if (combine) {
+-      return replaceEqualDeep(this.#combinedResult, combine(input))
++      if (
++        !this.#lastCombine ||
++        results.length !== this.#lastResult?.length ||
++        results.some((result, index) =>
++          !shallowEqualObjects(result, this.#lastResult?.[index]),
++        ) ||
++        combine !== this.#lastCombine
++      ) {
++        this.#combinedResult = replaceEqualDeep(
++          this.#combinedResult,
++          combine(input),
++        )
++        this.#lastCombine = combine
++        this.#lastResult = results
++      }
++
++      return this.#combinedResult
+     }
+     return input as any
+   }
+@@ -249,7 +266,7 @@ export class QueriesObserver<
+   #onUpdate(observer: QueryObserver, result: QueryObserverResult): void {
+     const index = this.#observers.indexOf(observer)
+     if (index !== -1) {
+-      this.#setResult(replaceAt(this.#result, index, result))
++      this.#result = replaceAt(this.#result, index, result)
+       this.#notify()
+     }
+   }
+diff --git a/packages/query-core/src/query.ts b/packages/query-core/src/query.ts
+index 3c19ce149d42bce797cc791795abd397a88cf111..c7872b23b82a24b0248d88f0ac43215d6dc68f66 100644
+--- a/packages/query-core/src/query.ts
++++ b/packages/query-core/src/query.ts
+@@ -1,4 +1,4 @@
+-import { noop, replaceData, timeUntilStale } from './utils'
++import { ensureQueryFn, noop, replaceData, timeUntilStale } from './utils'
+ import { notifyManager } from './notifyManager'
+ import { canFetch, createRetryer, isCancelledError } from './retryer'
+ import { Removable } from './removable'
+@@ -7,6 +7,8 @@ import type {
+   DefaultError,
+   FetchStatus,
+   InitialDataFunction,
++  OmitKeyof,
++  QueryFunction,
+   QueryFunctionContext,
+   QueryKey,
+   QueryMeta,
+@@ -81,9 +83,10 @@ export interface FetchMeta {
+   fetchMore?: { direction: FetchDirection }
+ }
+ 
+-export interface FetchOptions {
++export interface FetchOptions<TData = unknown> {
+   cancelRefetch?: boolean
+   meta?: FetchMeta
++  initialPromise?: Promise<TData>
+ }
+ 
+ interface FailedAction<TError> {
+@@ -158,7 +161,6 @@ export class Query<
+   #initialState: QueryState<TData, TError>
+   #revertState?: QueryState<TData, TError>
+   #cache: QueryCache
+-  #promise?: Promise<TData>
+   #retryer?: Retryer<TData>
+   #observers: Array<QueryObserver<any, any, any, any, any>>
+   #defaultOptions?: QueryOptions<TQueryFnData, TError, TData, TQueryKey>
+@@ -169,7 +171,7 @@ export class Query<
+ 
+     this.#abortSignalConsumed = false
+     this.#defaultOptions = config.defaultOptions
+-    this.#setOptions(config.options)
++    this.setOptions(config.options)
+     this.#observers = []
+     this.#cache = config.cache
+     this.queryKey = config.queryKey
+@@ -182,7 +184,11 @@ export class Query<
+     return this.options.meta
+   }
+ 
+-  #setOptions(
++  get promise(): Promise<TData> | undefined {
++    return this.#retryer?.promise
++  }
++
++  setOptions(
+     options?: QueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+   ): void {
+     this.options = { ...this.#defaultOptions, ...options }
+@@ -221,7 +227,7 @@ export class Query<
+   }
+ 
+   cancel(options?: CancelOptions): Promise<void> {
+-    const promise = this.#promise
++    const promise = this.#retryer?.promise
+     this.#retryer?.cancel(options)
+     return promise ? promise.then(noop).catch(noop) : Promise.resolve()
+   }
+@@ -248,17 +254,23 @@ export class Query<
+   }
+ 
+   isStale(): boolean {
+-    return (
+-      this.state.isInvalidated ||
+-      !this.state.dataUpdatedAt ||
+-      this.#observers.some((observer) => observer.getCurrentResult().isStale)
+-    )
++    if (this.state.isInvalidated) {
++      return true
++    }
++
++    if (this.getObserversCount() > 0) {
++      return this.#observers.some(
++        (observer) => observer.getCurrentResult().isStale,
++      )
++    }
++
++    return this.state.data === undefined
+   }
+ 
+   isStaleByTime(staleTime = 0): boolean {
+     return (
+       this.state.isInvalidated ||
+-      !this.state.dataUpdatedAt ||
++      this.state.data === undefined ||
+       !timeUntilStale(this.state.dataUpdatedAt, staleTime)
+     )
+   }
+@@ -326,23 +338,23 @@ export class Query<
+ 
+   fetch(
+     options?: QueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+-    fetchOptions?: FetchOptions,
++    fetchOptions?: FetchOptions<TQueryFnData>,
+   ): Promise<TData> {
+     if (this.state.fetchStatus !== 'idle') {
+-      if (this.state.dataUpdatedAt && fetchOptions?.cancelRefetch) {
++      if (this.state.data !== undefined && fetchOptions?.cancelRefetch) {
+         // Silently cancel current fetch if the user wants to cancel refetch
+         this.cancel({ silent: true })
+-      } else if (this.#promise) {
++      } else if (this.#retryer) {
+         // make sure that retries that were potentially cancelled due to unmounts can continue
+-        this.#retryer?.continueRetry()
++        this.#retryer.continueRetry()
+         // Return current promise if we are already fetching
+-        return this.#promise
++        return this.#retryer.promise
+       }
+     }
+ 
+     // Update config if passed, otherwise the config from the last execution is used
+     if (options) {
+-      this.#setOptions(options)
++      this.setOptions(options)
+     }
+ 
+     // Use the options from the first observer with a query function if no function is found.
+@@ -350,7 +362,7 @@ export class Query<
+     if (!this.options.queryFn) {
+       const observer = this.#observers.find((x) => x.options.queryFn)
+       if (observer) {
+-        this.#setOptions(observer.options)
++        this.setOptions(observer.options)
+       }
+     }
+ 
+@@ -364,12 +376,6 @@ export class Query<
+ 
+     const abortController = new AbortController()
+ 
+-    // Create query function context
+-    const queryFnContext: Omit<QueryFunctionContext<TQueryKey>, 'signal'> = {
+-      queryKey: this.queryKey,
+-      meta: this.meta,
+-    }
+-
+     // Adds an enumerable signal property to the object that
+     // which sets abortSignalConsumed to true when the signal
+     // is read.
+@@ -383,31 +389,35 @@ export class Query<
+       })
+     }
+ 
+-    addSignalProperty(queryFnContext)
+-
+     // Create fetch function
+     const fetchFn = () => {
+-      if (!this.options.queryFn) {
+-        return Promise.reject(
+-          new Error(`Missing queryFn: '${this.options.queryHash}'`),
+-        )
++      const queryFn = ensureQueryFn(this.options, fetchOptions)
++
++      // Create query function context
++      const queryFnContext: OmitKeyof<
++        QueryFunctionContext<TQueryKey>,
++        'signal'
++      > = {
++        queryKey: this.queryKey,
++        meta: this.meta,
+       }
++
++      addSignalProperty(queryFnContext)
++
+       this.#abortSignalConsumed = false
+       if (this.options.persister) {
+         return this.options.persister(
+-          this.options.queryFn,
++          queryFn as QueryFunction<any>,
+           queryFnContext as QueryFunctionContext<TQueryKey>,
+           this as unknown as Query,
+         )
+       }
+ 
+-      return this.options.queryFn(
+-        queryFnContext as QueryFunctionContext<TQueryKey>,
+-      )
++      return queryFn(queryFnContext as QueryFunctionContext<TQueryKey>)
+     }
+ 
+     // Trigger behavior hook
+-    const context: Omit<
++    const context: OmitKeyof<
+       FetchContext<TQueryFnData, TError, TData, TQueryKey>,
+       'signal'
+     > = {
+@@ -467,6 +477,9 @@ export class Query<
+ 
+     // Try to fetch the data
+     this.#retryer = createRetryer({
++      initialPromise: fetchOptions?.initialPromise as
++        | Promise<TData>
++        | undefined,
+       fn: context.fetchFn as () => Promise<TData>,
+       abort: abortController.abort.bind(abortController),
+       onSuccess: (data) => {
+@@ -509,11 +522,10 @@ export class Query<
+       retry: context.options.retry,
+       retryDelay: context.options.retryDelay,
+       networkMode: context.options.networkMode,
++      canRun: () => true,
+     })
+ 
+-    this.#promise = this.#retryer.promise
+-
+-    return this.#promise
++    return this.#retryer.start()
+   }
+ 
+   #dispatch(action: Action<TData, TError>): void {
+@@ -540,16 +552,8 @@ export class Query<
+         case 'fetch':
+           return {
+             ...state,
+-            fetchFailureCount: 0,
+-            fetchFailureReason: null,
++            ...fetchState(state.data, this.options),
+             fetchMeta: action.meta ?? null,
+-            fetchStatus: canFetch(this.options.networkMode)
+-              ? 'fetching'
+-              : 'paused',
+-            ...(!state.dataUpdatedAt && {
+-              error: null,
+-              status: 'pending',
+-            }),
+           }
+         case 'success':
+           return {
+@@ -608,6 +612,27 @@ export class Query<
+   }
+ }
+ 
++export function fetchState<
++  TQueryFnData,
++  TError,
++  TData,
++  TQueryKey extends QueryKey,
++>(
++  data: TData | undefined,
++  options: QueryOptions<TQueryFnData, TError, TData, TQueryKey>,
++) {
++  return {
++    fetchFailureCount: 0,
++    fetchFailureReason: null,
++    fetchStatus: canFetch(options.networkMode) ? 'fetching' : 'paused',
++    ...(data === undefined &&
++      ({
++        error: null,
++        status: 'pending',
++      } as const)),
++  } as const
++}
++
+ function getDefaultState<
+   TQueryFnData,
+   TError,
+diff --git a/packages/query-core/src/queryCache.ts b/packages/query-core/src/queryCache.ts
+index 53fcbd46f463be61f3eea4cc5c0cc81d74da7fd3..5222b2793b9a48afb46b4a967d86cfbdecb48758 100644
+--- a/packages/query-core/src/queryCache.ts
++++ b/packages/query-core/src/queryCache.ts
+@@ -97,7 +97,12 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
+     this.#queries = new Map<string, Query>()
+   }
+ 
+-  build<TQueryFnData, TError, TData, TQueryKey extends QueryKey>(
++  build<
++    TQueryFnData = unknown,
++    TError = DefaultError,
++    TData = TQueryFnData,
++    TQueryKey extends QueryKey = QueryKey,
++  >(
+     client: QueryClient,
+     options: WithRequired<
+       QueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+diff --git a/packages/query-core/src/queryClient.ts b/packages/query-core/src/queryClient.ts
+index 74f8b2335208c5ccf51bcb5064c0c1e60203262a..44a3a5632bf68d5e57d2f3d53eb64190d80089de 100644
+--- a/packages/query-core/src/queryClient.ts
++++ b/packages/query-core/src/queryClient.ts
+@@ -4,6 +4,8 @@ import {
+   hashQueryKeyByOptions,
+   noop,
+   partialMatchKey,
++  resolveStaleTime,
++  skipToken,
+ } from './utils'
+ import { QueryCache } from './queryCache'
+ import { MutationCache } from './mutationCache'
+@@ -11,13 +13,14 @@ import { focusManager } from './focusManager'
+ import { onlineManager } from './onlineManager'
+ import { notifyManager } from './notifyManager'
+ import { infiniteQueryBehavior } from './infiniteQueryBehavior'
+-import type { DataTag, NoInfer } from './types'
++import type { DataTag, NoInfer, OmitKeyof } from './types'
+ import type { QueryState } from './query'
+ import type {
+   CancelOptions,
+   DefaultError,
+   DefaultOptions,
+   DefaultedQueryObserverOptions,
++  EnsureQueryDataOptions,
+   FetchInfiniteQueryOptions,
+   FetchQueryOptions,
+   InfiniteData,
+@@ -41,7 +44,7 @@ import type { MutationFilters, QueryFilters, Updater } from './utils'
+ 
+ interface QueryDefaults {
+   queryKey: QueryKey
+-  defaultOptions: Omit<QueryOptions<any, any, any>, 'queryKey'>
++  defaultOptions: OmitKeyof<QueryOptions<any, any, any>, 'queryKey'>
+ }
+ 
+ interface MutationDefaults {
+@@ -74,15 +77,15 @@ export class QueryClient {
+     this.#mountCount++
+     if (this.#mountCount !== 1) return
+ 
+-    this.#unsubscribeFocus = focusManager.subscribe(() => {
+-      if (focusManager.isFocused()) {
+-        this.resumePausedMutations()
++    this.#unsubscribeFocus = focusManager.subscribe(async (focused) => {
++      if (focused) {
++        await this.resumePausedMutations()
+         this.#queryCache.onFocus()
+       }
+     })
+-    this.#unsubscribeOnline = onlineManager.subscribe(() => {
+-      if (onlineManager.isOnline()) {
+-        this.resumePausedMutations()
++    this.#unsubscribeOnline = onlineManager.subscribe(async (online) => {
++      if (online) {
++        await this.resumePausedMutations()
+         this.#queryCache.onOnline()
+       }
+     })
+@@ -129,13 +132,24 @@ export class QueryClient {
+     TData = TQueryFnData,
+     TQueryKey extends QueryKey = QueryKey,
+   >(
+-    options: FetchQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
++    options: EnsureQueryDataOptions<TQueryFnData, TError, TData, TQueryKey>,
+   ): Promise<TData> {
+     const cachedData = this.getQueryData<TData>(options.queryKey)
+ 
+-    return cachedData !== undefined
+-      ? Promise.resolve(cachedData)
+-      : this.fetchQuery(options)
++    if (cachedData === undefined) return this.fetchQuery(options)
++    else {
++      const defaultedOptions = this.defaultQueryOptions(options)
++      const query = this.#queryCache.build(this, defaultedOptions)
++
++      if (
++        options.revalidateIfStale &&
++        query.isStaleByTime(resolveStaleTime(defaultedOptions.staleTime, query))
++      ) {
++        void this.prefetchQuery(defaultedOptions)
++      }
++
++      return Promise.resolve(cachedData)
++    }
+   }
+ 
+   getQueriesData<TQueryFnData = unknown>(
+@@ -332,7 +346,9 @@ export class QueryClient {
+ 
+     const query = this.#queryCache.build(this, defaultedOptions)
+ 
+-    return query.isStaleByTime(defaultedOptions.staleTime)
++    return query.isStaleByTime(
++      resolveStaleTime(defaultedOptions.staleTime, query),
++    )
+       ? query.fetch(defaultedOptions)
+       : Promise.resolve(query.state.data as TData)
+   }
+@@ -391,7 +407,10 @@ export class QueryClient {
+   }
+ 
+   resumePausedMutations(): Promise<unknown> {
+-    return this.#mutationCache.resumePausedMutations()
++    if (onlineManager.isOnline()) {
++      return this.#mutationCache.resumePausedMutations()
++    }
++    return Promise.resolve()
+   }
+ 
+   getQueryCache(): QueryCache {
+@@ -413,7 +432,7 @@ export class QueryClient {
+   setQueryDefaults(
+     queryKey: QueryKey,
+     options: Partial<
+-      Omit<QueryObserverOptions<unknown, any, any, any>, 'queryKey'>
++      OmitKeyof<QueryObserverOptions<unknown, any, any, any>, 'queryKey'>
+     >,
+   ): void {
+     this.#queryDefaults.set(hashKey(queryKey), {
+@@ -424,10 +443,10 @@ export class QueryClient {
+ 
+   getQueryDefaults(
+     queryKey: QueryKey,
+-  ): Omit<QueryObserverOptions<any, any, any, any, any>, 'queryKey'> {
++  ): OmitKeyof<QueryObserverOptions<any, any, any, any, any>, 'queryKey'> {
+     const defaults = [...this.#queryDefaults.values()]
+ 
+-    let result: Omit<
++    let result: OmitKeyof<
+       QueryObserverOptions<any, any, any, any, any>,
+       'queryKey'
+     > = {}
+@@ -442,7 +461,10 @@ export class QueryClient {
+ 
+   setMutationDefaults(
+     mutationKey: MutationKey,
+-    options: Omit<MutationObserverOptions<any, any, any, any>, 'mutationKey'>,
++    options: OmitKeyof<
++      MutationObserverOptions<any, any, any, any>,
++      'mutationKey'
++    >,
+   ): void {
+     this.#mutationDefaults.set(hashKey(mutationKey), {
+       mutationKey,
+@@ -534,6 +556,13 @@ export class QueryClient {
+       defaultedOptions.networkMode = 'offlineFirst'
+     }
+ 
++    if (
++      defaultedOptions.enabled !== true &&
++      defaultedOptions.queryFn === skipToken
++    ) {
++      defaultedOptions.enabled = false
++    }
++
+     return defaultedOptions as DefaultedQueryObserverOptions<
+       TQueryFnData,
+       TError,
+diff --git a/packages/query-core/src/queryObserver.ts b/packages/query-core/src/queryObserver.ts
+index b972ab3fefed515a12b400efe66c2ea5cd3d36c0..44bc00f950a64e2cf148413d696da2d933ee636c 100644
+--- a/packages/query-core/src/queryObserver.ts
++++ b/packages/query-core/src/queryObserver.ts
+@@ -3,15 +3,16 @@ import {
+   isValidTimeout,
+   noop,
+   replaceData,
++  resolveStaleTime,
+   shallowEqualObjects,
+   timeUntilStale,
+ } from './utils'
+ import { notifyManager } from './notifyManager'
+ import { focusManager } from './focusManager'
+ import { Subscribable } from './subscribable'
+-import { canFetch } from './retryer'
+-import type { QueryClient } from './queryClient'
++import { fetchState } from './query'
+ import type { FetchOptions, Query, QueryState } from './query'
++import type { QueryClient } from './queryClient'
+ import type {
+   DefaultError,
+   DefaultedQueryObserverOptions,
+@@ -154,6 +155,7 @@ export class QueryObserver<
+     }
+ 
+     this.#updateQuery()
++    this.#currentQuery.setOptions(this.options)
+ 
+     if (!shallowEqualObjects(this.options, prevOptions)) {
+       this.#client.getQueryCache().notify({
+@@ -186,7 +188,8 @@ export class QueryObserver<
+       mounted &&
+       (this.#currentQuery !== prevQuery ||
+         this.options.enabled !== prevOptions.enabled ||
+-        this.options.staleTime !== prevOptions.staleTime)
++        resolveStaleTime(this.options.staleTime, this.#currentQuery) !==
++          resolveStaleTime(prevOptions.staleTime, this.#currentQuery))
+     ) {
+       this.#updateStaleTimeout()
+     }
+@@ -247,6 +250,7 @@ export class QueryObserver<
+ 
+   trackResult(
+     result: QueryObserverResult<TData, TError>,
++    onPropTracked?: (key: keyof QueryObserverResult) => void,
+   ): QueryObserverResult<TData, TError> {
+     const trackedResult = {} as QueryObserverResult<TData, TError>
+ 
+@@ -255,7 +259,8 @@ export class QueryObserver<
+         configurable: false,
+         enumerable: true,
+         get: () => {
+-          this.#trackedProps.add(key as keyof QueryObserverResult)
++          this.trackProp(key as keyof QueryObserverResult)
++          onPropTracked?.(key as keyof QueryObserverResult)
+           return result[key as keyof QueryObserverResult]
+         },
+       })
+@@ -264,6 +269,10 @@ export class QueryObserver<
+     return trackedResult
+   }
+ 
++  trackProp(key: keyof QueryObserverResult) {
++    this.#trackedProps.add(key)
++  }
++
+   getCurrentQuery(): Query<TQueryFnData, TError, TQueryData, TQueryKey> {
+     return this.#currentQuery
+   }
+@@ -308,7 +317,7 @@ export class QueryObserver<
+   }
+ 
+   #executeFetch(
+-    fetchOptions?: ObserverFetchOptions,
++    fetchOptions?: Omit<ObserverFetchOptions, 'initialPromise'>,
+   ): Promise<TQueryData | undefined> {
+     // Make sure we reference the latest query as the current one might have been removed
+     this.#updateQuery()
+@@ -328,19 +337,16 @@ export class QueryObserver<
+ 
+   #updateStaleTimeout(): void {
+     this.#clearStaleTimeout()
++    const staleTime = resolveStaleTime(
++      this.options.staleTime,
++      this.#currentQuery,
++    )
+ 
+-    if (
+-      isServer ||
+-      this.#currentResult.isStale ||
+-      !isValidTimeout(this.options.staleTime)
+-    ) {
++    if (isServer || this.#currentResult.isStale || !isValidTimeout(staleTime)) {
+       return
+     }
+ 
+-    const time = timeUntilStale(
+-      this.#currentResult.dataUpdatedAt,
+-      this.options.staleTime,
+-    )
++    const time = timeUntilStale(this.#currentResult.dataUpdatedAt, staleTime)
+ 
+     // The timeout is sometimes triggered 1 ms before the stale time expiration.
+     // To mitigate this issue we always add 1 ms to the timeout.
+@@ -427,7 +433,7 @@ export class QueryObserver<
+       : this.#currentQueryInitialState
+ 
+     const { state } = query
+-    let { error, errorUpdatedAt, fetchStatus, status } = state
++    let newState = { ...state }
+     let isPlaceholderData = false
+     let data: TData | undefined
+ 
+@@ -441,31 +447,31 @@ export class QueryObserver<
+         mounted && shouldFetchOptionally(query, prevQuery, options, prevOptions)
+ 
+       if (fetchOnMount || fetchOptionally) {
+-        fetchStatus = canFetch(query.options.networkMode)
+-          ? 'fetching'
+-          : 'paused'
+-        if (!state.dataUpdatedAt) {
+-          status = 'pending'
++        newState = {
++          ...newState,
++          ...fetchState(state.data, query.options),
+         }
+       }
+       if (options._optimisticResults === 'isRestoring') {
+-        fetchStatus = 'idle'
++        newState.fetchStatus = 'idle'
+       }
+     }
+ 
++    let { error, errorUpdatedAt, status } = newState
++
+     // Select data if needed
+-    if (options.select && state.data !== undefined) {
++    if (options.select && newState.data !== undefined) {
+       // Memoize select result
+       if (
+         prevResult &&
+-        state.data === prevResultState?.data &&
++        newState.data === prevResultState?.data &&
+         options.select === this.#selectFn
+       ) {
+         data = this.#selectResult
+       } else {
+         try {
+           this.#selectFn = options.select
+-          data = options.select(state.data)
++          data = options.select(newState.data)
+           data = replaceData(prevResult?.data, data, options)
+           this.#selectResult = data
+           this.#selectError = null
+@@ -476,7 +482,7 @@ export class QueryObserver<
+     }
+     // Use query data
+     else {
+-      data = state.data as unknown as TData
++      data = newState.data as unknown as TData
+     }
+ 
+     // Show placeholder data if needed
+@@ -531,37 +537,38 @@ export class QueryObserver<
+       status = 'error'
+     }
+ 
+-    const isFetching = fetchStatus === 'fetching'
++    const isFetching = newState.fetchStatus === 'fetching'
+     const isPending = status === 'pending'
+     const isError = status === 'error'
+ 
+     const isLoading = isPending && isFetching
++    const hasData = data !== undefined
+ 
+     const result: QueryObserverBaseResult<TData, TError> = {
+       status,
+-      fetchStatus,
++      fetchStatus: newState.fetchStatus,
+       isPending,
+       isSuccess: status === 'success',
+       isError,
+       isInitialLoading: isLoading,
+       isLoading,
+       data,
+-      dataUpdatedAt: state.dataUpdatedAt,
++      dataUpdatedAt: newState.dataUpdatedAt,
+       error,
+       errorUpdatedAt,
+-      failureCount: state.fetchFailureCount,
+-      failureReason: state.fetchFailureReason,
+-      errorUpdateCount: state.errorUpdateCount,
+-      isFetched: state.dataUpdateCount > 0 || state.errorUpdateCount > 0,
++      failureCount: newState.fetchFailureCount,
++      failureReason: newState.fetchFailureReason,
++      errorUpdateCount: newState.errorUpdateCount,
++      isFetched: newState.dataUpdateCount > 0 || newState.errorUpdateCount > 0,
+       isFetchedAfterMount:
+-        state.dataUpdateCount > queryInitialState.dataUpdateCount ||
+-        state.errorUpdateCount > queryInitialState.errorUpdateCount,
++        newState.dataUpdateCount > queryInitialState.dataUpdateCount ||
++        newState.errorUpdateCount > queryInitialState.errorUpdateCount,
+       isFetching,
+       isRefetching: isFetching && !isPending,
+-      isLoadingError: isError && state.dataUpdatedAt === 0,
+-      isPaused: fetchStatus === 'paused',
++      isLoadingError: isError && !hasData,
++      isPaused: newState.fetchStatus === 'paused',
+       isPlaceholderData,
+-      isRefetchError: isError && state.dataUpdatedAt !== 0,
++      isRefetchError: isError && hasData,
+       isStale: isStale(query, options),
+       refetch: this.refetch,
+     }
+@@ -683,7 +690,7 @@ function shouldLoadOnMount(
+ ): boolean {
+   return (
+     options.enabled !== false &&
+-    !query.state.dataUpdatedAt &&
++    query.state.data === undefined &&
+     !(query.state.status === 'error' && options.retryOnMount === false)
+   )
+ }
+@@ -694,7 +701,7 @@ function shouldFetchOnMount(
+ ): boolean {
+   return (
+     shouldLoadOnMount(query, options) ||
+-    (query.state.dataUpdatedAt > 0 &&
++    (query.state.data !== undefined &&
+       shouldFetchOn(query, options, options.refetchOnMount))
+   )
+ }
+@@ -721,7 +728,6 @@ function shouldFetchOptionally(
+   prevOptions: QueryObserverOptions<any, any, any, any, any>,
+ ): boolean {
+   return (
+-    options.enabled !== false &&
+     (query !== prevQuery || prevOptions.enabled === false) &&
+     (!options.suspense || query.state.status !== 'error') &&
+     isStale(query, options)
+@@ -732,7 +738,10 @@ function isStale(
+   query: Query<any, any, any, any>,
+   options: QueryObserverOptions<any, any, any, any, any>,
+ ): boolean {
+-  return query.isStaleByTime(options.staleTime)
++  return (
++    options.enabled !== false &&
++    query.isStaleByTime(resolveStaleTime(options.staleTime, query))
++  )
+ }
+ 
+ // this function would decide if we will update the observer's 'current'
+diff --git a/packages/query-core/src/retryer.ts b/packages/query-core/src/retryer.ts
+index 3a0dace8218d2d7055a12d377ec78f37c7ecf5e7..e677b0b9efd8193683c659bc3c0181570713952d 100644
+--- a/packages/query-core/src/retryer.ts
++++ b/packages/query-core/src/retryer.ts
+@@ -7,6 +7,7 @@ import type { CancelOptions, DefaultError, NetworkMode } from './types'
+ 
+ interface RetryerConfig<TData = unknown, TError = DefaultError> {
+   fn: () => TData | Promise<TData>
++  initialPromise?: Promise<TData>
+   abort?: () => void
+   onError?: (error: TError) => void
+   onSuccess?: (data: TData) => void
+@@ -16,6 +17,7 @@ interface RetryerConfig<TData = unknown, TError = DefaultError> {
+   retry?: RetryValue<TError>
+   retryDelay?: RetryDelayValue<TError>
+   networkMode: NetworkMode | undefined
++  canRun: () => boolean
+ }
+ 
+ export interface Retryer<TData = unknown> {
+@@ -24,6 +26,8 @@ export interface Retryer<TData = unknown> {
+   continue: () => Promise<unknown>
+   cancelRetry: () => void
+   continueRetry: () => void
++  canStart: () => boolean
++  start: () => Promise<TData>
+ }
+ 
+ export type RetryValue<TError> = boolean | number | ShouldRetryFunction<TError>
+@@ -69,7 +73,7 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+   let isRetryCancelled = false
+   let failureCount = 0
+   let isResolved = false
+-  let continueFn: ((value?: unknown) => boolean) | undefined
++  let continueFn: ((value?: unknown) => void) | undefined
+   let promiseResolve: (data: TData) => void
+   let promiseReject: (error: TError) => void
+ 
+@@ -93,9 +97,12 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+     isRetryCancelled = false
+   }
+ 
+-  const shouldPause = () =>
+-    !focusManager.isFocused() ||
+-    (config.networkMode !== 'always' && !onlineManager.isOnline())
++  const canContinue = () =>
++    focusManager.isFocused() &&
++    (config.networkMode === 'always' || onlineManager.isOnline()) &&
++    config.canRun()
++
++  const canStart = () => canFetch(config.networkMode) && config.canRun()
+ 
+   const resolve = (value: any) => {
+     if (!isResolved) {
+@@ -118,11 +125,9 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+   const pause = () => {
+     return new Promise((continueResolve) => {
+       continueFn = (value) => {
+-        const canContinue = isResolved || !shouldPause()
+-        if (canContinue) {
++        if (isResolved || canContinue()) {
+           continueResolve(value)
+         }
+-        return canContinue
+       }
+       config.onPause?.()
+     }).then(() => {
+@@ -142,9 +147,13 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+ 
+     let promiseOrValue: any
+ 
++    // we can re-use config.initialPromise on the first call of run()
++    const initialPromise =
++      failureCount === 0 ? config.initialPromise : undefined
++
+     // Execute query
+     try {
+-      promiseOrValue = config.fn()
++      promiseOrValue = initialPromise ?? config.fn()
+     } catch (error) {
+       promiseOrValue = Promise.reject(error)
+     }
+@@ -184,10 +193,7 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+         sleep(delay)
+           // Pause if the document is not visible or when the device is offline
+           .then(() => {
+-            if (shouldPause()) {
+-              return pause()
+-            }
+-            return
++            return canContinue() ? undefined : pause()
+           })
+           .then(() => {
+             if (isRetryCancelled) {
+@@ -199,21 +205,24 @@ export function createRetryer<TData = unknown, TError = DefaultError>(
+       })
+   }
+ 
+-  // Start loop
+-  if (canFetch(config.networkMode)) {
+-    run()
+-  } else {
+-    pause().then(run)
+-  }
+-
+   return {
+     promise,
+     cancel,
+     continue: () => {
+-      const didContinue = continueFn?.()
+-      return didContinue ? promise : Promise.resolve()
++      continueFn?.()
++      return promise
+     },
+     cancelRetry,
+     continueRetry,
++    canStart,
++    start: () => {
++      // Start loop
++      if (canStart()) {
++        run()
++      } else {
++        pause().then(run)
++      }
++      return promise
++    },
+   }
+ }
+diff --git a/packages/query-core/src/types.ts b/packages/query-core/src/types.ts
+index c4b2b29d4d5cd0e2ab0a8a21cab1f3b35582fed4..7a7430417277a732bf575554a69e22594c2a55c9 100644
+--- a/packages/query-core/src/types.ts
++++ b/packages/query-core/src/types.ts
+@@ -1,12 +1,21 @@
+ /* istanbul ignore file */
+ 
++import type { DehydrateOptions, HydrateOptions } from './hydration'
+ import type { MutationState } from './mutation'
+ import type { FetchDirection, Query, QueryBehavior } from './query'
+ import type { RetryDelayValue, RetryValue } from './retryer'
+-import type { QueryFilters, QueryTypeFilter } from './utils'
++import type { QueryFilters, QueryTypeFilter, SkipToken } from './utils'
+ import type { QueryCache } from './queryCache'
+ import type { MutationCache } from './mutationCache'
+ 
++export type OmitKeyof<
++  TObject,
++  TKey extends TStrictly extends 'safely'
++    ? keyof TObject | (string & Record<never, never>)
++    : keyof TObject,
++  TStrictly extends 'strictly' | 'safely' = 'strictly',
++> = Omit<TObject, TKey>
++
+ export type NoInfer<T> = [T][T extends any ? 0 : never]
+ 
+ export interface Register {
+@@ -34,6 +43,13 @@ export type QueryFunction<
+   TPageParam = never,
+ > = (context: QueryFunctionContext<TQueryKey, TPageParam>) => T | Promise<T>
+ 
++export type StaleTime<
++  TQueryFnData = unknown,
++  TError = DefaultError,
++  TData = TQueryFnData,
++  TQueryKey extends QueryKey = QueryKey,
++> = number | ((query: Query<TQueryFnData, TError, TData, TQueryKey>) => number)
++
+ export type QueryPersister<
+   T = unknown,
+   TQueryKey extends QueryKey = QueryKey,
+@@ -147,7 +163,7 @@ export interface QueryOptions<
+    * Setting it to `Infinity` will disable garbage collection.
+    */
+   gcTime?: number
+-  queryFn?: QueryFunction<TQueryFnData, TQueryKey, TPageParam>
++  queryFn?: QueryFunction<TQueryFnData, TQueryKey, TPageParam> | SkipToken
+   persister?: QueryPersister<
+     NoInfer<TQueryFnData>,
+     NoInfer<TQueryKey>,
+@@ -231,8 +247,9 @@ export interface QueryObserverOptions<
+   /**
+    * The time in milliseconds after data is considered stale.
+    * If set to `Infinity`, the data will never be considered stale.
++   * If set to a function, the function will be executed with the query to compute a `staleTime`.
+    */
+-  staleTime?: number
++  staleTime?: StaleTime<TQueryFnData, TError, TQueryData, TQueryKey>
+   /**
+    * If set to a number, the query will continuously refetch at this frequency in milliseconds.
+    * If set to a function, the function will be executed with the latest data and query to compute a frequency
+@@ -341,7 +358,7 @@ export type Optional<TTarget, TKey extends keyof TTarget> = Pick<
+   Partial<TTarget>,
+   TKey
+ > &
+-  Omit<TTarget, TKey>
++  OmitKeyof<TTarget, TKey>
+ 
+ export type DefaultedQueryObserverOptions<
+   TQueryFnData = unknown,
+@@ -404,7 +421,23 @@ export interface FetchQueryOptions<
+    * The time in milliseconds after data is considered stale.
+    * If the data is fresh it will be returned from the cache.
+    */
+-  staleTime?: number
++  staleTime?: StaleTime<TQueryFnData, TError, TData, TQueryKey>
++}
++
++export interface EnsureQueryDataOptions<
++  TQueryFnData = unknown,
++  TError = DefaultError,
++  TData = TQueryFnData,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = never,
++> extends FetchQueryOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryKey,
++    TPageParam
++  > {
++  revalidateIfStale?: boolean
+ }
+ 
+ type FetchInfiniteQueryPages<TQueryFnData = unknown, TPageParam = unknown> =
+@@ -435,6 +468,13 @@ export interface ResultOptions {
+ }
+ 
+ export interface RefetchOptions extends ResultOptions {
++  /**
++   * If set to `true`, a currently running request will be cancelled before a new request is made
++   *
++   * If set to `false`, no refetch will be made if there is already a request running.
++   *
++   * Defaults to `true`.
++   */
+   cancelRefetch?: boolean
+ }
+ 
+@@ -448,10 +488,26 @@ export interface InvalidateOptions extends RefetchOptions {}
+ export interface ResetOptions extends RefetchOptions {}
+ 
+ export interface FetchNextPageOptions extends ResultOptions {
++  /**
++   * If set to `true`, calling `fetchNextPage` repeatedly will invoke `queryFn` every time,
++   * whether the previous invocation has resolved or not. Also, the result from previous invocations will be ignored.
++   *
++   * If set to `false`, calling `fetchNextPage` repeatedly won't have any effect until the first invocation has resolved.
++   *
++   * Defaults to `true`.
++   */
+   cancelRefetch?: boolean
+ }
+ 
+ export interface FetchPreviousPageOptions extends ResultOptions {
++  /**
++   * If set to `true`, calling `fetchPreviousPage` repeatedly will invoke `queryFn` every time,
++   * whether the previous invocation has resolved or not. Also, the result from previous invocations will be ignored.
++   *
++   * If set to `false`, calling `fetchPreviousPage` repeatedly won't have any effect until the first invocation has resolved.
++   *
++   * Defaults to `true`.
++   */
+   cancelRefetch?: boolean
+ }
+ 
+@@ -585,15 +641,41 @@ export interface InfiniteQueryObserverBaseResult<
+   TData = unknown,
+   TError = DefaultError,
+ > extends QueryObserverBaseResult<TData, TError> {
++  /**
++   * This function allows you to fetch the next "page" of results.
++   */
+   fetchNextPage: (
+     options?: FetchNextPageOptions,
+   ) => Promise<InfiniteQueryObserverResult<TData, TError>>
++  /**
++   * This function allows you to fetch the previous "page" of results.
++   */
+   fetchPreviousPage: (
+     options?: FetchPreviousPageOptions,
+   ) => Promise<InfiniteQueryObserverResult<TData, TError>>
++  /**
++   * Will be `true` if there is a next page to be fetched (known via the `getNextPageParam` option).
++   */
+   hasNextPage: boolean
++  /**
++   * Will be `true` if there is a previous page to be fetched (known via the `getPreviousPageParam` option).
++   */
+   hasPreviousPage: boolean
++  /**
++   * Will be `true` if the query failed while fetching the next page.
++   */
++  isFetchNextPageError: boolean
++  /**
++   * Will be `true` while fetching the next page with `fetchNextPage`.
++   */
+   isFetchingNextPage: boolean
++  /**
++   * Will be `true` if the query failed while fetching the previous page.
++   */
++  isFetchPreviousPageError: boolean
++  /**
++   * Will be `true` while fetching the previous page with `fetchPreviousPage`.
++   */
+   isFetchingPreviousPage: boolean
+ }
+ 
+@@ -607,6 +689,8 @@ export interface InfiniteQueryObserverPendingResult<
+   isPending: true
+   isLoadingError: false
+   isRefetchError: false
++  isFetchNextPageError: false
++  isFetchPreviousPageError: false
+   isSuccess: false
+   status: 'pending'
+ }
+@@ -622,6 +706,8 @@ export interface InfiniteQueryObserverLoadingResult<
+   isLoading: true
+   isLoadingError: false
+   isRefetchError: false
++  isFetchNextPageError: false
++  isFetchPreviousPageError: false
+   isSuccess: false
+   status: 'pending'
+ }
+@@ -637,6 +723,8 @@ export interface InfiniteQueryObserverLoadingErrorResult<
+   isLoading: false
+   isLoadingError: true
+   isRefetchError: false
++  isFetchNextPageError: false
++  isFetchPreviousPageError: false
+   isSuccess: false
+   status: 'error'
+ }
+@@ -652,6 +740,8 @@ export interface InfiniteQueryObserverRefetchErrorResult<
+   isLoading: false
+   isLoadingError: false
+   isRefetchError: true
++  isFetchNextPageError: false
++  isFetchPreviousPageError: false
+   isSuccess: false
+   status: 'error'
+ }
+@@ -667,6 +757,8 @@ export interface InfiniteQueryObserverSuccessResult<
+   isLoading: false
+   isLoadingError: false
+   isRefetchError: false
++  isFetchNextPageError: false
++  isFetchPreviousPageError: false
+   isSuccess: true
+   status: 'success'
+ }
+@@ -691,6 +783,10 @@ export type MutationKey = ReadonlyArray<unknown>
+ 
+ export type MutationStatus = 'idle' | 'pending' | 'success' | 'error'
+ 
++export type MutationScope = {
++  id: string
++}
++
+ export type MutationMeta = Register extends {
+   mutationMeta: infer TMutationMeta
+ }
+@@ -736,6 +832,7 @@ export interface MutationOptions<
+   gcTime?: number
+   _defaulted?: boolean
+   meta?: MutationMeta
++  scope?: MutationScope
+ }
+ 
+ export interface MutationObserverOptions<
+@@ -873,8 +970,13 @@ export interface QueryClientConfig {
+ }
+ 
+ export interface DefaultOptions<TError = DefaultError> {
+-  queries?: Omit<QueryObserverOptions<unknown, TError>, 'suspense' | 'queryKey'>
++  queries?: OmitKeyof<
++    QueryObserverOptions<unknown, TError>,
++    'suspense' | 'queryKey'
++  >
+   mutations?: MutationObserverOptions<unknown, TError, unknown, unknown>
++  hydrate?: HydrateOptions['defaultOptions']
++  dehydrate?: DehydrateOptions
+ }
+ 
+ export interface CancelOptions {
+diff --git a/packages/query-core/src/utils.ts b/packages/query-core/src/utils.ts
+index 91af0759c1c4e86ffc410e36b3aba48ab53b4706..113e485870abd72f39859f25026736ac29b029ba 100644
+--- a/packages/query-core/src/utils.ts
++++ b/packages/query-core/src/utils.ts
+@@ -1,12 +1,15 @@
+-import type { Mutation } from './mutation'
+-import type { Query } from './query'
+ import type {
++  DefaultError,
+   FetchStatus,
+   MutationKey,
+   MutationStatus,
++  QueryFunction,
+   QueryKey,
+   QueryOptions,
++  StaleTime,
+ } from './types'
++import type { Mutation } from './mutation'
++import type { FetchOptions, Query } from './query'
+ 
+ // TYPES
+ 
+@@ -85,6 +88,18 @@ export function timeUntilStale(updatedAt: number, staleTime?: number): number {
+   return Math.max(updatedAt + (staleTime || 0) - Date.now(), 0)
+ }
+ 
++export function resolveStaleTime<
++  TQueryFnData = unknown,
++  TError = DefaultError,
++  TData = TQueryFnData,
++  TQueryKey extends QueryKey = QueryKey,
++>(
++  staleTime: undefined | StaleTime<TQueryFnData, TError, TData, TQueryKey>,
++  query: Query<TQueryFnData, TError, TData, TQueryKey>,
++): number | undefined {
++  return typeof staleTime === 'function' ? staleTime(query) : staleTime
++}
++
+ export function matchQuery(
+   filters: QueryFilters,
+   query: Query<any, any, any, any>,
+@@ -342,3 +357,39 @@ export function addToStart<T>(items: Array<T>, item: T, max = 0): Array<T> {
+   const newItems = [item, ...items]
+   return max && newItems.length > max ? newItems.slice(0, -1) : newItems
+ }
++
++export const skipToken = Symbol()
++export type SkipToken = typeof skipToken
++
++export const ensureQueryFn = <
++  TQueryFnData = unknown,
++  TQueryKey extends QueryKey = QueryKey,
++>(
++  options: {
++    queryFn?: QueryFunction<TQueryFnData, TQueryKey> | SkipToken
++    queryHash?: string
++  },
++  fetchOptions?: FetchOptions<TQueryFnData>,
++): QueryFunction<TQueryFnData, TQueryKey> => {
++  if (process.env.NODE_ENV !== 'production') {
++    if (options.queryFn === skipToken) {
++      console.error(
++        `Attempted to invoke queryFn when set to skipToken. This is likely a configuration error. Query hash: '${options.queryHash}'`,
++      )
++    }
++  }
++
++  // if we attempt to retry a fetch that was triggered from an initialPromise
++  // when we don't have a queryFn yet, we can't retry, so we just return the already rejected initialPromise
++  // if an observer has already mounted, we will be able to retry with that queryFn
++  if (!options.queryFn && fetchOptions?.initialPromise) {
++    return () => fetchOptions.initialPromise!
++  }
++
++  if (!options.queryFn || options.queryFn === skipToken) {
++    return () =>
++      Promise.reject(new Error(`Missing queryFn: '${options.queryHash}'`))
++  }
++
++  return options.queryFn
++}
+diff --git a/packages/react-query-persist-client/src/PersistQueryClientProvider.tsx b/packages/react-query-persist-client/src/PersistQueryClientProvider.tsx
+index 44f7eb92523b5e46cfd676d77d41bc0bfbeb732e..3f25bc89de8c3909eebbfa7a52b494809b37dc8b 100644
+--- a/packages/react-query-persist-client/src/PersistQueryClientProvider.tsx
++++ b/packages/react-query-persist-client/src/PersistQueryClientProvider.tsx
+@@ -7,10 +7,10 @@ import {
+ } from '@tanstack/query-persist-client-core'
+ import { IsRestoringProvider, QueryClientProvider } from '@tanstack/react-query'
+ import type { PersistQueryClientOptions } from '@tanstack/query-persist-client-core'
+-import type { QueryClientProviderProps } from '@tanstack/react-query'
++import type { OmitKeyof, QueryClientProviderProps } from '@tanstack/react-query'
+ 
+ export type PersistQueryClientProviderProps = QueryClientProviderProps & {
+-  persistOptions: Omit<PersistQueryClientOptions, 'queryClient'>
++  persistOptions: OmitKeyof<PersistQueryClientOptions, 'queryClient'>
+   onSuccess?: () => Promise<unknown> | unknown
+ }
+ 
+diff --git a/packages/react-query/src/HydrationBoundary.tsx b/packages/react-query/src/HydrationBoundary.tsx
+index 54dfd5258f8d2e4e31b02f86476e9160f5d51f83..47f56f35879d4927fd61f907c9c7555b05522a58 100644
+--- a/packages/react-query/src/HydrationBoundary.tsx
++++ b/packages/react-query/src/HydrationBoundary.tsx
+@@ -6,13 +6,17 @@ import { useQueryClient } from './QueryClientProvider'
+ import type {
+   DehydratedState,
+   HydrateOptions,
++  OmitKeyof,
+   QueryClient,
+ } from '@tanstack/query-core'
+ 
+ export interface HydrationBoundaryProps {
+   state?: unknown
+-  options?: Omit<HydrateOptions, 'defaultOptions'> & {
+-    defaultOptions?: Omit<HydrateOptions['defaultOptions'], 'mutations'>
++  options?: OmitKeyof<HydrateOptions, 'defaultOptions'> & {
++    defaultOptions?: OmitKeyof<
++      Exclude<HydrateOptions['defaultOptions'], undefined>,
++      'mutations'
++    >
+   }
+   children?: React.ReactNode
+   queryClient?: QueryClient
+diff --git a/packages/react-query/src/types.ts b/packages/react-query/src/types.ts
+index eb5b942a1ac9ffa207753e83c751e42a74f2efaa..c4e4804e6bfcf55253051df1de0e33de12f176f2 100644
+--- a/packages/react-query/src/types.ts
++++ b/packages/react-query/src/types.ts
+@@ -9,6 +9,7 @@ import type {
+   MutateFunction,
+   MutationObserverOptions,
+   MutationObserverResult,
++  OmitKeyof,
+   QueryKey,
+   QueryObserverOptions,
+   QueryObserverResult,
+@@ -33,7 +34,7 @@ export interface UseQueryOptions<
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+-> extends Omit<
++> extends OmitKeyof<
+     UseBaseQueryOptions<TQueryFnData, TError, TData, TQueryFnData, TQueryKey>,
+     'suspense'
+   > {}
+@@ -43,7 +44,7 @@ export interface UseSuspenseQueryOptions<
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+-> extends Omit<
++> extends OmitKeyof<
+     UseQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+     'enabled' | 'throwOnError' | 'placeholderData'
+   > {}
+@@ -55,7 +56,7 @@ export interface UseInfiniteQueryOptions<
+   TQueryData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     InfiniteQueryObserverOptions<
+       TQueryFnData,
+       TError,
+@@ -74,7 +75,7 @@ export interface UseSuspenseInfiniteQueryOptions<
+   TQueryData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     UseInfiniteQueryOptions<
+       TQueryFnData,
+       TError,
+@@ -99,7 +100,7 @@ export type UseQueryResult<
+ export type UseSuspenseQueryResult<
+   TData = unknown,
+   TError = DefaultError,
+-> = Omit<DefinedQueryObserverResult<TData, TError>, 'isPlaceholderData'>
++> = OmitKeyof<DefinedQueryObserverResult<TData, TError>, 'isPlaceholderData'>
+ 
+ export type DefinedUseQueryResult<
+   TData = unknown,
+@@ -119,14 +120,17 @@ export type DefinedUseInfiniteQueryResult<
+ export type UseSuspenseInfiniteQueryResult<
+   TData = unknown,
+   TError = DefaultError,
+-> = Omit<DefinedInfiniteQueryObserverResult<TData, TError>, 'isPlaceholderData'>
++> = OmitKeyof<
++  DefinedInfiniteQueryObserverResult<TData, TError>,
++  'isPlaceholderData'
++>
+ 
+ export interface UseMutationOptions<
+   TData = unknown,
+   TError = DefaultError,
+   TVariables = void,
+   TContext = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     MutationObserverOptions<TData, TError, TVariables, TContext>,
+     '_defaulted'
+   > {}
+diff --git a/packages/react-query/src/useMutationState.ts b/packages/react-query/src/useMutationState.ts
+index d14ebc46b7f96d06f8af957555186d474064519e..2d1bd7d335f1219cc28440c0cb3d74a722d8c5fe 100644
+--- a/packages/react-query/src/useMutationState.ts
++++ b/packages/react-query/src/useMutationState.ts
+@@ -4,7 +4,6 @@ import * as React from 'react'
+ import { notifyManager, replaceEqualDeep } from '@tanstack/query-core'
+ import { useQueryClient } from './QueryClientProvider'
+ import type {
+-  DefaultError,
+   Mutation,
+   MutationCache,
+   MutationFilters,
+@@ -25,9 +24,7 @@ export function useIsMutating(
+ 
+ type MutationStateOptions<TResult = MutationState> = {
+   filters?: MutationFilters
+-  select?: (
+-    mutation: Mutation<unknown, DefaultError, unknown, unknown>,
+-  ) => TResult
++  select?: (mutation: Mutation) => TResult
+ }
+ 
+ function getResult<TResult = MutationState>(
+@@ -38,11 +35,7 @@ function getResult<TResult = MutationState>(
+     .findAll(options.filters)
+     .map(
+       (mutation): TResult =>
+-        (options.select
+-          ? options.select(
+-              mutation as Mutation<unknown, DefaultError, unknown, unknown>,
+-            )
+-          : mutation.state) as TResult,
++        (options.select ? options.select(mutation) : mutation.state) as TResult,
+     )
+ }
+ 
+diff --git a/packages/react-query/src/useQueries.ts b/packages/react-query/src/useQueries.ts
+index 34e9b38be0753763ccb7fe75fe1fa7feff935eb2..f33c3513ef370d52b1232c055b0956da3b4f8c79 100644
+--- a/packages/react-query/src/useQueries.ts
++++ b/packages/react-query/src/useQueries.ts
+@@ -27,11 +27,13 @@ import type {
+ } from './types'
+ import type {
+   DefaultError,
++  OmitKeyof,
+   QueriesObserverOptions,
+   QueriesPlaceholderDataFunction,
+   QueryClient,
+   QueryFunction,
+   QueryKey,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -42,9 +44,9 @@ type UseQueryOptionsForUseQueries<
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+-> = Omit<
++> = OmitKeyof<
+   UseQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+-  'placeholderData' | 'suspense'
++  'placeholderData'
+ > & {
+   placeholderData?: TQueryFnData | QueriesPlaceholderDataFunction<TQueryFnData>
+ }
+@@ -73,7 +75,9 @@ type GetOptions<T> =
+               ? UseQueryOptionsForUseQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -84,10 +88,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? UseQueryOptionsForUseQueries<
+@@ -133,7 +136,7 @@ type GetResults<T> =
+               ? GetDefinedOrUndefinedQueryResult<T, TQueryFnData>
+               : // Part 3: responsible for mapping inferred type to results, if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, any>
++                    queryFn?: QueryFunction<infer TQueryFnData, any> | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -143,7 +146,9 @@ type GetResults<T> =
+                     unknown extends TError ? DefaultError : TError
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<infer TQueryFnData, any>
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, any>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? GetDefinedOrUndefinedQueryResult<
+diff --git a/packages/react-query/src/useSuspenseQueries.ts b/packages/react-query/src/useSuspenseQueries.ts
+index 1d58da0c5333452d99e922a95123e02ef1bf55ae..1802e3a207ff879c7e3b4bd111229fc2194c18f1 100644
+--- a/packages/react-query/src/useSuspenseQueries.ts
++++ b/packages/react-query/src/useSuspenseQueries.ts
+@@ -6,6 +6,7 @@ import type {
+   DefaultError,
+   QueryClient,
+   QueryFunction,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -33,7 +34,9 @@ type GetSuspenseOptions<T> =
+               ? UseSuspenseQueryOptions<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -44,10 +47,9 @@ type GetSuspenseOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? UseSuspenseQueryOptions<
+diff --git a/packages/react-query/src/useSuspenseQuery.ts b/packages/react-query/src/useSuspenseQuery.ts
+index 3bf6039d01611fcc4a4b2b387612883095126a4d..9bc53e6fd6a4968c0522855c629ab7aaf3c066f6 100644
+--- a/packages/react-query/src/useSuspenseQuery.ts
++++ b/packages/react-query/src/useSuspenseQuery.ts
+@@ -1,5 +1,5 @@
+ 'use client'
+-import { QueryObserver } from '@tanstack/query-core'
++import { QueryObserver, skipToken } from '@tanstack/query-core'
+ import { useBaseQuery } from './useBaseQuery'
+ import { defaultThrowOnError } from './suspense'
+ import type { UseSuspenseQueryOptions, UseSuspenseQueryResult } from './types'
+@@ -14,6 +14,12 @@ export function useSuspenseQuery<
+   options: UseSuspenseQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+   queryClient?: QueryClient,
+ ): UseSuspenseQueryResult<TData, TError> {
++  if (process.env.NODE_ENV !== 'production') {
++    if (options.queryFn === skipToken) {
++      console.error('skipToken is not allowed for useSuspenseQuery')
++    }
++  }
++
+   return useBaseQuery(
+     {
+       ...options,
+diff --git a/packages/solid-query-persist-client/src/PersistQueryClientProvider.tsx b/packages/solid-query-persist-client/src/PersistQueryClientProvider.tsx
+index 8a6d72396f66702a528d7eaecb4666e9219b4870..e6092a582c601044290647d7851e5e3296c36226 100644
+--- a/packages/solid-query-persist-client/src/PersistQueryClientProvider.tsx
++++ b/packages/solid-query-persist-client/src/PersistQueryClientProvider.tsx
+@@ -5,11 +5,11 @@ import {
+ import { createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
+ import { IsRestoringProvider, QueryClientProvider } from '@tanstack/solid-query'
+ import type { PersistQueryClientOptions } from '@tanstack/query-persist-client-core'
+-import type { QueryClientProviderProps } from '@tanstack/solid-query'
++import type { OmitKeyof, QueryClientProviderProps } from '@tanstack/solid-query'
+ import type { JSX } from 'solid-js'
+ 
+ export type PersistQueryClientProviderProps = QueryClientProviderProps & {
+-  persistOptions: Omit<PersistQueryClientOptions, 'queryClient'>
++  persistOptions: OmitKeyof<PersistQueryClientOptions, 'queryClient'>
+   onSuccess?: () => void
+ }
+ 
+diff --git a/packages/solid-query/src/QueryClient.ts b/packages/solid-query/src/QueryClient.ts
+index af5ab8aff07851d64a761b97a61dc05302042b19..ddbe9927da1de75bd118b480015d516d3f6bac3b 100644
+--- a/packages/solid-query/src/QueryClient.ts
++++ b/packages/solid-query/src/QueryClient.ts
+@@ -2,6 +2,7 @@ import { QueryClient as QueryCoreClient } from '@tanstack/query-core'
+ import type {
+   DefaultOptions as CoreDefaultOptions,
+   DefaultError,
++  OmitKeyof,
+   QueryClientConfig as QueryCoreClientConfig,
+   InfiniteQueryObserverOptions as QueryCoreInfiniteQueryObserverOptions,
+   QueryObserverOptions as QueryCoreObserverOptions,
+@@ -15,7 +16,7 @@ export interface QueryObserverOptions<
+   TQueryData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = never,
+-> extends Omit<
++> extends OmitKeyof<
+     QueryCoreObserverOptions<
+       TQueryFnData,
+       TError,
+@@ -45,7 +46,7 @@ export interface InfiniteQueryObserverOptions<
+   TQueryData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     QueryCoreInfiniteQueryObserverOptions<
+       TQueryFnData,
+       TError,
+@@ -70,7 +71,7 @@ export interface InfiniteQueryObserverOptions<
+ 
+ export interface DefaultOptions<TError = DefaultError>
+   extends CoreDefaultOptions<TError> {
+-  queries?: Omit<QueryObserverOptions<unknown, TError>, 'queryKey'>
++  queries?: OmitKeyof<QueryObserverOptions<unknown, TError>, 'queryKey'>
+ }
+ 
+ export interface QueryClientConfig extends QueryCoreClientConfig {
+diff --git a/packages/solid-query/src/createBaseQuery.ts b/packages/solid-query/src/createBaseQuery.ts
+index a88a16945eba6143654f40b51604133402a0765d..a0f3b51cc92169bb7eac4a7f4fd74fb9d5dd0b1e 100644
+--- a/packages/solid-query/src/createBaseQuery.ts
++++ b/packages/solid-query/src/createBaseQuery.ts
+@@ -16,7 +16,7 @@ import { useQueryClient } from './QueryClientProvider'
+ import { shouldThrowError } from './utils'
+ import { useIsRestoring } from './isRestoring'
+ import type { CreateBaseQueryOptions } from './types'
+-import type { Accessor } from 'solid-js'
++import type { Accessor, Signal } from 'solid-js'
+ import type { QueryClient } from './QueryClient'
+ import type {
+   InfiniteQueryObserverResult,
+@@ -138,14 +138,15 @@ export function createBaseQuery<
+     }
+     return defaultOptions
+   })
++  const initialOptions = defaultedOptions()
+ 
+   const [observer, setObserver] = createSignal(
+     new Observer(client(), defaultedOptions()),
+   )
+ 
+-  const [state, setState] = createStore<QueryObserverResult<TData, TError>>(
+-    observer().getOptimisticResult(defaultedOptions()),
+-  )
++  let observerResult = observer().getOptimisticResult(defaultedOptions())
++  const [state, setState] =
++    createStore<QueryObserverResult<TData, TError>>(observerResult)
+ 
+   const createServerSubscriber = (
+     resolve: (
+@@ -179,44 +180,43 @@ export function createBaseQuery<
+   const createClientSubscriber = () => {
+     const obs = observer()
+     return obs.subscribe((result) => {
+-      notifyManager.batchCalls(() => {
+-        // @ts-expect-error - This will error because the reconcile option does not
+-        // exist on the query-core QueryObserverResult type
+-        const reconcileOptions = obs.options.reconcile
+-
+-        // If the query has data we don't suspend but instead mutate the resource
+-        // This could happen when placeholderData/initialData is defined
+-        if (queryResource()?.data && result.data && !queryResource.loading) {
+-          setState((store) => {
+-            return reconcileFn(
+-              store,
+-              result,
+-              reconcileOptions === undefined ? false : reconcileOptions,
+-            )
+-          })
+-          mutate(state)
+-        } else {
+-          setState((store) => {
+-            return reconcileFn(
+-              store,
+-              result,
+-              reconcileOptions === undefined ? false : reconcileOptions,
+-            )
+-          })
+-          refetch()
+-        }
+-      })()
++      observerResult = result
++      queueMicrotask(() => refetch())
++    })
++  }
++
++  function setStateWithReconciliation(res: typeof observerResult) {
++    // @ts-expect-error - Reconcile option is not correctly typed internally
++    const reconcileOptions = observer().options.reconcile
++
++    setState((store) => {
++      return reconcileFn(
++        store,
++        res,
++        reconcileOptions === undefined ? false : reconcileOptions,
++      )
+     })
+   }
+ 
++  function createDeepSignal<T>(): Signal<T> {
++    return [
++      () => state,
++      (v: T) => {
++        const unwrapped = unwrap(state)
++        if (typeof v === 'function') {
++          v = v(unwrapped)
++        }
++        setStateWithReconciliation(v as any)
++      },
++    ] as Signal<T>
++  }
++
+   /**
+    * Unsubscribe is set lazily, so that we can subscribe after hydration when needed.
+    */
+   let unsubscribe: (() => void) | null = null
+ 
+-  const [queryResource, { refetch, mutate }] = createResource<
+-    ResourceData | undefined
+-  >(
++  const [queryResource, { refetch }] = createResource<ResourceData | undefined>(
+     () => {
+       const obs = observer()
+       return new Promise((resolve, reject) => {
+@@ -227,19 +227,28 @@ export function createBaseQuery<
+         }
+         obs.updateResult()
+ 
+-        if (!state.isLoading) {
++        if (
++          observerResult.isError &&
++          !observerResult.isFetching &&
++          !isRestoring() &&
++          shouldThrowError(obs.options.throwOnError, [
++            observerResult.error,
++            obs.getCurrentQuery(),
++          ])
++        ) {
++          setStateWithReconciliation(observerResult)
++          return reject(observerResult.error)
++        }
++        if (!observerResult.isLoading) {
+           const query = obs.getCurrentQuery()
+-          resolve(hydratableObserverResult(query, state))
++          return resolve(hydratableObserverResult(query, observerResult))
+         }
++
++        setStateWithReconciliation(observerResult)
+       })
+     },
+     {
+-      initialValue: state,
+-
+-      // If initialData is provided, we resolve the resource immediately
+-      get ssrLoadFrom() {
+-        return options().initialData ? 'initial' : 'server'
+-      },
++      storage: createDeepSignal,
+ 
+       get deferStream() {
+         return options().deferStream
+@@ -254,13 +263,12 @@ export function createBaseQuery<
+        * Note that this is only invoked on the client, for queries that were originally run on the server.
+        */
+       onHydrated(_k, info) {
+-        const defaultOptions = defaultedOptions()
+         if (info.value) {
+           hydrate(client(), {
+             queries: [
+               {
+-                queryKey: defaultOptions.queryKey,
+-                queryHash: defaultOptions.queryHash,
++                queryKey: initialOptions.queryKey,
++                queryHash: initialOptions.queryHash,
+                 state: info.value,
+               },
+             ],
+@@ -272,8 +280,11 @@ export function createBaseQuery<
+          * Do not refetch query on mount if query was fetched on server,
+          * even if `staleTime` is not set.
+          */
+-        const newOptions = { ...defaultOptions }
+-        if (defaultOptions.staleTime || !defaultOptions.initialData) {
++        const newOptions = { ...initialOptions }
++        if (
++          (initialOptions.staleTime || !initialOptions.initialData) &&
++          info.value
++        ) {
+           newOptions.refetchOnMount = false
+         }
+         // Setting the options as an immutable object to prevent
+@@ -324,39 +335,25 @@ export function createBaseQuery<
+       [observer, defaultedOptions],
+       ([obs, opts]) => {
+         obs.setOptions(opts)
+-        setState(obs.getOptimisticResult(opts))
++        setStateWithReconciliation(obs.getOptimisticResult(opts))
+       },
+       { defer: true },
+     ),
+   )
+ 
+-  createComputed(
+-    on(
+-      () => state.status,
+-      () => {
+-        const obs = observer()
+-        if (
+-          state.isError &&
+-          !state.isFetching &&
+-          !isRestoring() &&
+-          shouldThrowError(obs.options.throwOnError, [
+-            state.error,
+-            obs.getCurrentQuery(),
+-          ])
+-        ) {
+-          throw state.error
+-        }
+-      },
+-    ),
+-  )
+-
+   const handler = {
+     get(
+       target: QueryObserverResult<TData, TError>,
+       prop: keyof QueryObserverResult<TData, TError>,
+     ): any {
+-      const val = queryResource()?.[prop]
+-      return val !== undefined ? val : Reflect.get(target, prop)
++      if (prop === 'data') {
++        const opts = observer().options
++        if (opts.placeholderData) {
++          return queryResource.latest?.data
++        }
++        return queryResource()?.data
++      }
++      return Reflect.get(target, prop)
+     },
+   }
+ 
+diff --git a/packages/solid-query/src/createInfiniteQuery.ts b/packages/solid-query/src/createInfiniteQuery.ts
+index ec79c76b0e5ef0fb58a2d935088f7e4678fd4cf9..10e08b96acc93b0756b774e5e331fe019b18623f 100644
+--- a/packages/solid-query/src/createInfiniteQuery.ts
++++ b/packages/solid-query/src/createInfiniteQuery.ts
+@@ -2,6 +2,7 @@ import { InfiniteQueryObserver } from '@tanstack/query-core'
+ import { createMemo } from 'solid-js'
+ import { createBaseQuery } from './createBaseQuery'
+ import type {
++  DataTag,
+   DefaultError,
+   InfiniteData,
+   QueryKey,
+@@ -11,9 +12,146 @@ import type { QueryClient } from './QueryClient'
+ import type {
+   CreateInfiniteQueryOptions,
+   CreateInfiniteQueryResult,
++  DefinedCreateInfiniteQueryResult,
++  FunctionedParams,
++  SolidInfiniteQueryOptions,
+ } from './types'
+ import type { Accessor } from 'solid-js'
+ 
++export type UndefinedInitialDataInfiniteOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++> = FunctionedParams<
++  SolidInfiniteQueryOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryFnData,
++    TQueryKey,
++    TPageParam
++  > & {
++    initialData?: undefined
++  }
++>
++type NonUndefinedGuard<T> = T extends undefined ? never : T
++export type DefinedInitialDataInfiniteOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  // should we handle page param correctly
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++> = FunctionedParams<
++  SolidInfiniteQueryOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryFnData,
++    TQueryKey,
++    TPageParam
++  > & {
++    initialData:
++      | NonUndefinedGuard<InfiniteData<TQueryFnData, TPageParam>>
++      | (() => NonUndefinedGuard<InfiniteData<TQueryFnData, TPageParam>>)
++  }
++>
++function infiniteQueryOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++>(
++  options: ReturnType<
++    DefinedInitialDataInfiniteOptions<
++      TQueryFnData,
++      TError,
++      TData,
++      TQueryKey,
++      TPageParam
++    >
++  >,
++): ReturnType<
++  DefinedInitialDataInfiniteOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryKey,
++    TPageParam
++  >
++> & {
++  queryKey: DataTag<TQueryKey, InfiniteData<TQueryFnData>>
++}
++function infiniteQueryOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++>(
++  options: ReturnType<
++    UndefinedInitialDataInfiniteOptions<
++      TQueryFnData,
++      TError,
++      TData,
++      TQueryKey,
++      TPageParam
++    >
++  >,
++): ReturnType<
++  UndefinedInitialDataInfiniteOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryKey,
++    TPageParam
++  >
++> & {
++  queryKey: DataTag<TQueryKey, InfiniteData<TQueryFnData>>
++}
++
++function infiniteQueryOptions(options: unknown) {
++  return options
++}
++
++export { infiniteQueryOptions }
++
++export function createInfiniteQuery<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++>(
++  options: DefinedInitialDataInfiniteOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryKey,
++    TPageParam
++  >,
++  queryClient?: Accessor<QueryClient>,
++): DefinedCreateInfiniteQueryResult<TData, TError>
++export function createInfiniteQuery<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++>(
++  options: UndefinedInitialDataInfiniteOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryKey,
++    TPageParam
++  >,
++  queryClient?: Accessor<QueryClient>,
++): CreateInfiniteQueryResult<TData, TError>
++
+ export function createInfiniteQuery<
+   TQueryFnData,
+   TError = DefaultError,
+diff --git a/packages/solid-query/src/createQueries.ts b/packages/solid-query/src/createQueries.ts
+index 9fffdf60cbbdb0d14c7ac5d0ad32a2b146ed4242..77de5f8e1aa511288e9dccd51082e6f8327d35a4 100644
+--- a/packages/solid-query/src/createQueries.ts
++++ b/packages/solid-query/src/createQueries.ts
+@@ -18,11 +18,13 @@ import type { Accessor } from 'solid-js'
+ import type { QueryClient } from './QueryClient'
+ import type {
+   DefaultError,
++  OmitKeyof,
+   QueriesObserverOptions,
+   QueriesPlaceholderDataFunction,
+   QueryFunction,
+   QueryKey,
+   QueryObserverResult,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -33,7 +35,7 @@ type CreateQueryOptionsForCreateQueries<
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+-> = Omit<
++> = OmitKeyof<
+   SolidQueryOptions<TQueryFnData, TError, TData, TQueryKey>,
+   'placeholderData'
+ > & {
+@@ -64,7 +66,9 @@ type GetOptions<T> =
+               ? CreateQueryOptionsForCreateQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -75,10 +79,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? CreateQueryOptionsForCreateQueries<
+@@ -291,7 +294,7 @@ export function createQueries<
+           const dataResources_ = dataResources()
+           for (let index = 0; index < dataResources_.length; index++) {
+             const dataResource = dataResources_[index]!
+-            const unwrappedResult = { ...unwrap(result[index]!) }
++            const unwrappedResult = { ...unwrap(result[index]) }
+             // @ts-expect-error typescript pedantry regarding the possible range of index
+             setState(index, unwrap(unwrappedResult))
+             dataResource[1].mutate(() => unwrap(state[index]!.data))
+diff --git a/packages/solid-query/src/index.ts b/packages/solid-query/src/index.ts
+index b6045df6dbfc1939391f3af4c21b86da880754ee..aa2b74dd091288e0d41015f245ec9954564fe5e9 100644
+--- a/packages/solid-query/src/index.ts
++++ b/packages/solid-query/src/index.ts
+@@ -1,8 +1,5 @@
+ /* istanbul ignore file */
+ 
+-// Side Effects
+-import './setBatchUpdatesFn'
+-
+ // Re-export core
+ export * from '@tanstack/query-core'
+ 
+@@ -23,7 +20,14 @@ export {
+ } from './QueryClientProvider'
+ export type { QueryClientProviderProps } from './QueryClientProvider'
+ export { useIsFetching } from './useIsFetching'
+-export { createInfiniteQuery } from './createInfiniteQuery'
++export {
++  createInfiniteQuery,
++  infiniteQueryOptions,
++} from './createInfiniteQuery'
++export type {
++  DefinedInitialDataInfiniteOptions,
++  UndefinedInitialDataInfiniteOptions,
++} from './createInfiniteQuery'
+ export { createMutation } from './createMutation'
+ export { useIsMutating } from './useIsMutating'
+ export { useMutationState } from './useMutationState'
+diff --git a/packages/solid-query/src/setBatchUpdatesFn.ts b/packages/solid-query/src/setBatchUpdatesFn.ts
+deleted file mode 100644
+index f53c357200af832f6e2cf0b939dc1e3531e4666b..0000000000000000000000000000000000000000
+--- a/packages/solid-query/src/setBatchUpdatesFn.ts
++++ /dev/null
+@@ -1,4 +0,0 @@
+-import { notifyManager } from '@tanstack/query-core'
+-import { batch } from 'solid-js'
+-
+-notifyManager.setBatchNotifyFunction(batch)
+diff --git a/packages/solid-query/src/types.ts b/packages/solid-query/src/types.ts
+index 0155d7137ab0714e90ac3d572b153421c510e94d..71c004ee28c52405266a198b8385490f4b562189 100644
+--- a/packages/solid-query/src/types.ts
++++ b/packages/solid-query/src/types.ts
+@@ -2,11 +2,13 @@
+ 
+ import type {
+   DefaultError,
++  DefinedInfiniteQueryObserverResult,
+   DefinedQueryObserverResult,
+   InfiniteQueryObserverResult,
+   MutateFunction,
+   MutationObserverOptions,
+   MutationObserverResult,
++  OmitKeyof,
+   QueryKey,
+   QueryObserverResult,
+ } from '@tanstack/query-core'
+@@ -83,7 +85,7 @@ export interface SolidInfiniteQueryOptions<
+   TQueryData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+   TPageParam = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     InfiniteQueryObserverOptions<
+       TQueryFnData,
+       TError,
+@@ -120,13 +122,18 @@ export type CreateInfiniteQueryResult<
+   TError = DefaultError,
+ > = InfiniteQueryObserverResult<TData, TError>
+ 
++export type DefinedCreateInfiniteQueryResult<
++  TData = unknown,
++  TError = DefaultError,
++> = DefinedInfiniteQueryObserverResult<TData, TError>
++
+ /* --- Create Mutation Types --- */
+ export interface SolidMutationOptions<
+   TData = unknown,
+   TError = DefaultError,
+   TVariables = void,
+   TContext = unknown,
+-> extends Omit<
++> extends OmitKeyof<
+     MutationObserverOptions<TData, TError, TVariables, TContext>,
+     '_defaulted'
+   > {}
+diff --git a/packages/solid-query/src/useMutationState.ts b/packages/solid-query/src/useMutationState.ts
+index e04a8c115b7ee2b7389b739c3aaa6f742497f214..2a405a1ae4bc6a4747009a78e2e537c51b93f822 100644
+--- a/packages/solid-query/src/useMutationState.ts
++++ b/packages/solid-query/src/useMutationState.ts
+@@ -2,7 +2,6 @@ import { createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
+ import { replaceEqualDeep } from '@tanstack/query-core'
+ import { useQueryClient } from './QueryClientProvider'
+ import type {
+-  DefaultError,
+   Mutation,
+   MutationCache,
+   MutationFilters,
+@@ -13,9 +12,7 @@ import type { QueryClient } from './QueryClient'
+ 
+ type MutationStateOptions<TResult = MutationState> = {
+   filters?: MutationFilters
+-  select?: (
+-    mutation: Mutation<unknown, DefaultError, unknown, unknown>,
+-  ) => TResult
++  select?: (mutation: Mutation) => TResult
+ }
+ 
+ function getResult<TResult = MutationState>(
+@@ -26,11 +23,7 @@ function getResult<TResult = MutationState>(
+     .findAll(options.filters)
+     .map(
+       (mutation): TResult =>
+-        (options.select
+-          ? options.select(
+-              mutation as Mutation<unknown, DefaultError, unknown, unknown>,
+-            )
+-          : mutation.state) as TResult,
++        (options.select ? options.select(mutation) : mutation.state) as TResult,
+     )
+ }
+ 
+diff --git a/packages/svelte-query-persist-client/src/PersistQueryClientProvider.svelte b/packages/svelte-query-persist-client/src/PersistQueryClientProvider.svelte
+index 0543d1ac80585e55e9360264b236e437a05c2a11..5f5e04ada71297704a756e748eba0ac98eba6839 100644
+--- a/packages/svelte-query-persist-client/src/PersistQueryClientProvider.svelte
++++ b/packages/svelte-query-persist-client/src/PersistQueryClientProvider.svelte
+@@ -7,11 +7,11 @@
+   } from '@tanstack/svelte-query'
+   import { writable } from 'svelte/store'
+   import type { PersistQueryClientOptions } from '@tanstack/query-persist-client-core'
+-  import type { QueryClient } from '@tanstack/svelte-query'
++  import type { OmitKeyof, QueryClient } from '@tanstack/svelte-query'
+ 
+   export let client: QueryClient
+   export let onSuccess: () => Promise<unknown> | unknown = () => undefined
+-  export let persistOptions: Omit<PersistQueryClientOptions, 'queryClient'>
++  export let persistOptions: OmitKeyof<PersistQueryClientOptions, 'queryClient'>
+ 
+   const isRestoring = writable(true)
+   setIsRestoringContext(isRestoring)
+diff --git a/packages/svelte-query/src/createQueries.ts b/packages/svelte-query/src/createQueries.ts
+index cb8d0c4bd1b9e42c8e667ad8d9acf159237388ee..9d6aa1ff487e55c1586e92dad69cf5cbb0863022 100644
+--- a/packages/svelte-query/src/createQueries.ts
++++ b/packages/svelte-query/src/createQueries.ts
+@@ -7,6 +7,7 @@ import type { Readable } from 'svelte/store'
+ import type { StoreOrVal } from './types'
+ import type {
+   DefaultError,
++  OmitKeyof,
+   QueriesObserverOptions,
+   QueriesPlaceholderDataFunction,
+   QueryClient,
+@@ -14,6 +15,7 @@ import type {
+   QueryKey,
+   QueryObserverOptions,
+   QueryObserverResult,
++  SkipToken,
+   ThrowOnError,
+ } from '@tanstack/query-core'
+ 
+@@ -24,7 +26,7 @@ type QueryObserverOptionsForCreateQueries<
+   TError = DefaultError,
+   TData = TQueryFnData,
+   TQueryKey extends QueryKey = QueryKey,
+-> = Omit<
++> = OmitKeyof<
+   QueryObserverOptions<TQueryFnData, TError, TData, TQueryFnData, TQueryKey>,
+   'placeholderData'
+ > & {
+@@ -55,7 +57,9 @@ type GetOptions<T> =
+               ? QueryObserverOptionsForCreateQueries<TQueryFnData>
+               : // Part 3: responsible for inferring and enforcing type if no explicit parameter was provided
+                 T extends {
+-                    queryFn?: QueryFunction<infer TQueryFnData, infer TQueryKey>
++                    queryFn?:
++                      | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                      | SkipToken
+                     select?: (data: any) => infer TData
+                     throwOnError?: ThrowOnError<any, infer TError, any, any>
+                   }
+@@ -66,10 +70,9 @@ type GetOptions<T> =
+                     TQueryKey
+                   >
+                 : T extends {
+-                      queryFn?: QueryFunction<
+-                        infer TQueryFnData,
+-                        infer TQueryKey
+-                      >
++                      queryFn?:
++                        | QueryFunction<infer TQueryFnData, infer TQueryKey>
++                        | SkipToken
+                       throwOnError?: ThrowOnError<any, infer TError, any, any>
+                     }
+                   ? QueryObserverOptionsForCreateQueries<
+diff --git a/packages/svelte-query/src/types.ts b/packages/svelte-query/src/types.ts
+index a4114198e37155888911e1acfb9415235daabf88..66bac4e229b42bf92711e9871fabaf291bd3c07e 100644
+--- a/packages/svelte-query/src/types.ts
++++ b/packages/svelte-query/src/types.ts
+@@ -6,6 +6,7 @@ import type {
+   MutateFunction,
+   MutationObserverOptions,
+   MutationObserverResult,
++  OmitKeyof,
+   QueryKey,
+   QueryObserverOptions,
+   QueryObserverResult,
+@@ -86,7 +87,7 @@ export type CreateMutationOptions<
+   TVariables = void,
+   TContext = unknown,
+ > = StoreOrVal<
+-  Omit<
++  OmitKeyof<
+     MutationObserverOptions<TData, TError, TVariables, TContext>,
+     '_defaulted'
+   >
+diff --git a/packages/vue-query/src/index.ts b/packages/vue-query/src/index.ts
+index 846cabfaf453993344064c0db201b947388e73b7..c3ea3e98e06b359241f7f9a1ed0d21689914406c 100644
+--- a/packages/vue-query/src/index.ts
++++ b/packages/vue-query/src/index.ts
+@@ -6,6 +6,11 @@ export { VueQueryPlugin } from './vueQueryPlugin'
+ export { QueryClient } from './queryClient'
+ export { QueryCache } from './queryCache'
+ export { queryOptions } from './queryOptions'
++export { infiniteQueryOptions } from './infiniteQueryOptions'
++export type {
++  DefinedInitialDataInfiniteOptions,
++  UndefinedInitialDataInfiniteOptions,
++} from './infiniteQueryOptions'
+ export { MutationCache } from './mutationCache'
+ export { useQuery } from './useQuery'
+ export { useQueries } from './useQueries'
+diff --git a/packages/vue-query/src/infiniteQueryOptions.ts b/packages/vue-query/src/infiniteQueryOptions.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f457718728d0664d03018697b2ee8f69c2579f89
+--- /dev/null
++++ b/packages/vue-query/src/infiniteQueryOptions.ts
+@@ -0,0 +1,94 @@
++import type { DataTag } from '@tanstack/query-core'
++import type { InfiniteData } from '@tanstack/query-core'
++import type { UseInfiniteQueryOptions } from './useInfiniteQuery'
++import type { DefaultError, QueryKey } from '@tanstack/query-core'
++
++export type UndefinedInitialDataInfiniteOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++> = UseInfiniteQueryOptions<
++  TQueryFnData,
++  TError,
++  TData,
++  TQueryFnData,
++  TQueryKey,
++  TPageParam
++> & {
++  initialData?: undefined
++}
++
++type NonUndefinedGuard<T> = T extends undefined ? never : T
++
++export type DefinedInitialDataInfiniteOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++> = UseInfiniteQueryOptions<
++  TQueryFnData,
++  TError,
++  TData,
++  TQueryFnData,
++  TQueryKey,
++  TPageParam
++> & {
++  initialData:
++    | NonUndefinedGuard<InfiniteData<TQueryFnData, TPageParam>>
++    | (() => NonUndefinedGuard<InfiniteData<TQueryFnData, TPageParam>>)
++}
++
++export function infiniteQueryOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++>(
++  options: UndefinedInitialDataInfiniteOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryKey,
++    TPageParam
++  >,
++): UndefinedInitialDataInfiniteOptions<
++  TQueryFnData,
++  TError,
++  TData,
++  TQueryKey,
++  TPageParam
++> & {
++  queryKey: DataTag<TQueryKey, InfiniteData<TQueryFnData>>
++}
++
++export function infiniteQueryOptions<
++  TQueryFnData,
++  TError = DefaultError,
++  TData = InfiniteData<TQueryFnData>,
++  TQueryKey extends QueryKey = QueryKey,
++  TPageParam = unknown,
++>(
++  options: DefinedInitialDataInfiniteOptions<
++    TQueryFnData,
++    TError,
++    TData,
++    TQueryKey,
++    TPageParam
++  >,
++): DefinedInitialDataInfiniteOptions<
++  TQueryFnData,
++  TError,
++  TData,
++  TQueryKey,
++  TPageParam
++> & {
++  queryKey: DataTag<TQueryKey, InfiniteData<TQueryFnData>>
++}
++
++export function infiniteQueryOptions(options: unknown) {
++  return options
++}
+diff --git a/packages/vue-query/src/queryClient.ts b/packages/vue-query/src/queryClient.ts
+index ae4cf4a733bcda06b8982393f8357a926fce71b7..8041d52f6855e4427f536c17b1673909addedd7e 100644
+--- a/packages/vue-query/src/queryClient.ts
++++ b/packages/vue-query/src/queryClient.ts
+@@ -18,6 +18,7 @@ import type {
+   MutationKey,
+   MutationObserverOptions,
+   NoInfer,
++  OmitKeyof,
+   QueryClientConfig,
+   QueryFilters,
+   QueryKey,
+@@ -377,7 +378,7 @@ export class QueryClient extends QC {
+   setQueryDefaults(
+     queryKey: MaybeRefDeep<QueryKey>,
+     options: MaybeRefDeep<
+-      Omit<QueryObserverOptions<unknown, any, any, any>, 'queryKey'>
++      OmitKeyof<QueryObserverOptions<unknown, any, any, any>, 'queryKey'>
+     >,
+   ): void {
+     super.setQueryDefaults(cloneDeepUnref(queryKey), cloneDeepUnref(options))
+@@ -385,7 +386,7 @@ export class QueryClient extends QC {
+ 
+   getQueryDefaults(
+     queryKey: MaybeRefDeep<QueryKey>,
+-  ): Omit<QueryObserverOptions<any, any, any, any, any>, 'queryKey'> {
++  ): OmitKeyof<QueryObserverOptions<any, any, any, any, any>, 'queryKey'> {
+     return super.getQueryDefaults(cloneDeepUnref(queryKey))
+   }
+ 
+diff --git a/packages/vue-query/src/useMutationState.ts b/packages/vue-query/src/useMutationState.ts
+index 9720a5d6e897a144630f24f00ee451e787ea5d13..ae9ccd6476a6b018fe4c7119089be0cfde258657 100644
+--- a/packages/vue-query/src/useMutationState.ts
++++ b/packages/vue-query/src/useMutationState.ts
+@@ -10,7 +10,6 @@ import { useQueryClient } from './useQueryClient'
+ import { cloneDeepUnref } from './utils'
+ import type { DeepReadonly, Ref } from 'vue-demi'
+ import type {
+-  DefaultError,
+   MutationFilters as MF,
+   Mutation,
+   MutationState,
+@@ -51,9 +50,7 @@ export function useIsMutating(
+ 
+ export type MutationStateOptions<TResult = MutationState> = {
+   filters?: MutationFilters
+-  select?: (
+-    mutation: Mutation<unknown, DefaultError, unknown, unknown>,
+-  ) => TResult
++  select?: (mutation: Mutation) => TResult
+ }
+ 
+ function getResult<TResult = MutationState>(
+@@ -64,11 +61,7 @@ function getResult<TResult = MutationState>(
+     .findAll(options.filters)
+     .map(
+       (mutation): TResult =>
+-        (options.select
+-          ? options.select(
+-              mutation as Mutation<unknown, DefaultError, unknown, unknown>,
+-            )
+-          : mutation.state) as TResult,
++        (options.select ? options.select(mutation) : mutation.state) as TResult,
+     )
+ }
+ 

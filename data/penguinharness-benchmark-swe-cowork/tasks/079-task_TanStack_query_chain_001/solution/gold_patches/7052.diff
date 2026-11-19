@@ -1,0 +1,97 @@
+diff --git a/packages/angular-query-experimental/src/create-base-query.ts b/packages/angular-query-experimental/src/create-base-query.ts
+index 511505b87e4f324712f9001e9901ba021f60582a..7fd249020fed45584a6804f1e14a5c716da4daa9 100644
+--- a/packages/angular-query-experimental/src/create-base-query.ts
++++ b/packages/angular-query-experimental/src/create-base-query.ts
+@@ -11,6 +11,7 @@ import {
+ } from '@angular/core'
+ import { notifyManager } from '@tanstack/query-core'
+ import { signalProxy } from './signal-proxy'
++import { shouldThrowError } from './util'
+ import { lazyInit } from './util/lazy-init/lazy-init'
+ import type {
+   QueryClient,
+@@ -88,11 +89,24 @@ export function createBaseQuery<
+ 
+       // observer.trackResult is not used as this optimization is not needed for Angular
+       const unsubscribe = observer.subscribe(
+-        notifyManager.batchCalls((val: QueryObserverResult<TData, TError>) => {
+-          ngZone.run(() => {
+-            resultSignal.set(val)
+-          })
+-        }),
++        notifyManager.batchCalls(
++          (state: QueryObserverResult<TData, TError>) => {
++            ngZone.run(() => {
++              if (
++                state.isError &&
++                !state.isFetching &&
++                // !isRestoring() && // todo: enable when client persistence is implemented
++                shouldThrowError(observer.options.throwOnError, [
++                  state.error,
++                  observer.getCurrentQuery(),
++                ])
++              ) {
++                throw state.error
++              }
++              resultSignal.set(state)
++            })
++          },
++        ),
+       )
+       destroyRef.onDestroy(unsubscribe)
+ 
+diff --git a/packages/angular-query-experimental/src/inject-mutation.ts b/packages/angular-query-experimental/src/inject-mutation.ts
+index 8d7911e2e40a249dc5ac1ce921edb8335690189f..7bd474451e6fa1cbf563cdef0cb9d53bc73b5469 100644
+--- a/packages/angular-query-experimental/src/inject-mutation.ts
++++ b/packages/angular-query-experimental/src/inject-mutation.ts
+@@ -12,7 +12,7 @@ import { MutationObserver, notifyManager } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import { signalProxy } from './signal-proxy'
+ import { injectQueryClient } from './inject-query-client'
+-import { noop } from './util'
++import { noop, shouldThrowError } from './util'
+ 
+ import { lazyInit } from './util/lazy-init/lazy-init'
+ import type {
+@@ -69,10 +69,21 @@ export function injectMutation<
+         const unsubscribe = observer.subscribe(
+           notifyManager.batchCalls(
+             (
+-              val: MutationObserverResult<TData, TError, TVariables, TContext>,
++              state: MutationObserverResult<
++                TData,
++                TError,
++                TVariables,
++                TContext
++              >,
+             ) => {
+               ngZone.run(() => {
+-                result.set(val)
++                if (
++                  state.isError &&
++                  shouldThrowError(observer.options.throwOnError, [state.error])
++                ) {
++                  throw state.error
++                }
++                result.set(state)
+               })
+             },
+           ),
+diff --git a/packages/angular-query-experimental/src/util/index.ts b/packages/angular-query-experimental/src/util/index.ts
+index 177804c7aba909945e5a7a1f7f40ffd6f7cda81e..d07a9316fe9bcb35a7d7d528f65ef6d3a5360a4e 100644
+--- a/packages/angular-query-experimental/src/util/index.ts
++++ b/packages/angular-query-experimental/src/util/index.ts
+@@ -1 +1,13 @@
++export function shouldThrowError<T extends (...args: Array<any>) => boolean>(
++  throwError: boolean | T | undefined,
++  params: Parameters<T>,
++): boolean {
++  // Allow throwError function to override throwing behavior on a per-error basis
++  if (typeof throwError === 'function') {
++    return throwError(...params)
++  }
++
++  return !!throwError
++}
++
+ export function noop() {}

@@ -1,0 +1,303 @@
+diff --git a/packages/angular-query-experimental/src/create-base-query.ts b/packages/angular-query-experimental/src/create-base-query.ts
+index a6685da626cbfea5247c9347c2aff5f68adbf570..2b75d2a66cd096c47ff5bec252856e81f569acb5 100644
+--- a/packages/angular-query-experimental/src/create-base-query.ts
++++ b/packages/angular-query-experimental/src/create-base-query.ts
+@@ -10,7 +10,7 @@ import {
+ } from '@angular/core'
+ import { notifyManager } from '@tanstack/query-core'
+ import { signalProxy } from './signal-proxy'
+-import { lazyInit } from './lazy-init'
++import { lazyInit } from './util/lazy-init/lazy-init'
+ import type { QueryClient, QueryKey, QueryObserver } from '@tanstack/query-core'
+ import type { CreateBaseQueryOptions, CreateBaseQueryResult } from './types'
+ 
+@@ -67,20 +67,17 @@ export function createBaseQuery<
+         observer.getOptimisticResult(defaultedOptionsSignal()),
+       )
+ 
+-      // Effects should not be called inside reactive contexts
+-      untracked(() =>
+-        effect(() => {
+-          const defaultedOptions = defaultedOptionsSignal()
+-          observer.setOptions(defaultedOptions, {
+-            // Do not notify on updates because of changes in the options because
+-            // these changes should already be reflected in the optimistic result.
+-            listeners: false,
+-          })
+-          untracked(() => {
+-            resultSignal.set(observer.getOptimisticResult(defaultedOptions))
+-          })
+-        }),
+-      )
++      effect(() => {
++        const defaultedOptions = defaultedOptionsSignal()
++        observer.setOptions(defaultedOptions, {
++          // Do not notify on updates because of changes in the options because
++          // these changes should already be reflected in the optimistic result.
++          listeners: false,
++        })
++        untracked(() => {
++          resultSignal.set(observer.getOptimisticResult(defaultedOptions))
++        })
++      })
+ 
+       // observer.trackResult is not used as this optimization is not needed for Angular
+       const unsubscribe = observer.subscribe(
+diff --git a/packages/angular-query-experimental/src/inject-mutation-state.ts b/packages/angular-query-experimental/src/inject-mutation-state.ts
+index 94fd80458f1105330373bfeeb0af5d3ce948df23..5f516ffe71de39df284cb82732aea0a4c4752c9f 100644
+--- a/packages/angular-query-experimental/src/inject-mutation-state.ts
++++ b/packages/angular-query-experimental/src/inject-mutation-state.ts
+@@ -10,6 +10,7 @@ import {
+ } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import { injectQueryClient } from './inject-query-client'
++import { lazySignalInitializer } from './util/lazy-signal-initializer/lazy-signal-initializer'
+ import type { Injector, Signal } from '@angular/core'
+ 
+ type MutationStateOptions<TResult = MutationState> = {
+@@ -49,33 +50,38 @@ export function injectMutationState<TResult = MutationState>(
+ 
+     const mutationCache = queryClient.getMutationCache()
+ 
+-    const result = signal<Array<TResult>>(
+-      getResult(mutationCache, mutationStateOptionsFn()),
+-    )
++    return lazySignalInitializer((injector) => {
++      const result = signal<Array<TResult>>(
++        getResult(mutationCache, mutationStateOptionsFn()),
++      )
+ 
+-    effect(() => {
+-      const mutationStateOptions = mutationStateOptionsFn()
+-      untracked(() => {
+-        // Setting the signal from an effect because it's both 'computed' from options()
+-        // and needs to be set imperatively in the mutationCache listener.
+-        result.set(getResult(mutationCache, mutationStateOptions))
+-      })
+-    })
++      effect(
++        () => {
++          const mutationStateOptions = mutationStateOptionsFn()
++          untracked(() => {
++            // Setting the signal from an effect because it's both 'computed' from options()
++            // and needs to be set imperatively in the mutationCache listener.
++            result.set(getResult(mutationCache, mutationStateOptions))
++          })
++        },
++        { injector },
++      )
+ 
+-    const unsubscribe = mutationCache.subscribe(
+-      notifyManager.batchCalls(() => {
+-        const nextResult = replaceEqualDeep(
+-          result(),
+-          getResult(mutationCache, mutationStateOptionsFn()),
+-        )
+-        if (result() !== nextResult) {
+-          result.set(nextResult)
+-        }
+-      }),
+-    )
++      const unsubscribe = mutationCache.subscribe(
++        notifyManager.batchCalls(() => {
++          const nextResult = replaceEqualDeep(
++            result(),
++            getResult(mutationCache, mutationStateOptionsFn()),
++          )
++          if (result() !== nextResult) {
++            result.set(nextResult)
++          }
++        }),
++      )
+ 
+-    destroyRef.onDestroy(unsubscribe)
++      destroyRef.onDestroy(unsubscribe)
+ 
+-    return result
++      return result
++    })
+   })
+ }
+diff --git a/packages/angular-query-experimental/src/inject-mutation.ts b/packages/angular-query-experimental/src/inject-mutation.ts
+index f4e23340133c7117195a4d0e2140d3ddae2acae9..3ab52f173660a6f08efc48db438021ee6088b6c5 100644
+--- a/packages/angular-query-experimental/src/inject-mutation.ts
++++ b/packages/angular-query-experimental/src/inject-mutation.ts
+@@ -1,12 +1,20 @@
+-import { DestroyRef, computed, effect, inject, signal } from '@angular/core'
++import {
++  DestroyRef,
++  Injector,
++  computed,
++  effect,
++  inject,
++  runInInjectionContext,
++  signal,
++} from '@angular/core'
+ import { MutationObserver, notifyManager } from '@tanstack/query-core'
+ import { assertInjector } from './util/assert-injector/assert-injector'
+ import { signalProxy } from './signal-proxy'
+ import { injectQueryClient } from './inject-query-client'
+ import { noop } from './util'
+-import type { DefaultError, QueryClient } from '@tanstack/query-core'
+-import type { Injector } from '@angular/core'
+ 
++import { lazyInit } from './util/lazy-init/lazy-init'
++import type { DefaultError, QueryClient } from '@tanstack/query-core'
+ import type {
+   CreateMutateFunction,
+   CreateMutationOptions,
+@@ -26,42 +34,51 @@ export function injectMutation<
+ ): CreateMutationResult<TData, TError, TVariables, TContext> {
+   return assertInjector(injectMutation, injector, () => {
+     const queryClient = injectQueryClient()
++    const currentInjector = inject(Injector)
+     const destroyRef = inject(DestroyRef)
+ 
+-    const observer = new MutationObserver<TData, TError, TVariables, TContext>(
+-      queryClient,
+-      options(queryClient),
+-    )
+-    const mutate: CreateMutateFunction<TData, TError, TVariables, TContext> = (
+-      variables,
+-      mutateOptions,
+-    ) => {
+-      observer.mutate(variables, mutateOptions).catch(noop)
+-    }
++    return lazyInit(() =>
++      runInInjectionContext(currentInjector, () => {
++        const observer = new MutationObserver<
++          TData,
++          TError,
++          TVariables,
++          TContext
++        >(queryClient, options(queryClient))
++        const mutate: CreateMutateFunction<
++          TData,
++          TError,
++          TVariables,
++          TContext
++        > = (variables, mutateOptions) => {
++          observer.mutate(variables, mutateOptions).catch(noop)
++        }
+ 
+-    effect(() => {
+-      observer.setOptions(options(queryClient))
+-    })
++        effect(() => {
++          observer.setOptions(options(queryClient))
++        })
+ 
+-    const result = signal(observer.getCurrentResult())
++        const result = signal(observer.getCurrentResult())
+ 
+-    const unsubscribe = observer.subscribe(
+-      notifyManager.batchCalls((val) => result.set(val)),
+-    )
++        const unsubscribe = observer.subscribe(
++          notifyManager.batchCalls((val) => result.set(val)),
++        )
+ 
+-    destroyRef.onDestroy(unsubscribe)
++        destroyRef.onDestroy(unsubscribe)
+ 
+-    const resultSignal = computed(() => ({
+-      ...result(),
+-      mutate,
+-      mutateAsync: result().mutate,
+-    }))
++        const resultSignal = computed(() => ({
++          ...result(),
++          mutate,
++          mutateAsync: result().mutate,
++        }))
+ 
+-    return signalProxy(resultSignal) as unknown as CreateMutationResult<
+-      TData,
+-      TError,
+-      TVariables,
+-      TContext
+-    >
++        return signalProxy(resultSignal) as unknown as CreateMutationResult<
++          TData,
++          TError,
++          TVariables,
++          TContext
++        >
++      }),
++    )
+   })
+ }
+diff --git a/packages/angular-query-experimental/src/util/lazy-init/lazy-init.ts b/packages/angular-query-experimental/src/util/lazy-init/lazy-init.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..16c58429c38e3abd368b86f2a5af8b5737f52f95
+--- /dev/null
++++ b/packages/angular-query-experimental/src/util/lazy-init/lazy-init.ts
+@@ -0,0 +1,34 @@
++import { untracked } from '@angular/core'
++
++export function lazyInit<T extends object>(initializer: () => T): T {
++  let object: T | null = null
++
++  const initializeObject = () => {
++    if (!object) {
++      object = untracked(() => initializer())
++    }
++  }
++
++  queueMicrotask(() => initializeObject())
++
++  return new Proxy<T>({} as T, {
++    get(_, prop, receiver) {
++      initializeObject()
++      return Reflect.get(object as T, prop, receiver)
++    },
++    has(_, prop) {
++      initializeObject()
++      return Reflect.has(object as T, prop)
++    },
++    ownKeys() {
++      initializeObject()
++      return Reflect.ownKeys(object as T)
++    },
++    getOwnPropertyDescriptor() {
++      return {
++        enumerable: true,
++        configurable: true,
++      }
++    },
++  })
++}
+diff --git a/packages/angular-query-experimental/src/util/lazy-signal-initializer/lazy-signal-initializer.ts b/packages/angular-query-experimental/src/util/lazy-signal-initializer/lazy-signal-initializer.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb33083aab97e1a929902ad571012ab95fe9a067
+--- /dev/null
++++ b/packages/angular-query-experimental/src/util/lazy-signal-initializer/lazy-signal-initializer.ts
+@@ -0,0 +1,28 @@
++import {
++  Injector,
++  type Signal,
++  computed,
++  inject,
++  untracked,
++} from '@angular/core'
++
++type SignalInitializerFn<T> = (injector: Injector) => Signal<T>
++
++export function lazySignalInitializer<T>(
++  initializerFn: SignalInitializerFn<T>,
++) {
++  const injector = inject(Injector)
++
++  let source: Signal<T> | null = null
++
++  const unwrapSignal = () => {
++    if (!source) {
++      source = untracked(() => initializerFn(injector))
++    }
++    return source()
++  }
++
++  queueMicrotask(() => unwrapSignal())
++
++  return computed(unwrapSignal)
++}
