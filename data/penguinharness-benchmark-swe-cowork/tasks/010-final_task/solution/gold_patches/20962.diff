@@ -1,0 +1,2047 @@
+diff --git a/bin/use-vm-tarballs.mjs b/bin/use-vm-tarballs.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca7ceccb4043e141148c362e353819f957694742
+--- /dev/null
++++ b/bin/use-vm-tarballs.mjs
+@@ -0,0 +1,36 @@
++/**
++ * Scans the root folder and sets overrides
++ * for the package.json
++ *
++ * This script exists temporarily while when work on merging
++ * the glimmer-vm repo in to this one.
++ *
++ * Once the merge happens, we should delete this file.
++ */
++import fs from 'node:fs/promises';
++import { join } from 'node:path';
++import * as glob from 'glob';
++
++const tgzs = glob.default.sync('*.tgz', { ignore: 'node_modules/**' });
++
++const PARSE = /glimmer-(?<name>.+)-(?<version>(\d+\.?)+)\.tgz/;
++
++const overrides = {};
++
++for (let file of tgzs) {
++  let match = file.match(PARSE);
++  let { name } = match.groups;
++
++  overrides[`@glimmer/${name}`] = `file:./${file}`;
++}
++
++let manifestPath = join(process.cwd(), 'package.json');
++let manifestBuffer = await fs.readFile(manifestPath);
++let manifest = JSON.parse(manifestBuffer.toString());
++
++manifest.pnpm ||= {};
++manifest.pnpm.overrides ||= {};
++
++Object.assign(manifest.pnpm.overrides, overrides);
++
++await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+diff --git a/package.json b/package.json
+index 26f12c57083324e7b3a32dcc293d9b60cb608691..88a94574029daf0b81aa5ed3fa9ac164417ff98c 100644
+--- a/package.json
++++ b/package.json
+@@ -57,23 +57,23 @@
+   "dependencies": {
+     "@babel/core": "^7.24.4",
+     "@ember/edition-utils": "^1.2.0",
+-    "@glimmer/compiler": "0.94.8",
++    "@glimmer/compiler": "0.94.11",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/global-context": "0.93.2",
+     "@glimmer/interfaces": "0.94.5",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/node": "0.94.7",
+-    "@glimmer/opcode-compiler": "0.94.7",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/node": "0.94.10",
++    "@glimmer/opcode-compiler": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+-    "@glimmer/program": "0.94.7",
+-    "@glimmer/reference": "0.94.6",
+-    "@glimmer/runtime": "0.94.7",
+-    "@glimmer/syntax": "0.94.7",
++    "@glimmer/program": "0.94.10",
++    "@glimmer/reference": "0.94.9",
++    "@glimmer/runtime": "0.94.11",
++    "@glimmer/syntax": "0.95.0",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "@glimmer/vm": "0.94.6",
+-    "@glimmer/vm-babel-plugins": "0.93.3",
++    "@glimmer/vm-babel-plugins": "0.93.5",
+     "@simple-dom/interface": "^1.4.0",
+     "backburner.js": "^2.8.0",
+     "broccoli-file-creator": "^2.1.1",
+@@ -149,7 +149,7 @@
+     "simple-dom": "^1.4.0",
+     "testem": "^3.10.1",
+     "testem-failure-only-reporter": "^1.0.0",
+-    "typescript": "5.1",
++    "typescript": "5.2",
+     "vite": "^5.0.10",
+     "rollup": "^4.2.0",
+     "babel-plugin-debug-macros": "1.0.0",
+@@ -367,7 +367,8 @@
+       "ember/version.js": "ember-source/ember/version.js",
+       "route-recognizer/index.js": "ember-source/route-recognizer/index.js",
+       "router_js/index.js": "ember-source/router_js/index.js",
+-      "rsvp/index.js": "ember-source/rsvp/index.js"
++      "rsvp/index.js": "ember-source/rsvp/index.js",
++      "@ember/reactive/index.js": "ember-source/@ember/reactive/index.js"
+     }
+   },
+   "typesVersions": {
+diff --git a/packages/@ember/-internals/glimmer/lib/renderer.ts b/packages/@ember/-internals/glimmer/lib/renderer.ts
+index 01ef5bc3327c5d8d98feebb3e8af73b49e062f20..b995cac3721d4ace6af725cd4b61a63996d53767 100644
+--- a/packages/@ember/-internals/glimmer/lib/renderer.ts
++++ b/packages/@ember/-internals/glimmer/lib/renderer.ts
+@@ -6,20 +6,26 @@ import { guidFor } from '@ember/-internals/utils';
+ import { getViewElement, getViewId } from '@ember/-internals/views';
+ import { assert } from '@ember/debug';
+ import { _backburner, _getCurrentRunLoop } from '@ember/runloop';
+-import { destroy } from '@glimmer/destroyable';
++import {
++  associateDestroyableChild,
++  destroy,
++  isDestroyed,
++  registerDestructor,
++} from '@glimmer/destroyable';
+ import { DEBUG } from '@glimmer/env';
+ import type {
+   Bounds,
+   Cursor,
+   DebugRenderTree,
+-  DynamicScope as GlimmerDynamicScope,
+   Environment,
+-  RenderResult,
++  DynamicScope as GlimmerDynamicScope,
++  RenderResult as GlimmerRenderResult,
+   Template,
+   TemplateFactory,
+   EvaluationContext,
+   CurriedComponent,
+   TreeBuilder,
++  ClassicResolver,
+ } from '@glimmer/interfaces';
+ 
+ import type { Nullable } from '@ember/-internals/utility-types';
+@@ -33,6 +39,7 @@ import {
+   curry,
+   EMPTY_POSITIONAL,
+   inTransaction,
++  renderComponent as glimmerRenderComponent,
+   renderMain,
+   runtimeOptions,
+ } from '@glimmer/runtime';
+@@ -42,10 +49,13 @@ import { CURRENT_TAG, validateTag, valueForTag } from '@glimmer/validator';
+ import type { SimpleDocument, SimpleElement, SimpleNode } from '@simple-dom/interface';
+ import RSVP from 'rsvp';
+ import type Component from './component';
++import { hasDOM } from '../../browser-environment';
++import type ClassicComponent from './component';
+ import { BOUNDS } from './component-managers/curly';
+ import { createRootOutlet } from './component-managers/outlet';
+ import { RootComponentDefinition } from './component-managers/root';
+ import { EmberEnvironmentDelegate } from './environment';
++import { StrictResolver } from './renderer/strict-resolver';
+ import ResolverImpl from './resolver';
+ import type { OutletState } from './utils/outlet';
+ import OutletView from './views/outlet';
+@@ -120,9 +130,62 @@ function errorLoopTransaction(fn: () => void) {
+   }
+ }
+ 
+-class RootState {
++type RootState = ClassicRootState | ComponentRootState;
++
++class ComponentRootState {
++  readonly type = 'component';
++
++  #result: GlimmerRenderResult | undefined;
++  #render: () => void;
++
++  constructor(
++    state: RendererState,
++    definition: object,
++    options: { into: Cursor; args?: Record<string, unknown> }
++  ) {
++    this.#render = errorLoopTransaction(() => {
++      let iterator = glimmerRenderComponent(
++        state.context,
++        state.builder(state.env, options.into),
++        state.owner,
++        definition,
++        options?.args
++      );
++
++      let result = (this.#result = iterator.sync());
++
++      associateDestroyableChild(this, this.#result);
++
++      // override .render function after initial render
++      this.#render = errorLoopTransaction(() => result.rerender({ alwaysRevalidate: false }));
++    });
++  }
++
++  isFor(_component: ClassicComponent): boolean {
++    return false;
++  }
++
++  render(): void {
++    this.#render();
++  }
++
++  destroy(): void {
++    destroy(this);
++  }
++
++  get destroyed(): boolean {
++    return isDestroyed(this);
++  }
++
++  get result(): GlimmerRenderResult | undefined {
++    return this.#result;
++  }
++}
++
++class ClassicRootState {
++  readonly type = 'classic';
+   public id: string;
+-  public result: RenderResult | undefined;
++  public result: GlimmerRenderResult | undefined;
+   public destroyed: boolean;
+   public render: () => void;
+   readonly env: Environment;
+@@ -130,7 +193,7 @@ class RootState {
+   constructor(
+     public root: Component | OutletView,
+     context: EvaluationContext,
+-    owner: InternalOwner,
++    owner: object,
+     template: Template,
+     self: Reference<unknown>,
+     parentElement: SimpleElement,
+@@ -196,18 +259,18 @@ class RootState {
+   }
+ }
+ 
+-const renderers: Renderer[] = [];
++const renderers: BaseRenderer[] = [];
+ 
+ export function _resetRenderers() {
+   renderers.length = 0;
+ }
+ 
+-function register(renderer: Renderer): void {
++function register(renderer: BaseRenderer): void {
+   assert('Cannot register the same renderer twice', renderers.indexOf(renderer) === -1);
+   renderers.push(renderer);
+ }
+ 
+-function deregister(renderer: Renderer): void {
++function deregister(renderer: BaseRenderer): void {
+   let index = renderers.indexOf(renderer);
+   assert('Cannot deregister unknown unregistered renderer', index !== -1);
+   renderers.splice(index, 1);
+@@ -215,7 +278,7 @@ function deregister(renderer: Renderer): void {
+ 
+ function loopBegin(): void {
+   for (let renderer of renderers) {
+-    renderer._scheduleRevalidate();
++    renderer.rerender();
+   }
+ }
+ 
+@@ -255,7 +318,7 @@ function resolveRenderPromise() {
+ let loops = 0;
+ function loopEnd() {
+   for (let renderer of renderers) {
+-    if (!renderer._isValid()) {
++    if (!renderer.isValid()) {
+       if (loops > ENV._RERENDER_LOOP_LIMIT) {
+         loops = 0;
+         // TODO: do something better
+@@ -277,73 +340,379 @@ interface ViewRegistry {
+   [viewId: string]: unknown;
+ }
+ 
+-export class Renderer {
+-  private _rootTemplate: Template;
+-  private _viewRegistry: ViewRegistry;
+-  private _roots: RootState[];
+-  private _removedRoots: RootState[];
+-  private _builder: IBuilder;
+-  private _inRenderTransaction = false;
++type Resolver = ClassicResolver | StrictResolver;
+ 
+-  private _owner: InternalOwner;
+-  private _context: EvaluationContext;
++interface RendererData {
++  owner: object;
++  context: EvaluationContext;
++  builder: IBuilder;
++}
+ 
+-  private _lastRevision = -1;
+-  private _destroyed = false;
++export class RendererState {
++  static create(data: RendererData, renderer: BaseRenderer): RendererState {
++    const state = new RendererState(data, renderer);
++    associateDestroyableChild(renderer, state);
++    return state;
++  }
+ 
+-  /** @internal */
+-  _isInteractive: boolean;
++  readonly #data: RendererData;
++  #lastRevision = -1;
++  #inRenderTransaction = false;
++  #destroyed = false;
++  #roots: RootState[] = [];
++  #removedRoots: RootState[] = [];
+ 
+-  readonly _runtimeResolver: ResolverImpl;
+-  readonly env: Environment;
++  private constructor(data: RendererData, renderer: BaseRenderer) {
++    this.#data = data;
+ 
+-  static create(props: { _viewRegistry: any }): Renderer {
+-    let { _viewRegistry } = props;
+-    let owner = getOwner(props);
+-    assert('Renderer is unexpectedly missing an owner', owner);
+-    let document = owner.lookup('service:-document') as SimpleDocument;
+-    let env = owner.lookup('-environment:main') as {
+-      isInteractive: boolean;
+-      hasDOM: boolean;
++    registerDestructor(this, () => {
++      this.clearAllRoots(renderer);
++    });
++  }
++
++  get debug() {
++    return {
++      roots: this.#roots,
++      inRenderTransaction: this.#inRenderTransaction,
++      isInteractive: this.isInteractive,
+     };
+-    let rootTemplate = owner.lookup(P`template:-root`) as TemplateFactory;
+-    let builder = owner.lookup('service:-dom-builder') as IBuilder;
+-    return new this(owner, document, env, rootTemplate, _viewRegistry, builder);
+   }
+ 
++  get roots() {
++    return this.#roots;
++  }
++
++  get owner(): object {
++    return this.#data.owner;
++  }
++
++  get builder(): IBuilder {
++    return this.#data.builder;
++  }
++
++  get context(): EvaluationContext {
++    return this.#data.context;
++  }
++
++  get env(): Environment {
++    return this.context.env;
++  }
++
++  get isInteractive(): boolean {
++    return this.#data.context.env.isInteractive;
++  }
++
++  renderRoot(root: RootState, renderer: BaseRenderer): RootState {
++    let roots = this.#roots;
++
++    roots.push(root);
++    associateDestroyableChild(this, root);
++
++    if (roots.length === 1) {
++      register(renderer);
++    }
++
++    this.#renderRootsTransaction(renderer);
++
++    return root;
++  }
++
++  #renderRootsTransaction(renderer: BaseRenderer): void {
++    if (this.#inRenderTransaction) {
++      // currently rendering roots, a new root was added and will
++      // be processed by the existing _renderRoots invocation
++      return;
++    }
++
++    // used to prevent calling _renderRoots again (see above)
++    // while we are actively rendering roots
++    this.#inRenderTransaction = true;
++
++    let completedWithoutError = false;
++    try {
++      this.renderRoots(renderer);
++      completedWithoutError = true;
++    } finally {
++      if (!completedWithoutError) {
++        this.#lastRevision = valueForTag(CURRENT_TAG);
++      }
++      this.#inRenderTransaction = false;
++    }
++  }
++
++  renderRoots(renderer: BaseRenderer): void {
++    let roots = this.#roots;
++    let removedRoots = this.#removedRoots;
++    let initialRootsLength: number;
++
++    do {
++      initialRootsLength = roots.length;
++
++      inTransaction(this.context.env, () => {
++        // ensure that for the first iteration of the loop
++        // each root is processed
++        for (let i = 0; i < roots.length; i++) {
++          let root = roots[i];
++          assert('has root', root);
++
++          if (root.destroyed) {
++            // add to the list of roots to be removed
++            // they will be removed from `this._roots` later
++            removedRoots.push(root);
++
++            // skip over roots that have been marked as destroyed
++            continue;
++          }
++
++          // when processing non-initial reflush loops,
++          // do not process more roots than needed
++          if (i >= initialRootsLength) {
++            continue;
++          }
++
++          root.render();
++        }
++
++        this.#lastRevision = valueForTag(CURRENT_TAG);
++      });
++    } while (roots.length > initialRootsLength);
++
++    // remove any roots that were destroyed during this transaction
++    while (removedRoots.length) {
++      let root = removedRoots.pop();
++
++      let rootIndex = roots.indexOf(root!);
++      roots.splice(rootIndex, 1);
++    }
++
++    if (this.#roots.length === 0) {
++      deregister(renderer);
++    }
++  }
++
++  scheduleRevalidate(renderer: BaseRenderer): void {
++    _backburner.scheduleOnce('render', this, this.revalidate, renderer);
++  }
++
++  isValid(): boolean {
++    return (
++      this.#destroyed || this.#roots.length === 0 || validateTag(CURRENT_TAG, this.#lastRevision)
++    );
++  }
++
++  revalidate(renderer: BaseRenderer): void {
++    if (this.isValid()) {
++      return;
++    }
++    this.#renderRootsTransaction(renderer);
++  }
++
++  clearAllRoots(renderer: BaseRenderer): void {
++    let roots = this.#roots;
++    for (let root of roots) {
++      destroy(root);
++    }
++
++    this.#removedRoots.length = 0;
++    this.#roots = [];
++
++    // if roots were present before destroying
++    // deregister this renderer instance
++    if (roots.length) {
++      deregister(renderer);
++    }
++  }
++}
++
++type IntoTarget = Cursor | Element | SimpleElement;
++
++/**
++ * The returned object from `renderComponent`
++ * @public
++ * @module @ember/renderer
++ */
++export interface RenderResult {
++  /**
++   * Destroys the render tree and removes all rendered content from the element rendered into
++   */
++  destroy(): void;
++}
++
++function intoTarget(into: IntoTarget): Cursor {
++  if ('element' in into) {
++    return into;
++  } else {
++    return { element: into as SimpleElement, nextSibling: null };
++  }
++}
++
++/**
++ * Render a component into DOM element.
++ *
++ * @method renderComponent
++ * @static
++ * @for @ember/renderer
++ * @param {Object} component The component to render.
++ * @param {Object} options
++ * @param {Element} options.into Where to render the component in to.
++ * @param {Object} [options.owner] Optionally specify the owner to use. This will be used for injections, and overall cleanup.
++ * @param {Object} [options.env] Optional renderer configuration
++ * @param {Object} [options.args] Optionally pass args in to the component. These may be reactive as long as it is an object or object-like
++ * @public
++ */
++export function renderComponent(
++  /**
++   * The component definition to render.
++   *
++   * Any component that has had its manager registered is valid.
++   * For the component-types that ship with ember, manager registration
++   * does not need to be worried about.
++   */
++  component: object,
++  {
++    owner = {},
++    env,
++    into,
++    args,
++  }: {
++    /**
++     * The element to render the component in to.
++     */
++    into: IntoTarget;
++
++    /**
++     * Optional owner. Defaults to `{}`, can be any object, but will need to implement the [Owner](https://api.emberjs.com/ember/release/classes/Owner) API for components within this render tree to access services.
++     */
++    owner?: object;
++    /**
++     * Optionally configure the rendering environment
++     */
++    env?: {
++      /**
++       * When false, modifiers will not run.
++       */
++      isInteractive?: boolean;
++      /**
++       * All other options are forwarded to the underlying renderer.
++       * (its API is currently private and out of scope for this RFC,
++       *  so passing additional things here is also considered private API)
++       */
++      [rendererOption: string]: unknown;
++    };
++
++    /**
++     * These args get passed to the rendered component
++     *
++     * If your args are reactive, re-rendering will happen automatically.
++     *
++     */
++    args?: Record<string, unknown>;
++  }
++): RenderResult {
++  /**
++   * SAFETY: we should figure out what we need out of a `document` and narrow the API.
++   *         this exercise should also end up beginning to define what we need for CLI rendering (or to other outputs)
++   */
++  let document =
++    env && 'document' in env
++      ? (env?.['document'] as SimpleDocument | Document)
++      : globalThis.document;
++  let renderer = BaseRenderer.strict(owner, document, {
++    ...env,
++    isInteractive: env?.isInteractive ?? true,
++    hasDOM: env && 'hasDOM' in env ? Boolean(env?.['hasDOM']) : true,
++  });
++
++  /**
++   * Replace all contents, if we've rendered multiple times.
++   *
++   * https://github.com/emberjs/rfcs/pull/1099/files#diff-2b962105b9083ca84579cdc957f27f49407440f3c5078083fa369ec18cc46da8R365
++   *
++   * We could later add an option to not do this behavior
++   *
++   * NOTE: destruction is async
++   */
++  let existing = RENDER_CACHE.get(into);
++  existing?.destroy();
++  /**
++   * We can only replace the inner HTML the first time.
++   * Because destruction is async, it won't be safe to
++   * do this again, and we'll have to rely on the above destroy.
++   */
++  if (!existing && into instanceof Element) {
++    into.innerHTML = '';
++  }
++
++  let innerResult = renderer.render(component, { into, args }).result;
++
++  let result = {
++    destroy() {
++      if (innerResult) {
++        destroy(innerResult);
++      }
++    },
++  };
++
++  RENDER_CACHE.set(into, result);
++
++  return result;
++}
++
++const RENDER_CACHE = new WeakMap<IntoTarget, RenderResult>();
++
++export class BaseRenderer {
++  static strict(
++    owner: object,
++    document: SimpleDocument | Document,
++    options: { isInteractive: boolean; hasDOM?: boolean }
++  ) {
++    return new BaseRenderer(
++      owner,
++      { hasDOM: hasDOM, ...options },
++      document as SimpleDocument,
++      new StrictResolver(),
++      clientBuilder
++    );
++  }
++
++  readonly state: RendererState;
++
+   constructor(
+-    owner: InternalOwner,
+-    document: SimpleDocument,
++    owner: object,
+     envOptions: { isInteractive: boolean; hasDOM: boolean },
+-    rootTemplate: TemplateFactory,
+-    viewRegistry: ViewRegistry,
+-    builder = clientBuilder
++    document: SimpleDocument,
++    resolver: Resolver,
++    builder: IBuilder
+   ) {
+-    this._owner = owner;
+-    this._rootTemplate = rootTemplate(owner);
+-    this._viewRegistry = viewRegistry || owner.lookup('-view-registry:main');
+-    this._roots = [];
+-    this._removedRoots = [];
+-    this._builder = builder;
+-    this._isInteractive = envOptions.isInteractive;
+-
+     let sharedArtifacts = artifacts();
+ 
+-    // resolver is exposed for tests
+-    let resolver = (this._runtimeResolver = new ResolverImpl());
+-    let env = new EmberEnvironmentDelegate(owner, envOptions.isInteractive);
++    /**
++     * SAFETY: are there consequences for being looser with *this* owner?
++     *         the public API for `owner` is kinda `Partial<InternalOwner>`
++     *         aka: implement only what you need.
++     *         But for actual ember apps, you *need* to implement everything
++     *         an app needs (which will actually change and become less over time)
++     */
++    let env = new EmberEnvironmentDelegate(owner as InternalOwner, envOptions.isInteractive);
+     let options = runtimeOptions({ document }, env, sharedArtifacts, resolver);
+-
+-    this._context = new EvaluationContextImpl(
++    let context = new EvaluationContextImpl(
+       sharedArtifacts,
+       (heap) => new RuntimeOpImpl(heap),
+       options
+     );
+-    this.env = this._context.env;
++
++    this.state = RendererState.create(
++      {
++        owner,
++        context,
++        builder,
++      },
++      this
++    );
+   }
+ 
+   get debugRenderTree(): DebugRenderTree {
+-    let { debugRenderTree } = this.env;
++    let { debugRenderTree } = this.state.env;
+ 
+     assert(
+       'Attempted to access the DebugRenderTree, but it did not exist. Is the Ember Inspector open?',
+@@ -353,6 +722,80 @@ export class Renderer {
+     return debugRenderTree;
+   }
+ 
++  isValid(): boolean {
++    return this.state.isValid();
++  }
++
++  destroy() {
++    destroy(this);
++  }
++
++  render(
++    component: object,
++    options: { into: IntoTarget; args?: Record<string, unknown> }
++  ): RootState {
++    const root = new ComponentRootState(this.state, component, {
++      args: options.args,
++      into: intoTarget(options.into),
++    });
++    return this.state.renderRoot(root, this);
++  }
++
++  rerender(): void {
++    this.state.scheduleRevalidate(this);
++  }
++
++  // render(component: Component, options: { into: Cursor; args?: Record<string, unknown> }): void {
++  //   this.state.renderRoot(component);
++  // }
++}
++
++export class Renderer extends BaseRenderer {
++  static strict(
++    owner: object,
++    document: SimpleDocument | Document,
++    options: { isInteractive: boolean; hasDOM?: boolean }
++  ): BaseRenderer {
++    return new BaseRenderer(
++      owner,
++      { hasDOM: hasDOM, ...options },
++      document as SimpleDocument,
++      new StrictResolver(),
++      clientBuilder
++    );
++  }
++
++  private _rootTemplate: Template;
++  private _viewRegistry: ViewRegistry;
++
++  static create(props: { _viewRegistry: any }): Renderer {
++    let { _viewRegistry } = props;
++    let owner = getOwner(props);
++    assert('Renderer is unexpectedly missing an owner', owner);
++    let document = owner.lookup('service:-document') as SimpleDocument;
++    let env = owner.lookup('-environment:main') as {
++      isInteractive: boolean;
++      hasDOM: boolean;
++    };
++    let rootTemplate = owner.lookup(P`template:-root`) as TemplateFactory;
++    let builder = owner.lookup('service:-dom-builder') as IBuilder;
++    return new this(owner, document, env, rootTemplate, _viewRegistry, builder);
++  }
++
++  constructor(
++    owner: InternalOwner,
++    document: SimpleDocument,
++    env: { isInteractive: boolean; hasDOM: boolean },
++    rootTemplate: TemplateFactory,
++    viewRegistry: ViewRegistry,
++    builder = clientBuilder,
++    resolver = new ResolverImpl()
++  ) {
++    super(owner, env, document, resolver, builder);
++    this._rootTemplate = rootTemplate(owner);
++    this._viewRegistry = viewRegistry || owner.lookup('-view-registry:main');
++  }
++
+   // renderer HOOKS
+ 
+   appendOutletView(view: OutletView, target: SimpleElement): void {
+@@ -391,94 +834,98 @@ export class Renderer {
+     );
+   }
+ 
+-  appendTo(view: Component, target: SimpleElement): void {
++  appendTo(view: ClassicComponent, target: SimpleElement): void {
+     let definition = new RootComponentDefinition(view);
+     this._appendDefinition(
+       view,
+-      curry(0 as CurriedComponent, definition, this._owner, null, true),
++      curry(0 as CurriedComponent, definition, this.state.owner, null, true),
+       target
+     );
+   }
+ 
+   _appendDefinition(
+-    root: OutletView | Component,
++    root: OutletView | ClassicComponent,
+     definition: CurriedValue,
+     target: SimpleElement
+   ): void {
+     let self = createConstRef(definition, 'this');
+     let dynamicScope = new DynamicScope(null, UNDEFINED_REFERENCE);
+-    let rootState = new RootState(
++    let rootState = new ClassicRootState(
+       root,
+-      this._context,
+-      this._owner,
++      this.state.context,
++      this.state.owner,
+       this._rootTemplate,
+       self,
+       target,
+       dynamicScope,
+-      this._builder
++      this.state.builder
+     );
+-    this._renderRoot(rootState);
++    this.state.renderRoot(rootState, this);
+   }
+ 
+-  rerender(): void {
+-    this._scheduleRevalidate();
+-  }
+-
+-  register(view: any): void {
+-    let id = getViewId(view);
+-    assert(
+-      'Attempted to register a view with an id already in use: ' + id,
+-      !this._viewRegistry[id]
+-    );
+-    this._viewRegistry[id] = view;
+-  }
+-
+-  unregister(view: any): void {
+-    delete this._viewRegistry[getViewId(view)];
+-  }
+-
+-  remove(view: Component): void {
+-    view._transitionTo('destroying');
+-
+-    this.cleanupRootFor(view);
+-
+-    if (this._isInteractive) {
+-      view.trigger('didDestroyElement');
+-    }
+-  }
+-
+-  cleanupRootFor(view: unknown): void {
++  cleanupRootFor(component: ClassicComponent): void {
+     // no need to cleanup roots if we have already been destroyed
+-    if (this._destroyed) {
++    if (isDestroyed(this)) {
+       return;
+     }
+ 
+-    let roots = this._roots;
++    let roots = this.state.roots;
+ 
+     // traverse in reverse so we can remove items
+     // without mucking up the index
+-    let i = this._roots.length;
++    let i = roots.length;
+     while (i--) {
+       let root = roots[i];
+       assert('has root', root);
+-      if (root.isFor(view)) {
++      if (root.type === 'classic' && root.isFor(component)) {
+         root.destroy();
+         roots.splice(i, 1);
+       }
+     }
+   }
+ 
+-  destroy() {
+-    if (this._destroyed) {
+-      return;
++  remove(view: ClassicComponent): void {
++    view._transitionTo('destroying');
++
++    this.cleanupRootFor(view);
++
++    if (this.state.isInteractive) {
++      view.trigger('didDestroyElement');
+     }
+-    this._destroyed = true;
+-    this._clearAllRoots();
+   }
+ 
+-  getElement(view: View): Nullable<Element> {
++  get _roots() {
++    return this.state.debug.roots;
++  }
++
++  get _inRenderTransaction() {
++    return this.state.debug.inRenderTransaction;
++  }
++
++  get _isInteractive() {
++    return this.state.debug.isInteractive;
++  }
++
++  get _context() {
++    return this.state.context;
++  }
++
++  register(view: any): void {
++    let id = getViewId(view);
++    assert(
++      'Attempted to register a view with an id already in use: ' + id,
++      !this._viewRegistry[id]
++    );
++    this._viewRegistry[id] = view;
++  }
++
++  unregister(view: any): void {
++    delete this._viewRegistry[getViewId(view)];
++  }
++
++  getElement(component: View): Nullable<Element> {
+     if (this._isInteractive) {
+-      return getViewElement(view);
++      return getViewElement(component);
+     } else {
+       throw new Error(
+         'Accessing `this.element` is not allowed in non-interactive environments (such as FastBoot).'
+@@ -486,12 +933,12 @@ export class Renderer {
+     }
+   }
+ 
+-  getBounds(view: View): {
++  getBounds(component: View): {
+     parentElement: SimpleElement;
+     firstNode: SimpleNode;
+     lastNode: SimpleNode;
+   } {
+-    let bounds: Bounds | null = view[BOUNDS];
++    let bounds: Bounds | null = component[BOUNDS];
+ 
+     assert('object passed to getBounds must have the BOUNDS symbol as a property', bounds);
+ 
+@@ -501,125 +948,4 @@ export class Renderer {
+ 
+     return { parentElement, firstNode, lastNode };
+   }
+-
+-  createElement(tagName: string): SimpleElement {
+-    return this.env.getAppendOperations().createElement(tagName);
+-  }
+-
+-  _renderRoot(root: RootState): void {
+-    let { _roots: roots } = this;
+-
+-    roots.push(root);
+-
+-    if (roots.length === 1) {
+-      register(this);
+-    }
+-
+-    this._renderRootsTransaction();
+-  }
+-
+-  _renderRoots(): void {
+-    let { _roots: roots, _removedRoots: removedRoots } = this;
+-    let initialRootsLength: number;
+-
+-    do {
+-      initialRootsLength = roots.length;
+-
+-      inTransaction(this.env, () => {
+-        // ensure that for the first iteration of the loop
+-        // each root is processed
+-        for (let i = 0; i < roots.length; i++) {
+-          let root = roots[i];
+-          assert('has root', root);
+-
+-          if (root.destroyed) {
+-            // add to the list of roots to be removed
+-            // they will be removed from `this._roots` later
+-            removedRoots.push(root);
+-
+-            // skip over roots that have been marked as destroyed
+-            continue;
+-          }
+-
+-          // when processing non-initial reflush loops,
+-          // do not process more roots than needed
+-          if (i >= initialRootsLength) {
+-            continue;
+-          }
+-
+-          root.render();
+-        }
+-
+-        this._lastRevision = valueForTag(CURRENT_TAG);
+-      });
+-    } while (roots.length > initialRootsLength);
+-
+-    // remove any roots that were destroyed during this transaction
+-    while (removedRoots.length) {
+-      let root = removedRoots.pop();
+-
+-      let rootIndex = roots.indexOf(root!);
+-      roots.splice(rootIndex, 1);
+-    }
+-
+-    if (this._roots.length === 0) {
+-      deregister(this);
+-    }
+-  }
+-
+-  _renderRootsTransaction(): void {
+-    if (this._inRenderTransaction) {
+-      // currently rendering roots, a new root was added and will
+-      // be processed by the existing _renderRoots invocation
+-      return;
+-    }
+-
+-    // used to prevent calling _renderRoots again (see above)
+-    // while we are actively rendering roots
+-    this._inRenderTransaction = true;
+-
+-    let completedWithoutError = false;
+-    try {
+-      this._renderRoots();
+-      completedWithoutError = true;
+-    } finally {
+-      if (!completedWithoutError) {
+-        this._lastRevision = valueForTag(CURRENT_TAG);
+-      }
+-      this._inRenderTransaction = false;
+-    }
+-  }
+-
+-  _clearAllRoots(): void {
+-    let roots = this._roots;
+-    for (let root of roots) {
+-      root.destroy();
+-    }
+-
+-    this._removedRoots.length = 0;
+-    this._roots = [];
+-
+-    // if roots were present before destroying
+-    // deregister this renderer instance
+-    if (roots.length) {
+-      deregister(this);
+-    }
+-  }
+-
+-  _scheduleRevalidate(): void {
+-    _backburner.scheduleOnce('render', this, this._revalidate);
+-  }
+-
+-  _isValid(): boolean {
+-    return (
+-      this._destroyed || this._roots.length === 0 || validateTag(CURRENT_TAG, this._lastRevision)
+-    );
+-  }
+-
+-  _revalidate(): void {
+-    if (this._isValid()) {
+-      return;
+-    }
+-    this._renderRootsTransaction();
+-  }
+ }
+diff --git a/packages/@ember/-internals/glimmer/lib/renderer/strict-resolver.ts b/packages/@ember/-internals/glimmer/lib/renderer/strict-resolver.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7a80b8022d8231b99c3d2fe33018be3e0614c12
+--- /dev/null
++++ b/packages/@ember/-internals/glimmer/lib/renderer/strict-resolver.ts
+@@ -0,0 +1,38 @@
++import type {
++  InternalComponentManager,
++  Nullable,
++  ResolvedComponentDefinition,
++} from '@glimmer/interfaces';
++import { BUILTIN_HELPERS, BUILTIN_KEYWORD_HELPERS } from '../resolver';
++
++///////////
++
++/**
++ * Resolution for non built ins is now handled by the vm as we are using strict mode
++ */
++export class StrictResolver {
++  lookupHelper(name: string, _owner: object): Nullable<object> {
++    return BUILTIN_HELPERS[name] ?? null;
++  }
++
++  lookupBuiltInHelper(name: string): Nullable<object> {
++    return BUILTIN_KEYWORD_HELPERS[name] ?? null;
++  }
++
++  lookupModifier(_name: string, _owner: object): Nullable<object> {
++    return null;
++  }
++
++  lookupComponent(
++    _name: string,
++    _owner: object
++  ): Nullable<
++    ResolvedComponentDefinition<object, unknown, InternalComponentManager<unknown, object>>
++  > {
++    return null;
++  }
++
++  lookupBuiltInModifier(_name: string): Nullable<object> {
++    return null;
++  }
++}
+diff --git a/packages/@ember/-internals/glimmer/lib/resolver.ts b/packages/@ember/-internals/glimmer/lib/resolver.ts
+index af51ab9865d023a182d7fd8ce2d8933ea0238332..e6517bc3e88e44ad5c93d33eb0f83a7669b647fe 100644
+--- a/packages/@ember/-internals/glimmer/lib/resolver.ts
++++ b/packages/@ember/-internals/glimmer/lib/resolver.ts
+@@ -87,7 +87,7 @@ function lookupComponentPair(owner: InternalOwner, name: string): Nullable<Looku
+   }
+ }
+ 
+-const BUILTIN_KEYWORD_HELPERS: Record<string, object> = {
++export const BUILTIN_KEYWORD_HELPERS: Record<string, object> = {
+   mut,
+   readonly,
+   unbound,
+@@ -101,7 +101,7 @@ const BUILTIN_KEYWORD_HELPERS: Record<string, object> = {
+   '-in-el-null': inElementNullCheckHelper,
+ };
+ 
+-const BUILTIN_HELPERS: Record<string, object> = {
++export const BUILTIN_HELPERS: Record<string, object> = {
+   ...BUILTIN_KEYWORD_HELPERS,
+   array,
+   concat,
+diff --git a/packages/@ember/-internals/package.json b/packages/@ember/-internals/package.json
+index 282336b41306547b14212f473f65e5c3e8b0d6e6..549ccec5b4dbe813424183a30355b62f4e176bae 100644
+--- a/packages/@ember/-internals/package.json
++++ b/packages/@ember/-internals/package.json
+@@ -39,22 +39,22 @@
+     "@ember/service": "workspace:*",
+     "@ember/template-factory": "workspace:*",
+     "@ember/utils": "workspace:*",
+-    "@glimmer/compiler": "0.94.8",
++    "@glimmer/compiler": "0.94.11",
+     "@glimmer/component": "workspace:^",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/global-context": "0.93.2",
+     "@glimmer/interfaces": "0.94.5",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/node": "0.94.7",
+-    "@glimmer/opcode-compiler": "0.94.7",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/node": "0.94.10",
++    "@glimmer/opcode-compiler": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+-    "@glimmer/program": "0.94.7",
+-    "@glimmer/reference": "0.94.6",
+-    "@glimmer/runtime": "0.94.7",
+-    "@glimmer/syntax": "0.94.7",
++    "@glimmer/program": "0.94.10",
++    "@glimmer/reference": "0.94.9",
++    "@glimmer/runtime": "0.94.11",
++    "@glimmer/syntax": "0.95.0",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "@glimmer/vm": "0.94.6",
+     "@simple-dom/interface": "^1.4.0",
+     "backburner.js": "^2.7.0",
+diff --git a/packages/@ember/application/package.json b/packages/@ember/application/package.json
+index e6c2159c3144e2ded8c19a04020986a9c1d26ff4..dbf463fe3703016b97c15564581f7a94b4947c81 100644
+--- a/packages/@ember/application/package.json
++++ b/packages/@ember/application/package.json
+@@ -23,7 +23,7 @@
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "dag-map": "^2.0.2",
+     "ember": "workspace:*",
+diff --git a/packages/@ember/array/package.json b/packages/@ember/array/package.json
+index 2e7dd6d0e18d35f4abfd6a11cd098398f4292fa2..2d8d9459a8463013f33f84c466c8ae8eda48c498 100644
+--- a/packages/@ember/array/package.json
++++ b/packages/@ember/array/package.json
+@@ -19,10 +19,10 @@
+     "@ember/utils": "workspace:*",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
++    "@glimmer/manager": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*"
+   }
+diff --git a/packages/@ember/component/package.json b/packages/@ember/component/package.json
+index 088a0fceeaef0e48ba4b82172e839351af9aeb43..e45515c0c8df503ee2e12b0a0f6ee251f6430159 100644
+--- a/packages/@ember/component/package.json
++++ b/packages/@ember/component/package.json
+@@ -9,8 +9,8 @@
+   },
+   "dependencies": {
+     "@ember/-internals": "workspace:*",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/runtime": "0.94.7",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/runtime": "0.94.11",
+     "expect-type": "^0.15.0"
+   }
+ }
+diff --git a/packages/@ember/controller/package.json b/packages/@ember/controller/package.json
+index 9661c55ad50ac8bd583e52fcd7cf80730dba9181..10005aa56ad47c8e68e636c2bc69386bcb1ae476 100644
+--- a/packages/@ember/controller/package.json
++++ b/packages/@ember/controller/package.json
+@@ -15,7 +15,7 @@
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*"
+   }
+diff --git a/packages/@ember/debug/package.json b/packages/@ember/debug/package.json
+index 1c000f915e9d30dc7139b6d69365bf88e0c101a4..4c2a9fb2cb5fdafc9aa48937e4e1b07156319f26 100644
+--- a/packages/@ember/debug/package.json
++++ b/packages/@ember/debug/package.json
+@@ -20,10 +20,10 @@
+     "@ember/utils": "workspace:*",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
++    "@glimmer/manager": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*"
+diff --git a/packages/@ember/engine/package.json b/packages/@ember/engine/package.json
+index fa65165335e9a49d4fe778a44c762e1d91d921dc..e7389ac3f312e2a9725cb9e450c968696b373504 100644
+--- a/packages/@ember/engine/package.json
++++ b/packages/@ember/engine/package.json
+@@ -23,7 +23,7 @@
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "dag-map": "^2.0.2",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*",
+diff --git a/packages/@ember/enumerable/package.json b/packages/@ember/enumerable/package.json
+index a92bac8e7ef3e86866f9c51dfad27b9605bc7ed5..88560dbd3e37e7c7926a9cfca3950f3268f1a445 100644
+--- a/packages/@ember/enumerable/package.json
++++ b/packages/@ember/enumerable/package.json
+@@ -15,7 +15,7 @@
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "internal-test-helpers": "workspace:*"
+   }
+ }
+diff --git a/packages/@ember/helper/package.json b/packages/@ember/helper/package.json
+index db255c38c829f6ab89db1536dc9225567ea4207d..dbaa12165ae578830f7d8c0f07271531ef838277 100644
+--- a/packages/@ember/helper/package.json
++++ b/packages/@ember/helper/package.json
+@@ -8,8 +8,8 @@
+   "dependencies": {
+     "@ember/-internals": "workspace:*",
+     "@ember/component": "workspace:*",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/runtime": "0.94.7",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/runtime": "0.94.11",
+     "expect-type": "^0.15.0"
+   }
+ }
+diff --git a/packages/@ember/instrumentation/package.json b/packages/@ember/instrumentation/package.json
+index f75eef6a49315945066c85bfbaa03da7d1ae09a0..9a10a4b808d2f70d5d62524594e29d896c4a3ad5 100644
+--- a/packages/@ember/instrumentation/package.json
++++ b/packages/@ember/instrumentation/package.json
+@@ -14,7 +14,7 @@
+     "@ember/runloop": "workspace:*",
+     "@ember/utils": "workspace:*",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "internal-test-helpers": "workspace:*"
+   }
+ }
+diff --git a/packages/@ember/modifier/package.json b/packages/@ember/modifier/package.json
+index e9fd459c2f5efa2f66cb035edb62110d6576d535..97b207bbffbcccea2e2900bb2fc2e2490c69c22c 100644
+--- a/packages/@ember/modifier/package.json
++++ b/packages/@ember/modifier/package.json
+@@ -8,7 +8,7 @@
+   },
+   "dependencies": {
+     "@ember/-internals": "workspace:*",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/runtime": "0.94.7"
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/runtime": "0.94.11"
+   }
+ }
+diff --git a/packages/@ember/object/package.json b/packages/@ember/object/package.json
+index cab34a913aa7a429ba1c1c1a799978d69b4f4cf3..a58bfba9257c4b7e2a19a46820de32f1c288e389 100644
+--- a/packages/@ember/object/package.json
++++ b/packages/@ember/object/package.json
+@@ -28,10 +28,10 @@
+     "@ember/utils": "workspace:*",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
++    "@glimmer/manager": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*"
+   }
+diff --git a/packages/@ember/reactive/index.ts b/packages/@ember/reactive/index.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..60c46e3f540432d20a0681edc66dac13602ae8ea
+--- /dev/null
++++ b/packages/@ember/reactive/index.ts
+@@ -0,0 +1,8 @@
++export {
++  trackedArray,
++  trackedObject,
++  trackedWeakSet,
++  trackedSet,
++  trackedMap,
++  trackedWeakMap,
++} from '@glimmer/validator';
+diff --git a/packages/@ember/reactive/package.json b/packages/@ember/reactive/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..58ecd1d1e7a2c709d687250f504f62b2ec74b298
+--- /dev/null
++++ b/packages/@ember/reactive/package.json
+@@ -0,0 +1,11 @@
++{
++  "name": "@ember/reactive",
++  "private": true,
++  "type": "module",
++  "exports": {
++    ".": "./index.ts"
++  },
++  "dependencies": {
++    "@glimmer/validator": "0.95.0"
++  }
++}
+diff --git a/packages/@ember/routing/package.json b/packages/@ember/routing/package.json
+index cc1e0f9ff961a5ec6ce489c4493a0e4c8a4caf5f..ff6eabab078d6e28931c150c22ed11762b663084 100644
+--- a/packages/@ember/routing/package.json
++++ b/packages/@ember/routing/package.json
+@@ -27,10 +27,10 @@
+     "@ember/utils": "workspace:*",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
++    "@glimmer/manager": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "dag-map": "^2.0.2",
+     "expect-type": "^0.15.0",
+diff --git a/packages/@ember/runloop/package.json b/packages/@ember/runloop/package.json
+index 88c19905e0dbf7616574877f3e256ffa67b15d07..aea9ebd3ae4223cd7aad62bfaa2f7db634a89bb1 100644
+--- a/packages/@ember/runloop/package.json
++++ b/packages/@ember/runloop/package.json
+@@ -13,7 +13,7 @@
+     "@ember/object": "workspace:*",
+     "@ember/utils": "workspace:*",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*"
+diff --git a/packages/@ember/service/package.json b/packages/@ember/service/package.json
+index 34b375e2e248d39b72e6df5a7b98fd4250906412..387f1be381019a76afb941e06ca95ce8be394ab2 100644
+--- a/packages/@ember/service/package.json
++++ b/packages/@ember/service/package.json
+@@ -14,7 +14,7 @@
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*"
+   }
+diff --git a/packages/@ember/template-compilation/package.json b/packages/@ember/template-compilation/package.json
+index 1b961dcd37840f43dc20aa8450ea8a35bc1f3a33..5b4c27b28d8e9f31c937023c19868c80ec0663a8 100644
+--- a/packages/@ember/template-compilation/package.json
++++ b/packages/@ember/template-compilation/package.json
+@@ -8,9 +8,9 @@
+   "dependencies": {
+     "@ember/-internals": "workspace:*",
+     "@ember/canary-features": "workspace:*",
+-    "@glimmer/compiler": "0.94.8",
++    "@glimmer/compiler": "0.94.11",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/syntax": "0.94.7",
++    "@glimmer/syntax": "0.95.0",
+     "ember": "workspace:*",
+     "ember-template-compiler": "workspace:*"
+   }
+diff --git a/packages/@ember/template-compiler/lib/plugins/utils.ts b/packages/@ember/template-compiler/lib/plugins/utils.ts
+index 6cc5b5ab4c91c0ce01f2684f7ed6ed16ce79755e..1a36792df4172ba6fad41a7eb1f28d1fe339a324 100644
+--- a/packages/@ember/template-compiler/lib/plugins/utils.ts
++++ b/packages/@ember/template-compiler/lib/plugins/utils.ts
+@@ -5,6 +5,10 @@ export function isPath(node: AST.Node): node is AST.PathExpression {
+   return node.type === 'PathExpression';
+ }
+ 
++export function isSubExpression(node: AST.Node): node is AST.SubExpression {
++  return node.type === 'SubExpression';
++}
++
+ export function isStringLiteral(node: AST.Expression): node is AST.StringLiteral {
+   return node.type === 'StringLiteral';
+ }
+diff --git a/packages/@ember/template-compiler/package.json b/packages/@ember/template-compiler/package.json
+index 4c592562e56863a920862a7c66b89ba7c8fe265a..6ef24ec9f2a83b806d47b0600671b06dd3b6346a 100644
+--- a/packages/@ember/template-compiler/package.json
++++ b/packages/@ember/template-compiler/package.json
+@@ -10,11 +10,11 @@
+   },
+   "dependencies": {
+     "@ember/debug": "workspace:*",
+-    "@glimmer/compiler": "0.94.8",
++    "@glimmer/compiler": "0.94.11",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/opcode-compiler": "0.94.7",
+-    "@glimmer/syntax": "0.94.7",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/opcode-compiler": "0.94.10",
++    "@glimmer/syntax": "0.95.0",
+     "@glimmer/interfaces": "0.94.5",
+     "@ember/-internals": "workspace:*",
+     "@ember/component": "workspace:*",
+diff --git a/packages/@ember/template-factory/package.json b/packages/@ember/template-factory/package.json
+index c9dd225acdaf407bb59ecf23310ef61d4211ddd6..ca9eec29dc440f92fb4f8c3bd483a9d26a9925b9 100644
+--- a/packages/@ember/template-factory/package.json
++++ b/packages/@ember/template-factory/package.json
+@@ -6,6 +6,6 @@
+     ".": "./index.ts"
+   },
+   "dependencies": {
+-    "@glimmer/opcode-compiler": "0.94.7"
++    "@glimmer/opcode-compiler": "0.94.10"
+   }
+ }
+diff --git a/packages/@ember/utils/package.json b/packages/@ember/utils/package.json
+index 45740fddf84fa7c19c2db6017e908c83ba3698be..450139748d686a57f787d66581f758516fe9d67d 100644
+--- a/packages/@ember/utils/package.json
++++ b/packages/@ember/utils/package.json
+@@ -15,10 +15,10 @@
+     "@ember/runloop": "workspace:*",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
++    "@glimmer/manager": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "expect-type": "^0.15.0",
+     "internal-test-helpers": "workspace:*"
+   }
+diff --git a/packages/@ember/version/package.json b/packages/@ember/version/package.json
+index e8c7d5edf60201cd38d7976a61ff782028a24d8f..1ddde78a0429ee19f449dd25fc5256521d9f6e4c 100644
+--- a/packages/@ember/version/package.json
++++ b/packages/@ember/version/package.json
+@@ -22,8 +22,8 @@
+     "@ember/runloop": "workspace:*",
+     "@ember/service": "workspace:*",
+     "@ember/utils": "workspace:*",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/runtime": "0.94.7",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/runtime": "0.94.11",
+     "backburner.js": "^2.7.0",
+     "ember": "workspace:*",
+     "expect-type": "^0.15.0"
+diff --git a/packages/ember-template-compiler/lib/types.ts b/packages/ember-template-compiler/lib/types.ts
+index a54ec7f0d233a7092f1bb0c0f91898a4e891e319..9844f780e721e3bcb194e0c39f8acd1d4cefb57f 100644
+--- a/packages/ember-template-compiler/lib/types.ts
++++ b/packages/ember-template-compiler/lib/types.ts
+@@ -3,6 +3,7 @@ import type {
+   ASTPluginEnvironment,
+   builders,
+   PrecompileOptions,
++  PrecompileOptionsWithLexicalScope,
+ } from '@glimmer/syntax';
+ 
+ export type Builders = typeof builders;
+@@ -19,11 +20,13 @@ interface Plugins {
+   ast: PluginFunc[];
+ }
+ 
++export type LexicalScope = NonNullable<PrecompileOptionsWithLexicalScope['lexicalScope']>;
++
+ export interface EmberPrecompileOptions extends PrecompileOptions {
+   isProduction?: boolean;
+   moduleName?: string;
+   plugins?: Plugins;
+-  lexicalScope?: (name: string) => boolean;
++  lexicalScope?: LexicalScope;
+ }
+ 
+ export type EmberASTPluginEnvironment = ASTPluginEnvironment & EmberPrecompileOptions;
+diff --git a/packages/ember-template-compiler/package.json b/packages/ember-template-compiler/package.json
+index 7e1378861b5a637f3035297b3ff79196cf5e6a60..ad3528b84fe3181eed4f1e8701e2148797e1af39 100644
+--- a/packages/ember-template-compiler/package.json
++++ b/packages/ember-template-compiler/package.json
+@@ -25,12 +25,12 @@
+     "@ember/service": "workspace:*",
+     "@ember/template-compilation": "workspace:*",
+     "@ember/utils": "workspace:*",
+-    "@glimmer/compiler": "0.94.8",
++    "@glimmer/compiler": "0.94.11",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/runtime": "0.94.7",
+-    "@glimmer/syntax": "0.94.7",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/runtime": "0.94.11",
++    "@glimmer/syntax": "0.95.0",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "ember": "workspace:*",
+     "internal-test-helpers": "workspace:*",
+diff --git a/packages/ember-testing/package.json b/packages/ember-testing/package.json
+index 5cbfb1461f3a1523689c52d0937121b94d36659a..df0bb582ea91d9cc1e1a77ef7b630f7316f80416 100644
+--- a/packages/ember-testing/package.json
++++ b/packages/ember-testing/package.json
+@@ -23,7 +23,7 @@
+     "@glimmer/env": "^0.1.7",
+     "@glimmer/owner": "0.93.2",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "ember": "workspace:*",
+     "internal-test-helpers": "workspace:*",
+diff --git a/packages/ember/package.json b/packages/ember/package.json
+index 9ee3e72107b41f788bb691208bd9800158be884e..ace271fa60c9a3829591de6cf91d27aec92e9675 100644
+--- a/packages/ember/package.json
++++ b/packages/ember/package.json
+@@ -33,12 +33,12 @@
+     "@ember/version": "workspace:*",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
++    "@glimmer/manager": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+-    "@glimmer/runtime": "0.94.7",
++    "@glimmer/runtime": "0.94.11",
+     "@glimmer/tracking": "workspace:*",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "dag-map": "^2.0.2",
+     "ember-template-compiler": "workspace:*",
+diff --git a/packages/internal-test-helpers/index.ts b/packages/internal-test-helpers/index.ts
+index 8ac563ea43a7341127d493b13c270361c1c5f0eb..33c768572fa35f4434d10d7f1ebd9f8ae2ad4f87 100644
+--- a/packages/internal-test-helpers/index.ts
++++ b/packages/internal-test-helpers/index.ts
+@@ -19,6 +19,7 @@ export {
+   ignoreDeprecation,
+ } from './lib/ember-dev/deprecation';
+ export {
++  defComponent,
+   defineComponent,
+   defineSimpleHelper,
+   defineSimpleModifier,
+@@ -29,7 +30,11 @@ export { equalsElement, classes, styles, regex } from './lib/matchers';
+ export { runAppend, runDestroy, runTask, runTaskNext, runLoopSettled } from './lib/run';
+ export { getContext, setContext, unsetContext } from './lib/test-context';
+ 
+-export { default as AbstractTestCase } from './lib/test-cases/abstract';
++export {
++  default as AbstractTestCase,
++  type TestCase,
++  AbstractStrictTestCase,
++} from './lib/test-cases/abstract';
+ export { default as AbstractApplicationTestCase } from './lib/test-cases/abstract-application';
+ export { default as ApplicationTestCase } from './lib/test-cases/application';
+ export { default as QueryParamTestCase } from './lib/test-cases/query-param';
+@@ -37,6 +42,15 @@ export { default as RenderingTestCase } from './lib/test-cases/rendering';
+ export { default as RouterNonApplicationTestCase } from './lib/test-cases/router-non-application';
+ export { default as RouterTestCase } from './lib/test-cases/router';
+ export { default as AutobootApplicationTestCase } from './lib/test-cases/autoboot-application';
++export { getAssert } from './lib/assert-helpers';
++export {
++  getElement,
++  assertElement,
++  assertHTML,
++  assertClassicComponentElement,
++  type ClassicComponentShape,
++} from './lib/element-helpers';
++export { clickElement } from './lib/event-helpers';
+ 
+ export {
+   default as TestResolver,
+diff --git a/packages/internal-test-helpers/lib/assert-helpers.ts b/packages/internal-test-helpers/lib/assert-helpers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e86e6b9d20d2ea7f65416031bc63feb0587d7564
+--- /dev/null
++++ b/packages/internal-test-helpers/lib/assert-helpers.ts
+@@ -0,0 +1,16 @@
++import { getContext } from './test-context';
++
++export function getAssert(): QUnit['assert'] {
++  let context = getContext();
++
++  if (!context) {
++    throw new Error('Test context is not set up.');
++  }
++
++  let assert = context['assert'];
++  if (!assert) {
++    throw new Error('`assert` property on test context is not set up.');
++  }
++
++  return assert;
++}
+diff --git a/packages/internal-test-helpers/lib/component-helper.ts b/packages/internal-test-helpers/lib/component-helper.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0313da0bed816838eed371a7771d8c382940e43
+--- /dev/null
++++ b/packages/internal-test-helpers/lib/component-helper.ts
+@@ -0,0 +1,35 @@
++import { getContext } from './test-context';
++
++export function getComponent(): Record<string, unknown> {
++  let context = getContext();
++  if (!context) {
++    throw new Error('Test context is not set up.');
++  }
++
++  let component = context['component'];
++  if (component && typeof component === 'object') {
++    return component;
++  }
++
++  throw new Error('`component` property on test context is not set up.');
++}
++
++export function getOwner() {
++  let context = getContext();
++
++  if (!context) {
++    throw new Error('Test context is not set up.');
++  }
++
++  return context['owner'];
++}
++
++export function rerenderComponent() {
++  let component = getComponent();
++
++  if (typeof component['rerender'] !== 'function') {
++    throw new Error('Component does not support `rerender`.');
++  }
++
++  component['rerender']();
++}
+diff --git a/packages/internal-test-helpers/lib/define-template-values.ts b/packages/internal-test-helpers/lib/define-template-values.ts
+index a4a93af4c7182a18ad9226e5d77604f111f9498f..aff8f09d4b8509481a7ebed0ec01aefb0fdd39fd 100644
+--- a/packages/internal-test-helpers/lib/define-template-values.ts
++++ b/packages/internal-test-helpers/lib/define-template-values.ts
+@@ -87,6 +87,26 @@ class FunctionalModifierManager implements ModifierManager<SimpleModifierState>
+ const FUNCTIONAL_MODIFIER_MANAGER = new FunctionalModifierManager();
+ const FUNCTIONAL_MODIFIER_MANAGER_FACTORY = () => FUNCTIONAL_MODIFIER_MANAGER;
+ 
++/**
++ * The signature of this test helper is closer to the signature of the
++ * `template()` function in `@ember/template-compiler`. It can express the same
++ * functionality as {@linkcode defineComponent}, but most tests still use
++ * `defineComponent`. Migrating tests from {@linkcode defineComponent} is
++ * straightforward, and there's no *semantic* reason not to do so.
++ */
++export function defComponent(
++  templateSource: string,
++  options?: {
++    component?: object | undefined;
++    scope?: Record<string, unknown> | undefined;
++  }
++) {
++  let definition = options?.component ?? templateOnlyComponent();
++  let scopeValues = options?.scope ?? null;
++
++  return defineComponent(scopeValues, templateSource, definition);
++}
++
+ export function defineComponent(
+   scopeValues: Record<string, unknown> | null,
+   templateSource: string,
+@@ -103,10 +123,12 @@ export function defineComponent(
+   return definition;
+ }
+ 
+-export function defineSimpleHelper<T extends Function>(helperFn: T): T {
++export function defineSimpleHelper<T extends (...args: unknown[]) => unknown>(helperFn: T): T {
+   return setHelperManager(FUNCTIONAL_HELPER_MANAGER_FACTORY, helperFn);
+ }
+ 
+-export function defineSimpleModifier<T extends Function>(modifierFn: T): T {
++export function defineSimpleModifier<T extends (element: Element, ...args: any[]) => any>(
++  modifierFn: T
++): T {
+   return setModifierManager(FUNCTIONAL_MODIFIER_MANAGER_FACTORY, modifierFn);
+ }
+diff --git a/packages/internal-test-helpers/lib/element-helpers.ts b/packages/internal-test-helpers/lib/element-helpers.ts
+index 5915f757043bcf5ec77e63bb5d478a211fb566f9..280bafb492714afaf91032848d42df8baef4ebfc 100644
+--- a/packages/internal-test-helpers/lib/element-helpers.ts
++++ b/packages/internal-test-helpers/lib/element-helpers.ts
+@@ -1,5 +1,12 @@
++import { getAssert } from './assert-helpers';
++import equalTokens from './equal-tokens';
++import { classes, equalsElement, regex } from './matchers';
+ import { getContext } from './test-context';
+ 
++export const TextNode = window.Text;
++export const HTMLElement = window.HTMLElement;
++export const Comment = window.Comment;
++
+ export function getElement(): HTMLElement {
+   let context = getContext();
+   if (!context) {
+@@ -13,3 +20,102 @@ export function getElement(): HTMLElement {
+ 
+   return element;
+ }
++
++export function isMarker(node: unknown): node is Comment | typeof TextNode {
++  if (node instanceof Comment && node.textContent === '') {
++    return true;
++  }
++
++  if (node instanceof TextNode && node.textContent === '') {
++    return true;
++  }
++
++  return false;
++}
++
++export function assertHTML(html: string): void {
++  equalTokens(getElement(), html, `#qunit-fixture content should be: \`${html}\``);
++}
++
++export function assertElement(
++  node: ChildNode | null,
++  {
++    ElementType = HTMLElement,
++    tagName,
++    attrs = null,
++    content = null,
++  }: {
++    ElementType?: typeof HTMLElement;
++    tagName: string;
++    attrs?: Record<string, unknown> | null;
++    content?: unknown;
++  }
++) {
++  if (!node || !(node instanceof ElementType)) {
++    throw new Error(`Expecting a ${ElementType.name}, but got ${String(node)}`);
++  }
++
++  equalsElement(getAssert(), node, tagName, attrs, content);
++}
++
++export interface ClassicComponentShape {
++  ElementType?: typeof HTMLElement;
++  tagName: string;
++  attrs?: Record<string, unknown>;
++  content?: unknown;
++}
++
++export function assertClassicComponentElement(
++  node: ChildNode | null,
++  shape: ClassicComponentShape
++): void;
++export function assertClassicComponentElement(shape: ClassicComponentShape): void;
++export function assertClassicComponentElement(
++  ...args: [node: ChildNode | null, shape: ClassicComponentShape] | [shape: ClassicComponentShape]
++): void {
++  let node = args.length === 2 ? args[0] : getElement().firstChild;
++  let shape = args.length === 2 ? args[1] : args[0];
++
++  let attrs = Object.assign({
++    id: regex(/^ember\d*$/),
++    class: classes('ember-view'),
++    ...shape.attrs,
++  });
++
++  assertElement(node, {
++    ElementType: shape.ElementType ?? HTMLElement,
++    tagName: shape.tagName,
++    attrs,
++    content: shape.content,
++  });
++}
++
++export function assertSameNode(actual: ChildNode | undefined, expected: ChildNode | undefined) {
++  getAssert().strictEqual(actual, expected, 'DOM node stability');
++}
++
++export function assertInvariants(oldSnapshot: ChildNode[], newSnapshot?: ChildNode[]): void {
++  newSnapshot = newSnapshot || takeSnapshot();
++
++  getAssert().strictEqual(newSnapshot.length, oldSnapshot.length, 'Same number of nodes');
++
++  for (let i = 0; i < oldSnapshot.length; i++) {
++    assertSameNode(newSnapshot[i], oldSnapshot[i]);
++  }
++}
++
++export function takeSnapshot() {
++  let snapshot: ChildNode[] = [];
++
++  let node = getElement().firstChild;
++
++  while (node) {
++    if (!isMarker(node)) {
++      snapshot.push(node);
++    }
++
++    node = node.nextSibling;
++  }
++
++  return snapshot;
++}
+diff --git a/packages/internal-test-helpers/lib/ember-dev/namespaces.ts b/packages/internal-test-helpers/lib/ember-dev/namespaces.ts
+index 32d6c5d709ead231ce826e0c0f057a8e5d108955..f9e3597926638cfb12afd6999489281e0995383c 100644
+--- a/packages/internal-test-helpers/lib/ember-dev/namespaces.ts
++++ b/packages/internal-test-helpers/lib/ember-dev/namespaces.ts
+@@ -6,7 +6,7 @@ export function setupNamespacesCheck(hooks: NestedHooks): void {
+     let { assert } = QUnit.config.current;
+ 
+     if (NAMESPACES.length > 0) {
+-      assert.ok(false, 'Should not have any NAMESPACES after tests');
++      assert.ok(false, `Should not have any NAMESPACES after tests (had: ${NAMESPACES.join(',')})`);
+       run(() => {
+         let namespaces = NAMESPACES.slice();
+         for (let namespace of namespaces) {
+diff --git a/packages/internal-test-helpers/lib/event-helpers.ts b/packages/internal-test-helpers/lib/event-helpers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..765494c376ff40883ad4b6f671da8f389c0e9c88
+--- /dev/null
++++ b/packages/internal-test-helpers/lib/event-helpers.ts
+@@ -0,0 +1,15 @@
++import { getElement } from './element-helpers';
++import { runLoopSettled } from './run';
++
++export function clickElement(selector: HTMLElement | string) {
++  let element;
++  if (typeof selector === 'string') {
++    element = getElement().querySelector(selector) as HTMLElement | null;
++  } else {
++    element = selector;
++  }
++
++  let event = element!.click();
++
++  return runLoopSettled(event);
++}
+diff --git a/packages/internal-test-helpers/lib/module-for.ts b/packages/internal-test-helpers/lib/module-for.ts
+index ba6cb702daff8d44ba4d46a65ea4ff2882c6c71c..e1e09cb3bd764e2127a12b96be5fe2c77717a486 100644
+--- a/packages/internal-test-helpers/lib/module-for.ts
++++ b/packages/internal-test-helpers/lib/module-for.ts
+@@ -1,19 +1,19 @@
+ /* globals URLSearchParams */
+-import { DEBUG } from '@glimmer/env';
+ import { isEnabled } from '@ember/canary-features';
+-import type { Mixin, Generator } from './apply-mixins';
++import { assertDestroyablesDestroyed, enableDestroyableTracking } from '@glimmer/destroyable';
++import { DEBUG } from '@glimmer/env';
++import { all } from 'rsvp';
++import type { Generator, Mixin } from './apply-mixins';
+ import applyMixins from './apply-mixins';
+ import getAllPropertyNames from './get-all-property-names';
++import type { TestCase } from './test-cases/abstract';
+ import { setContext, unsetContext } from './test-context';
+-import { all } from 'rsvp';
+-import { enableDestroyableTracking, assertDestroyablesDestroyed } from '@glimmer/destroyable';
+-import type AbstractTestCase from './test-cases/abstract';
+ 
+-interface TestClass<T extends AbstractTestCase> {
++interface TestClass<T extends TestCase> {
+   new (assert: QUnit['assert']): T;
+ }
+ 
+-interface TestContext<T extends AbstractTestCase> {
++interface TestContext<T extends TestCase> {
+   instance: T | null | undefined;
+ }
+ 
+@@ -28,7 +28,7 @@ const ASSERT_DESTROYABLES = (() => {
+   return assertDestroyables !== null;
+ })();
+ 
+-export function moduleForDevelopment<T extends AbstractTestCase, M extends Generator>(
++export function moduleForDevelopment<T extends TestCase, M extends Generator>(
+   description: string,
+   TestClass: TestClass<T>,
+   ...mixins: Mixin<M>[]
+@@ -45,7 +45,7 @@ export async function define<T>(callback: () => T): Promise<T> {
+   return result;
+ }
+ 
+-export default function moduleFor<T extends AbstractTestCase, M extends Generator>(
++export default function moduleFor<T extends TestCase, M extends Generator>(
+   description: string,
+   TestClass: TestClass<T>,
+   ...mixins: Mixin<M>[]
+@@ -63,7 +63,7 @@ function afterEachFinally() {
+   }
+ }
+ 
+-export function setupTestClass<T extends AbstractTestCase, G extends Generator>(
++export function setupTestClass<T extends TestCase, G extends Generator>(
+   hooks: NestedHooks,
+   TestClass: TestClass<T>,
+   ...mixins: Mixin<G>[]
+@@ -129,7 +129,7 @@ export function setupTestClass<T extends AbstractTestCase, G extends Generator>(
+     });
+   }
+ 
+-  function generateTest<T extends AbstractTestCase>(name: keyof T & string) {
++  function generateTest<T extends TestCase>(name: keyof T & string) {
+     if (name.indexOf('@test ') === 0) {
+       QUnit.test(name.slice(5), function (this: TestContext<T>, assert) {
+         return (this.instance![name] as any)(assert);
+diff --git a/packages/internal-test-helpers/lib/test-cases/abstract.ts b/packages/internal-test-helpers/lib/test-cases/abstract.ts
+index 6f7d17392afda4a3cffc01a5c1ccace68017bbaa..e937761ef7319d20c8426fc87664a58b4eddd4d2 100644
+--- a/packages/internal-test-helpers/lib/test-cases/abstract.ts
++++ b/packages/internal-test-helpers/lib/test-cases/abstract.ts
+@@ -3,10 +3,12 @@
+ import NodeQuery from '../node-query';
+ import equalInnerHTML from '../equal-inner-html';
+ import equalTokens from '../equal-tokens';
+-import { getElement } from '../element-helpers';
++import { assertInvariants, getElement, takeSnapshot } from '../element-helpers';
+ import { equalsElement, regex, classes } from '../matchers';
+-import { runLoopSettled } from '../run';
++import { runDestroy, runLoopSettled, runTask } from '../run';
+ import { assert } from '@ember/debug';
++import { rerenderComponent } from '../component-helper';
++import { _resetRenderers } from '@ember/-internals/glimmer';
+ 
+ const TextNode = window.Text;
+ const HTMLElement = window.HTMLElement;
+@@ -24,6 +26,53 @@ function isMarker(node: unknown): node is Comment | typeof TextNode {
+   return false;
+ }
+ 
++export type TestCase = AbstractStrictTestCase | AbstractTestCase;
++
++export abstract class AbstractStrictTestCase {
++  snapshot: ChildNode[] | null = null;
++  component: unknown;
++  readonly assert: QUnit['assert'];
++
++  rerender(): void {
++    rerenderComponent();
++  }
++
++  beforeEach?(_assert: QUnit['assert']) {}
++  teardown?(): unknown;
++
++  constructor(assert: QUnit['assert']) {
++    this.assert = assert;
++  }
++
++  afterEach() {
++    try {
++      runDestroy(this);
++    } finally {
++      _resetRenderers();
++    }
++  }
++
++  takeSnapshot() {
++    this.snapshot = takeSnapshot();
++  }
++
++  assertStableRerender() {
++    this.takeSnapshot();
++    runTask(() => rerenderComponent());
++    this.assertInvariants();
++  }
++
++  assertInvariants(): void;
++  assertInvariants(oldSnapshot: ChildNode[], newSnapshot: ChildNode[]): void;
++  assertInvariants(oldSnapshot?: ChildNode[], newSnapshot?: ChildNode[]): void {
++    if (!oldSnapshot) {
++      assert('expected an existing snapshot', this.snapshot);
++      oldSnapshot = this.snapshot;
++    }
++    assertInvariants(oldSnapshot, newSnapshot);
++  }
++}
++
+ export default abstract class AbstractTestCase {
+   snapshot: ChildNode[] | null;
+   assert: QUnit['assert'];
+diff --git a/packages/internal-test-helpers/package.json b/packages/internal-test-helpers/package.json
+index 0616a3fd039a862e0fd80560cb0aa43aa84b65e9..0935ac1e57c9f50be0f42d817fb1cbdeab25a282 100644
+--- a/packages/internal-test-helpers/package.json
++++ b/packages/internal-test-helpers/package.json
+@@ -24,16 +24,16 @@
+     "@ember/runloop": "workspace:*",
+     "@ember/service": "workspace:*",
+     "@ember/utils": "workspace:*",
+-    "@glimmer/compiler": "0.94.8",
++    "@glimmer/compiler": "0.94.11",
+     "@glimmer/destroyable": "0.94.6",
+     "@glimmer/env": "^0.1.7",
+-    "@glimmer/manager": "0.94.7",
+-    "@glimmer/opcode-compiler": "0.94.7",
++    "@glimmer/manager": "0.94.10",
++    "@glimmer/opcode-compiler": "0.94.10",
+     "@glimmer/owner": "0.93.2",
+-    "@glimmer/runtime": "0.94.7",
+-    "@glimmer/syntax": "0.94.7",
++    "@glimmer/runtime": "0.94.11",
++    "@glimmer/syntax": "0.95.0",
+     "@glimmer/util": "0.94.6",
+-    "@glimmer/validator": "0.94.6",
++    "@glimmer/validator": "0.95.0",
+     "backburner.js": "^2.7.0",
+     "dag-map": "^2.0.2",
+     "ember": "workspace:*",

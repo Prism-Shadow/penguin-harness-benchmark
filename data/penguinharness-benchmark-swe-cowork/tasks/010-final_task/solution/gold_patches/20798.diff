@@ -1,0 +1,164 @@
+diff --git a/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts b/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts
+index 669ba8e58b983a0232eab0a44e49e249fcc0b8ce..debf7a97eb923c8da513bd9f5013ac61834d74ea 100644
+--- a/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts
++++ b/packages/@ember/-internals/glimmer/lib/syntax/outlet.ts
+@@ -1,5 +1,5 @@
+ import type { InternalOwner } from '@ember/-internals/owner';
+-import { assert, deprecate } from '@ember/debug';
++import { assert } from '@ember/debug';
+ import { DEBUG } from '@glimmer/env';
+ import type { CapturedArguments, DynamicScope } from '@glimmer/interfaces';
+ import { CurriedType } from '@glimmer/vm';
+@@ -17,7 +17,6 @@ import type { OutletDefinitionState } from '../component-managers/outlet';
+ import { OutletComponentDefinition } from '../component-managers/outlet';
+ import { internalHelper } from '../helpers/internal-helper';
+ import type { OutletState } from '../utils/outlet';
+-import { isTemplateFactory } from '../template';
+ 
+ /**
+   The `{{outlet}}` helper lets you specify where a child route will render in
+@@ -121,40 +120,6 @@ function stateFor(
+   let template = render.template;
+   if (template === undefined) return null;
+ 
+-  if (isTemplateFactory(template)) {
+-    template = template(render.owner);
+-
+-    if (DEBUG) {
+-      let message =
+-        'The `template` property of `OutletState` should be a ' +
+-        '`Template` rather than a `TemplateFactory`. This is known to be a ' +
+-        "problem in older versions of `@ember/test-helpers`. If you haven't " +
+-        'done so already, try upgrading to the latest version.\n\n';
+-
+-      if (template.result === 'ok' && typeof template.moduleName === 'string') {
+-        message +=
+-          'The offending template has a moduleName `' +
+-          template.moduleName +
+-          '`, which might be helpful for identifying ' +
+-          'source of this issue.\n\n';
+-      }
+-
+-      message +=
+-        'Please note that `OutletState` is a private API in Ember.js ' +
+-        "and not meant to be used outside of the framework's internal code.";
+-
+-      deprecate(message, false, {
+-        id: 'outlet-state-template-factory',
+-        until: '5.9.0',
+-        for: 'ember-source',
+-        since: {
+-          available: '5.6.0',
+-          enabled: '5.6.0',
+-        },
+-      });
+-    }
+-  }
+-
+   return {
+     ref,
+     name: render.name,
+diff --git a/packages/@ember/-internals/glimmer/lib/utils/outlet.ts b/packages/@ember/-internals/glimmer/lib/utils/outlet.ts
+index 7fe032ae51fd6d450b94f575b609ab7e98f4c2a2..741c4a20fd79cbd915ac6ebd2bfdfb12c29a41fe 100644
+--- a/packages/@ember/-internals/glimmer/lib/utils/outlet.ts
++++ b/packages/@ember/-internals/glimmer/lib/utils/outlet.ts
+@@ -1,22 +1,6 @@
+ import type { InternalOwner } from '@ember/-internals/owner';
+ import type { Template } from '@glimmer/interfaces';
+ 
+-// Note: a lot of these does not make sense anymore. This design was from back
+-// when we supported "named outlets", where a route can do:
+-//
+-// this.renderTemplate("some-template", {
+-//   into: 'some-parent-route',
+-//   outlet: 'some-name' /* {{outlet "some-name"}} */ | undefined /* {{outlet}} */,
+-//   controller: 'some-controller' | SomeController,
+-//   model: { ... },
+-// });
+-//
+-// And interface reflects that. Now that this is not supported anymore, each
+-// route implicitly renders into its immediate parent's `{{outlet}}` (no name).
+-// Keeping around most of these to their appropriately hardcoded values for the
+-// time being to minimize churn for external consumers, as we are about to rip
+-// all of it out anyway.
+-
+ export interface RenderState {
+   /**
+    * This is usually inherited from the parent (all the way up to the app
+@@ -25,18 +9,6 @@ export interface RenderState {
+    */
+   owner: InternalOwner;
+ 
+-  /**
+-   * @deprecated This used to specify "which parent route to render into",
+-   * which is not a thing anymore.
+-   */
+-  into: undefined;
+-
+-  /**
+-   * @deprecated This used to specify "which named outlet in the parent
+-   * template to render into", which is not a thing anymore.
+-   */
+-  outlet: 'main';
+-
+   /**
+    * The name of the route/template
+    */
+@@ -53,7 +25,7 @@ export interface RenderState {
+   model: unknown;
+ 
+   /**
+-   * template (the layout of the outlet component)
++   * The template (the route template to use in the {{outlet}})
+    */
+   template: Template | undefined;
+ }
+@@ -75,22 +47,4 @@ export interface OutletState {
+   outlets: {
+     main: OutletState | undefined;
+   };
+-
+-  /**
+-   * @deprecated
+-   *
+-   * This tracks whether this outlet state actually made it onto the page
+-   * somewhere. This was more of a problem when you can declare named outlets
+-   * left and right, and anything can render into anywhere else. We want to
+-   * warn users when you tried to render into somewhere that does not exist,
+-   * but we don't know what named outlets exists until after we have rendered
+-   * everything, so this was used to track these orphan renders.
+-   *
+-   * This can still happen, if, according to the router, a route is active and
+-   * so its template should be rendered, but the parent template is missing the
+-   * `{{outlet}}` keyword, or that it was hidden by an `{{#if}}` or something.
+-   * I guess that is considered valid, because nothing checks for this anymore.
+-   * seems valid for the parent to decide not to render a child template?
+-   */
+-  wasUsed?: undefined;
+ }
+diff --git a/packages/@ember/-internals/glimmer/lib/views/outlet.ts b/packages/@ember/-internals/glimmer/lib/views/outlet.ts
+index ced2115585d95d7d89cad90eef5c73b18832eacd..dc97e2b627678ee00083af817175b293ca135f73 100644
+--- a/packages/@ember/-internals/glimmer/lib/views/outlet.ts
++++ b/packages/@ember/-internals/glimmer/lib/views/outlet.ts
+@@ -67,8 +67,6 @@ export default class OutletView {
+       outlets: { main: undefined },
+       render: {
+         owner: owner,
+-        into: undefined,
+-        outlet: 'main',
+         name: TOP_LEVEL_NAME,
+         controller: undefined,
+         model: undefined,
+diff --git a/packages/@ember/routing/route.ts b/packages/@ember/routing/route.ts
+index c407f629cafef297334ad797e66b3d3fa5d41a43..cfab81cfe5afa7e5c9c6d8647c7e88b4496c3d00 100644
+--- a/packages/@ember/routing/route.ts
++++ b/packages/@ember/routing/route.ts
+@@ -1842,8 +1842,6 @@ function buildRenderState(route: Route): RenderState {
+ 
+   let render: RenderState = {
+     owner,
+-    into: undefined,
+-    outlet: 'main',
+     name,
+     controller,
+     model,
