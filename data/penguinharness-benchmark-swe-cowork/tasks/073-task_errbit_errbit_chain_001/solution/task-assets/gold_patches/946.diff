@@ -1,0 +1,745 @@
+diff --git a/app/controllers/site_config_controller.rb b/app/controllers/site_config_controller.rb
+new file mode 100644
+index 0000000..7d767ed
+--- /dev/null
++++ b/app/controllers/site_config_controller.rb
+@@ -0,0 +1,27 @@
++class SiteConfigController < ApplicationController
++  before_action :require_admin!
++
++  def index
++    @config = SiteConfig.document
++  end
++
++  def update
++    SiteConfig.document.update_attributes(
++      notice_fingerprinter: filtered_update_params)
++    flash[:success] = 'Updated site config'
++    redirect_to action: :index
++  end
++
++  private def filtered_update_params
++    params
++      .require(:site_config)
++      .require(:notice_fingerprinter_attributes)
++      .permit(
++        :error_class,
++        :message,
++        :backtrace_lines,
++        :component,
++        :action,
++        :environment_name)
++  end
++end
+diff --git a/app/interactors/notice_refingerprinter.rb b/app/interactors/notice_refingerprinter.rb
+new file mode 100644
+index 0000000..f966b95
+--- /dev/null
++++ b/app/interactors/notice_refingerprinter.rb
+@@ -0,0 +1,38 @@
++class NoticeRefingerprinter
++  LOG_EVERY = 100
++  LOG_ITR = '%.1f%% complete, %i notice(s) remaining'
++  LOG_START = 'Regenerating notice fingerprints for %i notices'
++
++  def self.run
++    count = Notice.count
++    puts format(LOG_START, count)
++
++    Notice.no_timeout.each_with_index do |notice, index|
++      refingerprint(notice)
++
++      next unless (index + 1) % LOG_EVERY == 0
++      puts format(LOG_ITR, (index * 100 / count), count - index)
++    end
++
++    puts 'Finished generating notice fingerprints'
++    puts 'Destroying orphaned err records'
++
++    Err.each { |e| e.destroy if e.notices.size == 0 }
++
++    puts 'Finished destroying orphaned err records'
++  end
++
++  def self.refingerprint(notice)
++    app = notice.app
++    notice.err = app.find_or_create_err!(
++      error_class: notice.error_class,
++      environment: notice.environment_name,
++      fingerprint: app.notice_fingerprinter.generate(app.api_key, notice, notice.backtrace)
++    )
++    notice.save!
++  end
++
++  def self.puts(*args)
++    Rails.logger.info(*args)
++  end
++end
+diff --git a/app/interactors/problem_merge.rb b/app/interactors/problem_merge.rb
+index 7610fb2..75ba63a 100644
+--- a/app/interactors/problem_merge.rb
++++ b/app/interactors/problem_merge.rb
+@@ -16,13 +16,7 @@ class ProblemMerge
+       problem.reload # deference all associate objet to avoid delete him after
+       ProblemDestroy.execute(problem)
+     end
+-    reset_cached_attributes
++    merged_problem.recache
+     merged_problem
+   end
+-
+-  private
+-
+-  def reset_cached_attributes
+-    ProblemUpdaterCache.new(merged_problem).update
+-  end
+ end
+diff --git a/app/interactors/problem_recacher.rb b/app/interactors/problem_recacher.rb
+new file mode 100644
+index 0000000..5e1f7c1
+--- /dev/null
++++ b/app/interactors/problem_recacher.rb
+@@ -0,0 +1,24 @@
++class ProblemRecacher
++  LOG_EVERY = 100
++  LOG_ITR = '%.1f%% complete, %i problem(s) remaining'
++  LOG_START = 'Re-caching problem attributes for %i problems'
++
++  def self.run
++    count = Problem.count
++    puts format(LOG_START, count)
++
++    Problem.no_timeout.each_with_index do |problem, index|
++      problem.recache
++      problem.destroy if problem.notices_count == 0
++
++      next unless (index + 1) % LOG_EVERY == 0
++      puts format(LOG_ITR, (index * 100 / count), count - index)
++    end
++
++    puts "Finished re-caching problem attributes"
++  end
++
++  def self.puts(*args)
++    Rails.logger.info(*args)
++  end
++end
+diff --git a/app/interactors/problem_updater_cache.rb b/app/interactors/problem_updater_cache.rb
+deleted file mode 100644
+index 29891a8..0000000
+--- a/app/interactors/problem_updater_cache.rb
++++ /dev/null
+@@ -1,88 +0,0 @@
+-class ProblemUpdaterCache
+-  def initialize(problem, notice=nil)
+-    @problem = problem
+-    @notice = notice
+-  end
+-  attr_reader :problem
+-
+-  ##
+-  # Update cache information about child associate to this problem
+-  #
+-  # update the notices count, and some notice informations
+-  #
+-  # @return [ Problem ] the problem with this update
+-  #
+-  def update
+-    update_notices_count
+-    update_notices_cache
+-    problem
+-  end
+-
+-  private
+-
+-  def update_notices_count
+-    if @notice
+-      problem.inc(notices_count: 1)
+-    else
+-      problem.update_attribute(
+-        :notices_count, problem.notices.count
+-      )
+-    end
+-  end
+-
+-  ##
+-  # Update problem statistique from some notice information
+-  #
+-  def update_notices_cache
+-    first_notice = notices.first
+-    last_notice = notices.last
+-    notice ||= @notice || first_notice
+-
+-    attrs = {}
+-    attrs[:first_notice_at] = first_notice.created_at if first_notice
+-    attrs[:last_notice_at] = last_notice.created_at if last_notice
+-    attrs.merge!(
+-      :message     => notice.message,
+-      :where       => notice.where,
+-      :messages    => attribute_count(:message, messages),
+-      :hosts       => attribute_count(:host, hosts),
+-      :user_agents => attribute_count(:user_agent_string, user_agents)
+-    ) if notice
+-    problem.update_attributes!(attrs)
+-  end
+-
+-  def notices
+-    @notices ||= @notice ? [@notice].sort(&:created_at) : problem.notices.order_by([:created_at, :asc])
+-  end
+-
+-  def messages
+-    @notice ? problem.messages : {}
+-  end
+-
+-  def hosts
+-    @notice ? problem.hosts : {}
+-  end
+-
+-  def user_agents
+-    @notice ? problem.user_agents : {}
+-  end
+-
+-  private
+-
+-    def attribute_count(value, init)
+-      init.tap do |counts|
+-        notices.each do |notice|
+-          counts[attribute_index(notice.send(value))] ||= {
+-            'value' => notice.send(value),
+-            'count' => 0
+-          }
+-          counts[attribute_index(notice.send(value))]['count'] += 1
+-        end
+-      end
+-    end
+-
+-    def attribute_index(value)
+-      @attributes_index ||= {}
+-      @attributes_index[value.to_s] ||= Digest::MD5.hexdigest(value.to_s)
+-    end
+-end
+diff --git a/app/models/app.rb b/app/models/app.rb
+index c581ba1..186f796 100644
+--- a/app/models/app.rb
++++ b/app/models/app.rb
+@@ -27,6 +27,7 @@ class App
+   embeds_many :deploys
+   embeds_one :issue_tracker, :class_name => 'IssueTracker'
+   embeds_one :notification_service
++  embeds_one :notice_fingerprinter, autobuild: true
+ 
+   has_many :problems, :inverse_of => :app, :dependent => :destroy
+ 
+@@ -38,6 +39,7 @@ class App
+   validates_uniqueness_of :name, :allow_blank => true
+   validates_uniqueness_of :api_key, :allow_blank => true
+   validates_associated :watchers
++  validates_associated :notice_fingerprinter
+   validate :check_issue_tracker
+ 
+   accepts_nested_attributes_for :watchers, :allow_destroy => true,
+@@ -46,6 +48,7 @@ class App
+     :reject_if => proc { |attrs| !ErrbitPlugin::Registry.issue_trackers.keys.map(&:to_s).include?(attrs[:type_tracker].to_s) }
+   accepts_nested_attributes_for :notification_service, :allow_destroy => true,
+     :reject_if => proc { |attrs| !NotificationService.subclasses.map(&:to_s).include?(attrs[:type].to_s) }
++  accepts_nested_attributes_for :notice_fingerprinter
+ 
+   scope :watched_by, ->(user) do
+     where watchers: { "$elemMatch" => { "user_id" => user.id } }
+@@ -62,16 +65,15 @@ class App
+   # * <tt>:fingerprint</tt> - a unique value identifying the notice
+   #
+   def find_or_create_err!(attrs)
+-    Err.where(
+-      :fingerprint => attrs[:fingerprint]
+-    ).first || (
+-      problem = problems.create!(
+-        error_class: attrs[:error_class],
+-        environment: attrs[:environment],
+-        app_name: name
+-      )
+-      problem.errs.create!(attrs.slice(:fingerprint, :problem_id))
++    err = Err.where(fingerprint: attrs[:fingerprint]).first
++    return err if err
++
++    problem = problems.create!(
++      error_class: attrs[:error_class],
++      environment: attrs[:environment],
++      app_name: name
+     )
++    problem.errs.create!(attrs.slice(:fingerprint, :problem_id))
+   end
+ 
+   # Mongoid Bug: find(id) on association proxies returns an Enumerator
+diff --git a/app/models/error_report.rb b/app/models/error_report.rb
+index 09d79ff..d2b4020 100644
+--- a/app/models/error_report.rb
++++ b/app/models/error_report.rb
+@@ -26,10 +26,6 @@ class ErrorReport
+   attr_reader :server_environment
+   attr_reader :user_attributes
+ 
+-  cattr_accessor :fingerprint_strategy do
+-    Fingerprint::Sha1
+-  end
+-
+   def initialize(xml_or_attributes)
+     @attributes = xml_or_attributes
+     @attributes = Hoptoad.parse_xml!(@attributes) if @attributes.is_a? String
+@@ -130,9 +126,7 @@ class ErrorReport
+     Gem::Version.new(app_version) >= Gem::Version.new(current_version)
+   end
+ 
+-  private
+-
+   def fingerprint
+-    @fingerprint ||= fingerprint_strategy.generate(notice, api_key)
++    app.notice_fingerprinter.generate(api_key, notice, backtrace)
+   end
+ end
+diff --git a/app/models/fingerprint/md5.rb b/app/models/fingerprint/md5.rb
+deleted file mode 100644
+index 6bd76dd..0000000
+--- a/app/models/fingerprint/md5.rb
++++ /dev/null
+@@ -1,22 +0,0 @@
+-require 'digest/md5'
+-
+-module Fingerprint
+-  class MD5 < Sha1
+-    def to_s
+-      Digest::MD5.hexdigest(fingerprint_source)
+-    end
+-
+-    def fingerprint_source
+-      location['method'] &&= sanitized_method_signature
+-    end
+-
+-    private
+-    def sanitized_method_signature
+-      location['method'].gsub(/[0-9]+|FRAGMENT/, '#').gsub(/_+#/, '_#')
+-    end
+-
+-    def location
+-      notice.backtrace.lines.first
+-    end
+-  end
+-end
+diff --git a/app/models/fingerprint/sha1.rb b/app/models/fingerprint/sha1.rb
+deleted file mode 100644
+index 78961fd..0000000
+--- a/app/models/fingerprint/sha1.rb
++++ /dev/null
+@@ -1,43 +0,0 @@
+-require 'digest/sha1'
+-
+-module Fingerprint
+-  class Sha1
+-
+-    attr_reader :notice, :api_key
+-
+-    def self.generate(notice, api_key)
+-      self.new(notice, api_key).to_s
+-    end
+-
+-    def initialize(notice, api_key)
+-      @notice = notice
+-      @api_key = api_key
+-    end
+-
+-    def to_s
+-      Digest::SHA1.hexdigest(fingerprint_source.to_s)
+-    end
+-
+-    def fingerprint_source
+-      {
+-        :file_or_message => file_or_message,
+-        :error_class => notice.error_class,
+-        :component => notice.component || 'unknown',
+-        :action => notice.action,
+-        :environment => notice.environment_name || 'development',
+-        :api_key => api_key
+-      }
+-    end
+-
+-    def file_or_message
+-      @file_or_message ||= unified_message + notice.backtrace.fingerprint
+-    end
+-
+-    # filter memory addresses out of object strings
+-    # example: "#<Object:0x007fa2b33d9458>" becomes "#<Object>"
+-    def unified_message
+-      notice.message.gsub(/(#<.+?):[0-9a-f]x[0-9a-f]+(>)/, '\1\2')
+-    end
+-
+-  end
+-end
+diff --git a/app/models/notice.rb b/app/models/notice.rb
+index 7916260..5fa5b0a 100644
+--- a/app/models/notice.rb
++++ b/app/models/notice.rb
+@@ -29,9 +29,7 @@ class Notice
+   scope :ordered, ->{ order_by(:created_at.asc) }
+   scope :reverse_ordered, ->{ order_by(:created_at.desc) }
+   scope :for_errs, Proc.new { |errs|
+-    if (ids = errs.all.map(&:id)) && ids.present?
+-      where(:err_id.in => ids)
+-    end
++    where(:err_id.in => errs.all.map(&:id))
+   }
+ 
+   def user_agent
+@@ -48,7 +46,8 @@ class Notice
+   end
+ 
+   def environment_name
+-    server_environment['server-environment'] || server_environment['environment-name']
++    n = server_environment['server-environment'] || server_environment['environment-name']
++    n.blank? ? 'development' : n
+   end
+ 
+   def component
+@@ -119,6 +118,12 @@ class Notice
+     end
+   end
+ 
++  # filter memory addresses out of object strings
++  # example: "#<Object:0x007fa2b33d9458>" becomes "#<Object>"
++  def filtered_message
++    message.gsub(/(#<.+?):[0-9a-f]x[0-9a-f]+(>)/, '\1\2')
++  end
++
+   protected
+ 
+   def problem_recache
+diff --git a/app/models/notice_fingerprinter.rb b/app/models/notice_fingerprinter.rb
+new file mode 100644
+index 0000000..0bdc7c9
+--- /dev/null
++++ b/app/models/notice_fingerprinter.rb
+@@ -0,0 +1,32 @@
++class NoticeFingerprinter
++  include Mongoid::Document
++  include Mongoid::Timestamps
++
++  field :error_class, default: true, type: Boolean
++  field :message, default: true, type: Boolean
++  field :backtrace_lines, default: -1, type: Integer
++  field :component, default: true, type: Boolean
++  field :action, default: true, type: Boolean
++  field :environment_name, default: true, type: Boolean
++  field :source, type: String
++
++  embedded_in :app
++  embedded_in :site_config
++
++  def generate(api_key, notice, backtrace)
++    material = [ api_key ]
++    material << notice.error_class if error_class
++    material << notice.filtered_message if message
++    material << notice.component if component
++    material << notice.action if action
++    material << notice.environment_name if environment_name
++
++    if backtrace_lines < 0
++      material << backtrace.lines
++    else
++      material << backtrace.lines.slice(0, backtrace_lines)
++    end
++
++    Digest::MD5.hexdigest(material.reduce('') { |c, m| c << m.to_s; c })
++  end
++end
+diff --git a/app/models/problem.rb b/app/models/problem.rb
+index 99d8037..7314772 100644
+--- a/app/models/problem.rb
++++ b/app/models/problem.rb
+@@ -142,16 +142,22 @@ class Problem
+         { "$match" => { err_id: { "$in" => err_ids } } },
+         { "$group" => { _id: "$#{v}", count: {"$sum" => 1} } }
+       ]).each do |agg|
+-        next if agg[:_id] == nil
+-
+-        send(k)[Digest::MD5.hexdigest(agg[:_id])] = {
+-          value: agg[:_id],
+-          count: agg[:count]
++        send(k)[Digest::MD5.hexdigest(agg[:_id] || 'N/A')] = {
++          'value' => agg[:_id] || 'N/A',
++          'count' => agg[:count]
+         }
+       end
+     end
+ 
+-    self.notices_count = Notice.where({ err_id: { "$in" => err_ids }}).count
++    first_notice = notices.order_by([:created_at, :asc]).first
++    last_notice = notices.order_by([:created_at, :desc]).first
++
++    self.notices_count = notices.count
++    self.first_notice_at = first_notice.created_at if first_notice
++    self.message = first_notice.message if first_notice
++    self.where = first_notice.where if first_notice
++    self.last_notice_at = last_notice.created_at if last_notice
++
+     save
+   end
+ 
+@@ -217,10 +223,6 @@ class Problem
+     end
+   end
+ 
+-  def self.in_date_range(date_range)
+-    where(:first_notice_at.lte => date_range.end).where("$or" => [{:resolved_at => nil}, {:resolved_at.gte => date_range.begin}])
+-  end
+-
+   def cache_app_attributes
+     if app
+       self.app_name = app.name
+diff --git a/app/models/site_config.rb b/app/models/site_config.rb
+new file mode 100644
+index 0000000..434a93e
+--- /dev/null
++++ b/app/models/site_config.rb
+@@ -0,0 +1,36 @@
++class SiteConfig
++  CONFIG_SOURCE_SITE = 'site'.freeze
++  CONFIG_SOURCE_APP = 'app'.freeze
++
++  include Mongoid::Document
++  include Mongoid::Timestamps
++
++  before_save :denormalize
++
++  embeds_one :notice_fingerprinter, autobuild: true
++  validates_associated :notice_fingerprinter
++  accepts_nested_attributes_for :notice_fingerprinter
++
++  # Get the one and only SiteConfig document
++  def self.document
++    first || create
++  end
++
++  # Denormalize SiteConfig onto individual apps so that this record doesn't
++  # need to be accessed when inserting new error notices
++  def denormalize
++    notice_fingerprinter_attributes = notice_fingerprinter.attributes.tap do |attrs|
++      attrs.delete('_id')
++      attrs[:source] = :site
++    end
++
++    App.each do |app|
++      f = app.notice_fingerprinter
++
++      if !f || f.source == CONFIG_SOURCE_SITE
++        app.update_attributes(
++          notice_fingerprinter: notice_fingerprinter_attributes)
++      end
++    end
++  end
++end
+diff --git a/app/views/shared/_navigation.html.haml b/app/views/shared/_navigation.html.haml
+index f075254..d901b8b 100644
+--- a/app/views/shared/_navigation.html.haml
++++ b/app/views/shared/_navigation.html.haml
+@@ -1,7 +1,20 @@
+ #nav-bar
+   %ul
+-    %li.apps{:class => active_if_here(:apps)}= link_to t('.apps'), apps_path
+-    %li.errs{:class => active_if_here(:problems)}= link_to t('.errors'), problems_path
++    %li{:class => active_if_here(:apps)}
++      = link_to apps_path do
++        %i.fa.fa-briefcase
++        = t('.apps')
++    %li{:class => active_if_here(:problems)}
++      = link_to problems_path do
++        %i.fa.fa-warning
++        = t('.errors')
+     - if user_signed_in? && current_user.admin?
+-      %li.users{:class => active_if_here(:users)}= link_to t('.users'), users_path
++      %li{:class => active_if_here(:users)}
++        = link_to users_path do
++          %i.fa.fa-users
++          = t('.users')
++      %li{:class => active_if_here(:site_config)}
++        = link_to site_config_index_path do
++          %i.fa.fa-wrench
++          = t('.config')
+   %div.clear
+diff --git a/app/views/site_config/index.html.haml b/app/views/site_config/index.html.haml
+new file mode 100644
+index 0000000..9358f5a
+--- /dev/null
++++ b/app/views/site_config/index.html.haml
+@@ -0,0 +1,39 @@
++- content_for :title, 'Config'
++
++- content_for :action_bar, link_to('cancel', users_path, :class => 'button')
++
++= form_for @config, url: site_config_index_path, method: 'put' do |f|
++  = errors_for @config
++
++  %fieldset
++    %legend Notice Fingerprinter
++    %p
++      The notice fingerprinter governs how error notifications are grouped.
++      Each item counts toward an error's uniqueness if enabled.
++
++    = f.fields_for :notice_fingerprinter do |g|
++      .checkbox
++        = g.check_box :error_class
++        = g.label :error_class, 'Error class'
++
++      .checkbox
++        = g.check_box :message
++        = g.label :message, 'Error message'
++
++      %div
++        = g.label :backtrace_lines, 'Number of backtrace lines (-1 for unlimited)'
++        = g.text_field :backtrace_lines
++
++      .checkbox
++        = g.check_box :component
++        = g.label :component, 'Component (or controller)'
++
++      .checkbox
++        = g.check_box :action
++        = g.label :action, 'Action'
++
++      .checkbox
++        = g.check_box :environment_name
++        = g.label :environment_name, 'Environment name'
++
++  %div.buttons= f.submit 'Update Config'
+diff --git a/config/routes.rb b/config/routes.rb
+index 63c58b0..df63f5b 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -14,7 +14,14 @@ Rails.application.routes.draw do
+       delete :unlink_github
+     end
+   end
+-  resources :problems,      :only => [:index] do
++
++  resources :site_config, :only => [:index] do
++    collection do
++      put :update
++    end
++  end
++
++  resources :problems,    :only => [:index] do
+     collection do
+       post :destroy_several
+       post :resolve_several
+@@ -61,6 +68,7 @@ Rails.application.routes.draw do
+   end
+ 
+   match '/api/v3/projects/:project_id/create-notice' => 'api/v3/notices#create', via: [:post]
++  match '/api/v3/projects/:project_id/notices' => 'api/v3/notices#create', via: [:post]
+ 
+   root :to => 'apps#index'
+ end
+diff --git a/lib/tasks/errbit/database.rake b/lib/tasks/errbit/database.rake
+index 940a7d1..b26c05f 100644
+--- a/lib/tasks/errbit/database.rake
++++ b/lib/tasks/errbit/database.rake
+@@ -1,74 +1,35 @@
+-require 'digest/sha1'
+-
+ namespace :errbit do
+-  namespace :db do
+-
+-    desc "Updates cached attributes on Problem"
+-    task :update_problem_attrs => :environment do
+-      puts "Updating problems"
+-      Problem.no_timeout.all.each do |problem|
+-        ProblemUpdaterCache.new(problem).update
+-      end
+-    end
+-
+-    desc "Updates Problem#notices_count"
+-    task :update_notices_count => :environment do
+-      puts "Updating problem.notices_count"
+-      Problem.no_timeout.all.each do |pr|
+-        pr.update_attributes(:notices_count => pr.notices.count)
+-      end
+-    end
+-
+-    desc "Delete resolved errors from the database. (Useful for limited heroku databases)"
+-    task :clear_resolved => :environment do
+-      require 'resolved_problem_clearer'
+-      puts "=== Cleared #{ResolvedProblemClearer.new.execute} resolved errors from the database."
+-    end
+-
+-    desc "Regenerate fingerprints"
+-    task :regenerate_fingerprints => :environment do
+-
+-      def normalize_backtrace(backtrace)
+-        backtrace[0...3].map do |trace|
+-          trace.merge 'method' => trace['method'].to_s.gsub(/[0-9_]{10,}+/, "__FRAGMENT__")
+-        end
+-      end
++  desc "Updates cached attributes on Problem"
++  task :problem_recache => :environment do
++    ProblemRecacher.run
++  end
+ 
+-      def fingerprint(source)
+-        Digest::SHA1.hexdigest(source.to_s)
+-      end
++  desc "Delete resolved errors from the database. (Useful for limited heroku databases)"
++  task :clear_resolved => :environment do
++    require 'resolved_problem_clearer'
++    puts "=== Cleared #{ResolvedProblemClearer.new.execute} resolved errors from the database."
++  end
+ 
+-      puts "Regenerating Err fingerprints"
+-      Err.create_indexes
+-      Err.all.each do |err|
+-        next if err.notices.count == 0
+-        source = {
+-          :backtrace => normalize_backtrace(err.notices.first.backtrace).to_s,
+-          :error_class => err.error_class,
+-          :component => err.component,
+-          :action => err.action,
+-          :environment => err.environment,
+-          :api_key => err.app.api_key
+-        }
+-        err.update_attributes(:fingerprint => fingerprint(source))
+-      end
+-    end
++  desc "Regenerate fingerprints"
++  task :notice_refingerprint => :environment do
++    NoticeRefingerprinter.run
++    ProblemRecacher.run
++  end
+ 
+-    desc "Remove notices in batch"
+-    task :notices_delete, [ :problem_id ] => [ :environment ] do
+-      BATCH_SIZE = 1000
+-      if args[:problem_id]
+-        item_count = Problem.find(args[:problem_id]).notices.count
+-        removed_count = 0
+-        puts "Notices to remove: #{item_count}"
+-        while item_count > 0
+-          Problem.find(args[:problem_id]).notices.limit(BATCH_SIZE).each do |notice|
+-            notice.remove
+-            removed_count += 1
+-          end
+-          item_count -= BATCH_SIZE
+-          puts "Removed #{removed_count} notices"
++  desc "Remove notices in batch"
++  task :notices_delete, [ :problem_id ] => [ :environment ] do
++    BATCH_SIZE = 1000
++    if args[:problem_id]
++      item_count = Problem.find(args[:problem_id]).notices.count
++      removed_count = 0
++      puts "Notices to remove: #{item_count}"
++      while item_count > 0
++        Problem.find(args[:problem_id]).notices.limit(BATCH_SIZE).each do |notice|
++          notice.remove
++          removed_count += 1
+         end
++        item_count -= BATCH_SIZE
++        puts "Removed #{removed_count} notices"
+       end
+     end
+   end
