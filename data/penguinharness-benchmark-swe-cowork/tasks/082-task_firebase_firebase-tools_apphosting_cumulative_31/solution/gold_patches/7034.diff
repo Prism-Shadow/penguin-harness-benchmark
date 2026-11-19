@@ -1,0 +1,159 @@
+diff --git a/src/api.ts b/src/api.ts
+index c4e3c052..59454f43 100644
+--- a/src/api.ts
++++ b/src/api.ts
+@@ -24,6 +24,12 @@ export const cloudMonitoringOrigin = () =>
+   utils.envOverride("CLOUD_MONITORING_URL", "https://monitoring.googleapis.com");
+ export const containerRegistryDomain = () =>
+   utils.envOverride("CONTAINER_REGISTRY_DOMAIN", "gcr.io");
++
++export const developerConnectOrigin = () =>
++  utils.envOverride("DEVELOPERCONNECT_URL", "https://developerconnect.googleapis.com");
++export const developerConnectP4SADomain = () =>
++  utils.envOverride("DEVELOPERCONNECT_P4SA_DOMAIN", "gcp-sa-devconnect.iam.gserviceaccount.com");
++
+ export const artifactRegistryDomain = () =>
+   utils.envOverride("ARTIFACT_REGISTRY_DOMAIN", "https://artifactregistry.googleapis.com");
+ export const appDistributionOrigin = () =>
+@@ -31,6 +37,14 @@ export const appDistributionOrigin = () =>
+     "FIREBASE_APP_DISTRIBUTION_URL",
+     "https://firebaseappdistribution.googleapis.com",
+   );
++export const apphostingOrigin = () =>
++  utils.envOverride("FIREBASE_APPHOSTING_URL", "https://firebaseapphosting.googleapis.com");
++export const apphostingP4SADomain = () =>
++  utils.envOverride(
++    "FIREBASE_APPHOSTING_P4SA_DOMAIN",
++    "gcp-sa-firebaseapphosting.iam.gserviceaccount.com",
++  );
++
+ export const authOrigin = () =>
+   utils.envOverride("FIREBASE_AUTH_URL", "https://accounts.google.com");
+ export const consoleOrigin = () =>
+@@ -71,15 +85,6 @@ export const functionsDefaultRegion = () =>
+ export const cloudbuildOrigin = () =>
+   utils.envOverride("FIREBASE_CLOUDBUILD_URL", "https://cloudbuild.googleapis.com");
+ 
+-export const developerConnectOrigin = () =>
+-  utils.envOverride("FIREBASE_DEVELOPERCONNECT_URL", "https://developerconnect.googleapis.com");
+-
+-export const developerConnectP4SAOrigin = () =>
+-  utils.envOverride(
+-    "FIREBASE_DEVELOPERCONNECT_P4SA_URL",
+-    "gcp-sa-devconnect.iam.gserviceaccount.com",
+-  );
+-
+ export const cloudschedulerOrigin = () =>
+   utils.envOverride("FIREBASE_CLOUDSCHEDULER_URL", "https://cloudscheduler.googleapis.com");
+ export const cloudTasksOrigin = () =>
+@@ -128,8 +133,7 @@ export const cloudRunApiOrigin = () =>
+   utils.envOverride("CLOUD_RUN_API_URL", "https://run.googleapis.com");
+ export const serviceUsageOrigin = () =>
+   utils.envOverride("FIREBASE_SERVICE_USAGE_URL", "https://serviceusage.googleapis.com");
+-export const apphostingOrigin = () =>
+-  utils.envOverride("APPHOSTING_URL", "https://firebaseapphosting.googleapis.com");
++
+ export const githubOrigin = () => utils.envOverride("GITHUB_URL", "https://github.com");
+ export const githubApiOrigin = () => utils.envOverride("GITHUB_API_URL", "https://api.github.com");
+ export const secretManagerOrigin = () =>
+diff --git a/src/apphosting/secrets/index.ts b/src/apphosting/secrets/index.ts
+index 6ce7d2a8..8fd96e5c 100644
+--- a/src/apphosting/secrets/index.ts
++++ b/src/apphosting/secrets/index.ts
+@@ -62,9 +62,11 @@ export function serviceAccountsForBackend(
+  */
+ export async function grantSecretAccess(
+   projectId: string,
++  projectNumber: string,
+   secretName: string,
+   accounts: MultiServiceAccounts,
+ ): Promise<void> {
++  const p4saEmail = apphosting.serviceAgentEmail(projectNumber);
+   const newBindings: iam.Binding[] = [
+     {
+       role: "roles/secretmanager.secretAccessor",
+@@ -78,6 +80,11 @@ export async function grantSecretAccess(
+       role: "roles/secretmanager.viewer",
+       members: accounts.buildServiceAccounts.map((sa) => `serviceAccount:${sa}`),
+     },
++    // The App Hosting service agent needs the version manager role for automated garbage collection.
++    {
++      role: "roles/secretmanager.secretVersionManager",
++      members: [`serviceAccount:${p4saEmail}`],
++    },
+   ];
+ 
+   let existingBindings;
+diff --git a/src/commands/apphosting-secrets-grantaccess.ts b/src/commands/apphosting-secrets-grantaccess.ts
+index d0618d7d..5645378c 100644
+--- a/src/commands/apphosting-secrets-grantaccess.ts
++++ b/src/commands/apphosting-secrets-grantaccess.ts
+@@ -50,5 +50,5 @@ export const command = new Command("apphosting:secrets:grantaccess <secretName>"
+     const backend = await apphosting.getBackend(projectId, location, backendId);
+     const accounts = secrets.toMulti(secrets.serviceAccountsForBackend(projectNumber, backend));
+ 
+-    await secrets.grantSecretAccess(projectId, secretName, accounts);
++    await secrets.grantSecretAccess(projectId, projectNumber, secretName, accounts);
+   });
+diff --git a/src/commands/apphosting-secrets-set.ts b/src/commands/apphosting-secrets-set.ts
+index cee2a1c8..390181af 100644
+--- a/src/commands/apphosting-secrets-set.ts
++++ b/src/commands/apphosting-secrets-set.ts
+@@ -71,7 +71,7 @@ export const command = new Command("apphosting:secrets:set <secretName>")
+ 
+       // TODO: For existing secrets, enter the grantSecretAccess dialog only when the necessary permissions don't exist.
+     } else {
+-      await secrets.grantSecretAccess(projectId, secretName, accounts);
++      await secrets.grantSecretAccess(projectId, projectNumber, secretName, accounts);
+     }
+ 
+     await config.maybeAddSecretToYaml(secretName);
+diff --git a/src/gcp/apphosting.ts b/src/gcp/apphosting.ts
+index c25ba16c..f005d47d 100644
+--- a/src/gcp/apphosting.ts
++++ b/src/gcp/apphosting.ts
+@@ -1,7 +1,7 @@
+ import * as proto from "../gcp/proto";
+ import { Client } from "../apiv2";
+ import { needProjectId } from "../projectUtils";
+-import { apphostingOrigin } from "../api";
++import { apphostingOrigin, apphostingP4SADomain } from "../api";
+ import { ensure } from "../ensureApiEnabled";
+ import * as deploymentTool from "../deploymentTool";
+ import { FirebaseError } from "../error";
+@@ -264,6 +264,15 @@ export interface ListBackendsResponse {
+   unreachable: string[];
+ }
+ 
++const P4SA_DOMAIN = apphostingP4SADomain();
++
++/**
++ * Returns the App Hosting service agent.
++ */
++export function serviceAgentEmail(projectNumber: string): string {
++  return `service-${projectNumber}@${P4SA_DOMAIN}`;
++}
++
+ /**
+  * Creates a new Backend in a given project and location.
+  */
+diff --git a/src/gcp/devConnect.ts b/src/gcp/devConnect.ts
+index ee60438b..a69d63cd 100644
+--- a/src/gcp/devConnect.ts
++++ b/src/gcp/devConnect.ts
+@@ -1,5 +1,5 @@
+ import { Client } from "../apiv2";
+-import { developerConnectOrigin, developerConnectP4SAOrigin } from "../api";
++import { developerConnectOrigin, developerConnectP4SADomain } from "../api";
+ import { generateServiceIdentityAndPoll } from "./serviceusage";
+ 
+ const PAGE_SIZE_MAX = 1000;
+@@ -275,7 +275,7 @@ export async function getGitRepositoryLink(
+  * Returns email associated with the Developer Connect Service Agent
+  */
+ export function serviceAgentEmail(projectNumber: string): string {
+-  return `service-${projectNumber}@${developerConnectP4SAOrigin()}`;
++  return `service-${projectNumber}@${developerConnectP4SADomain()}`;
+ }
+ 
+ /**

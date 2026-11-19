@@ -1,0 +1,211 @@
+diff --git a/src/apphosting/constants.ts b/src/apphosting/constants.ts
+index d773e922..87ebefb1 100644
+--- a/src/apphosting/constants.ts
++++ b/src/apphosting/constants.ts
+@@ -1,3 +1,3 @@
+-export const DEFAULT_REGION = "us-central1";
++export const DEFAULT_LOCATION = "us-central1";
+ export const DEFAULT_DEPLOY_METHOD = "github";
+ export const ALLOWED_DEPLOY_METHODS = [{ name: "Deploy using github", value: "github" }];
+diff --git a/src/apphosting/index.ts b/src/apphosting/index.ts
+index 7abf320b..bb6a975d 100644
+--- a/src/apphosting/index.ts
++++ b/src/apphosting/index.ts
+@@ -17,7 +17,7 @@ import * as iam from "../gcp/iam";
+ import { Repository } from "../gcp/cloudbuild";
+ import { FirebaseError } from "../error";
+ import { promptOnce } from "../prompt";
+-import { DEFAULT_REGION } from "./constants";
++import { DEFAULT_LOCATION } from "./constants";
+ import { ensure } from "../ensureApiEnabled";
+ import * as deploymentTool from "../deploymentTool";
+ import { DeepOmit } from "../metaprogramming";
+@@ -62,16 +62,8 @@ export async function doSetup(
+   logBullet("First we need a few details to create your backend.\n");
+ 
+   location =
+-    location ||
+-    ((await promptOnce({
+-      name: "region",
+-      type: "list",
+-      default: DEFAULT_REGION,
+-      message: "Select a region to host your backend:\n",
+-      choices: allowedLocations.map((loc) => ({ value: loc })),
+-    })) as string);
+-
+-  logSuccess(`Region set to ${location}.\n`);
++    location || (await promptLocation(projectId, "Select a location to host your backend:\n"));
++  logSuccess(`Location set to ${location}.\n`);
+ 
+   const backendId = await promptNewBackendId(projectId, location, {
+     name: "backendId",
+@@ -383,3 +375,21 @@ export async function deleteBackendAndPoll(
+     operationResourceName: op.name,
+   });
+ }
++
++/**
++ * Prompts the user for a location.
++ */
++export async function promptLocation(
++  projectId: string,
++  prompt = "Please select a location:",
++): Promise<string> {
++  const allowedLocations = (await apphosting.listLocations(projectId)).map((loc) => loc.locationId);
++
++  return (await promptOnce({
++    name: "location",
++    type: "list",
++    default: DEFAULT_LOCATION,
++    message: prompt,
++    choices: allowedLocations,
++  })) as string;
++}
+diff --git a/src/commands/apphosting-backends-create.ts b/src/commands/apphosting-backends-create.ts
+index 2d471b31..bb006181 100644
+--- a/src/commands/apphosting-backends-create.ts
++++ b/src/commands/apphosting-backends-create.ts
+@@ -11,7 +11,7 @@ export const command = new Command("apphosting:backends:create")
+     "-a, --app <webApp>",
+     "specify an existing Firebase web app to associate your App Hosting backend with",
+   )
+-  .option("-l, --location <location>", "specify the region of the backend", "")
++  .option("-l, --location <location>", "specify the location of the backend", "")
+   .option(
+     "-s, --service-account <serviceAccount>",
+     "specify the service account used to run the server",
+diff --git a/src/commands/apphosting-backends-delete.ts b/src/commands/apphosting-backends-delete.ts
+index 7100a10a..bf4e6194 100644
+--- a/src/commands/apphosting-backends-delete.ts
++++ b/src/commands/apphosting-backends-delete.ts
+@@ -3,36 +3,26 @@ import { Options } from "../options";
+ import { needProjectId } from "../projectUtils";
+ import { FirebaseError } from "../error";
+ import { promptOnce } from "../prompt";
+-import { DEFAULT_REGION } from "../apphosting/constants";
+ import * as utils from "../utils";
+ import * as apphosting from "../gcp/apphosting";
+ import { printBackendsTable } from "./apphosting-backends-list";
+-import { deleteBackendAndPoll } from "../apphosting";
++import { deleteBackendAndPoll, promptLocation } from "../apphosting";
+ 
+ export const command = new Command("apphosting:backends:delete <backend>")
+   .description("delete a Firebase App Hosting backend")
+-  .option("-l, --location <location>", "specify the region of the backend", "")
++  .option("-l, --location <location>", "specify the location of the backend", "")
+   .withForce()
+   .before(apphosting.ensureApiEnabled)
+   .action(async (backendId: string, options: Options) => {
+     const projectId = needProjectId(options);
+     let location = options.location as string;
+-    if (!backendId) {
+-      throw new FirebaseError("Backend id can't be empty.");
+-    }
+ 
+-    if (!location) {
+-      const allowedLocations = (await apphosting.listLocations(projectId)).map(
+-        (loc) => loc.locationId,
+-      );
+-      location = await promptOnce({
+-        name: "region",
+-        type: "list",
+-        default: DEFAULT_REGION,
+-        message: "Please select the region of the backend you'd like to delete:",
+-        choices: allowedLocations,
+-      });
+-    }
++    location =
++      location ||
++      (await promptLocation(
++        projectId,
++        "Please select the location of the backend you'd like to delete:",
++      ));
+ 
+     let backend: apphosting.Backend;
+     try {
+diff --git a/src/commands/apphosting-backends-list.ts b/src/commands/apphosting-backends-list.ts
+index d46c2da0..83add937 100644
+--- a/src/commands/apphosting-backends-list.ts
++++ b/src/commands/apphosting-backends-list.ts
+@@ -7,7 +7,7 @@ import { Options } from "../options";
+ import * as apphosting from "../gcp/apphosting";
+ 
+ const Table = require("cli-table");
+-const TABLE_HEAD = ["Backend ID", "Repository", "Location", "URL", "Created Date", "Updated Date"];
++const TABLE_HEAD = ["Backend", "Repository", "URL", "Location", "Updated Date"];
+ 
+ export const command = new Command("apphosting:backends:list")
+   .description("list Firebase App Hosting backends")
+@@ -48,9 +48,8 @@ export function printBackendsTable(backends: apphosting.Backend[]): void {
+       backendId,
+       // sample repository value: "projects/<project-name>/locations/us-central1/connections/<connection-id>/repositories/<repository-name>"
+       backend.codebase?.repository?.split("/").pop() ?? "",
+-      backendLocation,
+       backend.uri.startsWith("https:") ? backend.uri : "https://" + backend.uri,
+-      datetimeString(new Date(backend.createTime)),
++      backendLocation,
+       datetimeString(new Date(backend.updateTime)),
+     ]);
+   }
+diff --git a/src/commands/apphosting-secrets-grantaccess.ts b/src/commands/apphosting-secrets-grantaccess.ts
+index 532447fb..d0618d7d 100644
+--- a/src/commands/apphosting-secrets-grantaccess.ts
++++ b/src/commands/apphosting-secrets-grantaccess.ts
+@@ -7,6 +7,7 @@ import * as secretManager from "../gcp/secretManager";
+ import { requirePermissions } from "../requirePermissions";
+ import * as apphosting from "../gcp/apphosting";
+ import * as secrets from "../apphosting/secrets";
++import { promptLocation } from "../apphosting";
+ 
+ export const command = new Command("apphosting:secrets:grantaccess <secretName>")
+   .description("grant service accounts permissions to the provided secret")
+@@ -27,21 +28,18 @@ export const command = new Command("apphosting:secrets:grantaccess <secretName>"
+     const projectId = needProjectId(options);
+     const projectNumber = await needProjectNumber(options);
+ 
+-    // TODO: Consider reusing dialog in apphosting/secrets/dialogs.ts if backend (and location) is not set.
+-    if (!options.location) {
+-      throw new FirebaseError(
+-        "Missing required flag --location. See firebase apphosting:secrets:grantaccess --help for more info",
+-      );
+-    }
+-    const location = options.location as string;
+-
+     if (!options.backend) {
+       throw new FirebaseError(
+         "Missing required flag --backend. See firebase apphosting:secrets:grantaccess --help for more info",
+       );
+     }
+ 
+-    // TODO: consider showing dialog if both --location and --backend are missing
++    let location = options.location as string;
++
++    location =
++      location || (await promptLocation(projectId, "Please select the location of your backend"));
++
++    // TODO: consider showing dialog if --backend is missing
+ 
+     const exists = await secretManager.secretExists(projectId, secretName);
+     if (!exists) {
+diff --git a/src/gcp/apphosting.ts b/src/gcp/apphosting.ts
+index 64322698..c25ba16c 100644
+--- a/src/gcp/apphosting.ts
++++ b/src/gcp/apphosting.ts
+@@ -25,7 +25,7 @@ interface Codebase {
+ /**
+  * Specifies how Backend's data is replicated and served.
+  *   GLOBAL_ACCESS: Stores and serves content from multiple points-of-presence (POP)
+- *   REGIONAL_STRICT: Restricts data and serving infrastructure in Backend's region
++ *   REGIONAL_STRICT: Restricts data and serving infrastructure in Backend's location
+  *
+  */
+ export type ServingLocality = "GLOBAL_ACCESS" | "REGIONAL_STRICT";
+@@ -302,7 +302,7 @@ export async function getBackend(
+ }
+ 
+ /**
+- * List all backends present in a project and region.
++ * List all backends present in a project and location.
+  */
+ export async function listBackends(
+   projectId: string,

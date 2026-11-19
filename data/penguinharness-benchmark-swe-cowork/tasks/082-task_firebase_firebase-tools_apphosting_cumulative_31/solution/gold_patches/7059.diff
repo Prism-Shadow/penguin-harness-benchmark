@@ -1,0 +1,192 @@
+diff --git a/src/apphosting/index.ts b/src/apphosting/index.ts
+index e1ba8ba5..0b16d8df 100644
+--- a/src/apphosting/index.ts
++++ b/src/apphosting/index.ts
+@@ -400,7 +400,7 @@ export async function deleteBackendAndPoll(
+  */
+ export async function promptLocation(
+   projectId: string,
+-  prompt = "Please select a location:",
++  prompt: string = "Please select a location:",
+ ): Promise<string> {
+   const allowedLocations = (await apphosting.listLocations(projectId)).map((loc) => loc.locationId);
+ 
+@@ -412,3 +412,42 @@ export async function promptLocation(
+     choices: allowedLocations,
+   })) as string;
+ }
++
++/**
++ * Fetches a backend from the server. If there are multiple backends with that name (ie multi-regional backends),
++ * prompts the user to disambiguate.
++ */
++export async function getBackendForAmbiguousLocation(
++  projectId: string,
++  backendId: string,
++  locationDisambugationPrompt: string,
++): Promise<apphosting.Backend> {
++  let { unreachable, backends } = await apphosting.listBackends(projectId, "-");
++  if (unreachable && unreachable.length !== 0) {
++    logWarning(
++      `The following locations are currently unreachable: ${unreachable}.\n` +
++        "If your backend is in one of these regions, please try again later.",
++    );
++  }
++  backends = backends.filter(
++    (backend) => apphosting.parseBackendName(backend.name).id === backendId,
++  );
++  if (backends.length === 0) {
++    throw new FirebaseError(`No backend named "${backendId}" found.`);
++  }
++  if (backends.length === 1) {
++    return backends[0];
++  }
++
++  const backendsByLocation = new Map<string, apphosting.Backend>();
++  backends.forEach((backend) =>
++    backendsByLocation.set(apphosting.parseBackendName(backend.name).location, backend),
++  );
++  const location = await promptOnce({
++    name: "location",
++    type: "list",
++    message: locationDisambugationPrompt,
++    choices: [...backendsByLocation.keys()],
++  });
++  return backendsByLocation.get(location)!;
++}
+diff --git a/src/commands/apphosting-backends-delete.ts b/src/commands/apphosting-backends-delete.ts
+index bf4e6194..d54e4f61 100644
+--- a/src/commands/apphosting-backends-delete.ts
++++ b/src/commands/apphosting-backends-delete.ts
+@@ -6,36 +6,31 @@ import { promptOnce } from "../prompt";
+ import * as utils from "../utils";
+ import * as apphosting from "../gcp/apphosting";
+ import { printBackendsTable } from "./apphosting-backends-list";
+-import { deleteBackendAndPoll, promptLocation } from "../apphosting";
++import { deleteBackendAndPoll, getBackendForAmbiguousLocation } from "../apphosting";
++import * as ora from "ora";
+ 
+ export const command = new Command("apphosting:backends:delete <backend>")
+   .description("delete a Firebase App Hosting backend")
+-  .option("-l, --location <location>", "specify the location of the backend", "")
++  .option("-l, --location <location>", "specify the location of the backend", "-")
+   .withForce()
+   .before(apphosting.ensureApiEnabled)
+   .action(async (backendId: string, options: Options) => {
+     const projectId = needProjectId(options);
+     let location = options.location as string;
+-
+-    location =
+-      location ||
+-      (await promptLocation(
++    let backend: apphosting.Backend;
++    if (location === "-" || location === "") {
++      backend = await getBackendForAmbiguousLocation(
+         projectId,
++        backendId,
+         "Please select the location of the backend you'd like to delete:",
+-      ));
+-
+-    let backend: apphosting.Backend;
+-    try {
+-      backend = await apphosting.getBackend(projectId, location, backendId);
+-    } catch (err: any) {
+-      throw new FirebaseError(`No backends found with given parameters. Command aborted.`, {
+-        original: err,
+-      });
++      );
++      location = apphosting.parseBackendName(backend.name).location;
++    } else {
++      backend = await getBackendForLocation(projectId, location, backendId);
+     }
+ 
+-    utils.logWarning("You are about to permanently delete the backend:");
+-    const backends: apphosting.Backend[] = [backend];
+-    printBackendsTable(backends);
++    utils.logWarning("You are about to permanently delete this backend:");
++    printBackendsTable([backend]);
+ 
+     const confirmDeletion = await promptOnce(
+       {
+@@ -47,18 +42,29 @@ export const command = new Command("apphosting:backends:delete <backend>")
+       options,
+     );
+     if (!confirmDeletion) {
+-      throw new FirebaseError("Deletion Aborted");
++      return;
+     }
+ 
++    const spinner = ora("Deleting backend...").start();
+     try {
+       await deleteBackendAndPoll(projectId, location, backendId);
+-      utils.logSuccess(`Successfully deleted the backend: ${backendId}`);
++      spinner.succeed(`Successfully deleted the backend: ${backendId}`);
+     } catch (err: any) {
+-      throw new FirebaseError(
+-        `Failed to delete backend: ${backendId}. Please check the parameters you have provided.`,
+-        { original: err },
+-      );
++      spinner.stop();
++      throw new FirebaseError(`Failed to delete backend: ${backendId}.`, { original: err });
+     }
+-
+-    return backend;
+   });
++
++async function getBackendForLocation(
++  projectId: string,
++  location: string,
++  backendId: string,
++): Promise<apphosting.Backend> {
++  try {
++    return await apphosting.getBackend(projectId, location, backendId);
++  } catch (err: any) {
++    throw new FirebaseError(`No backend named "${backendId}" found in ${location}.`, {
++      original: err,
++    });
++  }
++}
+diff --git a/src/commands/apphosting-backends-list.ts b/src/commands/apphosting-backends-list.ts
+index 83add937..0b583e2d 100644
+--- a/src/commands/apphosting-backends-list.ts
++++ b/src/commands/apphosting-backends-list.ts
+@@ -42,14 +42,13 @@ export function printBackendsTable(backends: apphosting.Backend[]): void {
+   });
+ 
+   for (const backend of backends) {
+-    // sample backend.name value: "projects/<project-name>/locations/us-central1/backends/<backend-id>"
+-    const [backendLocation, , backendId] = backend.name.split("/").slice(3, 6);
++    const { location, id } = apphosting.parseBackendName(backend.name);
+     table.push([
+-      backendId,
++      id,
+       // sample repository value: "projects/<project-name>/locations/us-central1/connections/<connection-id>/repositories/<repository-name>"
+       backend.codebase?.repository?.split("/").pop() ?? "",
+       backend.uri.startsWith("https:") ? backend.uri : "https://" + backend.uri,
+-      backendLocation,
++      location,
+       datetimeString(new Date(backend.updateTime)),
+     ]);
+   }
+diff --git a/src/gcp/apphosting.ts b/src/gcp/apphosting.ts
+index f005d47d..871d46f6 100644
+--- a/src/gcp/apphosting.ts
++++ b/src/gcp/apphosting.ts
+@@ -273,6 +273,17 @@ export function serviceAgentEmail(projectNumber: string): string {
+   return `service-${projectNumber}@${P4SA_DOMAIN}`;
+ }
+ 
++/** Splits a backend resource name into its parts. */
++export function parseBackendName(backendName: string): {
++  projectName: string;
++  location: string;
++  id: string;
++} {
++  // sample value: "projects/<project-name>/locations/us-central1/backends/<backend-id>"
++  const [, projectName, , location, , id] = backendName.split("/");
++  return { projectName, location, id };
++}
++
+ /**
+  * Creates a new Backend in a given project and location.
+  */
