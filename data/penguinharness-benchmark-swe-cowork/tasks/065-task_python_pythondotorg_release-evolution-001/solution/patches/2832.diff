@@ -1,0 +1,350 @@
+diff --git a/downloads/templatetags/download_tags.py b/downloads/templatetags/download_tags.py
+index f61f25ada8416bf7f5a8202c669a8866d469f224..0bc50ff8fb1156fd1ddbe2a9ce29700fcc1a7591 100644
+--- a/downloads/templatetags/download_tags.py
++++ b/downloads/templatetags/download_tags.py
+@@ -1,6 +1,76 @@
++import logging
++import re
++
++import requests
+ from django import template
++from django.core.cache import cache
+ 
+ register = template.Library()
++logger = logging.getLogger(__name__)
++
++PYTHON_RELEASES_URL = "https://peps.python.org/api/python-releases.json"
++PYTHON_RELEASES_CACHE_KEY = "python_python_releases"
++PYTHON_RELEASES_CACHE_TIMEOUT = 3600  # 1 hour
++
++
++def get_python_releases_data() -> dict | None:
++    """Fetch and cache the Python release cycle data from PEPs API."""
++    data = cache.get(PYTHON_RELEASES_CACHE_KEY)
++    if data is not None:
++        return data
++
++    try:
++        response = requests.get(PYTHON_RELEASES_URL, timeout=5)
++        response.raise_for_status()
++        data = response.json()
++        cache.set(PYTHON_RELEASES_CACHE_KEY, data, PYTHON_RELEASES_CACHE_TIMEOUT)
++        return data
++    except (requests.RequestException, ValueError) as e:
++        logger.warning("Failed to fetch release cycle data: %s", e)
++        return None
++
++
++@register.simple_tag
++def get_eol_info(release) -> dict:
++    """
++    Check if a release's minor version is end-of-life.
++
++    Returns a dict with 'is_eol' boolean and 'eol_date' if available.
++    Python 2 releases not found in the release cycle data, assumes EOL.
++    """
++    result = {"is_eol": False, "eol_date": None}
++
++    version = release.get_version()
++    if not version:
++        return result
++
++    # Extract minor version (e.g. "3.9" from "3.9.14")
++    match = re.match(r"^(\d+)\.(\d+)", version)
++    if not match:
++        return result
++
++    major = int(match.group(1))
++    minor_version = f"{match.group(1)}.{match.group(2)}"
++
++    python_releases = get_python_releases_data()
++    if python_releases is None:
++        # Can't determine EOL status, don't show warning
++        return result
++
++    metadata = python_releases.get("metadata", {})
++    version_info = metadata.get(minor_version)
++
++    if version_info is None:
++        # Python 2 releases not in the list are EOL
++        if major <= 2:
++            result["is_eol"] = True
++        return result
++
++    if version_info.get("status") == "end-of-life":
++        result["is_eol"] = True
++        result["eol_date"] = version_info.get("end_of_life")
++
++    return result
+ 
+ 
+ @register.filter
+diff --git a/downloads/tests/test_template_tags.py b/downloads/tests/test_template_tags.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4a1b410484afc1a18aa05a0fc2339ceb043d42a
+--- /dev/null
++++ b/downloads/tests/test_template_tags.py
+@@ -0,0 +1,170 @@
++import unittest.mock as mock
++
++import requests
++from django.core.cache import cache
++from django.test import TestCase, override_settings
++from django.urls import reverse
++
++from ..templatetags.download_tags import get_eol_info, get_python_releases_data
++from .base import BaseDownloadTests
++
++MOCK_PYTHON_RELEASE = {
++    "metadata": {
++        "2.7": {"status": "end-of-life", "end_of_life": "2020-01-01"},
++        "3.8": {"status": "end-of-life", "end_of_life": "2024-10-07"},
++        "3.10": {"status": "security", "end_of_life": "2026-10-04"},
++    }
++}
++
++
++TEST_CACHES = {
++    "default": {
++        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
++        "LOCATION": "test-cache",
++    }
++}
++
++
++@override_settings(CACHES=TEST_CACHES)
++class GetEOLInfoTests(BaseDownloadTests):
++    def setUp(self):
++        super().setUp()
++        cache.clear()
++
++    @mock.patch("downloads.templatetags.download_tags.get_python_releases_data")
++    def test_eol_status(self, mock_get_data):
++        """Test get_eol_info returns correct EOL status."""
++        # Arrange
++        mock_get_data.return_value = MOCK_PYTHON_RELEASE
++        tests = [
++            (self.release_275, True, "2020-01-01"),  # EOL
++            (self.python_3_8_20, True, "2024-10-07"),  # EOL
++            (self.python_3_10_18, False, None),  # security
++        ]
++
++        for release, expected_is_eol, expected_eol_date in tests:
++            with self.subTest(release=release.name):
++                # Act
++                result = get_eol_info(release)
++
++                # Assert
++                self.assertEqual(result["is_eol"], expected_is_eol)
++                self.assertEqual(result["eol_date"], expected_eol_date)
++
++    @mock.patch("downloads.templatetags.download_tags.get_python_releases_data")
++    def test_eol_status_api_failure(self, mock_get_data):
++        """Test that API failure results in not showing EOL warning."""
++        # Arrange
++        mock_get_data.return_value = None
++
++        # Act
++        result = get_eol_info(self.python_3_8_20)
++
++        # Assert
++        self.assertFalse(result["is_eol"])
++        self.assertIsNone(result["eol_date"])
++
++
++@override_settings(CACHES=TEST_CACHES)
++class GetReleaseCycleDataTests(TestCase):
++    def setUp(self):
++        cache.clear()
++
++    @mock.patch("downloads.templatetags.download_tags.requests.get")
++    def test_successful_fetch(self, mock_get):
++        """Test successful API fetch."""
++        # Arrange
++        mock_response = mock.Mock()
++        mock_response.json.return_value = MOCK_PYTHON_RELEASE
++        mock_response.raise_for_status = mock.Mock()
++        mock_get.return_value = mock_response
++
++        # Act
++        result = get_python_releases_data()
++
++        # Assert
++        self.assertEqual(result, MOCK_PYTHON_RELEASE)
++        mock_get.assert_called_once()
++
++    @mock.patch("downloads.templatetags.download_tags.requests.get")
++    def test_caches_result(self, mock_get):
++        """Test that the result is cached."""
++        # Arrange
++        mock_response = mock.Mock()
++        mock_response.json.return_value = MOCK_PYTHON_RELEASE
++        mock_response.raise_for_status = mock.Mock()
++        mock_get.return_value = mock_response
++
++        # Act
++        result1 = get_python_releases_data()
++        result2 = get_python_releases_data()
++
++        # Assert
++        self.assertEqual(result1, result2)
++        mock_get.assert_called_once()
++
++    @mock.patch("downloads.templatetags.download_tags.requests.get")
++    def test_request_exception_returns_none(self, mock_get):
++        """Test that request exceptions return None."""
++        # Arrange
++        mock_get.side_effect = requests.RequestException("Connection error")
++
++        # Act
++        result = get_python_releases_data()
++
++        # Assert
++        self.assertIsNone(result)
++
++    @mock.patch("downloads.templatetags.download_tags.requests.get")
++    def test_json_decode_error_returns_none(self, mock_get):
++        """Test that JSON decode errors return None."""
++        # Arrange
++        mock_response = mock.Mock()
++        mock_response.raise_for_status = mock.Mock()
++        mock_response.json.side_effect = ValueError("Invalid JSON")
++        mock_get.return_value = mock_response
++
++        # Act
++        result = get_python_releases_data()
++
++        # Assert
++        self.assertIsNone(result)
++
++
++@override_settings(CACHES=TEST_CACHES)
++class EOLBannerViewTests(BaseDownloadTests):
++
++    def setUp(self):
++        super().setUp()
++        cache.clear()
++
++    @mock.patch("downloads.templatetags.download_tags.get_python_releases_data")
++    def test_eol_banner_visibility(self, mock_get_data):
++        """Test EOL banner is shown or hidden correctly."""
++        # Arrange
++        tests = [
++            ("release_275", MOCK_PYTHON_RELEASE, True),
++            ("python_3_8_20", MOCK_PYTHON_RELEASE, True),
++            ("python_3_10_18", MOCK_PYTHON_RELEASE, False),
++            ("python_3_8_20", None, False),
++        ]
++
++        for release_attr, mock_data, expect_banner in tests:
++            with self.subTest(release=release_attr):
++                mock_get_data.return_value = mock_data
++                release = getattr(self, release_attr)
++                url = reverse(
++                    "download:download_release_detail",
++                    kwargs={"release_slug": release.slug},
++                )
++
++                # Act
++                response = self.client.get(url)
++
++                # Assert
++                self.assertEqual(response.status_code, 200)
++                if expect_banner:
++                    self.assertContains(response, "level-error")
++                    self.assertContains(response, "no longer supported")
++                else:
++                    self.assertNotContains(response, "level-error")
+diff --git a/static/sass/style.css b/static/sass/style.css
+index c6d67bc8e3d9845f19ef2ef9d46ac7bfdd49daf9..9c5cb26e39022887ed18677465ec1dbd280f0a00 100644
+--- a/static/sass/style.css
++++ b/static/sass/style.css
+@@ -2645,14 +2645,20 @@ p.quote-by-organization {
+   background-color: #fff7dc;
+   border: 2px solid #ffd343; }
+   .level-notice span {
+-    color: #dca900; }
++    color: #765a00;
++    font-weight: bold; }
+ 
+ /* Something went wrong */
+ .level-error {
+   background-color: #ecd4d7;
+   border: 2px solid #b55863; }
+   .level-error span {
+-    color: #b55863; }
++    color: #853b44;
++    font-weight: bold; }
++  .level-error a {
++    color: #2b5b84; }
++    .level-error a:hover, .level-error a:focus {
++      color: #1e415e; }
+ 
+ /* Yeah! It worked correctly */
+ .level-success {
+diff --git a/static/sass/style.scss b/static/sass/style.scss
+index 826473bdc4433524ae5f0139f6183e2e425f5705..97963a5b95db75a0d6063b4583efda5cd3cbfb65 100644
+--- a/static/sass/style.scss
++++ b/static/sass/style.scss
+@@ -1758,7 +1758,10 @@ $colors: $blue, $psf, $yellow, $green, $purple, $red;
+     background-color: lighten( $yellow, 30% );
+     border: 2px solid $yellow;
+ 
+-    span { color: darken( $yellow, 20% ); }
++    span {
++        color: darken( $yellow, 40% );
++        font-weight: bold;
++    }
+ }
+ 
+ /* Something went wrong */
+@@ -1766,7 +1769,14 @@ $colors: $blue, $psf, $yellow, $green, $purple, $red;
+     background-color: lighten( $red, 35% );
+     border: 2px solid $red;
+ 
+-    span { color: $red; }
++    span {
++        color: darken( $red, 15% );
++        font-weight: bold;
++    }
++    a {
++        color: darken( $blue, 10% );
++        &:hover, &:focus { color: darken( $blue, 20% ); }
++    }
+ }
+ 
+ /* Yeah! It worked correctly */
+diff --git a/templates/downloads/release_detail.html b/templates/downloads/release_detail.html
+index 318441ccd13d7bdb9bb5eba662061fbd6890de50..a4139371100d1c51486e34a7ab94a6c16611ffa1 100644
+--- a/templates/downloads/release_detail.html
++++ b/templates/downloads/release_detail.html
+@@ -5,6 +5,7 @@
+ {% load has_sigstore_materials from download_tags %}
+ {% load has_sbom from download_tags %}
+ {% load sort_windows from download_tags %}
++{% load get_eol_info from download_tags %}
+ 
+ {% block body_attributes %}class="python downloads"{% endblock %}
+ 
+@@ -29,8 +30,20 @@
+             <h1 class="page-title">{{ release.name }}</h1>
+         </header>
+ 
++        {% get_eol_info release as eol_info %}
++        {% if eol_info.is_eol %}
++        <div class="user-feedback level-error">
++            <span>Warning:</span>
++            Python {{ release.get_version|default:release.name }} reached end-of-life{% if eol_info.eol_date %} on {{ eol_info.eol_date }}{% endif %}.
++            It is no longer supported and does not receive security updates.
++            We recommend upgrading to the <a href="{% url 'downloads:download_latest_python3' %}">latest Python release</a>.
++        </div>
++        {% endif %}
++
+         {% if latest_in_series %}
+-        <p><strong>Note:</strong> {{ release.name }} has been superseded by <a href="{{ latest_in_series.get_absolute_url }}">{{ latest_in_series.name }}</a>.</p>
++        <div class="user-feedback level-notice">
++            <span>Note:</span> {{ release.name }} has been superseded by <a href="{{ latest_in_series.get_absolute_url }}">{{ latest_in_series.name }}</a>.
++        </div>
+         {% endif %}
+ 
+         <p><strong>Release date:</strong> {{ release.release_date|date }}</p>

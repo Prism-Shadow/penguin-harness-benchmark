@@ -1,0 +1,172 @@
+diff --git a/downloads/views.py b/downloads/views.py
+index 21e66cd555b460d6c31733c0571aee430d9abf4d..57196d622e5394e18fc21b22d6f1e51e57914d81 100644
+--- a/downloads/views.py
++++ b/downloads/views.py
+@@ -2,7 +2,7 @@ from typing import Any
+ 
+ from datetime import datetime
+ 
+-from django.db.models import Prefetch
++from django.db.models import Case, IntegerField, Prefetch, When
+ from django.urls import reverse
+ from django.utils import timezone
+ from django.views.generic import DetailView, TemplateView, ListView, RedirectView
+@@ -157,6 +157,20 @@ class DownloadReleaseDetail(DownloadBase, DetailView):
+     def get_context_data(self, **kwargs):
+         context = super().get_context_data(**kwargs)
+ 
++        # Add featured files (files with download_button=True)
++        # Order: macOS first, Windows second, Source last
++        context['featured_files'] = self.object.files.filter(
++            download_button=True
++        ).annotate(
++            os_order=Case(
++                When(os__slug='macos', then=1),
++                When(os__slug='windows', then=2),
++                When(os__slug='source', then=3),
++                default=4,
++                output_field=IntegerField(),
++            )
++        ).order_by('os_order')
++
+         # Manually add release files for better ordering
+         context['release_files'] = []
+ 
+diff --git a/static/sass/style.css b/static/sass/style.css
+index 09c84948219b320d6885a9ee6c1148eb418a00b1..b66cc9de4716b37a7cd98d89c96149f0032f5463 100644
+--- a/static/sass/style.css
++++ b/static/sass/style.css
+@@ -2113,6 +2113,50 @@ table tfoot {
+ .download-widget p:last-child a {
+   white-space: nowrap; }
+ 
++.featured-downloads-list {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 1.5em;
++  justify-content: center;
++  margin-bottom: 2em; }
++
++.featured-download-box {
++  background-color: #f2f4f6;
++  border: 1px solid #caccce;
++  border-radius: 5px;
++  display: flex;
++  flex: 1 1 300px;
++  flex-direction: column;
++  min-width: 250px;
++  max-width: 400px;
++  padding: 1.25em; }
++  .featured-download-box h3 {
++    margin-top: 0; }
++  .featured-download-box .button {
++    background-color: #ffd343;
++    *zoom: 1;
++    filter: progid:DXImageTransform.Microsoft.gradient(gradientType=0, startColorstr='#FFFFDF76', endColorstr='#FFFFD343');
++    background-image: -webkit-gradient(linear, 50% 0%, 50% 100%, color-stop(10%, #ffdf76), color-stop(90%, #ffd343));
++    background-image: -webkit-linear-gradient(#ffdf76 10%, #ffd343 90%);
++    background-image: -moz-linear-gradient(#ffdf76 10%, #ffd343 90%);
++    background-image: -o-linear-gradient(#ffdf76 10%, #ffd343 90%);
++    background-image: linear-gradient(#ffdf76 10%, #ffd343 90%);
++    border: 1px solid #dca900;
++    white-space: normal; }
++    .featured-download-box .button:hover, .featured-download-box .button:active {
++      background-color: inherit;
++      background-color: #ffd343;
++      *zoom: 1;
++      filter: progid:DXImageTransform.Microsoft.gradient(gradientType=0, startColorstr='#FFFFEBA9', endColorstr='#FFFFD343');
++      background-image: -webkit-gradient(linear, 50% 0%, 50% 100%, color-stop(10%, #ffeba9), color-stop(90%, #ffd343));
++      background-image: -webkit-linear-gradient(#ffeba9 10%, #ffd343 90%);
++      background-image: -moz-linear-gradient(#ffeba9 10%, #ffd343 90%);
++      background-image: -o-linear-gradient(#ffeba9 10%, #ffd343 90%);
++      background-image: linear-gradient(#ffeba9 10%, #ffd343 90%); }
++  .featured-download-box .download-buttons {
++    margin-bottom: 0;
++    text-align: center; }
++
+ .time-posted {
+   display: block;
+   font-size: 0.875em;
+diff --git a/static/sass/style.scss b/static/sass/style.scss
+index cb78d9a4da3ae5328bb59c39be4c83acbaa9ca7a..174a7337407c8f8b3b37ed55a143e2b131b9a662 100644
+--- a/static/sass/style.scss
++++ b/static/sass/style.scss
+@@ -1098,6 +1098,46 @@ $colors: $blue, $psf, $yellow, $green, $purple, $red;
+     p:last-child a { white-space: nowrap; }
+ }
+ 
++.featured-downloads-list {
++    display: flex;
++    flex-wrap: wrap;
++    gap: 1.5em;
++    justify-content: center;
++    margin-bottom: 2em;
++}
++
++.featured-download-box {
++    background-color: $grey-lighterest;
++    border: 1px solid $default-border-color;
++    border-radius: 5px;
++    display: flex;
++    flex: 1 1 300px;
++    flex-direction: column;
++    min-width: 250px;
++    max-width: 400px;
++    padding: 1.25em;
++
++    h3 {
++        margin-top: 0;
++    }
++
++    .button {
++        @include vertical-gradient( lighten($yellow, 10%), $yellow );
++        border: 1px solid darken($yellow, 20%);
++        white-space: normal;
++
++        &:hover, &:active {
++            background-color: inherit;
++            @include vertical-gradient( lighten($yellow, 20%), $yellow );
++        }
++    }
++
++    .download-buttons {
++        margin-bottom: 0;
++        text-align: center;
++    }
++}
++
+ .documentation-widget { }
+ 
+ .jobs-widget { }
+diff --git a/templates/downloads/release_detail.html b/templates/downloads/release_detail.html
+index db49d974e443a2ee9c33a9b353448c6513a9e918..5959dfe30c603265f712af9e1adff6a407aa81b4 100644
+--- a/templates/downloads/release_detail.html
++++ b/templates/downloads/release_detail.html
+@@ -41,9 +41,26 @@
+         {% endif %}
+ 
+         <header class="article-header">
+-            <h1 class="page-title">Files</h1>
++            <h2 class="page-title">Files</h2>
+         </header>
+ 
++        {% if featured_files %}
++        <div class="featured-downloads-list">
++            {% for f in featured_files %}
++            <div class="featured-download-box">
++                <h3>{{ f.os.name }}</h3>
++                <p class="download-buttons">
++                    {% if f.os.slug == 'windows' and latest_pymanager and release.is_version_at_least_3_5 %}
++                    <a class="button" href="https://www.python.org/downloads/latest/pymanager/">Download Python install manager</a>
++                    {% else %}
++                    <a class="button" href="{{ f.url }}">Download {{ f.name }}</a>
++                    {% endif %}
++                </p>
++            </div>
++            {% endfor %}
++        </div>
++        {% endif %}
++
+         <table>
+           <thead>
+             <tr>
