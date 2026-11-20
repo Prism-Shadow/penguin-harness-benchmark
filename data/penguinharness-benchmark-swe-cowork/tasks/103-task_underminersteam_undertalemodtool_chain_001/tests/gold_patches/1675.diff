@@ -1,0 +1,171 @@
+diff --git a/UndertaleModLib/Decompiler/DoubleToString.cs b/UndertaleModLib/Decompiler/DoubleToString.cs
+index e4676c87b90839a856c71ebb2ab2d97ea521f4b1..87af3ae597ce4ab5b5eb10549a5f71c5e503caeb 100644
+--- a/UndertaleModLib/Decompiler/DoubleToString.cs
++++ b/UndertaleModLib/Decompiler/DoubleToString.cs
+@@ -36,7 +36,7 @@ namespace UndertaleModLib.Decompiler
+             if (PredefinedValues.TryGetValue(number, out string res))
+                 return res;
+ 
+-            ReadOnlySpan<char> numberAsSpan = number.ToString("G17", CultureInfo.InvariantCulture).AsSpan();      // This can sometimes return a scientific notation
++            ReadOnlySpan<char> numberAsSpan = number.ToString("G16", CultureInfo.InvariantCulture).AsSpan();      // This can sometimes return a scientific notation
+             int indexOfE = numberAsSpan.IndexOf("E".AsSpan());
+             if (indexOfE < 0)
+                 return numberAsSpan.ToString();
+@@ -44,7 +44,9 @@ namespace UndertaleModLib.Decompiler
+             // This converts the scientific notation to standard form/fixed point notation
+             // As of time of writing this comment, C# does not offer a way to print fixed point notation while preserving precision.
+             // You may ask "But why not use F17?". And the answer is, that for everything but R and G, the precision is hard-capped to 15 (according to MSDN: Double.ToString()).
+-            // Thus we use G17 to keep our precision, and then manually convert this to fixed point notation.
++            // You may also ask "And G17? What merits the drop to G16?".
++            // This is because G17 is long enough to show IEEE 754 errors, which almost always make code less readable and don't affect recompilation.
++            // Thus we use G16, and then manually convert this to fixed point notation.
+             // For anyone unaware of the general algorithm: you get the exponent 'n', then move the decimal point n times to the right if it's positive / left if it's negative.
+             ReadOnlySpan<char> exponentAsSpan = numberAsSpan.Slice(indexOfE + 1);
+             int exponent = Int32.Parse(exponentAsSpan);
+diff --git a/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs b/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs
+index 7ce02a941210b1aa031c2e8f9a3d9680c9b30f09..e0bb21d1d276adaf5be63bc74002dedd33b7232b 100644
+--- a/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs
++++ b/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs
+@@ -129,7 +129,16 @@ public static partial class Decompiler
+                     }
+                 }
+             }
+-            return String.Format("{0}{1}{2} {3}", varPrefix, varName, context.DecompilingStruct ? ":" : " =", Value.ToString(context));
++
++            // Since parenthesized is now the default output of ExpressionTwo (mainly math operations)
++            // It is specifically safe in variable assignment to not parenthesize this (e.g. "foo = a + b")
++            string stringOfValue;
++            if (Value is ExpressionTwo expressionTwoVal)
++                stringOfValue = expressionTwoVal.ToStringNoParens(context);
++            else
++                stringOfValue = Value.ToString(context);
++
++            return String.Format("{0}{1}{2} {3}", varPrefix, varName, context.DecompilingStruct ? ":" : " =", stringOfValue);
+         }
+ 
+         public override Statement CleanStatement(DecompileContext context, BlockHLStatement block)
+diff --git a/UndertaleModLib/Decompiler/Instructions/Decompiler.DirectFunctionCall.cs b/UndertaleModLib/Decompiler/Instructions/Decompiler.DirectFunctionCall.cs
+index e82781e7dd35b43e52ccaeebf4350f69e91fe88d..a2910435f7f5920e21ea0b2c92432dafdf94de10 100644
+--- a/UndertaleModLib/Decompiler/Instructions/Decompiler.DirectFunctionCall.cs
++++ b/UndertaleModLib/Decompiler/Instructions/Decompiler.DirectFunctionCall.cs
+@@ -86,13 +86,21 @@ public static partial class Decompiler
+             }
+             else
+             {
+-                foreach (Expression exp in Arguments)
++                if (Arguments.Count == 1 && Arguments[0] is ExpressionTwo expTwo)
+                 {
+                     context.currentFunction = this;
+-                    if (argumentString.Length > 0)
+-                        argumentString.Append(", ");
+-                    argumentString.Append(exp.ToString(context));
++                    argumentString.Append(expTwo.ToStringNoParens(context));
++                }
++                else
++                {
++                    foreach (Expression exp in Arguments)
++                    {
++                        context.currentFunction = this;
++                        if (argumentString.Length > 0)
++                            argumentString.Append(", ");
++                        argumentString.Append(exp.ToString(context));
+ 
++                    }
+                 }
+                 context.currentFunction = null;
+ 
+diff --git a/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionCompare.cs b/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionCompare.cs
+index 3ae8580f526428d2a61721e3e8f64d00214744a0..a0634cae011cecf1acf446b8be7774b4f14522f0 100644
+--- a/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionCompare.cs
++++ b/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionCompare.cs
+@@ -29,7 +29,7 @@ public static partial class Decompiler
+         {
+             string arg1 = Argument1.ToString(context);
+             string arg2 = Argument2.ToString(context);
+-            return String.Format("({0} {1} {2})", arg1, OperationToPrintableString(Opcode), arg2);
++            return String.Format("{0} {1} {2}", arg1, OperationToPrintableString(Opcode), arg2);
+         }
+ 
+         public string ToStringWithParen(DecompileContext context)
+diff --git a/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionTwo.cs b/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionTwo.cs
+index 3c1395fcfc34a7bc008a44d8410e6ce648f38d94..c56f3762e4e6d3590bf312f9dd954724dc330e1f 100644
+--- a/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionTwo.cs
++++ b/UndertaleModLib/Decompiler/Instructions/Decompiler.ExpressionTwo.cs
+@@ -34,15 +34,74 @@ public static partial class Decompiler
+             return this;
+         }
+ 
+-        public override string ToString(DecompileContext context)
++        private string AddParensIfNeeded(Expression argument, DecompileContext context, bool isSecond)
++        {
++            string arg = argument.ToString(context);
++            bool needsParens;
++            if (arg[0] != '(' &&
++                argument is not ExpressionConstant &&
++                arg.Contains(' ', StringComparison.InvariantCulture))
++                needsParens = true;
++            else
++                needsParens = false;
++
++
++            if (argument is ExpressionTwo argumentAsBinaryExpression)
++            {
++                int outerPriorityLevel = Opcode switch
++                {
++                    UndertaleInstruction.Opcode.Mul or UndertaleInstruction.Opcode.Div => 2,
++                    UndertaleInstruction.Opcode.Add or UndertaleInstruction.Opcode.Sub => 1,
++                    _ => 0,
++                };
++
++                // First, no parentheses on this type
++                arg = argumentAsBinaryExpression.ToStringNoParens(context);
++
++                int argPriorityLevel = argumentAsBinaryExpression.Opcode switch
++                {
++                    UndertaleInstruction.Opcode.Mul or UndertaleInstruction.Opcode.Div => 2,
++                    UndertaleInstruction.Opcode.Add or UndertaleInstruction.Opcode.Sub => 1,
++                    _ => 0,
++                };
++
++
++                // Suppose we have "(arg1a argOp arg1b) opcode argument2", and are wondering whether the depicted parentheses are needed
++                // If the argument's opcode is more highly-prioritized than our own, such as it being multiplication
++                // while we use addition, then no parentheses are required.
++                // If the argument's opcode doesn't fall into typical math rules (that is, I don't know my full order of operations)
++                // Assume it has lower priority and needs parentheses to clarify.
++                // Parentheses are also not needed for operations of the same level, especially string concatenation.
++                needsParens = (outerPriorityLevel > argPriorityLevel);
++                if (outerPriorityLevel == 0)
++                    needsParens = true; // Better safe than sorry
++                
++                // Non-commutative operators may still need parentheses, e.g `a - (b - c)`
++                bool nonCommutative = Opcode is UndertaleInstruction.Opcode.Sub or UndertaleInstruction.Opcode.Div;
++                if (isSecond && nonCommutative && Opcode == argumentAsBinaryExpression.Opcode)
++                    needsParens = true;
++            }
++
++            return (needsParens ? String.Format("({0})", arg) : arg);
++        }
++
++        public string ToStringNoParens(DecompileContext context)
+         {
++            string arg1 = AddParensIfNeeded(Argument1, context, false);
++            string arg2 = AddParensIfNeeded(Argument2, context, true);
++
+             if (Opcode == UndertaleInstruction.Opcode.Or || Opcode == UndertaleInstruction.Opcode.And)
+             {
+                 // If both arguments are a boolean type, this is a non-short-circuited logical condition
+                 if (Type == UndertaleInstruction.DataType.Boolean && Type2 == UndertaleInstruction.DataType.Boolean)
+-                    return String.Format("({0} {1}{1} {2})", Argument1.ToString(context), OperationToPrintableString(Opcode), Argument2.ToString(context));
++                    return String.Format("{0} {1}{1} {2}", arg1, OperationToPrintableString(Opcode), arg2);
+             }
+-            return String.Format("({0} {1} {2})", Argument1.ToString(context), OperationToPrintableString(Opcode), Argument2.ToString(context));
++            return String.Format("{0} {1} {2}", arg1, OperationToPrintableString(Opcode), arg2);
++        }
++
++        public override string ToString(DecompileContext context)
++        {
++            return String.Format("({0})", ToStringNoParens(context));
+         }
+ 
+         internal override AssetIDType DoTypePropagation(DecompileContext context, AssetIDType suggestedType)

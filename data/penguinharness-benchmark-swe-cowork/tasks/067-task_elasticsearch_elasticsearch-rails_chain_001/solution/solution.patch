@@ -1,0 +1,3135 @@
+diff --git a/elasticsearch-model/lib/elasticsearch/model.rb b/elasticsearch-model/lib/elasticsearch/model.rb
+index 2c395bd845ceb647a2ded751ae61102e43b4fc3e..ec5b0c704860e6c89cd1921e15510342576932de 100644
+--- a/elasticsearch-model/lib/elasticsearch/model.rb
++++ b/elasticsearch-model/lib/elasticsearch/model.rb
+@@ -72,9 +72,10 @@ module Elasticsearch
+ 
+     # Adds the `Elasticsearch::Model` functionality to the including class.
+     #
+-    # * Creates the `__elasticsearch__` class and instance methods, pointing to the proxy object
+-    # * Includes the necessary modules in the proxy classes
+-    # * Sets up delegation for crucial methods such as `search`, etc.
++    # * Creates the `__elasticsearch__` class and instance method. These methods return a proxy object with
++    #   other common methods defined on them.
++    # * The module includes other modules with further functionality.
++    # * Sets up delegation for common methods such as `import` and `search`.
+     #
+     # @example Include the module in the `Article` model definition
+     #
+@@ -91,50 +92,16 @@ module Elasticsearch
+       base.class_eval do
+         include Elasticsearch::Model::Proxy
+ 
+-        Elasticsearch::Model::Proxy::ClassMethodsProxy.class_eval do
+-          include Elasticsearch::Model::Client::ClassMethods
+-          include Elasticsearch::Model::Naming::ClassMethods
+-          include Elasticsearch::Model::Indexing::ClassMethods
+-          include Elasticsearch::Model::Searching::ClassMethods
+-        end
+-
+-        Elasticsearch::Model::Proxy::InstanceMethodsProxy.class_eval do
+-          include Elasticsearch::Model::Client::InstanceMethods
+-          include Elasticsearch::Model::Naming::InstanceMethods
+-          include Elasticsearch::Model::Indexing::InstanceMethods
+-          include Elasticsearch::Model::Serializing::InstanceMethods
+-        end
+-
+-        Elasticsearch::Model::Proxy::InstanceMethodsProxy.class_eval <<-CODE, __FILE__, __LINE__ + 1
+-          def as_indexed_json(options={})
+-            target.respond_to?(:as_indexed_json) ? target.__send__(:as_indexed_json, options) : super
+-          end
+-        CODE
+-
+-        # Delegate important methods to the `__elasticsearch__` proxy, unless they are defined already
+-        #
++        # Delegate common methods to the `__elasticsearch__` ClassMethodsProxy, unless they are defined already
+         class << self
+           METHODS.each do |method|
+             delegate method, to: :__elasticsearch__ unless self.public_instance_methods.include?(method)
+           end
+         end
+-
+-        # Mix the importing module into the proxy
+-        #
+-        self.__elasticsearch__.class_eval do
+-          include Elasticsearch::Model::Importing::ClassMethods
+-          include Adapter.from_class(base).importing_mixin
+-        end
+-
+-        # Add to the registry if it's a class (and not in intermediate module)
+-        Registry.add(base) if base.is_a?(Class)
+       end
+-    end
+ 
+-    # Access the module settings
+-    #
+-    def self.settings
+-      @settings ||= {}
++      # Add to the model to the registry if it's a class (and not in intermediate module)
++      Registry.add(base) if base.is_a?(Class)
+     end
+ 
+     module ClassMethods
+@@ -188,22 +155,10 @@ module Elasticsearch
+         Response::Response.new(models, request)
+       end
+ 
+-      # Check if inheritance is enabled
+-      #
+-      # @note Inheritance is disabled by default.
+-      #
+-      def inheritance_enabled
+-        @inheritance_enabled ||= false
+-      end
+-
+-      # Enable inheritance of index_name and document_type
+-      #
+-      # @example Enable inheritance
+-      #
+-      #     Elasticsearch::Model.inheritance_enabled = true
++      # Access the module settings
+       #
+-      def inheritance_enabled=(inheritance_enabled)
+-        @inheritance_enabled = inheritance_enabled
++      def settings
++        @settings ||= {}
+       end
+     end
+     extend ClassMethods
+diff --git a/elasticsearch-model/lib/elasticsearch/model/adapters/active_record.rb b/elasticsearch-model/lib/elasticsearch/model/adapters/active_record.rb
+index 23c4267fa5c82aeb0a2675c8ee967ee59f848937..3fb3f987e26a3ee23863fac58341922750aa4506 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/adapters/active_record.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/adapters/active_record.rb
+@@ -35,7 +35,11 @@ module Elasticsearch
+                 else
+                   self.__send__(:exec_queries)
+                 end
+-                @records.sort_by { |record| hits.index { |hit| hit['_id'].to_s == record.id.to_s } }
++                if !self.order_values.present?
++                  @records.sort_by { |record| hits.index { |hit| hit['_id'].to_s == record.id.to_s } }
++                else
++                  @records
++                end
+               end if self
+             end
+ 
+@@ -47,27 +51,6 @@ module Elasticsearch
+           def load
+             records.__send__(:load)
+           end
+-
+-          # Intercept call to the `order` method, so we can ignore the order from Elasticsearch
+-          #
+-          def order(*args)
+-            sql_records = records.__send__ :order, *args
+-
+-            # Redefine the `to_a` method to the original one
+-            #
+-            sql_records.instance_exec do
+-              define_singleton_method(:to_a) do
+-                if defined?(::ActiveRecord) && ::ActiveRecord::VERSION::MAJOR >= 4
+-                  self.load
+-                else
+-                  self.__send__(:exec_queries)
+-                end
+-                @records
+-              end
+-            end
+-
+-            sql_records
+-          end
+         end
+ 
+         module Callbacks
+@@ -103,7 +86,8 @@ module Elasticsearch
+             scope = scope.instance_exec(&query) if query
+ 
+             scope.find_in_batches(options) do |batch|
+-              yield (preprocess ? self.__send__(preprocess, batch) : batch)
++              batch = self.__send__(preprocess, batch) if preprocess
++              yield(batch) if batch.present?
+             end
+           end
+ 
+diff --git a/elasticsearch-model/lib/elasticsearch/model/adapters/mongoid.rb b/elasticsearch-model/lib/elasticsearch/model/adapters/mongoid.rb
+index 5117dbf58d4be99fd317437c831e82e2616939d3..d4aff56f925a74cc6770df8f1e48bbf0b958c863 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/adapters/mongoid.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/adapters/mongoid.rb
+@@ -63,10 +63,17 @@ module Elasticsearch
+           # @see https://github.com/karmi/retire/pull/724
+           #
+           def __find_in_batches(options={}, &block)
+-            options[:batch_size] ||= 1_000
++            batch_size = options[:batch_size] || 1_000
++            query = options[:query]
++            named_scope = options[:scope]
++            preprocess = options[:preprocess]
++
++            scope = all
++            scope = scope.send(named_scope) if named_scope
++            scope = query.is_a?(Proc) ? scope.class_exec(&query) : scope.where(query) if query
+   
+-            all.no_timeout.each_slice(options[:batch_size]) do |items|
+-              yield items
++            scope.no_timeout.each_slice(batch_size) do |items|
++              yield (preprocess ? self.__send__(preprocess, items) : items)
+             end
+           end
+ 
+diff --git a/elasticsearch-model/lib/elasticsearch/model/adapters/multiple.rb b/elasticsearch-model/lib/elasticsearch/model/adapters/multiple.rb
+index 9a0bc4e8eb857fb7f69b76e2cbb81efaa8a9d46f..f58a64bfed8e84994c6dffe2f58b550b15c2cc7e 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/adapters/multiple.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/adapters/multiple.rb
+@@ -58,8 +58,8 @@ module Elasticsearch
+                 klass.where(klass.primary_key => ids)
+               when Elasticsearch::Model::Adapter::Mongoid.equal?(adapter)
+                 klass.where(:id.in => ids)
+-              else
+-                klass.find(ids)
++            else
++              klass.find(ids)
+             end
+           end
+ 
+@@ -91,13 +91,21 @@ module Elasticsearch
+           def __type_for_hit(hit)
+             @@__types ||= {}
+ 
+-            @@__types[ "#{hit[:_index]}::#{hit[:_type]}" ] ||= begin
++            key = "#{hit[:_index]}::#{hit[:_type]}" if hit[:_type] && hit[:_type] != '_doc'
++            key = hit[:_index] unless key
++
++            @@__types[key] ||= begin
+               Registry.all.detect do |model|
+-                model.index_name == hit[:_index] && model.document_type == hit[:_type]
++                (model.index_name == hit[:_index] && __no_type?(hit)) ||
++                    (model.index_name == hit[:_index] && model.document_type == hit[:_type])
+               end
+             end
+           end
+ 
++          def __no_type?(hit)
++            hit[:_type].nil? || hit[:_type] == '_doc'
++          end
++
+           # Returns the adapter registered for a particular `klass` or `nil` if not available
+           #
+           # @api private
+diff --git a/elasticsearch-model/lib/elasticsearch/model/importing.rb b/elasticsearch-model/lib/elasticsearch/model/importing.rb
+index 7c42545d2ac5b0ae8ab755b0da51ac77d971dbe2..764413acf83e0055862c6ad224a7c51ce8c3984a 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/importing.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/importing.rb
+@@ -130,7 +130,7 @@ module Elasticsearch
+             errors +=  response['items'].select { |k, v| k.values.first['error'] }
+           end
+ 
+-          self.refresh_index! if refresh
++          self.refresh_index! index: target_index if refresh
+ 
+           case return_value
+             when 'errors'
+diff --git a/elasticsearch-model/lib/elasticsearch/model/indexing.rb b/elasticsearch-model/lib/elasticsearch/model/indexing.rb
+index 39ad06bc3f84c05e72d6b0e52b0b608af9a1ceea..1727fce749b9963af67f647c1544aa5bba2dfce5 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/indexing.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/indexing.rb
+@@ -39,9 +39,7 @@ module Elasticsearch
+         # @private
+         TYPES_WITH_EMBEDDED_PROPERTIES = %w(object nested)
+ 
+-        def initialize(type, options={})
+-          raise ArgumentError, "`type` is missing" if type.nil?
+-
++        def initialize(type = nil, options={})
+           @type    = type
+           @options = options
+           @mapping = {}
+@@ -72,7 +70,11 @@ module Elasticsearch
+         end
+ 
+         def to_hash
+-          { @type.to_sym => @options.merge( properties: @mapping ) }
++          if @type
++            { @type.to_sym => @options.merge( properties: @mapping ) }
++          else
++            @options.merge( properties: @mapping )
++          end
+         end
+ 
+         def as_json(options={})
+@@ -229,10 +231,12 @@ module Elasticsearch
+           delete_index!(options.merge index: target_index) if options[:force]
+ 
+           unless index_exists?(index: target_index)
+-            self.client.indices.create index: target_index,
+-                                       body: {
+-                                         settings: settings,
+-                                         mappings: mappings }
++            options.delete(:force)
++            self.client.indices.create({ index: target_index,
++                                         body: {
++                                           settings: settings,
++                                           mappings: mappings }
++                                       }.merge(options))
+           end
+         end
+ 
+@@ -269,7 +273,8 @@ module Elasticsearch
+             self.client.indices.delete index: target_index
+           rescue Exception => e
+             if e.class.to_s =~ /NotFound/ && options[:force]
+-              STDERR.puts "[!!!] Index does not exist (#{e.class})"
++              client.transport.logger.debug("[!!!] Index does not exist (#{e.class})") if client.transport.logger
++              nil
+             else
+               raise e
+             end
+@@ -295,7 +300,8 @@ module Elasticsearch
+             self.client.indices.refresh index: target_index
+           rescue Exception => e
+             if e.class.to_s =~ /NotFound/ && options[:force]
+-              STDERR.puts "[!!!] Index does not exist (#{e.class})"
++              client.transport.logger.debug("[!!!] Index does not exist (#{e.class})") if client.transport.logger
++              nil
+             else
+               raise e
+             end
+@@ -315,13 +321,17 @@ module Elasticsearch
+           #
+           # @see #update_document
+           #
+-          base.before_save do |i|
+-            if i.class.instance_methods.include?(:changes_to_save) # Rails 5.1
+-              i.instance_variable_set(:@__changed_model_attributes,
+-                                      Hash[ i.changes_to_save.map { |key, value| [key, value.last] } ])
+-            elsif i.class.instance_methods.include?(:changes)
+-              i.instance_variable_set(:@__changed_model_attributes,
+-                                      Hash[ i.changes.map { |key, value| [key, value.last] } ])
++          base.before_save do |obj|
++            if obj.respond_to?(:changes_to_save) # Rails 5.1
++              changes_to_save = obj.changes_to_save
++            elsif obj.respond_to?(:changes)
++              changes_to_save = obj.changes
++            end
++
++            if changes_to_save
++              attrs = obj.instance_variable_get(:@__changed_model_attributes) || {}
++              latest_changes = changes_to_save.inject({}) { |latest_changes, (k,v)| latest_changes.merge!(k => v.last) }
++              obj.instance_variable_set(:@__changed_model_attributes, attrs.merge(latest_changes))
+             end
+           end if base.respond_to?(:before_save)
+         end
+@@ -341,14 +351,13 @@ module Elasticsearch
+         # @see http://rubydoc.info/gems/elasticsearch-api/Elasticsearch/API/Actions:index
+         #
+         def index_document(options={})
+-          document = self.as_indexed_json
+-
+-          client.index(
+-            { index: index_name,
+-              type:  document_type,
+-              id:    self.id,
+-              body:  document }.merge(options)
+-          )
++          document = as_indexed_json
++          request = { index: index_name,
++                      id:    id,
++                      body:  document }
++          request.merge!(type: document_type) if document_type
++
++          client.index(request.merge(options).reject { |key, _value| key == :type && document_type.nil? })
+         end
+ 
+         # Deletes the model instance from the index
+@@ -365,11 +374,11 @@ module Elasticsearch
+         # @see http://rubydoc.info/gems/elasticsearch-api/Elasticsearch/API/Actions:delete
+         #
+         def delete_document(options={})
+-          client.delete(
+-            { index: index_name,
+-              type:  document_type,
+-              id:    self.id }.merge(options)
+-          )
++          request = { index: index_name,
++                      id:    self.id }
++          request.merge!(type: document_type) if document_type
++
++          client.delete(request.merge(options).reject { |key, _value| key == :type && document_type.nil? })
+         end
+ 
+         # Tries to gather the changed attributes of a model instance
+@@ -397,19 +406,21 @@ module Elasticsearch
+         # @see http://rubydoc.info/gems/elasticsearch-api/Elasticsearch/API/Actions:update
+         #
+         def update_document(options={})
+-          if attributes_in_database = self.instance_variable_get(:@__changed_model_attributes)
++          if attributes_in_database = self.instance_variable_get(:@__changed_model_attributes).presence
+             attributes = if respond_to?(:as_indexed_json)
+               self.as_indexed_json.select { |k,v| attributes_in_database.keys.map(&:to_s).include? k.to_s }
+             else
+               attributes_in_database
+             end
+ 
+-            client.update(
+-              { index: index_name,
+-                type:  document_type,
+-                id:    self.id,
+-                body:  { doc: attributes } }.merge(options)
+-            )
++            unless attributes.empty?
++              request = { index: index_name,
++                          id:    self.id,
++                          body:  { doc: attributes } }
++              request.merge!(type: document_type) if document_type
++
++              client.update(request.merge(options).reject { |key, _value| key == :type && document_type.nil? })
++            end
+           else
+             index_document(options)
+           end
+@@ -430,12 +441,12 @@ module Elasticsearch
+         # @return [Hash] The response from Elasticsearch
+         #
+         def update_document_attributes(attributes, options={})
+-          client.update(
+-            { index: index_name,
+-              type:  document_type,
+-              id:    self.id,
+-              body:  { doc: attributes } }.merge(options)
+-          )
++          request = { index: index_name,
++                      id:    self.id,
++                      body:  { doc: attributes } }
++          request.merge!(type: document_type) if document_type
++
++          client.update(request.merge(options).reject { |key, _value| key == :type && document_type.nil? })
+         end
+       end
+ 
+diff --git a/elasticsearch-model/lib/elasticsearch/model/naming.rb b/elasticsearch-model/lib/elasticsearch/model/naming.rb
+index 7bf24f0898a9e93fb44e87ecf5bc2112e4afc435..3a963e0c9a2c0c91262482212a41398bb5854ab7 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/naming.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/naming.rb
+@@ -5,6 +5,8 @@ module Elasticsearch
+     #
+     module Naming
+ 
++      DEFAULT_DOC_TYPE= '_doc'.freeze
++
+       module ClassMethods
+ 
+         # Get or set the name of the index
+@@ -73,26 +75,14 @@ module Elasticsearch
+         private
+ 
+           def implicit(prop)
+-            value = nil
+-
+-            if Elasticsearch::Model.settings[:inheritance_enabled]
+-              self.ancestors.each do |klass|
+-                next if klass == self
+-                break if value = klass.respond_to?(prop) && klass.send(prop)
+-              end
+-            end
+-
+-            value || self.send("default_#{prop}")
++            self.send("default_#{prop}")
+           end
+ 
+           def default_index_name
+             self.model_name.collection.gsub(/\//, '-')
+           end
+ 
+-          def default_document_type
+-            self.model_name.element
+-          end
+-
++          def default_document_type; end
+       end
+ 
+       module InstanceMethods
+diff --git a/elasticsearch-model/lib/elasticsearch/model/proxy.rb b/elasticsearch-model/lib/elasticsearch/model/proxy.rb
+index a1c89ca958f88cc306532e3c83f7aa863d98d3f9..6ecc79c83638984c3f36e1b26e7a7aaa759d5072 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/proxy.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/proxy.rb
+@@ -2,15 +2,15 @@ module Elasticsearch
+   module Model
+ 
+     # This module provides a proxy interfacing between the including class and
+-    # {Elasticsearch::Model}, preventing the pollution of the including class namespace.
++    # `Elasticsearch::Model`, preventing the pollution of the including class namespace.
+     #
+     # The only "gateway" between the model and Elasticsearch::Model is the
+-    # `__elasticsearch__` class and instance method.
++    # `#__elasticsearch__` class and instance method.
+     #
+     # The including class must be compatible with
+     # [ActiveModel](https://github.com/rails/rails/tree/master/activemodel).
+     #
+-    # @example Include the {Elasticsearch::Model} module into an `Article` model
++    # @example Include the `Elasticsearch::Model` module into an `Article` model
+     #
+     #     class Article < ActiveRecord::Base
+     #       include Elasticsearch::Model
+@@ -36,21 +36,19 @@ module Elasticsearch
+       #       module and the functionality is accessible via the proxy.
+       #
+       def self.included(base)
++
+         base.class_eval do
+-          # {ClassMethodsProxy} instance, accessed as `MyModel.__elasticsearch__`
+-          #
++
++          # `ClassMethodsProxy` instance, accessed as `MyModel.__elasticsearch__`
+           def self.__elasticsearch__ &block
+             @__elasticsearch__ ||= ClassMethodsProxy.new(self)
+             @__elasticsearch__.instance_eval(&block) if block_given?
+             @__elasticsearch__
+           end
+ 
+-          # {InstanceMethodsProxy}, accessed as `@mymodel.__elasticsearch__`
+-          #
+-          def __elasticsearch__ &block
+-            @__elasticsearch__ ||= InstanceMethodsProxy.new(self)
+-            @__elasticsearch__.instance_eval(&block) if block_given?
+-            @__elasticsearch__
++          # Mix the importing module into the `ClassMethodsProxy`
++          self.__elasticsearch__.class_eval do
++            include Adapter.from_class(base).importing_mixin
+           end
+ 
+           # Register a callback for storing changed attributes for models which implement
+@@ -58,18 +56,28 @@ module Elasticsearch
+           #
+           # @see http://api.rubyonrails.org/classes/ActiveModel/Dirty.html
+           #
+-          before_save do |i|
+-            if i.class.instance_methods.include?(:changes_to_save) # Rails 5.1
+-              a = i.__elasticsearch__.instance_variable_get(:@__changed_model_attributes) || {}
+-              i.__elasticsearch__.instance_variable_set(:@__changed_model_attributes,
+-                                                        a.merge(Hash[ i.changes_to_save.map { |key, value| [key, value.last] } ]))
+-            elsif i.class.instance_methods.include?(:changes)
+-              a = i.__elasticsearch__.instance_variable_get(:@__changed_model_attributes) || {}
+-              i.__elasticsearch__.instance_variable_set(:@__changed_model_attributes,
+-                                                        a.merge(Hash[ i.changes.map { |key, value| [key, value.last] } ]))
++          before_save do |obj|
++            if obj.respond_to?(:changes_to_save) # Rails 5.1
++              changes_to_save = obj.changes_to_save
++            elsif obj.respond_to?(:changes)
++              changes_to_save = obj.changes
++            end
++
++            if changes_to_save
++              attrs = obj.__elasticsearch__.instance_variable_get(:@__changed_model_attributes) || {}
++              latest_changes = changes_to_save.inject({}) { |latest_changes, (k,v)| latest_changes.merge!(k => v.last) }
++              obj.__elasticsearch__.instance_variable_set(:@__changed_model_attributes, attrs.merge(latest_changes))
+             end
+           end if respond_to?(:before_save)
+         end
++
++        # {InstanceMethodsProxy}, accessed as `@mymodel.__elasticsearch__`
++        #
++        def __elasticsearch__ &block
++          @__elasticsearch__ ||= InstanceMethodsProxy.new(self)
++          @__elasticsearch__.instance_eval(&block) if block_given?
++          @__elasticsearch__
++        end
+       end
+ 
+       # @overload dup
+@@ -113,6 +121,11 @@ module Elasticsearch
+       #
+       class ClassMethodsProxy
+         include Base
++        include Elasticsearch::Model::Client::ClassMethods
++        include Elasticsearch::Model::Naming::ClassMethods
++        include Elasticsearch::Model::Indexing::ClassMethods
++        include Elasticsearch::Model::Searching::ClassMethods
++        include Elasticsearch::Model::Importing::ClassMethods
+       end
+ 
+       # A proxy interfacing between Elasticsearch::Model instance methods and model instance methods
+@@ -121,6 +134,10 @@ module Elasticsearch
+       #
+       class InstanceMethodsProxy
+         include Base
++        include Elasticsearch::Model::Client::InstanceMethods
++        include Elasticsearch::Model::Naming::InstanceMethods
++        include Elasticsearch::Model::Indexing::InstanceMethods
++        include Elasticsearch::Model::Serializing::InstanceMethods
+ 
+         def klass
+           target.class
+@@ -136,8 +153,11 @@ module Elasticsearch
+         def as_json(options={})
+           target.as_json(options)
+         end
+-      end
+ 
++        def as_indexed_json(options={})
++          target.respond_to?(:as_indexed_json) ? target.__send__(:as_indexed_json, options) : super
++        end
++      end
+     end
+   end
+ end
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response.rb b/elasticsearch-model/lib/elasticsearch/model/response.rb
+index d15c24a04449c2be528275458fc21a1cb472221a..acb25669eaccc24d78cb3f9b875ea2361db54fe8 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/response.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/response.rb
+@@ -10,8 +10,7 @@ module Elasticsearch
+       # Implements Enumerable and forwards its methods to the {#results} object.
+       #
+       class Response
+-        attr_reader :klass, :search, :response,
+-                    :took, :timed_out, :shards
++        attr_reader :klass, :search
+ 
+         include Enumerable
+ 
+@@ -27,9 +26,7 @@ module Elasticsearch
+         # @return [Hash]
+         #
+         def response
+-          @response ||= begin
+-            HashWrapper.new(search.execute!)
+-          end
++          @response ||= HashWrapper.new(search.execute!)
+         end
+ 
+         # Returns the collection of "hits" from Elasticsearch
+@@ -51,31 +48,35 @@ module Elasticsearch
+         # Returns the "took" time
+         #
+         def took
+-          response['took']
++          raw_response['took']
+         end
+ 
+         # Returns whether the response timed out
+         #
+         def timed_out
+-          response['timed_out']
++          raw_response['timed_out']
+         end
+ 
+         # Returns the statistics on shards
+         #
+         def shards
+-          HashWrapper.new(response['_shards'])
++          @shards ||= response['_shards']
+         end
+ 
+         # Returns a Hashie::Mash of the aggregations
+         #
+         def aggregations
+-          Aggregations.new(response['aggregations'])
++          @aggregations ||= Aggregations.new(raw_response['aggregations'])
+         end
+ 
+         # Returns a Hashie::Mash of the suggestions
+         #
+         def suggestions
+-          Suggestions.new(response['suggest'])
++          @suggestions ||= Suggestions.new(raw_response['suggest'])
++        end
++
++        def raw_response
++          @raw_response ||= @response ? @response.to_hash : search.execute!
+         end
+       end
+     end
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response/aggregations.rb b/elasticsearch-model/lib/elasticsearch/model/response/aggregations.rb
+index 43dfd23e8e555e1642cdf265f6b7ea0c12e91cd0..c2dd23c67d3d057d60705d79910d1da034595bed 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/response/aggregations.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/response/aggregations.rb
+@@ -2,7 +2,7 @@ module Elasticsearch
+   module Model
+     module Response
+ 
+-      class Aggregations < Hashie::Mash
++      class Aggregations < HashWrapper
+         disable_warnings if respond_to?(:disable_warnings)
+ 
+         def initialize(attributes={})
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response/base.rb b/elasticsearch-model/lib/elasticsearch/model/response/base.rb
+index 3bb8005b63954e702b01aba210b20a0090c96588..71207052b47a8b7a38f3d57a87989a8c495d21dd 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/response/base.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/response/base.rb
+@@ -4,7 +4,7 @@ module Elasticsearch
+       # Common funtionality for classes in the {Elasticsearch::Model::Response} module
+       #
+       module Base
+-        attr_reader :klass, :response
++        attr_reader :klass, :response, :raw_response
+ 
+         # @param klass    [Class] The name of the model class
+         # @param response [Hash]  The full response returned from Elasticsearch client
+@@ -12,7 +12,8 @@ module Elasticsearch
+         #
+         def initialize(klass, response, options={})
+           @klass     = klass
+-          @response  = response
++          @raw_response = response
++          @response = response
+         end
+ 
+         # @abstract Implement this method in specific class
+@@ -30,7 +31,11 @@ module Elasticsearch
+         # Returns the total number of hits
+         #
+         def total
+-          response.response['hits']['total']
++          if response.response['hits']['total'].respond_to?(:keys)
++            response.response['hits']['total']['value']
++          else
++            response.response['hits']['total']
++          end
+         end
+ 
+         # Returns the max_score
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response/pagination.rb b/elasticsearch-model/lib/elasticsearch/model/response/pagination.rb
+index c8e74b7934ea57f74293a209147bcd734dfb36dc..82f1301a56e6a6f6ef1873866e2eca0d3905bb48 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/response/pagination.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/response/pagination.rb
+@@ -1,192 +1,2 @@
+-module Elasticsearch
+-  module Model
+-    module Response
+-
+-      # Pagination for search results/records
+-      #
+-      module Pagination
+-        # Allow models to be paginated with the "kaminari" gem [https://github.com/amatsuda/kaminari]
+-        #
+-        module Kaminari
+-          def self.included(base)
+-            # Include the Kaminari configuration and paging method in response
+-            #
+-            base.__send__ :include, ::Kaminari::ConfigurationMethods::ClassMethods
+-            base.__send__ :include, ::Kaminari::PageScopeMethods
+-
+-            # Include the Kaminari paging methods in results and records
+-            #
+-            Elasticsearch::Model::Response::Results.__send__ :include, ::Kaminari::ConfigurationMethods::ClassMethods
+-            Elasticsearch::Model::Response::Results.__send__ :include, ::Kaminari::PageScopeMethods
+-            Elasticsearch::Model::Response::Records.__send__ :include, ::Kaminari::PageScopeMethods
+-
+-            Elasticsearch::Model::Response::Results.__send__ :delegate, :limit_value, :offset_value, :total_count, :max_pages, to: :response
+-            Elasticsearch::Model::Response::Records.__send__ :delegate, :limit_value, :offset_value, :total_count, :max_pages, to: :response
+-
+-            base.class_eval <<-RUBY, __FILE__, __LINE__ + 1
+-              # Define the `page` Kaminari method
+-              #
+-              def #{::Kaminari.config.page_method_name}(num=nil)
+-                @results  = nil
+-                @records  = nil
+-                @response = nil
+-                @page     = [num.to_i, 1].max
+-                @per_page ||= __default_per_page
+-
+-                self.search.definition.update size: @per_page,
+-                                              from: @per_page * (@page - 1)
+-
+-                self
+-              end
+-            RUBY
+-          end
+-
+-          # Returns the current "limit" (`size`) value
+-          #
+-          def limit_value
+-            case
+-              when search.definition[:size]
+-                search.definition[:size]
+-              else
+-                __default_per_page
+-            end
+-          end
+-
+-          # Returns the current "offset" (`from`) value
+-          #
+-          def offset_value
+-            case
+-              when search.definition[:from]
+-                search.definition[:from]
+-              else
+-                0
+-            end
+-          end
+-
+-          # Set the "limit" (`size`) value
+-          #
+-          def limit(value)
+-            return self if value.to_i <= 0
+-            @results  = nil
+-            @records  = nil
+-            @response = nil
+-            @per_page = value.to_i
+-
+-            search.definition.update :size => @per_page
+-            search.definition.update :from => @per_page * (@page - 1) if @page
+-            self
+-          end
+-
+-          # Set the "offset" (`from`) value
+-          #
+-          def offset(value)
+-            return self if value.to_i < 0
+-            @results  = nil
+-            @records  = nil
+-            @response = nil
+-            @page     = nil
+-            search.definition.update :from => value.to_i
+-            self
+-          end
+-
+-          # Returns the total number of results
+-          #
+-          def total_count
+-            results.total
+-          end
+-
+-          # Returns the models's `per_page` value or the default
+-          #
+-          # @api private
+-          #
+-          def __default_per_page
+-            klass.respond_to?(:default_per_page) && klass.default_per_page || ::Kaminari.config.default_per_page
+-          end
+-        end
+-
+-        # Allow models to be paginated with the "will_paginate" gem [https://github.com/mislav/will_paginate]
+-        #
+-        module WillPaginate
+-          def self.included(base)
+-            base.__send__ :include, ::WillPaginate::CollectionMethods
+-
+-            # Include the paging methods in results and records
+-            #
+-            methods = [:current_page, :offset, :length, :per_page, :total_entries, :total_pages, :previous_page, :next_page, :out_of_bounds?]
+-            Elasticsearch::Model::Response::Results.__send__ :delegate, *methods, to: :response
+-            Elasticsearch::Model::Response::Records.__send__ :delegate, *methods, to: :response
+-          end
+-
+-          def offset
+-            (current_page - 1) * per_page
+-          end
+-
+-          def length
+-            search.definition[:size]
+-          end
+-
+-          # Main pagination method
+-          #
+-          # @example
+-          #
+-          #     Article.search('foo').paginate(page: 1, per_page: 30)
+-          #
+-          def paginate(options)
+-            param_name = options[:param_name] || :page
+-            page       = [options[param_name].to_i, 1].max
+-            per_page   = (options[:per_page] || __default_per_page).to_i
+-
+-            search.definition.update size: per_page,
+-                                     from: (page - 1) * per_page
+-            self
+-          end
+-
+-          # Return the current page
+-          #
+-          def current_page
+-            search.definition[:from] / per_page + 1 if search.definition[:from] && per_page
+-          end
+-
+-          # Pagination method
+-          #
+-          # @example
+-          #
+-          #     Article.search('foo').page(2)
+-          #
+-          def page(num)
+-            paginate(page: num, per_page: per_page) # shorthand
+-          end
+-
+-          # Return or set the "size" value
+-          #
+-          # @example
+-          #
+-          #     Article.search('foo').per_page(15).page(2)
+-          #
+-          def per_page(num = nil)
+-            if num.nil?
+-              search.definition[:size]
+-            else
+-              paginate(page: current_page, per_page: num) # shorthand
+-            end
+-          end
+-
+-          # Returns the total number of results
+-          #
+-          def total_entries
+-            results.total
+-          end
+-
+-          # Returns the models's `per_page` value or the default
+-          #
+-          # @api private
+-          #
+-          def __default_per_page
+-            klass.respond_to?(:per_page) && klass.per_page || ::WillPaginate.per_page
+-          end
+-        end
+-      end
+-
+-    end
+-  end
+-end
++require 'elasticsearch/model/response/pagination/kaminari'
++require 'elasticsearch/model/response/pagination/will_paginate'
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response/pagination/kaminari.rb b/elasticsearch-model/lib/elasticsearch/model/response/pagination/kaminari.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b1acfd9b1c3d5e7dee560af4f2f1660ef328a70
+--- /dev/null
++++ b/elasticsearch-model/lib/elasticsearch/model/response/pagination/kaminari.rb
+@@ -0,0 +1,109 @@
++module Elasticsearch
++  module Model
++    module Response
++
++      # Pagination for search results/records
++      #
++      module Pagination
++        # Allow models to be paginated with the "kaminari" gem [https://github.com/amatsuda/kaminari]
++        #
++        module Kaminari
++          def self.included(base)
++            # Include the Kaminari configuration and paging method in response
++            #
++            base.__send__ :include, ::Kaminari::ConfigurationMethods::ClassMethods
++            base.__send__ :include, ::Kaminari::PageScopeMethods
++
++            # Include the Kaminari paging methods in results and records
++            #
++            Elasticsearch::Model::Response::Results.__send__ :include, ::Kaminari::ConfigurationMethods::ClassMethods
++            Elasticsearch::Model::Response::Results.__send__ :include, ::Kaminari::PageScopeMethods
++            Elasticsearch::Model::Response::Records.__send__ :include, ::Kaminari::PageScopeMethods
++
++            Elasticsearch::Model::Response::Results.__send__ :delegate, :limit_value, :offset_value, :total_count, :max_pages, to: :response
++            Elasticsearch::Model::Response::Records.__send__ :delegate, :limit_value, :offset_value, :total_count, :max_pages, to: :response
++
++            base.class_eval <<-RUBY, __FILE__, __LINE__ + 1
++              # Define the `page` Kaminari method
++              #
++              def #{::Kaminari.config.page_method_name}(num=nil)
++                @results  = nil
++                @records  = nil
++                @response = nil
++                @page     = [num.to_i, 1].max
++                @per_page ||= __default_per_page
++
++                self.search.definition.update size: @per_page,
++                                              from: @per_page * (@page - 1)
++
++                self
++              end
++            RUBY
++          end
++
++          # Returns the current "limit" (`size`) value
++          #
++          def limit_value
++            case
++            when search.definition[:size]
++              search.definition[:size]
++            else
++              __default_per_page
++            end
++          end
++
++          # Returns the current "offset" (`from`) value
++          #
++          def offset_value
++            case
++            when search.definition[:from]
++              search.definition[:from]
++            else
++              0
++            end
++          end
++
++          # Set the "limit" (`size`) value
++          #
++          def limit(value)
++            return self if value.to_i <= 0
++            @results  = nil
++            @records  = nil
++            @response = nil
++            @per_page = value.to_i
++
++            search.definition.update :size => @per_page
++            search.definition.update :from => @per_page * (@page - 1) if @page
++            self
++          end
++
++          # Set the "offset" (`from`) value
++          #
++          def offset(value)
++            return self if value.to_i < 0
++            @results  = nil
++            @records  = nil
++            @response = nil
++            @page     = nil
++            search.definition.update :from => value.to_i
++            self
++          end
++
++          # Returns the total number of results
++          #
++          def total_count
++            results.total
++          end
++
++          # Returns the models's `per_page` value or the default
++          #
++          # @api private
++          #
++          def __default_per_page
++            klass.respond_to?(:default_per_page) && klass.default_per_page || ::Kaminari.config.default_per_page
++          end
++        end
++      end
++    end
++  end
++end
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response/pagination/will_paginate.rb b/elasticsearch-model/lib/elasticsearch/model/response/pagination/will_paginate.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..7cfc36d0c742b87ef921afb134e4c2126a7427ac
+--- /dev/null
++++ b/elasticsearch-model/lib/elasticsearch/model/response/pagination/will_paginate.rb
+@@ -0,0 +1,95 @@
++module Elasticsearch
++  module Model
++    module Response
++
++      # Pagination for search results/records
++      #
++      module Pagination
++
++
++        # Allow models to be paginated with the "will_paginate" gem [https://github.com/mislav/will_paginate]
++        #
++        module WillPaginate
++          def self.included(base)
++            base.__send__ :include, ::WillPaginate::CollectionMethods
++
++            # Include the paging methods in results and records
++            #
++            methods = [:current_page, :offset, :length, :per_page, :total_entries, :total_pages, :previous_page, :next_page, :out_of_bounds?]
++            Elasticsearch::Model::Response::Results.__send__ :delegate, *methods, to: :response
++            Elasticsearch::Model::Response::Records.__send__ :delegate, *methods, to: :response
++          end
++
++          def offset
++            (current_page - 1) * per_page
++          end
++
++          def length
++            search.definition[:size]
++          end
++
++          # Main pagination method
++          #
++          # @example
++          #
++          #     Article.search('foo').paginate(page: 1, per_page: 30)
++          #
++          def paginate(options)
++            param_name = options[:param_name] || :page
++            page       = [options[param_name].to_i, 1].max
++            per_page   = (options[:per_page] || __default_per_page).to_i
++
++            search.definition.update size: per_page,
++                                     from: (page - 1) * per_page
++            self
++          end
++
++          # Return the current page
++          #
++          def current_page
++            search.definition[:from] / per_page + 1 if search.definition[:from] && per_page
++          end
++
++          # Pagination method
++          #
++          # @example
++          #
++          #     Article.search('foo').page(2)
++          #
++          def page(num)
++            paginate(page: num, per_page: per_page) # shorthand
++          end
++
++          # Return or set the "size" value
++          #
++          # @example
++          #
++          #     Article.search('foo').per_page(15).page(2)
++          #
++          def per_page(num = nil)
++            if num.nil?
++              search.definition[:size]
++            else
++              paginate(page: current_page, per_page: num) # shorthand
++            end
++          end
++
++          # Returns the total number of results
++          #
++          def total_entries
++            results.total
++          end
++
++          # Returns the models's `per_page` value or the default
++          #
++          # @api private
++          #
++          def __default_per_page
++            klass.respond_to?(:per_page) && klass.per_page || ::WillPaginate.per_page
++          end
++        end
++      end
++
++    end
++  end
++end
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response/result.rb b/elasticsearch-model/lib/elasticsearch/model/response/result.rb
+index 01481d0e181f79db36c40d9100c78e03bd63b6a2..267ca6300a96643f6932aa69c849b56cd86b88e2 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/response/result.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/response/result.rb
+@@ -46,7 +46,7 @@ module Elasticsearch
+ 
+         # Respond to methods from `@result` or `@result._source`
+         #
+-        def respond_to?(method_name, include_private = false)
++        def respond_to_missing?(method_name, include_private = false)
+           @result.respond_to?(method_name.to_sym) || \
+           @result._source && @result._source.respond_to?(method_name.to_sym) || \
+           super
+diff --git a/elasticsearch-model/lib/elasticsearch/model/response/suggestions.rb b/elasticsearch-model/lib/elasticsearch/model/response/suggestions.rb
+index 1b1cc65986ec12edd1668f4136453c4bb944dfe7..b2809bb12d80f7c3d714011f6d027ffd9cbb6467 100644
+--- a/elasticsearch-model/lib/elasticsearch/model/response/suggestions.rb
++++ b/elasticsearch-model/lib/elasticsearch/model/response/suggestions.rb
+@@ -2,7 +2,7 @@ module Elasticsearch
+   module Model
+     module Response
+ 
+-      class Suggestions < Hashie::Mash
++      class Suggestions < HashWrapper
+         disable_warnings if respond_to?(:disable_warnings)
+ 
+         def terms
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence.rb b/elasticsearch-persistence/lib/elasticsearch/persistence.rb
+index 986ef1bc413b79fcf229f390182f8a67626f8bd5..ce0d25b6013de4b401b3d7f4f6cd7ce9c16d3655 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence.rb
+@@ -1,116 +1,8 @@
+ require 'hashie/mash'
+ 
+ require 'elasticsearch'
+-
+-require 'elasticsearch/model/hash_wrapper'
+-require 'elasticsearch/model/indexing'
+-require 'elasticsearch/model/searching'
+-
+-require 'active_support/inflector'
++require 'elasticsearch/model'
+ 
+ require 'elasticsearch/persistence/version'
+-
+-require 'elasticsearch/persistence/client'
+-require 'elasticsearch/persistence/repository/response/results'
+-require 'elasticsearch/persistence/repository/naming'
+-require 'elasticsearch/persistence/repository/serialize'
+-require 'elasticsearch/persistence/repository/store'
+-require 'elasticsearch/persistence/repository/find'
+-require 'elasticsearch/persistence/repository/search'
+-require 'elasticsearch/persistence/repository/class'
+ require 'elasticsearch/persistence/repository'
+-
+-module Elasticsearch
+-
+-  # Persistence for Ruby domain objects and models in Elasticsearch
+-  # ===============================================================
+-  #
+-  # `Elasticsearch::Persistence` contains modules for storing and retrieving Ruby domain objects and models
+-  # in Elasticsearch.
+-  #
+-  # == Repository
+-  #
+-  # The repository patterns allows to store and retrieve Ruby objects in Elasticsearch.
+-  #
+-  #     require 'elasticsearch/persistence'
+-  #
+-  #     class Note
+-  #       def to_hash; {foo: 'bar'}; end
+-  #     end
+-  #
+-  #     repository = Elasticsearch::Persistence::Repository.new
+-  #
+-  #     repository.save Note.new
+-  #     # => {"_index"=>"repository", "_type"=>"note", "_id"=>"mY108X9mSHajxIy2rzH2CA", ...}
+-  #
+-  # Customize your repository by including the main module in a Ruby class
+-  #     class MyRepository
+-  #       include Elasticsearch::Persistence::Repository
+-  #
+-  #       index 'my_notes'
+-  #       klass Note
+-  #
+-  #       client Elasticsearch::Client.new log: true
+-  #     end
+-  #
+-  #     repository = MyRepository.new
+-  #
+-  #     repository.save Note.new
+-  #     # 2014-04-04 22:15:25 +0200: POST http://localhost:9200/my_notes/note [status:201, request:0.009s, query:n/a]
+-  #     # 2014-04-04 22:15:25 +0200: > {"foo":"bar"}
+-  #     # 2014-04-04 22:15:25 +0200: < {"_index":"my_notes","_type":"note","_id":"-d28yXLFSlusnTxb13WIZQ", ...}
+-  #
+-  # == Model
+-  #
+-  # The active record pattern allows to use the interface familiar from ActiveRecord models:
+-  #
+-  #     require 'elasticsearch/persistence'
+-  #
+-  #     class Article
+-  #       attribute :title, String, mapping: { analyzer: 'snowball' }
+-  #     end
+-  #
+-  #     article = Article.new id: 1, title: 'Test'
+-  #     article.save
+-  #
+-  #     Article.find(1)
+-  #
+-  #     article.update_attributes title: 'Update'
+-  #
+-  #     article.destroy
+-  #
+-  module Persistence
+-
+-    # :nodoc:
+-    module ClassMethods
+-
+-      # Get or set the default client for all repositories and models
+-      #
+-      # @example Set and configure the default client
+-      #
+-      #     Elasticsearch::Persistence.client Elasticsearch::Client.new host: 'http://localhost:9200', tracer: true
+-      #
+-      # @example Perform an API request through the client
+-      #
+-      #     Elasticsearch::Persistence.client.cluster.health
+-      #     # => { "cluster_name" => "elasticsearch" ... }
+-      #
+-      def client client=nil
+-        @client = client || @client || Elasticsearch::Client.new
+-      end
+-
+-      # Set the default client for all repositories and models
+-      #
+-      # @example Set and configure the default client
+-      #
+-      #     Elasticsearch::Persistence.client = Elasticsearch::Client.new host: 'http://localhost:9200', tracer: true
+-      #     => #<Elasticsearch::Transport::Client:0x007f96a6dd0d80 @transport=... >
+-      #
+-      def client=(client)
+-        @client = client
+-      end
+-    end
+-
+-    extend ClassMethods
+-  end
+-end
++require 'elasticsearch/persistence/repository/response/results'
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/client.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/client.rb
+deleted file mode 100644
+index 3c9d618d421ad326c66a12b2d8bb5a0ddf1b2c7f..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/client.rb
++++ /dev/null
+@@ -1,51 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Repository
+-
+-      # Wraps the Elasticsearch Ruby
+-      # [client](https://github.com/elasticsearch/elasticsearch-ruby/tree/master/elasticsearch#usage)
+-      #
+-      module Client
+-
+-        # Get or set the default client for this repository
+-        #
+-        # @example Set and configure the client for the repository class
+-        #
+-        #     class MyRepository
+-        #       include Elasticsearch::Persistence::Repository
+-        #       client Elasticsearch::Client.new host: 'http://localhost:9200', log: true
+-        #     end
+-        #
+-        # @example Set and configure the client for this repository instance
+-        #
+-        #     repository.client Elasticsearch::Client.new host: 'http://localhost:9200', tracer: true
+-        #
+-        # @example Perform an API request through the client
+-        #
+-        #     MyRepository.client.cluster.health
+-        #     repository.client.cluster.health
+-        #     # => { "cluster_name" => "elasticsearch" ... }
+-        #
+-        def client client=nil
+-          @client = client || @client || Elasticsearch::Persistence.client
+-        end
+-
+-        # Set the default client for this repository
+-        #
+-        # @example Set and configure the client for the repository class
+-        #
+-        #     MyRepository.client = Elasticsearch::Client.new host: 'http://localhost:9200', log: true
+-        #
+-        # @example Set and configure the client for this repository instance
+-        #
+-        #     repository.client = Elasticsearch::Client.new host: 'http://localhost:9200', tracer: true
+-        #
+-        def client=(client)
+-          @client = client
+-          @client
+-        end
+-      end
+-
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/model.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/model.rb
+deleted file mode 100644
+index f6cd50eb0a2963be711654d28300bd1029c9e2b0..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/model.rb
++++ /dev/null
+@@ -1,135 +0,0 @@
+-require 'active_support/core_ext/module/delegation'
+-
+-require 'active_model'
+-require 'virtus'
+-
+-require 'elasticsearch/persistence'
+-require 'elasticsearch/persistence/model/base'
+-require 'elasticsearch/persistence/model/errors'
+-require 'elasticsearch/persistence/model/store'
+-require 'elasticsearch/persistence/model/find'
+-
+-module Elasticsearch
+-  module Persistence
+-
+-    # When included, extends a plain Ruby class with persistence-related features via the ActiveRecord pattern
+-    #
+-    # @example Include the repository in a custom class
+-    #
+-    #     require 'elasticsearch/persistence/model'
+-    #
+-    #     class MyObject
+-    #       include Elasticsearch::Persistence::Model
+-    #     end
+-    #
+-    module Model
+-      def self.included(base)
+-        base.class_eval do
+-          include ActiveModel::Naming
+-          include ActiveModel::Conversion
+-          include ActiveModel::Serialization
+-          include ActiveModel::Serializers::JSON
+-          include ActiveModel::Validations
+-
+-          include Virtus.model
+-
+-          extend  ActiveModel::Callbacks
+-          define_model_callbacks :create, :save, :update, :destroy
+-          define_model_callbacks :find, :touch, only: :after
+-
+-          include Elasticsearch::Persistence::Model::Base::InstanceMethods
+-
+-          extend  Elasticsearch::Persistence::Model::Store::ClassMethods
+-          include Elasticsearch::Persistence::Model::Store::InstanceMethods
+-
+-          extend  Elasticsearch::Persistence::Model::Find::ClassMethods
+-
+-          class << self
+-            # Re-define the Virtus' `attribute` method, to configure Elasticsearch mapping as well
+-            #
+-            def attribute(name, type=nil, options={}, &block)
+-              mapping = options.delete(:mapping) || {}
+-              super
+-
+-              gateway.mapping do
+-                indexes name, {type: Utils::lookup_type(type)}.merge(mapping)
+-              end
+-
+-              gateway.mapping(&block) if block_given?
+-            end
+-
+-            # Return the {Repository::Class} instance
+-            #
+-            def gateway(&block)
+-              @gateway ||= Elasticsearch::Persistence::Repository::Class.new host: self
+-              block.arity < 1 ? @gateway.instance_eval(&block) : block.call(@gateway) if block_given?
+-              @gateway
+-            end
+-
+-            # Delegate methods to repository
+-            #
+-            delegate :settings,
+-                     :mappings,
+-                     :mapping,
+-                     :document_type=,
+-                     :index_name,
+-                     :index_name=,
+-                     :find,
+-                     :exists?,
+-                     :create_index!,
+-                     :refresh_index!,
+-              to: :gateway
+-
+-            # forward document type to mappings when set
+-            def document_type(type = nil)
+-              return gateway.document_type unless type
+-              gateway.document_type type
+-              mapping.type = type
+-            end
+-          end
+-
+-          # Configure the repository based on the model (set up index_name, etc)
+-          #
+-          gateway do
+-            klass         base
+-            index_name    base.model_name.collection.gsub(/\//, '-')
+-            document_type base.model_name.element
+-
+-            def serialize(document)
+-              document.to_hash.except(:id, 'id')
+-            end
+-
+-            def deserialize(document)
+-              object = klass.new document['_source']
+-
+-              # Set the meta attributes when fetching the document from Elasticsearch
+-              #
+-              object.instance_variable_set :@_id,      document['_id']
+-              object.instance_variable_set :@_index,   document['_index']
+-              object.instance_variable_set :@_type,    document['_type']
+-              object.instance_variable_set :@_version, document['_version']
+-              object.instance_variable_set :@_source,  document['_source']
+-
+-              # Store the "hit" information (highlighting, score, ...)
+-              #
+-              object.instance_variable_set :@hit,
+-                 Elasticsearch::Model::HashWrapper.new(document.except('_index', '_type', '_id', '_version', '_source'))
+-
+-              object.instance_variable_set(:@persisted, true)
+-              object
+-            end
+-          end
+-
+-          # Set up common attributes
+-          #
+-          attribute :created_at, Time, default: lambda { |o,a| Time.now.utc }
+-          attribute :updated_at, Time, default: lambda { |o,a| Time.now.utc }
+-
+-          attr_reader :hit
+-        end
+-
+-      end
+-    end
+-
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/model/base.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/model/base.rb
+deleted file mode 100644
+index a0af32411fa0051ff403221d174ad182a758d9ac..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/model/base.rb
++++ /dev/null
+@@ -1,87 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Model
+-      # This module contains the base interface for models
+-      #
+-      module Base
+-        module InstanceMethods
+-
+-          # Model initializer sets the `@id` variable if passed
+-          #
+-          def initialize(attributes={})
+-            @_id = attributes[:id] || attributes['id']
+-            super
+-          end
+-
+-          # Return model attributes as a Hash, merging in the `id`
+-          #
+-          def attributes
+-            super.merge id: id
+-          end
+-
+-          # Return the document `_id`
+-          #
+-          def id
+-            @_id
+-          end; alias :_id :id
+-
+-          # Set the document `_id`
+-          #
+-          def id=(value)
+-            @_id = value
+-          end; alias :_id= :id=
+-
+-          # Return the document `_index`
+-          #
+-          def _index
+-            @_index
+-          end
+-
+-          # Return the document `_type`
+-          #
+-          def _type
+-            @_type
+-          end
+-
+-          # Return the document `_version`
+-          #
+-          def _version
+-            @_version
+-          end
+-
+-          # Return the raw document `_source`
+-          #
+-          def _source
+-            @_source
+-          end
+-
+-          def to_s
+-            "#<#{self.class} #{attributes.to_hash.inspect.gsub(/:(\w+)=>/, '\1: ')}>"
+-          end; alias :inspect :to_s
+-        end
+-      end
+-
+-      # Utility methods for {Elasticsearch::Persistence::Model}
+-      #
+-      module Utils
+-
+-        # Return Elasticsearch type based on passed Ruby class (used in the `attribute` method)
+-        #
+-        def lookup_type(type)
+-          case
+-            when type == String
+-              'text'
+-            when type == Integer
+-              'integer'
+-            when type == Float
+-              'float'
+-            when type == Date || type == Time || type == DateTime
+-              'date'
+-            when type == Virtus::Attribute::Boolean
+-              'boolean'
+-          end
+-        end; module_function :lookup_type
+-      end
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/model/errors.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/model/errors.rb
+deleted file mode 100644
+index 3d8ebb88ec7367a4477b8dcc06324ab647372da4..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/model/errors.rb
++++ /dev/null
+@@ -1,8 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Model
+-      class DocumentNotSaved     < StandardError; end
+-      class DocumentNotPersisted < StandardError; end
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/model/find.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/model/find.rb
+deleted file mode 100644
+index c09c9ac3846b66c74272f1362cc3ed561c5917ee..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/model/find.rb
++++ /dev/null
+@@ -1,180 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Model
+-
+-      module Find
+-        class SearchRequest < Elasticsearch::Model::Searching::SearchRequest
+-          def execute!
+-            klass.gateway.search(definition[:body] || definition[:q], options)
+-          end
+-        end
+-
+-        module ClassMethods
+-
+-          def search(query_or_definition, options={})
+-            SearchRequest.new(self, query_or_definition, options).execute!
+-          end
+-
+-          # Returns all models (up to 10,000)
+-          #
+-          # @example Retrieve all people
+-          #
+-          #     Person.all
+-          #     # => [#<Person:0x007ff1d8fb04b0 ... ]
+-          #
+-          # @example Retrieve all people matching a query
+-          #
+-          #     Person.all query: { match: { last_name: 'Smith'  } }
+-          #     # => [#<Person:0x007ff1d8fb04b0 ... ]
+-          #
+-          def all(query={ query: { match_all: {} } }, options={})
+-            query[:size] ||= 10_000
+-            search(query, options)
+-          end
+-
+-          # Returns the number of models
+-          #
+-          # @example Return the count of all models
+-          #
+-          #     Person.count
+-          #     # => 2
+-          #
+-          # @example Return the count of models matching a simple query
+-          #
+-          #     Person.count('fox or dog')
+-          #     # => 1
+-          #
+-          # @example Return the count of models matching a query in the Elasticsearch DSL
+-          #
+-          #    Person.search(query: { match: { title: 'fox dog' } })
+-          #    # => 1
+-          #
+-          # @return [Integer]
+-          #
+-          def count(query_or_definition=nil, options={})
+-            gateway.count( query_or_definition, options )
+-          end
+-
+-          # Returns all models efficiently via the Elasticsearch's scroll API
+-          #
+-          # You can restrict the models being returned with a query.
+-          #
+-          # The {http://rubydoc.info/gems/elasticsearch-api/Elasticsearch/API/Actions#search-instance_method Search API}
+-          # options are passed to the search method as parameters, all remaining options are passed
+-          # as the `:body` parameter.
+-          #
+-          # The full {Persistence::Repository::Response::Results} instance is yielded to the passed
+-          # block in each batch, so you can access any of its properties; calling `to_a` will
+-          # convert the object to an Array of model instances.
+-          #
+-          # @example Return all models in batches of 20 x number of primary shards
+-          #
+-          #     Person.find_in_batches { |batch| puts batch.map(&:name) }
+-          #
+-          # @example Return all models in batches of 100 x number of primary shards
+-          #
+-          #     Person.find_in_batches(size: 100) { |batch| puts batch.map(&:name) }
+-          #
+-          # @example Return all models matching a specific query
+-          #
+-          #      Person.find_in_batches(query: { match: { name: 'test' } }) { |batch| puts batch.map(&:name) }
+-          #
+-          # @example Return all models, fetching only the `name` attribute from Elasticsearch
+-          #
+-          #      Person.find_in_batches( _source_include: 'name') { |_| puts _.response.hits.hits.map(&:to_hash) }
+-          #
+-          # @example Leave out the block to return an Enumerator instance
+-          #
+-          #      Person.find_in_batches(size: 100).map { |batch| batch.size }
+-          #      # => [100, 100, 100, ... ]
+-          #
+-          # @return [String,Enumerator] The `scroll_id` for the request or Enumerator when the block is not passed
+-          #
+-          def find_in_batches(options={}, &block)
+-            return to_enum(:find_in_batches, options) unless block_given?
+-
+-            search_params = options.extract!(
+-              :index,
+-              :type,
+-              :scroll,
+-              :size,
+-              :explain,
+-              :ignore_indices,
+-              :ignore_unavailable,
+-              :allow_no_indices,
+-              :expand_wildcards,
+-              :preference,
+-              :q,
+-              :routing,
+-              :source,
+-              :_source,
+-              :_source_include,
+-              :_source_exclude,
+-              :stats,
+-              :timeout)
+-
+-            scroll = search_params.delete(:scroll) || '5m'
+-
+-            body = options
+-
+-            # Get the initial batch of documents and the scroll_id
+-            #
+-            response = gateway.client.search( {
+-                                         index: gateway.index_name,
+-                                         type:  gateway.document_type,
+-                                         scroll: scroll,
+-                                         sort:   ['_doc'],
+-                                         size:   20,
+-                                         body:   body }.merge(search_params) )
+-
+-
+-            # Scroll the search object and break when receiving an empty array of hits
+-            #
+-            while response['hits']['hits'].any? do
+-              yield Repository::Response::Results.new(gateway, response)
+-
+-              response = gateway.client.scroll( { scroll_id: response['_scroll_id'], scroll: scroll } )
+-            end
+-
+-            return response['_scroll_id']
+-          end
+-
+-          # Iterate effectively over models using the `find_in_batches` method.
+-          #
+-          # All the options are passed to `find_in_batches` and each result is yielded to the passed block.
+-          #
+-          # @example Print out the people's names by scrolling through the index
+-          #
+-          #     Person.find_each { |person| puts person.name }
+-          #
+-          #     # # GET http://localhost:9200/people/person/_search?scroll=5m&size=20
+-          #     # # GET http://localhost:9200/_search/scroll?scroll=5m&scroll_id=c2Nhbj...
+-          #     # Test 0
+-          #     # Test 1
+-          #     # Test 2
+-          #     # ...
+-          #     # # GET http://localhost:9200/_search/scroll?scroll=5m&scroll_id=c2Nhbj...
+-          #     # Test 20
+-          #     # Test 21
+-          #     # Test 22
+-          #
+-          # @example Leave out the block to return an Enumerator instance
+-          #
+-          #     Person.find_each.select { |person| person.name =~ /John/ }
+-          #     # => => [#<Person {id: "NkltJP5vRxqk9_RMP7SU8Q", name: "John Smith",  ...}>]
+-          #
+-          # @return [String,Enumerator] The `scroll_id` for the request or Enumerator when the block is not passed
+-          #
+-          def find_each(options = {})
+-            return to_enum(:find_each, options) unless block_given?
+-
+-            find_in_batches(options) do |batch|
+-              batch.each { |result| yield result }
+-            end
+-          end
+-        end
+-      end
+-
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/model/rails.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/model/rails.rb
+deleted file mode 100644
+index 5ed510e21073d774f323e556ccd43fcababf7eef..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/model/rails.rb
++++ /dev/null
+@@ -1,47 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Model
+-
+-      # Make the `Persistence::Model` models compatible with Ruby On Rails applications
+-      #
+-      module Rails
+-        def self.included(base)
+-          base.class_eval do
+-
+-            def initialize(attributes={})
+-              super(__convert_rails_dates(attributes))
+-            end
+-
+-            def update(attributes={}, options={})
+-              super(__convert_rails_dates(attributes), options)
+-            end
+-          end
+-        end
+-
+-        # Decorates the passed in `attributes` so they extract the date & time values from Rails forms
+-        #
+-        # @example Correctly combine the date and time to a datetime string
+-        #
+-        #     params = { "published_on(1i)"=>"2014",
+-        #                      "published_on(2i)"=>"1",
+-        #                      "published_on(3i)"=>"1",
+-        #                      "published_on(4i)"=>"12",
+-        #                      "published_on(5i)"=>"00"
+-        #                     }
+-        #     MyRailsModel.new(params).published_on.iso8601
+-        #     # => "2014-01-01T12:00:00+00:00"
+-        #
+-        def __convert_rails_dates(attributes={})
+-          day = attributes.select { |p| p =~ /\([1-3]/ }.reduce({}) { |sum, item| (sum[item.first.gsub(/\(.+\)/, '')] ||= '' )<< item.last+'-'; sum  }
+-          time = attributes.select { |p| p =~ /\([4-6]/ }.reduce({}) { |sum, item| (sum[item.first.gsub(/\(.+\)/, '')] ||= '' )<< item.last+':'; sum  }
+-          unless day.empty?
+-            attributes.update day.reduce({}) { |sum, item| sum[item.first] = item.last; sum[item.first] += ' ' + time[item.first] unless time.empty?; sum }
+-          end
+-
+-          return attributes
+-        end; module_function :__convert_rails_dates
+-      end
+-
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/model/store.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/model/store.rb
+deleted file mode 100644
+index a6c44c998c9f1893a74ffcdb14a251c8ce0a3874..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/model/store.rb
++++ /dev/null
+@@ -1,254 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Model
+-
+-      # This module contains the storage related features of {Elasticsearch::Persistence::Model}
+-      #
+-      module Store
+-        module ClassMethods #:nodoc:
+-
+-          # Creates a class instance, saves it, if validations pass, and returns it
+-          #
+-          # @example Create a new person
+-          #
+-          #     Person.create name: 'John Smith'
+-          #     # => #<Person:0x007f889e302b30 ... @id="bG7yQDAXRhCi3ZfVcx6oAA", @name="John Smith" ...>
+-          #
+-          # @return [Object] The model instance
+-          #
+-          def create(attributes, options={})
+-            object = self.new(attributes)
+-            object.run_callbacks :create do
+-              object.save(options)
+-              object
+-            end
+-          end
+-        end
+-
+-        module InstanceMethods
+-
+-          # Saves the model (if validations pass) and returns the response (or `false`)
+-          #
+-          # @example Save a valid model instance
+-          #
+-          #     p = Person.new(name: 'John')
+-          #     p.save
+-          #     => {"_index"=>"people", ... "_id"=>"RzFSXFR0R8u1CZIWNs2Gvg", "_version"=>1, "created"=>true}
+-          #
+-          # @example Save an invalid model instance
+-          #
+-          #     p = Person.new(name: nil)
+-          #     p.save
+-          #     # => false
+-          #
+-          # @return [Hash,FalseClass] The Elasticsearch response as a Hash or `false`
+-          #
+-          def save(options={})
+-            unless options.delete(:validate) == false
+-              return false unless valid?
+-            end
+-
+-            run_callbacks :save do
+-              options.update id: self.id
+-              options.update index: self._index if self._index
+-              options.update type:  self._type  if self._type
+-
+-              self[:updated_at] = Time.now.utc
+-
+-              response = self.class.gateway.save(self, options)
+-
+-              @_id       = response['_id']
+-              @_index    = response['_index']
+-              @_type     = response['_type']
+-              @_version  = response['_version']
+-              @persisted = true
+-
+-              response
+-            end
+-          end
+-
+-          # Deletes the model from Elasticsearch (if it's persisted), freezes it, and returns the response
+-          #
+-          # @example Delete a model instance
+-          #
+-          #     p.destroy
+-          #     => {"_index"=>"people", ... "_id"=>"RzFSXFR0R8u1CZIWNs2Gvg", "_version"=>2 ...}
+-          #
+-          # @return [Hash] The Elasticsearch response as a Hash
+-          #
+-          def destroy(options={})
+-            raise DocumentNotPersisted, "Object not persisted: #{self.inspect}" unless persisted?
+-
+-            run_callbacks :destroy do
+-              options.update index: self._index if self._index
+-              options.update type:  self._type  if self._type
+-
+-              response = self.class.gateway.delete(self.id, options)
+-
+-              @destroyed = true
+-              @persisted = false
+-              self.freeze
+-              response
+-            end
+-          end; alias :delete :destroy
+-
+-          # Updates the model (via Elasticsearch's "Update" API) and returns the response
+-          #
+-          # @example Update a model with partial attributes
+-          #
+-          #     p.update name: 'UPDATED'
+-          #     => {"_index"=>"people", ... "_version"=>2}
+-          #
+-          # @example Pass a version for concurrency control
+-          #
+-          #     p.update( { name: 'UPDATED' }, { version: 2 } )
+-          #     => {"_index"=>"people", ... "_version"=>3}
+-          #
+-          # @example An exception is raised when the version doesn't match
+-          #
+-          #     p.update( { name: 'UPDATED' }, { version: 2 } )
+-          #     => Elasticsearch::Transport::Transport::Errors::Conflict: [409] {"error" ... }
+-          #
+-          # @return [Hash] The Elasticsearch response as a Hash
+-          #
+-          def update(attributes={}, options={})
+-            unless options.delete(:validate) == false
+-              return false unless valid?
+-            end
+-            raise DocumentNotPersisted, "Object not persisted: #{self.inspect}" unless persisted?
+-
+-            run_callbacks :update do
+-              options.update index: self._index if self._index
+-              options.update type:  self._type  if self._type
+-
+-              attributes.update( { updated_at: Time.now.utc } )
+-              response = self.class.gateway.update(self.id, { doc: attributes}.merge(options))
+-
+-              self.attributes = self.attributes.merge(attributes)
+-              @_index    = response['_index']
+-              @_type     = response['_type']
+-              @_version  = response['_version']
+-
+-              response
+-            end
+-          end; alias :update_attributes :update
+-
+-          # Increments a numeric attribute (via Elasticsearch's "Update" API) and returns the response
+-          #
+-          # @example Increment the `salary` attribute by 1
+-          #
+-          #     p.increment :salary
+-          #
+-          # @example Increment the `salary` attribute by 100
+-          #
+-          #     p.increment :salary, 100
+-          #
+-          # @return [Hash] The Elasticsearch response as a Hash
+-          #
+-          def increment(attribute, value=1, options={})
+-            raise DocumentNotPersisted, "Object not persisted: #{self.inspect}" unless persisted?
+-
+-            options.update index: self._index if self._index
+-            options.update type:  self._type  if self._type
+-
+-            response = self.class.gateway.update(self.id, { script: "ctx._source.#{attribute} += #{value}"}.merge(options))
+-
+-            self[attribute] += value
+-
+-            @_index    = response['_index']
+-            @_type     = response['_type']
+-            @_version  = response['_version']
+-
+-            response
+-          end
+-
+-          # Decrements a numeric attribute (via Elasticsearch's "Update" API) and returns the response
+-          #
+-          # @example Decrement the `salary` attribute by 1
+-          #
+-          #     p.decrement :salary
+-          #
+-          # @example Decrement the `salary` attribute by 100
+-          #
+-          #     p.decrement :salary, 100
+-          #
+-          # @return [Hash] The Elasticsearch response as a Hash
+-          #
+-          def decrement(attribute, value=1, options={})
+-            raise DocumentNotPersisted, "Object not persisted: #{self.inspect}" unless persisted?
+-
+-            options.update index: self._index if self._index
+-            options.update type:  self._type  if self._type
+-
+-            response = self.class.gateway.update(self.id, { script: "ctx._source.#{attribute} = ctx._source.#{attribute} - #{value}"}.merge(options))
+-            self[attribute] -= value
+-
+-            @_index    = response['_index']
+-            @_type     = response['_type']
+-            @_version  = response['_version']
+-
+-            response
+-          end
+-
+-          # Updates the `updated_at` attribute, saves the model and returns the response
+-          #
+-          # @example Update the `updated_at` attribute (default)
+-          #
+-          #     p.touch
+-          #
+-          # @example Update a custom attribute: `saved_on`
+-          #
+-          #     p.touch :saved_on
+-          #
+-          # @return [Hash] The Elasticsearch response as a Hash
+-          #
+-          def touch(attribute=:updated_at, options={})
+-            raise DocumentNotPersisted, "Object not persisted: #{self.inspect}"  unless persisted?
+-            raise ArgumentError, "Object does not have '#{attribute}' attribute" unless respond_to?(attribute)
+-
+-            run_callbacks :touch do
+-              options.update index: self._index if self._index
+-              options.update type:  self._type  if self._type
+-
+-              value = Time.now.utc
+-              response = self.class.gateway.update(self.id, { doc: { attribute => value.iso8601 }}.merge(options))
+-
+-              self[attribute] = value
+-
+-              @_index    = response['_index']
+-              @_type     = response['_type']
+-              @_version  = response['_version']
+-
+-              response
+-            end
+-          end
+-
+-          # Returns true when the model has been destroyed, false otherwise
+-          #
+-          # @return [TrueClass,FalseClass]
+-          #
+-          def destroyed?
+-            !!@destroyed
+-          end
+-
+-          # Returns true when the model has been already saved to the database, false otherwise
+-          #
+-          # @return [TrueClass,FalseClass]
+-          #
+-          def persisted?
+-            !!@persisted && !destroyed?
+-          end
+-
+-          # Returns true when the model has not been saved yet, false otherwise
+-          #
+-          # @return [TrueClass,FalseClass]
+-          #
+-          def new_record?
+-            !persisted? && !destroyed?
+-          end
+-        end
+-      end
+-
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/model/utils.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/model/utils.rb
+deleted file mode 100644
+index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..0000000000000000000000000000000000000000
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository.rb
+index f6a2020292f7e02ddf1e1f4146a65043f69a40b0..a24a1564ffe1baf1e50e96376eb17b2031c30cb7 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/repository.rb
+@@ -1,77 +1,215 @@
++require 'elasticsearch/persistence/repository/dsl'
++require 'elasticsearch/persistence/repository/find'
++require 'elasticsearch/persistence/repository/store'
++require 'elasticsearch/persistence/repository/serialize'
++require 'elasticsearch/persistence/repository/search'
++
+ module Elasticsearch
+   module Persistence
+ 
+-    # Delegate methods to the repository (acting as a gateway)
++    # The base Repository mixin. This module should be included in classes that
++    # represent an Elasticsearch repository.
+     #
+-    module GatewayDelegation
+-      def method_missing(method_name, *arguments, &block)
+-        gateway.respond_to?(method_name) ? gateway.__send__(method_name, *arguments, &block) : super
+-      end
+-
+-      def respond_to?(method_name, include_private=false)
+-        gateway.respond_to?(method_name) || super
+-      end
++    # @since 6.0.0
++    module Repository
++      include Store
++      include Serialize
++      include Find
++      include Search
++      include Elasticsearch::Model::Indexing::ClassMethods
+ 
+-      def respond_to_missing?(method_name, *)
+-        gateway.respond_to?(method_name) || super
++      def self.included(base)
++        base.send(:extend, ClassMethods)
+       end
+-    end
+ 
+-    # When included, creates an instance of the {Repository::Class Repository} class as a "gateway"
+-    #
+-    # @example Include the repository in a custom class
+-    #
+-    #     require 'elasticsearch/persistence'
+-    #
+-    #     class MyRepository
+-    #       include Elasticsearch::Persistence::Repository
+-    #     end
+-    #
+-    module Repository
+-      def self.included(base)
+-        gateway = Elasticsearch::Persistence::Repository::Class.new host: base
++      module ClassMethods
+ 
+-        # Define the instance level gateway
++        # Initialize a repository instance. Optionally provide a block to define index mappings or
++        #   settings on the repository instance.
++        #
++        # @example Create a new repository.
++        #   MyRepository.create(index_name: 'notes', klass: Note)
+         #
+-        base.class_eval do
+-          define_method :gateway do
+-            @gateway ||= gateway
++        # @example Create a new repository and evaluate a block on it.
++        #   MyRepository.create(index_name: 'notes', klass: Note) do
++        #     mapping dynamic: 'strict' do
++        #       indexes :title
++        #     end
++        #   end
++        #
++        # @param [ Hash ] options The options to use.
++        # @param [ Proc ] block A block to evaluate on the new repository instance.
++        #
++        # @option options [ Symbol, String ] :index_name The name of the index.
++        # @option options [ Symbol, String ] :document_type The type of documents persisted in this repository.
++        # @option options [ Symbol, String ] :client The client used to handle requests to and from Elasticsearch.
++        # @option options [ Symbol, String ] :klass The class used to instantiate an object when documents are
++        #   deserialized. The default is nil, in which case the raw document will be returned as a Hash.
++        # @option options [ Elasticsearch::Model::Indexing::Mappings, Hash ] :mapping The mapping for this index.
++        # @option options [ Elasticsearch::Model::Indexing::Settings, Hash ] :settings The settings for this index.
++        #
++        # @since 6.0.0
++        def create(options = {}, &block)
++          new(options).tap do |obj|
++            obj.instance_eval(&block) if block_given?
+           end
+-
+-          include GatewayDelegation
+         end
++      end
+ 
+-        # Define the class level gateway
+-        #
+-        (class << base; self; end).class_eval do
+-          define_method :gateway do |&block|
+-            @gateway ||= gateway
+-            @gateway.instance_eval(&block) if block
+-            @gateway
+-          end
++      # The default index name.
++      #
++      # @return [ String ] The default index name.
++      #
++      # @since 6.0.0
++      DEFAULT_INDEX_NAME = 'repository'.freeze
+ 
+-          include GatewayDelegation
+-        end
++      # The repository options.
++      #
++      # @return [ Hash ]
++      #
++      # @since 6.0.0
++      attr_reader :options
+ 
+-        # Catch repository methods (such as `serialize` and others) defined in the receiving class,
+-        # and overload the default definition in the gateway
+-        #
+-        def base.method_added(name)
+-          if :gateway != name && respond_to?(:gateway) && (gateway.public_methods - Object.public_methods).include?(name)
+-            gateway.define_singleton_method(name, self.new.method(name).to_proc)
++      # Initialize a repository instance.
++      #
++      # @example Initialize the repository.
++      #   MyRepository.new(index_name: 'notes', klass: Note)
++      #
++      # @param [ Hash ] options The options to use.
++      #
++      # @option options [ Symbol, String ] :index_name The name of the index.
++      # @option options [ Symbol, String ] :document_type The type of documents persisted in this repository.
++      # @option options [ Symbol, String ] :client The client used to handle requests to and from Elasticsearch.
++      # @option options [ Symbol, String ] :klass The class used to instantiate an object when documents are
++      #   deserialized. The default is nil, in which case the raw document will be returned as a Hash.
++      # @option options [ Elasticsearch::Model::Indexing::Mappings, Hash ] :mapping The mapping for this index.
++      # @option options [ Elasticsearch::Model::Indexing::Settings, Hash ] :settings The settings for this index.
++      #
++      # @since 6.0.0
++      def initialize(options = {})
++        @options = options
++      end
++
++      # Get the client used by the repository.
++      #
++      # @example
++      #   repository.client
++      #
++      # @return [ Elasticsearch::Transport::Client ] The repository's client.
++      #
++      # @since 6.0.0
++      def client
++        @client ||= @options[:client] ||
++                      __get_class_value(:client) ||
++                      Elasticsearch::Transport::Client.new
++      end
++
++      # Get the document type used by the repository object.
++      #
++      # @example
++      #   repository.document_type
++      #
++      # @return [ String, Symbol ] The repository's document type.
++      #
++      # @since 6.0.0
++      def document_type
++        @document_type ||= @options[:document_type] ||
++                             __get_class_value(:document_type)
++      end
++
++      # Get the index name used by the repository.
++      #
++      # @example
++      #   repository.index_name
++      #
++      # @return [ String, Symbol ] The repository's index name.
++      #
++      # @since 6.0.0
++      def index_name
++        @index_name ||= @options[:index_name] ||
++                          __get_class_value(:index_name) ||
++                          DEFAULT_INDEX_NAME
++      end
++
++      # Get the class used by the repository when deserializing.
++      #
++      # @example
++      #   repository.klass
++      #
++      # @return [ Class ] The repository's klass for deserializing.
++      #
++      # @since 6.0.0
++      def klass
++        @klass ||= @options[:klass] || __get_class_value(:klass)
++      end
++
++      # Get the index mapping. Optionally pass a block to define the mappings.
++      #
++      # @example
++      #   repository.mapping
++      #
++      # @example Set the mappings with a block.
++      #     repository.mapping dynamic: 'strict' do
++      #       indexes :foo
++      #     end
++      #   end
++      #
++      # @note If mappings were set when the repository was created, a block passed to this
++      #   method will not be evaluated.
++      #
++      # @return [ Elasticsearch::Model::Indexing::Mappings ] The index mappings.
++      #
++      # @since 6.0.0
++      def mapping(*args)
++        @memoized_mapping ||= @options[:mapping] || (begin
++          if _mapping = __get_class_value(:mapping)
++            _mapping.instance_variable_set(:@type, document_type)
++            _mapping
+           end
+-        end
++        end) || (super && @mapping)
+       end
++      alias :mappings :mapping
+ 
+-      # Shortcut method to allow concise repository initialization
++      # Get the index settings.
+       #
+-      # @example Create a new default repository
++      # @example
++      #   repository.settings
+       #
+-      #     repository = Elasticsearch::Persistence::Repository.new
++      # @example Set the settings with a block.
++      #   repository.settings number_of_shards: 1, number_of_replicas: 0 do
++      #     mapping dynamic: 'strict' do
++      #       indexes :foo do
++      #         indexes :bar
++      #       end
++      #     end
++      #   end
+       #
+-      def new(options={}, &block)
+-        Elasticsearch::Persistence::Repository::Class.new( {index: 'repository'}.merge(options), &block )
+-      end; module_function :new
++      # @return [ Elasticsearch::Model::Indexing::Settings ] The index settings.
++      #
++      # @since 6.0.0
++      def settings(*args)
++        @memoized_settings ||= @options[:settings] || __get_class_value(:settings) || (super && @settings)
++      end
++
++      # Determine whether the index with this repository's index name exists.
++      #
++      # @example
++      #   repository.index_exists?
++      #
++      # @return [ true, false ] Whether the index exists.
++      #
++      # @since 6.0.0
++      def index_exists?(*args)
++        params = { index_name: index_name }
++        params.merge!(args.first) unless args.empty?
++        super(params)
++      end
++
++      private
++
++      def __get_class_value(_method_)
++        self.class.send(_method_) if self.class.respond_to?(_method_)
++      end
+     end
+   end
+ end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/class.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/class.rb
+deleted file mode 100644
+index 0dcd2d576e959c66e5932db54c710d20e81e3b82..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/class.rb
++++ /dev/null
+@@ -1,71 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Repository
+-
+-      # The default repository class, to be used either directly, or as a gateway in a custom repository class
+-      #
+-      # @example Standalone use
+-      #
+-      #     repository = Elasticsearch::Persistence::Repository::Class.new
+-      #     # => #<Elasticsearch::Persistence::Repository::Class ...>
+-      #     repository.save(my_object)
+-      #     # => {"_index"=> ... }
+-      #
+-      # @example Shortcut use
+-      #
+-      #     repository = Elasticsearch::Persistence::Repository.new
+-      #     # => #<Elasticsearch::Persistence::Repository::Class ...>
+-      #
+-      # @example Configuration via a block
+-      #
+-      #     repository = Elasticsearch::Persistence::Repository.new do
+-      #       index 'my_notes'
+-      #     end
+-      #
+-      #     # => #<Elasticsearch::Persistence::Repository::Class ...>
+-      #     # > repository.save(my_object)
+-      #     # => {"_index"=> ... }
+-      #
+-      # @example Accessing the gateway in a custom class
+-      #
+-      #     class MyRepository
+-      #       include Elasticsearch::Persistence::Repository
+-      #     end
+-      #
+-      #     repository = MyRepository.new
+-      #
+-      #     repository.gateway.client.info
+-      #     # => {"status"=>200, "name"=>"Venom", ... }
+-      #
+-      class Class
+-        include Elasticsearch::Persistence::Repository::Client
+-        include Elasticsearch::Persistence::Repository::Naming
+-        include Elasticsearch::Persistence::Repository::Serialize
+-        include Elasticsearch::Persistence::Repository::Store
+-        include Elasticsearch::Persistence::Repository::Find
+-        include Elasticsearch::Persistence::Repository::Search
+-
+-        include Elasticsearch::Model::Indexing::ClassMethods
+-
+-        attr_reader :options
+-
+-        def initialize(options={}, &block)
+-          @options = options
+-          index_name options.delete(:index)
+-          block.arity < 1 ? instance_eval(&block) : block.call(self) if block_given?
+-        end
+-
+-        # Return the "host" class, if this repository is a gateway hosted in another class
+-        #
+-        # @return [nil, Class]
+-        #
+-        # @api private
+-        #
+-        def host
+-          options[:host]
+-        end
+-      end
+-
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/dsl.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/dsl.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa993644466b5499e92ef0e74895a2af76bbac05
+--- /dev/null
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/dsl.rb
+@@ -0,0 +1,94 @@
++module Elasticsearch
++  module Persistence
++    module Repository
++
++      # Include this module to get class-level methods for repository configuration.
++      #
++      # @since 6.0.0
++      module DSL
++
++        def self.included(base)
++          base.send(:extend, Elasticsearch::Model::Indexing::ClassMethods)
++          base.send(:extend, ClassMethods)
++        end
++
++        # These methods are necessary to define at the class-level so that the methods available
++        # via Elasticsearch::Model::Indexing::ClassMethods have the references they depend on.
++        #
++        # @since 6.0.0
++        module ClassMethods
++
++          # Get or set the class-level document type setting.
++          #
++          # @example
++          #   MyRepository.document_type
++          #
++          # @return [ String, Symbol ] _type The repository's document type.
++          #
++          # @since 6.0.0
++          def document_type(_type = nil)
++            @document_type ||= _type
++          end
++
++          # Get or set the class-level index name setting.
++          #
++          # @example
++          #   MyRepository.index_name
++          #
++          # @return [ String, Symbol ] _name The repository's index name.
++          #
++          # @since 6.0.0
++          def index_name(_name = nil)
++            @index_name ||= (_name || DEFAULT_INDEX_NAME)
++          end
++
++          # Get or set the class-level setting for the class used by the repository when deserializing.
++          #
++          # @example
++          #   MyRepository.klass
++          #
++          # @return [ Class ] _class The repository's klass for deserializing.
++          #
++          # @since 6.0.0
++          def klass(_class = nil)
++            instance_variables.include?(:@klass) ? @klass : @klass = _class
++          end
++
++          # Get or set the class-level setting for the client used by the repository.
++          #
++          # @example
++          #   MyRepository.client
++          #
++          # @return [ Class ] _client The repository's client.
++          #
++          # @since 6.0.0
++          def client(_client = nil)
++            @client ||= (_client || Elasticsearch::Transport::Client.new)
++          end
++
++          def create_index!(*args)
++            __raise_not_implemented_error(__method__)
++          end
++
++          def delete_index!(*args)
++            __raise_not_implemented_error(__method__)
++          end
++
++          def refresh_index!(*args)
++            __raise_not_implemented_error(__method__)
++          end
++
++          def index_exists?(*args)
++            __raise_not_implemented_error(__method__)
++          end
++
++          private
++
++          def __raise_not_implemented_error(_method_)
++            raise NotImplementedError, "The '#{_method_}' method is not implemented on the Repository class."
++          end
++        end
++      end
++    end
++  end
++end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/find.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/find.rb
+index c6a9a6a4eed5bf1915b730f7acf43e5270f96a4c..cbd264ae2d9f5046591ddc75be6c262df33a31b7 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/find.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/find.rb
+@@ -40,19 +40,35 @@ module Elasticsearch
+         #     repository.exists?(1)
+         #     => true
+         #
++        # @param [ String, Integer ] id The id to search.
++        # @param [ Hash ] options The options.
++        #
+         # @return [true, false]
+         #
+         def exists?(id, options={})
+-          type     = document_type || (klass ? __get_type_from_class(klass) : '_all')
+-          client.exists( { index: index_name, type: type, id: id }.merge(options) )
++          request = { index: index_name, id: id }
++          request[:type] = document_type if document_type
++          client.exists(request.merge(options).reject { |key, _value| key == :type && document_type.nil? })
+         end
+ 
++        private
++
++        # The key for accessing the document found and returned from an
++        #   Elasticsearch _mget query.
++        #
++        DOCS = 'docs'.freeze
++
++        # The key for the boolean value indicating whether a particular id
++        #   has been successfully found in an Elasticsearch _mget query.
++        #
++        FOUND = 'found'.freeze
++
+         # @api private
+         #
+         def __find_one(id, options={})
+-          type     = document_type || (klass ? __get_type_from_class(klass) : '_all')
+-          document = client.get( { index: index_name, type: type, id: id }.merge(options) )
+-
++          request = { index: index_name, id: id }
++          request[:type] = document_type if document_type
++          document = client.get(request.merge(options))
+           deserialize(document)
+         rescue Elasticsearch::Transport::Transport::Errors::NotFound => e
+           raise DocumentNotFound, e.message, caller
+@@ -61,13 +77,14 @@ module Elasticsearch
+         # @api private
+         #
+         def __find_many(ids, options={})
+-          type     = document_type || (klass ? __get_type_from_class(klass) : '_all')
+-          documents = client.mget( { index: index_name, type: type, body: { ids: ids } }.merge(options) )
+-
+-          documents['docs'].map { |document| document['found'] ? deserialize(document) : nil }
++          request = { index: index_name, body: { ids: ids } }
++          request[:type] = document_type if document_type
++          documents = client.mget(request.merge(options))
++          documents[DOCS].map do |document|
++            deserialize(document) if document[FOUND]
++          end
+         end
+       end
+-
+     end
+   end
+ end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/naming.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/naming.rb
+deleted file mode 100644
+index 4c5794446fe17395c965d4a55cdf9972934db0c3..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/naming.rb
++++ /dev/null
+@@ -1,115 +0,0 @@
+-module Elasticsearch
+-  module Persistence
+-    module Repository
+-
+-      # Wraps all naming-related features of the repository (index name, the domain object class, etc)
+-      #
+-      module Naming
+-
+-        # Get or set the class used to initialize domain objects when deserializing them
+-        #
+-        def klass name=nil
+-          @klass = name || @klass
+-        end
+-
+-        # Set the class used to initialize domain objects when deserializing them
+-        #
+-        def klass=klass
+-          @klass = klass
+-        end
+-
+-        # Get or set the index name used when storing and retrieving documents
+-        #
+-        def index_name name=nil
+-          @index_name = name || @index_name || begin
+-            if respond_to?(:host) && host && host.is_a?(Module)
+-              self.host.to_s.underscore.gsub(/\//, '-')
+-            else
+-              self.class.to_s.underscore.gsub(/\//, '-')
+-            end
+-          end
+-        end; alias :index :index_name
+-
+-        # Set the index name used when storing and retrieving documents
+-        #
+-        def index_name=(name)
+-          @index_name = name
+-        end; alias :index= :index_name=
+-
+-        # Get or set the document type used when storing and retrieving documents
+-        #
+-        def document_type name=nil
+-          @document_type = name || @document_type || (klass ? klass.to_s.underscore : nil)
+-        end; alias :type :document_type
+-
+-        # Set the document type used when storing and retrieving documents
+-        #
+-        def document_type=(name)
+-          @document_type = name
+-        end; alias :type= :document_type=
+-
+-        # Get the Ruby class from the Elasticsearch `_type`
+-        #
+-        # @example
+-        #     repository.__get_klass_from_type 'note'
+-        #     => Note
+-        #
+-        # @return [Class] The class corresponding to the passed type
+-        # @raise [NameError] if the class cannot be found
+-        #
+-        # @api private
+-        #
+-        def __get_klass_from_type(type)
+-          klass = type.classify
+-          klass.constantize
+-        rescue NameError => e
+-          raise NameError, "Attempted to get class '#{klass}' from the '#{type}' type, but no such class can be found."
+-        end
+-
+-        # Get the Elasticsearch `_type` from the Ruby class
+-        #
+-        # @example
+-        #     repository.__get_type_from_class Note
+-        #     => "note"
+-        #
+-        # @return [String] The type corresponding to the passed class
+-        #
+-        # @api private
+-        #
+-        def __get_type_from_class(klass)
+-          klass.to_s.underscore
+-        end
+-
+-        # Get a document ID from the document (assuming Hash or Hash-like object)
+-        #
+-        # @example
+-        #     repository.__get_id_from_document title: 'Test', id: 'abc123'
+-        #     => "abc123"
+-        #
+-        # @api private
+-        #
+-        def __get_id_from_document(document)
+-          document[:id] || document['id'] || document[:_id] || document['_id']
+-        end
+-
+-        # Extract a document ID from the document (assuming Hash or Hash-like object)
+-        #
+-        # @note Calling this method will *remove* the `id` or `_id` key from the passed object.
+-        #
+-        # @example
+-        #     options = { title: 'Test', id: 'abc123' }
+-        #     repository.__extract_id_from_document options
+-        #     # => "abc123"
+-        #     options
+-        #     # => { title: 'Test' }
+-        #
+-        # @api private
+-        #
+-        def __extract_id_from_document(document)
+-          document.delete(:id) || document.delete('id') || document.delete(:_id) || document.delete('_id')
+-        end
+-      end
+-
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/response/results.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/response/results.rb
+index 73fb4f83692bfccf2b1287ba1ef6611df1b50a35..dfed623438e4098fd765f880c34e752b69c6d173 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/response/results.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/response/results.rb
+@@ -11,6 +11,23 @@ module Elasticsearch
+           include Enumerable
+ 
+           attr_reader :repository
++          attr_reader :raw_response
++
++          # The key for accessing the results in an Elasticsearch query response.
++          #
++          HITS = 'hits'.freeze
++
++          # The key for accessing the total number of hits in an Elasticsearch query response.
++          #
++          TOTAL = 'total'.freeze
++
++          # The key for accessing the value field in an Elasticsearch query response when 'total' is an object.
++          #
++          VALUE = 'value'.freeze
++
++          # The key for accessing the maximum score in an Elasticsearch query response.
++          #
++          MAX_SCORE = 'max_score'.freeze
+ 
+           # @param repository [Elasticsearch::Persistence::Repository::Class] The repository instance
+           # @param response   [Hash]  The full response returned from the Elasticsearch client
+@@ -18,8 +35,8 @@ module Elasticsearch
+           #
+           def initialize(repository, response, options={})
+             @repository = repository
+-            @response   = Elasticsearch::Model::HashWrapper.new(response)
+-            @options    = options
++            @raw_response = response
++            @options = options
+           end
+ 
+           def method_missing(method_name, *arguments, &block)
+@@ -33,25 +50,29 @@ module Elasticsearch
+           # The number of total hits for a query
+           #
+           def total
+-            response['hits']['total']
++            if raw_response[HITS][TOTAL].respond_to?(:keys)
++              raw_response[HITS][TOTAL][VALUE]
++            else
++              raw_response[HITS][TOTAL]
++            end
+           end
+ 
+           # The maximum score for a query
+           #
+           def max_score
+-            response['hits']['max_score']
++            raw_response[HITS][MAX_SCORE]
+           end
+ 
+           # Yields [object, hit] pairs to the block
+           #
+           def each_with_hit(&block)
+-            results.zip(response['hits']['hits']).each(&block)
++            results.zip(raw_response[HITS][HITS]).each(&block)
+           end
+ 
+           # Yields [object, hit] pairs and returns the result
+           #
+           def map_with_hit(&block)
+-            results.zip(response['hits']['hits']).map(&block)
++            results.zip(raw_response[HITS][HITS]).map(&block)
+           end
+ 
+           # Return the collection of domain objects
+@@ -64,7 +85,7 @@ module Elasticsearch
+           # @return [Array]
+           #
+           def results
+-            @results ||= response['hits']['hits'].map do |document|
++            @results ||= raw_response[HITS][HITS].map do |document|
+               repository.deserialize(document.to_hash)
+             end
+           end
+@@ -81,7 +102,7 @@ module Elasticsearch
+           # @return [Elasticsearch::Model::HashWrapper]
+           #
+           def response
+-            @response
++            @response ||= Elasticsearch::Model::HashWrapper.new(raw_response)
+           end
+         end
+       end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/search.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/search.rb
+index de9e01aac42b248168f84d4d703e44dbc35ba3de..203a7e246710eb47fc7a35b0d111ca6de02e5d49 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/search.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/search.rb
+@@ -37,10 +37,13 @@ module Elasticsearch
+         #     # GET http://localhost:9200/notes/note/_search
+         #     # > {"query":{"match":{"title":"fox dog"}},"size":25}
+         #
++        # @param [ Hash, String ] query_or_definition The query or search definition.
++        # @param [ Hash ] options The search options.
++        #
+         # @return [Elasticsearch::Persistence::Repository::Response::Results]
+         #
+         def search(query_or_definition, options={})
+-          type = document_type || (klass ? __get_type_from_class(klass) : nil  )
++          type = document_type
+ 
+           case
+           when query_or_definition.respond_to?(:to_hash)
+@@ -71,11 +74,14 @@ module Elasticsearch
+         #    repository.search(query: { match: { title: 'fox dog' } })
+         #    # => 1
+         #
++        # @param [ Hash, String ] query_or_definition The query or search definition.
++        # @param [ Hash ] options The search options.
++        #
+         # @return [Integer]
+         #
+         def count(query_or_definition=nil, options={})
+           query_or_definition ||= { query: { match_all: {} } }
+-          type = document_type || (klass ? __get_type_from_class(klass) : nil  )
++          type = document_type
+ 
+           case
+           when query_or_definition.respond_to?(:to_hash)
+@@ -86,10 +92,15 @@ module Elasticsearch
+             raise ArgumentError, "[!] Pass the search definition as a Hash-like object or pass the query as a String, not as [#{query_or_definition.class}]"
+           end
+ 
+-          response['count']
++          response[COUNT]
+         end
+-      end
+ 
++        private
++
++        # The key for accessing the count in a Elasticsearch query response.
++        #
++        COUNT = 'count'.freeze
++      end
+     end
+   end
+ end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/serialize.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/serialize.rb
+index 027f000b61457c1f88a0a462658ac9d43b7b4a0c..067a7daad3eddfaad40943828c39ceee1c0cdd97 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/serialize.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/serialize.rb
+@@ -2,30 +2,88 @@ module Elasticsearch
+   module Persistence
+     module Repository
+ 
+-      # Provide serialization and deserialization between Ruby objects and Elasticsearch documents
++      # Provide serialization and deserialization between Ruby objects and Elasticsearch documents.
+       #
+       # Override these methods in your repository class to customize the logic.
+       #
+       module Serialize
+ 
+-        # Serialize the object for storing it in Elasticsearch
++        # Serialize the object for storing it in Elasticsearch.
+         #
+         # In the default implementation, call the `to_hash` method on the passed object.
+         #
++        # @param [ Object ] document The Ruby object to serialize.
++        #
++        # @return [ Hash ] The serialized document.
++        #
+         def serialize(document)
+           document.to_hash
+         end
+ 
+-        # Deserialize the document retrieved from Elasticsearch into a Ruby object
++        # Deserialize the document retrieved from Elasticsearch into a Ruby object.
++        # If no klass is set for the Repository then the raw document '_source' field will be returned.
++        #
++        # def deserialize(document)
++        #   Note.new document[SOURCE]
++        # end
+         #
+-        # Use the `klass` property, if defined, otherwise try to get the class from the document's `_type`.
++        # @param [ Hash ] document The raw document.
++        #
++        # @return [ Object ] The deserialized object.
+         #
+         def deserialize(document)
+-          _klass = klass || __get_klass_from_type(document['_type'])
+-          _klass.new document['_source']
++          klass ? klass.new(document[SOURCE]) : document[SOURCE]
+         end
+-      end
+ 
++        private
++
++        # The key for document fields in an Elasticsearch query response.
++        #
++        SOURCE = '_source'.freeze
++
++        # The key for the document type in an Elasticsearch query response.
++        #   Note that it will be removed eventually, as multiple types in a single
++        #   index are deprecated as of Elasticsearch 6.0.
++        #
++        TYPE = '_type'.freeze
++
++        IDS = [:id, 'id', :_id, '_id'].freeze
++
++        # Get a document ID from the document (assuming Hash or Hash-like object)
++        #
++        # @example
++        #     repository.__get_id_from_document title: 'Test', id: 'abc123'
++        #     => "abc123"
++        #
++        # @api private
++        #
++        def __get_id_from_document(document)
++          document[IDS.find { |id| document[id] }]
++        end
++
++        # Extract a document ID from the document (assuming Hash or Hash-like object)
++        #
++        # @note Calling this method will *remove* the `id` or `_id` key from the passed object.
++        #
++        # @example
++        #     options = { title: 'Test', id: 'abc123' }
++        #     repository.__extract_id_from_document options
++        #     # => "abc123"
++        #     options
++        #     # => { title: 'Test' }
++        #
++        # @api private
++        #
++        def __extract_id_from_document(document)
++          IDS.inject(nil) do |deleted, id|
++            if document[id]
++              document.delete(id)
++            else
++              deleted
++            end
++          end
++        end
++      end
+     end
+   end
+ end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/store.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/store.rb
+index 5bec487cee0a83dc0c13486adb963faeb05f6f80..6571e107807e0ca265556ebb4782f8ac6050293c 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/repository/store.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/repository/store.rb
+@@ -12,13 +12,19 @@ module Elasticsearch
+         #     repository.save(myobject)
+         #     => {"_index"=>"...", "_type"=>"...", "_id"=>"...", "_version"=>1, "created"=>true}
+         #
+-        # @return {Hash} The response from Elasticsearch
++        # @param [ Object ] document The document to save into Elasticsearch.
++        # @param [ Hash ] options The save request options.
++        #
++        # @return [ Hash ] The response from Elasticsearch
+         #
+         def save(document, options={})
+           serialized = serialize(document)
+-          id   = __get_id_from_document(serialized)
+-          type = document_type || __get_type_from_class(klass || document.class)
+-          client.index( { index: index_name, type: type, id: id, body: serialized }.merge(options) )
++          id = __get_id_from_document(serialized)
++          request = { index: index_name,
++                      id: id,
++                      body: serialized }
++          request[:type] = document_type if document_type
++          client.index(request.merge(options))
+         end
+ 
+         # Update the serialized object in Elasticsearch with partial data or script
+@@ -33,39 +39,27 @@ module Elasticsearch
+         #     repository.update 1, script: 'ctx._source.views += 1'
+         #     # => {"_index"=>"...", "_type"=>"...", "_id"=>"1", "_version"=>3}
+         #
+-        # @return {Hash} The response from Elasticsearch
++        # @param [ Object ] document_or_id The document to update or the id of the document to update.
++        # @param [ Hash ] options The update request options.
+         #
+-        def update(document, options={})
+-          case
+-            when document.is_a?(String) || document.is_a?(Integer)
+-              id = document
+-            when document.respond_to?(:to_hash)
+-              serialized = document.to_hash
+-              id = __extract_id_from_document(serialized)
+-            else
+-              raise ArgumentError, "Expected a document ID or a Hash-like object, #{document.class} given"
+-          end
+-
+-          type = options.delete(:type) || \
+-                 (defined?(serialized) && serialized && serialized.delete(:type)) || \
+-                 document_type || \
+-                 __get_type_from_class(klass)
+-
+-          if defined?(serialized) && serialized
+-            body = if serialized[:script]
+-                       serialized.select { |k, v| [:script, :params, :upsert].include? k }
+-                     else
+-                       { doc: serialized }
+-                   end
++        # @return [ Hash ] The response from Elasticsearch
++        #
++        def update(document_or_id, options = {})
++          if document_or_id.is_a?(String) || document_or_id.is_a?(Integer)
++            id = document_or_id
++            body = options
++            type = document_type
+           else
+-            body = {}
+-            body.update( doc: options.delete(:doc)) if options[:doc]
+-            body.update( script: options.delete(:script)) if options[:script]
+-            body.update( params: options.delete(:params)) if options[:params]
+-            body.update( upsert: options.delete(:upsert)) if options[:upsert]
++            document = serialize(document_or_id)
++            id = __extract_id_from_document(document)
++            if options[:script]
++              body = options
++            else
++              body = { doc: document }.merge(options)
++            end
++            type = document.delete(:type) || document_type
+           end
+-
+-          client.update( { index: index_name, type: type, id: id, body: body }.merge(options) )
++          client.update(index: index_name, id: id, type: type, body: body)
+         end
+ 
+         # Remove the serialized object or document with specified ID from Elasticsearch
+@@ -75,21 +69,21 @@ module Elasticsearch
+         #     repository.delete(1)
+         #     # => {"_index"=>"...", "_type"=>"...", "_id"=>"1", "_version"=>4}
+         #
+-        # @return {Hash} The response from Elasticsearch
++        # @param [ Object ] document_or_id The document to delete or the id of the document to delete.
++        # @param [ Hash ] options The delete request options.
+         #
+-        def delete(document, options={})
+-          if document.is_a?(String) || document.is_a?(Integer)
+-            id   = document
+-            type = document_type || __get_type_from_class(klass)
++        # @return [ Hash ] The response from Elasticsearch
++        #
++        def delete(document_or_id, options = {})
++          if document_or_id.is_a?(String) || document_or_id.is_a?(Integer)
++            id = document_or_id
+           else
+-            serialized = serialize(document)
+-            id   = __get_id_from_document(serialized)
+-            type = document_type || __get_type_from_class(klass || document.class)
++            serialized = serialize(document_or_id)
++            id = __get_id_from_document(serialized)
+           end
+-          client.delete( { index: index_name, type: type, id: id }.merge(options) )
++          client.delete({ index: index_name, type: document_type, id: id }.merge(options))
+         end
+       end
+-
+     end
+   end
+ end
+diff --git a/elasticsearch-persistence/lib/elasticsearch/persistence/version.rb b/elasticsearch-persistence/lib/elasticsearch/persistence/version.rb
+index c27d0fb54fbed86d701910651b40949591e48a9c..393bf13438993669ca4f8226f11f942f6542ca8e 100644
+--- a/elasticsearch-persistence/lib/elasticsearch/persistence/version.rb
++++ b/elasticsearch-persistence/lib/elasticsearch/persistence/version.rb
+@@ -1,5 +1,5 @@
+ module Elasticsearch
+   module Persistence
+-    VERSION = "7.0.0"
++    VERSION = '7.0.0'
+   end
+ end
+diff --git a/elasticsearch-persistence/lib/rails/generators/elasticsearch/model/model_generator.rb b/elasticsearch-persistence/lib/rails/generators/elasticsearch/model/model_generator.rb
+deleted file mode 100644
+index 84fb632cd2c9c731225469dd24e911550ade28aa..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/rails/generators/elasticsearch/model/model_generator.rb
++++ /dev/null
+@@ -1,21 +0,0 @@
+-require "rails/generators/elasticsearch_generator"
+-
+-module Elasticsearch
+-  module Generators
+-    class ModelGenerator < ::Rails::Generators::NamedBase
+-      source_root File.expand_path('../templates', __FILE__)
+-
+-      desc "Creates an Elasticsearch::Persistence model"
+-      argument :attributes, type: :array, default: [], banner: "attribute:type attribute:type"
+-
+-      check_class_collision
+-
+-      def create_model_file
+-        @padding = attributes.map { |a| a.name.size }.max
+-        template "model.rb.tt", File.join("app/models", class_path, "#{file_name}.rb")
+-      end
+-
+-      hook_for :test_framework
+-    end
+-  end
+-end
+diff --git a/elasticsearch-persistence/lib/rails/generators/elasticsearch_generator.rb b/elasticsearch-persistence/lib/rails/generators/elasticsearch_generator.rb
+deleted file mode 100644
+index 20072ed93496fabb3623ea21fe991789c45c12d8..0000000000000000000000000000000000000000
+--- a/elasticsearch-persistence/lib/rails/generators/elasticsearch_generator.rb
++++ /dev/null
+@@ -1,2 +0,0 @@
+-require "rails/generators/named_base"
+-require "rails/generators/active_model"
+diff --git a/elasticsearch-rails/lib/elasticsearch/rails/instrumentation/railtie.rb b/elasticsearch-rails/lib/elasticsearch/rails/instrumentation/railtie.rb
+index dbcd0fc3891de0ed28bcb1d000cd22a985411185..6aeb6a866dd9bc2262ef7d13419c877ebd3dcda6 100644
+--- a/elasticsearch-rails/lib/elasticsearch/rails/instrumentation/railtie.rb
++++ b/elasticsearch-rails/lib/elasticsearch/rails/instrumentation/railtie.rb
+@@ -16,10 +16,6 @@ module Elasticsearch
+             include Elasticsearch::Rails::Instrumentation::Publishers::SearchRequest
+           end if defined?(Elasticsearch::Model::Searching::SearchRequest)
+ 
+-          Elasticsearch::Persistence::Model::Find::SearchRequest.class_eval do
+-            include Elasticsearch::Rails::Instrumentation::Publishers::SearchRequest
+-          end if defined?(Elasticsearch::Persistence::Model::Find::SearchRequest)
+-
+           ActiveSupport.on_load(:action_controller) do
+             include Elasticsearch::Rails::Instrumentation::ControllerRuntime
+           end
+diff --git a/elasticsearch-rails/lib/elasticsearch/rails/lograge.rb b/elasticsearch-rails/lib/elasticsearch/rails/lograge.rb
+index a8edd808480c7b341b081d41c02a684737191a2f..aa0f4f1f30f0bc21a976b1a3a0def4d5e6bc4534 100644
+--- a/elasticsearch-rails/lib/elasticsearch/rails/lograge.rb
++++ b/elasticsearch-rails/lib/elasticsearch/rails/lograge.rb
+@@ -25,10 +25,6 @@ module Elasticsearch
+             include Elasticsearch::Rails::Instrumentation::Publishers::SearchRequest
+           end if defined?(Elasticsearch::Model::Searching::SearchRequest)
+ 
+-          Elasticsearch::Persistence::Model::Find::SearchRequest.class_eval do
+-            include Elasticsearch::Rails::Instrumentation::Publishers::SearchRequest
+-          end if defined?(Elasticsearch::Persistence::Model::Find::SearchRequest)
+-
+           ActiveSupport.on_load(:action_controller) do
+             include Elasticsearch::Rails::Instrumentation::ControllerRuntime
+           end

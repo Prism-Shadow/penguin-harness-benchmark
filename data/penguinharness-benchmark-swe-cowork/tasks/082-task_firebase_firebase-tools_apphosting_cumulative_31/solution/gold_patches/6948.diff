@@ -1,0 +1,200 @@
+diff --git a/src/commands/apphosting-secrets-describe.ts b/src/commands/apphosting-secrets-describe.ts
+new file mode 100644
+index 00000000..7abafafa
+--- /dev/null
++++ b/src/commands/apphosting-secrets-describe.ts
+@@ -0,0 +1,30 @@
++import { Command } from "../command";
++import { Options } from "../options";
++import { needProjectId } from "../projectUtils";
++import { logger } from "../logger";
++import { requireAuth } from "../requireAuth";
++import { listSecretVersions } from "../gcp/secretManager";
++import * as secretManager from "../gcp/secretManager";
++import { requirePermissions } from "../requirePermissions";
++
++const Table = require("cli-table");
++
++export const command = new Command("apphosting:secrets:describe <secretName>")
++  .description("Get metadata for secret and its versions.")
++  .before(requireAuth)
++  .before(secretManager.ensureApi)
++  .before(requirePermissions, ["secretmanager.secrets.get"])
++  .action(async (secretName: string, options: Options) => {
++    const projectId = needProjectId(options);
++    const versions = await listSecretVersions(projectId, secretName);
++
++    const table = new Table({
++      head: ["Name", "Version", "Status", "Create Time"],
++      style: { head: ["yellow"] },
++    });
++    for (const version of versions) {
++      table.push([secretName, version.versionId, version.state, version.createTime]);
++    }
++    logger.info(table.toString());
++    return { secrets: versions };
++  });
+diff --git a/src/commands/functions-secrets-describe.ts b/src/commands/functions-secrets-describe.ts
+new file mode 100644
+index 00000000..4c699ea0
+--- /dev/null
++++ b/src/commands/functions-secrets-describe.ts
+@@ -0,0 +1,14 @@
++import { requireAuth } from "../requireAuth";
++import { Command } from "../command";
++import { requirePermissions } from "../requirePermissions";
++import * as secretManager from "../gcp/secretManager";
++import * as secrets from "../functions/secrets";
++
++export const command = new Command("functions:secrets:describe <KEY>")
++  .description(
++    "Get metadata for secret and its versions. Alias for functions:secrets:get to align with gcloud",
++  )
++  .before(requireAuth)
++  .before(secretManager.ensureApi)
++  .before(requirePermissions, ["secretmanager.secrets.get"])
++  .action(secrets.describeSecret);
+diff --git a/src/commands/functions-secrets-get.ts b/src/commands/functions-secrets-get.ts
+index 29c63a34..611ad101 100644
+--- a/src/commands/functions-secrets-get.ts
++++ b/src/commands/functions-secrets-get.ts
+@@ -1,29 +1,12 @@
+-const Table = require("cli-table");
+-
+ import { requireAuth } from "../requireAuth";
+ import { Command } from "../command";
+-import { logger } from "../logger";
+-import { Options } from "../options";
+-import { needProjectId } from "../projectUtils";
+-import { listSecretVersions } from "../gcp/secretManager";
+ import { requirePermissions } from "../requirePermissions";
+ import * as secretManager from "../gcp/secretManager";
++import * as secrets from "../functions/secrets";
+ 
+ export const command = new Command("functions:secrets:get <KEY>")
+   .description("Get metadata for secret and its versions")
+   .before(requireAuth)
+   .before(secretManager.ensureApi)
+   .before(requirePermissions, ["secretmanager.secrets.get"])
+-  .action(async (key: string, options: Options) => {
+-    const projectId = needProjectId(options);
+-    const versions = await listSecretVersions(projectId, key);
+-
+-    const table = new Table({
+-      head: ["Version", "State"],
+-      style: { head: ["yellow"] },
+-    });
+-    for (const version of versions) {
+-      table.push([version.versionId, version.state]);
+-    }
+-    logger.info(table.toString());
+-  });
++  .action(secrets.describeSecret);
+diff --git a/src/commands/index.ts b/src/commands/index.ts
+index 1af7485b..9382878c 100644
+--- a/src/commands/index.ts
++++ b/src/commands/index.ts
+@@ -135,6 +135,7 @@ export function load(client: any): any {
+   client.functions.secrets.access = loadCommand("functions-secrets-access");
+   client.functions.secrets.destroy = loadCommand("functions-secrets-destroy");
+   client.functions.secrets.get = loadCommand("functions-secrets-get");
++  client.functions.secrets.describe = loadCommand("functions-secrets-describe");
+   client.functions.secrets.prune = loadCommand("functions-secrets-prune");
+   client.functions.secrets.set = loadCommand("functions-secrets-set");
+   client.help = loadCommand("help");
+@@ -172,6 +173,7 @@ export function load(client: any): any {
+     client.apphosting.builds.create = loadCommand("apphosting-builds-create");
+     client.apphosting.secrets = {};
+     client.apphosting.secrets.grantaccess = loadCommand("apphosting-secrets-grantaccess");
++    client.apphosting.secrets.describe = loadCommand("apphosting-secrets-describe");
+     client.apphosting.rollouts = {};
+     client.apphosting.rollouts.create = loadCommand("apphosting-rollouts-create");
+     client.apphosting.rollouts.list = loadCommand("apphosting-rollouts-list");
+diff --git a/src/functions/secrets.ts b/src/functions/secrets.ts
+index 60e5d019..5e8cf851 100644
+--- a/src/functions/secrets.ts
++++ b/src/functions/secrets.ts
+@@ -26,6 +26,9 @@ import { logger } from "../logger";
+ import { assertExhaustive } from "../functional";
+ import { isFunctionsManaged, FIREBASE_MANAGED } from "../gcp/secretManager";
+ import { labels } from "../gcp/secretManager";
++import { needProjectId } from "../projectUtils";
++
++const Table = require("cli-table");
+ 
+ // For mysterious reasons, importing the poller option in fabricator.ts leads to some
+ // value of the poller option to be undefined at runtime. I can't figure out what's going on,
+@@ -371,3 +374,21 @@ export async function updateEndpointSecret(
+     assertExhaustive(endpoint.platform);
+   }
+ }
++
++/**
++ * Describe the given secret.
++ */
++export async function describeSecret(key: string, options: Options): Promise<any> {
++  const projectId = needProjectId(options);
++  const versions = await listSecretVersions(projectId, key);
++
++  const table = new Table({
++    head: ["Version", "State"],
++    style: { head: ["yellow"] },
++  });
++  for (const version of versions) {
++    table.push([version.versionId, version.state]);
++  }
++  logger.info(table.toString());
++  return { secrets: versions };
++}
+diff --git a/src/gcp/secretManager.ts b/src/gcp/secretManager.ts
+index 81206377..7388793c 100644
+--- a/src/gcp/secretManager.ts
++++ b/src/gcp/secretManager.ts
+@@ -57,6 +57,7 @@ export interface SecretVersion {
+ 
+   // Output-only fields
+   readonly state?: SecretVersionState;
++  readonly createTime?: string;
+ }
+ 
+ interface CreateSecretRequest {
+@@ -72,6 +73,7 @@ interface AddVersionRequest {
+ interface SecretVersionResponse {
+   name: string;
+   state: SecretVersionState;
++  createTime: string;
+ }
+ 
+ interface AccessSecretVersionResponse {
+@@ -178,6 +180,7 @@ export async function listSecretVersions(
+       secrets.push({
+         ...parseSecretVersionResourceName(s.name),
+         state: s.state,
++        createTime: s.createTime,
+       });
+     }
+ 
+@@ -203,6 +206,7 @@ export async function getSecretVersion(
+   return {
+     ...parseSecretVersionResourceName(getRes.body.name),
+     state: getRes.body.state,
++    createTime: getRes.body.createTime,
+   };
+ }
+ 
+@@ -282,6 +286,7 @@ export function parseSecretVersionResourceName(resourceName: string): SecretVers
+       replication: {},
+     },
+     versionId: match.groups.version,
++    createTime: "",
+   };
+ }
+ 
+@@ -380,6 +385,7 @@ export async function addVersion(
+   return {
+     ...parseSecretVersionResourceName(res.body.name),
+     state: res.body.state,
++    createTime: "",
+   };
+ }
+ 

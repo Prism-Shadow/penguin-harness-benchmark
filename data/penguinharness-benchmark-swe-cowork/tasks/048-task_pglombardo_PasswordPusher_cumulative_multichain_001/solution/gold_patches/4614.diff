@@ -1,0 +1,534 @@
+diff --git a/app/controllers/api/v1/pushes_controller.rb b/app/controllers/api/v1/pushes_controller.rb
+index ca9f40d8..041336b6 100644
+--- a/app/controllers/api/v1/pushes_controller.rb
++++ b/app/controllers/api/v1/pushes_controller.rb
+@@ -6,6 +6,12 @@ class Api::V1::PushesController < Api::BaseController
+ 
+   before_action :set_push, only: %i[show preview audit destroy]
+ 
++  rate_limit to: 5, within: 1.minute, only: :show,
++    if: -> { params[:passphrase].present? },
++    by: -> { params[:id] },
++    scope: :passphrase_attempts, name: "per-push",
++    with: -> { render json: {error: I18n._("Too many passphrase attempts. Please try again in a minute.")}, status: :too_many_requests }
++
+   resource_description do
+     name "Pushes"
+     short "Interact directly with pushes."
+diff --git a/app/controllers/pushes_controller.rb b/app/controllers/pushes_controller.rb
+index 4b95f175..51fc6ee2 100644
+--- a/app/controllers/pushes_controller.rb
++++ b/app/controllers/pushes_controller.rb
+@@ -8,6 +8,21 @@ class PushesController < BaseController
+   before_action :set_push, except: %i[new create index]
+   before_action :check_allowed
+ 
++  rate_limit to: 5, within: 1.minute, only: :notify_by_email,
++    by: -> { current_user&.id },
++    with: -> { redirect_to preview_push_path(@push), alert: I18n._("Too many email notification requests. Please try again in a minute.") }
++
++  rate_limit to: 5, within: 1.minute, only: :access,
++    by: -> { params[:id] },
++    scope: :passphrase_attempts, name: "per-push",
++    with: -> { redirect_to passphrase_push_path(@push), alert: I18n._("Too many passphrase attempts. Please try again in a minute.") }
++
++  rate_limit to: 5, within: 1.minute, only: :show,
++    if: -> { params[:passphrase].present? },
++    by: -> { params[:id] },
++    scope: :passphrase_attempts, name: "per-push",
++    with: -> { redirect_to passphrase_push_path(@push), alert: I18n._("Too many passphrase attempts. Please try again in a minute.") }
++
+   def show
+     # This push may have expired since the last view.  Validate the push
+     # expiration before doing anything.
+@@ -130,9 +145,11 @@ class PushesController < BaseController
+ 
+     assign_deletable_by_viewer(@push, push_params)
+     assign_retrieval_step(@push, push_params)
++    assign_notify_by_email_params(@push, notify_by_email_params)
+ 
+     if @push.save
+       log_creation(@push)
++      log_creation_email_send(@push)
+ 
+       redirect_to preview_push_path(@push)
+     else
+@@ -245,6 +262,27 @@ class PushesController < BaseController
+     @share_message = helpers.push_share_message_text(@push, secret_url: @secret_url)
+   end
+ 
++  def notify_by_email
++    authenticate_user!
++
++    if @push.user_id != current_user.id
++      redirect_to :root, notice: I18n._("That push doesn't belong to you.")
++      return
++    end
++
++    assign_notify_by_email_params(@push, notify_by_email_params, required: true)
++
++    if @push.valid?
++      log_creation_email_send(@push)
++      redirect_to preview_push_path(@push), notice: I18n._("Recipient(s) are added to the queue to be sent.")
++    else
++      @secret_url = helpers.secret_url(@push)
++      @qr_code = helpers.qr_code(@secret_url)
++
++      render action: "preview", status: :unprocessable_content
++    end
++  end
++
+   def print_preview
+     @secret_url = helpers.secret_url(@push)
+     @qr_code = helpers.qr_code(@secret_url)
+@@ -363,7 +401,12 @@ class PushesController < BaseController
+   end
+ 
+   def set_push
+-    @push = Push.includes(:audit_logs).find_by!(url_token: params[:id])
++    @push = if action_name == "audit"
++      # If notify_by_email is included unnecessarily, it will cause memory usage unnecessarily.
++      Push.includes(audit_logs: :notify_by_email).find_by!(url_token: params[:id])
++    else
++      Push.includes(:audit_logs).find_by!(url_token: params[:id])
++    end
+   rescue ActiveRecord::RecordNotFound
+     # Showing a 404 reveals that this Secret URL never existed
+     # which is an information leak (not a secret anymore)
+@@ -380,16 +423,14 @@ class PushesController < BaseController
+   end
+ 
+   def push_params
++    base = %i[kind name expire_after_days expire_after_views retrieval_step payload note passphrase]
+     case params.dig(:push, :kind)
+     when "url"
+-      params.require(:push).permit(:kind, :name, :expire_after_days, :expire_after_views,
+-        :retrieval_step, :payload, :note, :passphrase)
++      params.require(:push).permit(*base)
+     when "file"
+-      params.require(:push).permit(:kind, :name, :expire_after_days, :expire_after_views, :deletable_by_viewer,
+-        :retrieval_step, :payload, :note, :passphrase, files: [])
++      params.require(:push).permit(*(base + [:deletable_by_viewer, {files: []}]))
+     else
+-      params.require(:push).permit(:kind, :name, :expire_after_days, :expire_after_views, :deletable_by_viewer,
+-        :retrieval_step, :payload, :note, :passphrase)
++      params.require(:push).permit(*(base + [:deletable_by_viewer]))
+     end
+   rescue => e
+     Rails.logger.error("Error in push_params: #{e.message}")
+@@ -397,17 +438,15 @@ class PushesController < BaseController
+   end
+ 
+   def update_params
++    base = %i[name expire_after_days expire_after_views retrieval_step payload note passphrase]
+     # Don't allow kind to be changed after creation for security
+     case @push.kind
+     when "url"
+-      params.require(:push).permit(:name, :expire_after_days, :expire_after_views,
+-        :retrieval_step, :payload, :note, :passphrase)
++      params.require(:push).permit(*base)
+     when "file"
+-      params.require(:push).permit(:name, :expire_after_days, :expire_after_views, :deletable_by_viewer,
+-        :retrieval_step, :payload, :note, :passphrase, files: [])
++      params.require(:push).permit(*(base + [:deletable_by_viewer, {files: []}]))
+     else
+-      params.require(:push).permit(:name, :expire_after_days, :expire_after_views, :deletable_by_viewer,
+-        :retrieval_step, :payload, :note, :passphrase)
++      params.require(:push).permit(*(base + [:deletable_by_viewer]))
+     end
+   rescue => e
+     Rails.logger.error("Error in update_params: #{e.message}")
+@@ -459,7 +498,7 @@ class PushesController < BaseController
+       return
+     end
+ 
+-    @push_kind = if %w[preview print_preview preliminary passphrase access show expire audit edit update delete_file].include?(action_name)
++    @push_kind = if %w[preview print_preview preliminary passphrase access show expire audit edit update delete_file notify_by_email].include?(action_name)
+       @push.kind
+     elsif action_name == "new"
+       case params["tab"]
+@@ -525,4 +564,15 @@ class PushesController < BaseController
+       end
+     end
+   end
++
++  def notify_by_email_params
++    params.require(:push).permit(:notify_by_email_recipients, :notify_by_email_locale)
++  end
++
++  def assign_notify_by_email_params(push, permitted_params, required: false)
++    push.notify_by_email_recipients = permitted_params[:notify_by_email_recipients]
++    push.notify_by_email_locale = permitted_params[:notify_by_email_locale]
++    push.notify_by_email_creator = current_user if user_signed_in?
++    push.notify_by_email_required = required
++  end
+ end
+diff --git a/config/initializers/filter_parameter_logging.rb b/config/initializers/filter_parameter_logging.rb
+index 833d77bf..434c2e44 100644
+--- a/config/initializers/filter_parameter_logging.rb
++++ b/config/initializers/filter_parameter_logging.rb
+@@ -6,5 +6,5 @@
+ # Use this to limit dissemination of sensitive information.
+ # See the ActiveSupport::ParameterFilter documentation for supported notations and behaviors.
+ Rails.application.config.filter_parameters += %i[
+-  password note passw secret token _key crypt salt certificate otp ssn
++  password note passw passphrase payload secret token _key crypt salt certificate otp ssn
+ ]
+diff --git a/test/controllers/pushes_controller_test.rb b/test/controllers/pushes_controller_test.rb
+new file mode 100644
+index 00000000..6714ced9
+--- /dev/null
++++ b/test/controllers/pushes_controller_test.rb
+@@ -0,0 +1,319 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class PushesControllerTest < ActionDispatch::IntegrationTest
++  include ActiveJob::TestHelper
++  include Devise::Test::IntegrationHelpers
++
++  setup do
++    Settings.mail.smtp_address = "smtp.example.com"
++
++    @push = pushes(:test_push)
++    @user = @push.user
++    sign_in @user
++  end
++
++  teardown do
++    Settings.reload!
++    Rails.application.reload_routes!
++  end
++
++  # new
++  test "notify_by_email_recipients field is not shown when feature is disabled" do
++    Settings.notify_by_email.enabled = false
++    Rails.application.reload_routes!
++
++    get new_push_path
++
++    assert_response :success
++    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 0
++  end
++
++  test "notify_by_email_recipients field is shown when mail service is configured and user is signed in" do
++    get new_push_path
++
++    assert_response :success
++    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 1
++  end
++
++  test "notify_by_email_recipients field is not shown when mail service is not configured" do
++    Settings.mail.smtp_address = nil
++
++    get new_push_path
++
++    assert_response :success
++    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 0
++  end
++
++  test "notify_by_email_recipients fields are not shown when user is not signed in" do
++    sign_out @user
++    get new_push_path
++
++    assert_response :success
++    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 0
++  end
++
++  # create
++  test "create enqueues SendNotifyByEmailJob when user is signed in and params present" do
++    job = assert_enqueued_with(job: SendNotifyByEmailJob) do
++      post pushes_path, params: {
++        push: {
++          kind: "text",
++          payload: "secret",
++          notify_by_email_recipients: "recipient@example.com",
++          notify_by_email_locale: "fr"
++        }
++      }
++
++      assert_response :redirect
++    end
++
++    push_url_token = response.redirect_url.match(/\/p\/(.*)\/preview/)[1]
++    push = Push.find_by(url_token: push_url_token)
++
++    notify_by_email = NotifyByEmail.find(job.arguments.first)
++
++    assert_equal "recipient@example.com", notify_by_email.recipients
++    assert_equal "fr", notify_by_email.locale
++    assert_equal push, notify_by_email.push
++  end
++
++  test "create doesn't enqueue SendNotifyByEmailJob when user is not signed in" do
++    sign_out @user
++
++    assert_no_enqueued_jobs(only: SendNotifyByEmailJob) do
++      post pushes_path, params: {
++        push: {
++          kind: "text",
++          payload: "secret",
++          notify_by_email_recipients: "someone@example.com",
++          notify_by_email_locale: "fr"
++        }
++      }
++
++      assert_response :unprocessable_content
++      assert_includes response.body, "Notifying by email is not allowed for unknown users"
++    end
++  end
++
++  test "create doesn't enqueue SendNotifyByEmailJob when feature is disabled" do
++    Settings.notify_by_email.enabled = false
++    Rails.application.reload_routes!
++
++    assert_no_enqueued_jobs(only: SendNotifyByEmailJob) do
++      post pushes_path, params: {
++        push: {
++          kind: "text",
++          payload: "secret",
++          notify_by_email_recipients: "someone@example.com",
++          notify_by_email_locale: "fr"
++        }
++      }
++
++      assert_response :unprocessable_content
++      assert_includes response.body, "Notifying by email is not available"
++    end
++  end
++
++  test "create doesn't enqueue SendNotifyByEmailJob when email service is not configured" do
++    Settings.mail.smtp_address = nil
++
++    assert_no_enqueued_jobs(only: SendNotifyByEmailJob) do
++      post pushes_path, params: {
++        push: {
++          kind: "text",
++          payload: "secret",
++          notify_by_email_recipients: "someone@example.com",
++          notify_by_email_locale: "fr"
++        }
++      }
++
++      assert_response :unprocessable_content
++      assert_includes response.body, "Notifying by email is not available"
++    end
++  end
++
++  test "create doesn't enqueue SendNotifyByEmailJob if any mail is not provided" do
++    assert_no_enqueued_jobs(only: SendNotifyByEmailJob) do
++      post pushes_path, params: {
++        push: {
++          kind: "text",
++          payload: "secret",
++          notify_by_email_recipients: "",
++          notify_by_email_locale: "fr"
++        }
++      }
++    end
++
++    assert_response :redirect
++
++    push_url_token = response.redirect_url.match(/\/p\/(.*)\/preview/)[1]
++    push = Push.find_by(url_token: push_url_token)
++
++    creation_logs = push.audit_logs.where(kind: :creation)
++    assert_equal 1, creation_logs.count
++
++    # creation_email_send log is inside the transaction and should rollback.
++    creation_email_send_logs = push.audit_logs.where(kind: :creation_email_send)
++    assert_equal 0, creation_email_send_logs.count
++  end
++
++  # edit
++  test "edit does not show notify_by_email_recipients field when push is edited" do
++    get edit_push_path(@push)
++
++    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 0
++  end
++
++  # preview
++  test "preview does not show notify_by_email when feature is disabled" do
++    Settings.notify_by_email.enabled = false
++    Rails.application.reload_routes!
++
++    get preview_push_path(@push)
++
++    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 0
++    assert_select "div.collapse#notifyByEmailCollapse", count: 0
++  end
++
++  test "preview shows notify_by_email_recipients field when user is signed in and email service is configured" do
++    get preview_push_path(@push)
++
++    assert_select "input[name=?]", "push[notify_by_email_recipients]", count: 1
++    assert_select "div.collapse#notifyByEmailCollapse.show", count: 0
++  end
++
++  # notify_by_email
++  test "notify_by_email returns not found when feature is disabled" do
++    Settings.notify_by_email.enabled = false
++    Rails.application.reload_routes!
++
++    post "/p/#{@push.url_token}/notify_by_email", params: {
++      push: {
++        notify_by_email_recipients: "recipient@example.com",
++        notify_by_email_locale: "en"
++      }
++    }
++
++    assert_response :not_found
++  end
++
++  test "notify_by_email enqueues SendNotifyByEmailJob when user is signed in and params present" do
++    assert_enqueued_with(job: SendNotifyByEmailJob) do
++      post notify_by_email_push_path(@push), params: {
++        push: {
++          notify_by_email_recipients: "recipient@example.com",
++          notify_by_email_locale: "en"
++        }
++      }
++    end
++  end
++
++  test "notify_by_email retains form values when validation fails" do
++    post notify_by_email_push_path(@push), params: {
++      push: {
++        notify_by_email_recipients: "invalid-email, another-invalid",
++        notify_by_email_locale: "fr"
++      }
++    }
++
++    assert_response :unprocessable_content
++    assert_select "input[name=?][value=?]", "push[notify_by_email_recipients]", "invalid-email, another-invalid"
++    assert_select "input[name=?][value=?]", "push[notify_by_email_locale]", "fr"
++    assert_select "div.collapse#notifyByEmailCollapse.show", count: 1
++  end
++
++  test "notify_by_email redirects to preview when user is not signed in and disable_logins is true" do
++    Settings.disable_logins = true
++    sign_out @user
++
++    post notify_by_email_push_path(@push), params: {
++      push: {
++        notify_by_email_recipients: "recipient@example.com"
++      }
++    }
++
++    assert_response :redirect
++    assert_redirected_to new_user_session_path
++  end
++
++  test "notify_by_email redirects non-owner to root" do
++    sign_in users(:luca)
++
++    post notify_by_email_push_path(@push), params: {
++      push: {
++        notify_by_email_recipients: "recipient@example.com"
++      }
++    }
++
++    assert_redirected_to root_url
++  end
++
++  test "notify_by_email fails with error when user login is disabled" do
++    Settings.disable_logins = true
++
++    post notify_by_email_push_path(@push), params: {
++      push: {
++        notify_by_email_recipients: "recipient@example.com"
++      }
++    }
++
++    assert_response :unprocessable_content
++    assert_includes response.body, "Notifying by email is not available"
++  end
++
++  test "notify_by_email redirects to preview when push does not belong to user and disable_logins is false" do
++    sign_out @user
++
++    post notify_by_email_push_path(@push), params: {
++      push: {
++        notify_by_email_recipients: "recipient@example.com"
++      }
++    }
++
++    assert_response :redirect
++    assert_redirected_to new_user_session_path
++    assert_nil flash[:notice]
++  end
++
++  test "access is rate limited after five attempts per push" do
++
++    @push.update!(passphrase: "secret")
++
++    5.times do |i|
++      post access_push_path(@push), params: {passphrase: "wrong#{i}"}
++      assert_response :redirect
++    end
++
++    post access_push_path(@push), params: {passphrase: "wrong5"}
++
++    assert_response :redirect
++    assert_redirected_to passphrase_push_path(@push)
++    assert_match(/Too many passphrase attempts/, flash[:alert])
++  end
++
++  test "notify_by_email is rate limited after five bursts per user" do
++    Rails.cache.clear
++
++    5.times do |i|
++      post notify_by_email_push_path(@push), params: {
++        push: {
++          notify_by_email_recipients: "recipient#{i}@example.com",
++          notify_by_email_locale: "en"
++        }
++      }
++    end
++
++    post notify_by_email_push_path(@push), params: {
++      push: {
++        notify_by_email_recipients: "recipient5@example.com",
++        notify_by_email_locale: "en"
++      }
++    }
++
++    assert_response :redirect
++    assert_redirected_to preview_push_path(@push)
++    assert_match(/Too many email notification requests/, flash[:alert])
++  end
++end
+diff --git a/test/integration/api/api_v2_pushes_test.rb b/test/integration/api/api_v2_pushes_test.rb
+index 05d238dc..2e0ed0b4 100644
+--- a/test/integration/api/api_v2_pushes_test.rb
++++ b/test/integration/api/api_v2_pushes_test.rb
+@@ -102,6 +102,28 @@ class ApiV2PushesTest < ActionDispatch::IntegrationTest
+     assert_response :success
+   end
+ 
++  def test_show_passphrase_is_rate_limited_after_five_attempts_per_push
++
++    push = pushes(:test_push)
++    push.update!(passphrase: "super-secret")
++
++    5.times do
++      get "/api/v2/pushes/#{push.url_token}",
++        params: {passphrase: "wrong-passphrase"},
++        as: :json
++
++      assert_response :unauthorized
++    end
++
++    get "/api/v2/pushes/#{push.url_token}",
++      params: {passphrase: "wrong-passphrase"},
++      as: :json
++
++    assert_response :too_many_requests
++    body = response.parsed_body
++    assert_match(/Too many passphrase attempts/, body["error"])
++  end
++
+   def test_active_requires_authentication
+     get "/api/v2/pushes/active", as: :json
+     assert_response :unauthorized

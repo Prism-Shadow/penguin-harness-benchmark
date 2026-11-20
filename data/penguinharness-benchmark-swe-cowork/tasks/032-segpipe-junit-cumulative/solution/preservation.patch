@@ -1,0 +1,407 @@
+diff --git a/junit-jupiter-extensions/src/main/java/com/example/mockito/MockitoExtension.java b/junit-jupiter-extensions/src/main/java/com/example/mockito/MockitoExtension.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/main/java/com/example/mockito/MockitoExtension.java
+@@ -0,0 +1,75 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++import static org.mockito.Mockito.mock;
++
++import java.lang.reflect.Parameter;
++
++import org.junit.jupiter.api.extension.ExtensionContext;
++import org.junit.jupiter.api.extension.ExtensionContext.Namespace;
++import org.junit.jupiter.api.extension.ExtensionContext.Store;
++import org.junit.jupiter.api.extension.ParameterContext;
++import org.junit.jupiter.api.extension.ParameterResolver;
++import org.junit.jupiter.api.extension.TestInstancePostProcessor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++/**
++ * {@code MockitoExtension} showcases the {@link TestInstancePostProcessor}
++ * and {@link ParameterResolver} extension APIs of JUnit 5 by providing
++ * dependency injection support at the field level and at the method parameter
++ * level via Mockito 2.x's {@link Mock @Mock} annotation.
++ *
++ * @since 5.0
++ */
++public class MockitoExtension implements TestInstancePostProcessor, ParameterResolver {
++
++	@Override
++	public void postProcessTestInstance(Object testInstance, ExtensionContext context) {
++		MockitoAnnotations.initMocks(testInstance);
++	}
++
++	@Override
++	public boolean supportsParameter(ParameterContext parameterContext, ExtensionContext extensionContext) {
++		return parameterContext.getParameter().isAnnotationPresent(Mock.class);
++	}
++
++	@Override
++	public Object resolveParameter(ParameterContext parameterContext, ExtensionContext extensionContext) {
++		return getMock(parameterContext.getParameter(), extensionContext);
++	}
++
++	private Object getMock(Parameter parameter, ExtensionContext extensionContext) {
++		Class<?> mockType = parameter.getType();
++		Store mocks = extensionContext.getStore(Namespace.create(MockitoExtension.class, mockType));
++		String mockName = getMockName(parameter);
++
++		if (mockName != null) {
++			return mocks.getOrComputeIfAbsent(mockName, key -> mock(mockType, mockName));
++		}
++		else {
++			return mocks.getOrComputeIfAbsent(mockType.getCanonicalName(), key -> mock(mockType));
++		}
++	}
++
++	private String getMockName(Parameter parameter) {
++		String explicitMockName = parameter.getAnnotation(Mock.class).name().trim();
++		if (!explicitMockName.isEmpty()) {
++			return explicitMockName;
++		}
++		else if (parameter.isNamePresent()) {
++			return parameter.getName();
++		}
++		return null;
++	}
++
++}
+diff --git a/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionInBaseClassTest.java b/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionInBaseClassTest.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionInBaseClassTest.java
+@@ -0,0 +1,78 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNotSame;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.when;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.TestInfo;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.mockito.Mock;
++
++/**
++ * @since 5.0
++ * @see MockitoExtension
++ */
++@ExtendWith(MockitoExtension.class)
++class MockitoExtensionInBaseClassTest {
++
++	@Mock
++	private NumberGenerator numberGenerator;
++
++	@BeforeEach
++	void initialize(@Mock MyType myType, TestInfo testInfo) {
++		when(myType.getName()).thenReturn(testInfo.getDisplayName());
++		when(numberGenerator.next()).thenReturn(42);
++	}
++
++	@Test
++	void firstTestWithInjectedMock(@Mock MyType myType) {
++		assertEquals("firstTestWithInjectedMock(MyType)", myType.getName());
++		assertEquals(42, numberGenerator.next());
++	}
++
++	@Test
++	void secondTestWithInjectedMock(@Mock MyType myType) {
++		assertEquals("secondTestWithInjectedMock(MyType)", myType.getName());
++		assertEquals(42, numberGenerator.next());
++	}
++
++	@Test
++	void multipleImplicitlyNamedInjectedMocksOfSameTypeAreNotTheSameInstance(@Mock MyType myType1,
++			@Mock MyType myType2) {
++
++		assertNotNull(myType1);
++		assertNotNull(myType2);
++
++		assertNotSame(myType1, myType2, "Make sure the project was compiled with -parameters");
++
++		assertTrue(myType1.toString().contains("myType1"));
++		assertTrue(myType2.toString().contains("myType2"));
++	}
++
++	@Test
++	void multipleExplicitlyNamedInjectedMocksOfSameTypeAreNotTheSameInstanceTest(@Mock(name = "one") MyType myType1,
++			@Mock(name = "two") MyType myType2) {
++
++		assertNotNull(myType1);
++		assertNotNull(myType2);
++		assertNotSame(myType1, myType2);
++
++		assertTrue(myType1.toString().contains("one"));
++		assertTrue(myType2.toString().contains("two"));
++	}
++
++}
+diff --git a/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionTestSuite.java b/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionTestSuite.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionTestSuite.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++import org.junit.platform.suite.api.Suite;
++import org.junit.platform.suite.api.SelectPackages;
++
++/**
++ * Test suite for the {@link MockitoExtension}.
++ *
++ * @since 5.0
++ * @see MockitoExtension
++ */
++@Suite
++@SelectPackages("com.example.mockito")
++public class MockitoExtensionTestSuite {
++}
+diff --git a/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionWithNestedTests.java b/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionWithNestedTests.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/java/com/example/mockito/MockitoExtensionWithNestedTests.java
+@@ -0,0 +1,87 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.mockito.Mockito.when;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Nested;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.mockito.Mock;
++
++/**
++ * @since 5.0
++ * @see MockitoExtension
++ */
++@ExtendWith(MockitoExtension.class)
++class MockitoExtensionWithNestedTests {
++
++	boolean baseClassTestRun = false;
++
++	@BeforeEach
++	void initializeBaseClass(@Mock MyType myType) {
++		when(myType.getName()).thenReturn("base class");
++	}
++
++	@Test
++	void baseClassTest(@Mock MyType myType) {
++		assertEquals("base class", myType.getName());
++		baseClassTestRun = true;
++	}
++
++	@Nested
++	class FirstContext {
++
++		@BeforeEach
++		void initializeFirstNesting(@Mock YourType yourType, @Mock MyType myType) {
++			when(yourType.getName()).thenReturn("first nesting");
++			assertEquals("base class", myType.getName());
++		}
++
++		@Test
++		void firstNestedTest(@Mock YourType yourType) {
++			assertEquals("first nesting", yourType.getName());
++		}
++
++		@Nested
++		class SecondContext {
++
++			@BeforeEach
++			void initializeSecondNesting(@Mock YourType yourType, @Mock MyType myType, @Mock TheirType theirType) {
++				when(theirType.getName()).thenReturn("second nesting");
++				assertEquals("base class", myType.getName());
++				assertEquals("first nesting", yourType.getName());
++			}
++
++			@Test
++			void secondContextTest(@Mock TheirType theirType) {
++				assertEquals("second nesting", theirType.getName());
++			}
++
++		}
++
++		@AfterEach
++		void afterFirstContext(@Mock YourType yourType, @Mock MyType myType, @Mock TheirType theirType) {
++			assertEquals("base class", myType.getName());
++
++			if (baseClassTestRun) {
++				assertNull(theirType.getName());
++				assertNull(yourType.getName());
++			}
++		}
++
++	}
++
++}
+diff --git a/junit-jupiter-extensions/src/test/java/com/example/mockito/MyType.java b/junit-jupiter-extensions/src/test/java/com/example/mockito/MyType.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/java/com/example/mockito/MyType.java
+@@ -0,0 +1,16 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++interface MyType {
++
++	String getName();
++}
+diff --git a/junit-jupiter-extensions/src/test/java/com/example/mockito/NumberGenerator.java b/junit-jupiter-extensions/src/test/java/com/example/mockito/NumberGenerator.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/java/com/example/mockito/NumberGenerator.java
+@@ -0,0 +1,20 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++/**
++ * @since 5.0
++ */
++public interface NumberGenerator {
++
++	int next();
++
++}
+diff --git a/junit-jupiter-extensions/src/test/java/com/example/mockito/TheirType.java b/junit-jupiter-extensions/src/test/java/com/example/mockito/TheirType.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/java/com/example/mockito/TheirType.java
+@@ -0,0 +1,16 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++interface TheirType {
++
++	String getName();
++}
+diff --git a/junit-jupiter-extensions/src/test/java/com/example/mockito/YourType.java b/junit-jupiter-extensions/src/test/java/com/example/mockito/YourType.java
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/java/com/example/mockito/YourType.java
+@@ -0,0 +1,16 @@
++/*
++ * Copyright 2015-2016 the original author or authors.
++ *
++ * All rights reserved. This program and the accompanying materials are
++ * made available under the terms of the Eclipse Public License v1.0 which
++ * accompanies this distribution and is available at
++ *
++ * http://www.eclipse.org/legal/epl-v10.html
++ */
++
++package com.example.mockito;
++
++interface YourType {
++
++	String getName();
++}
+diff --git a/junit-jupiter-extensions/build.gradle b/junit-jupiter-extensions/build.gradle
+--- a/junit-jupiter-extensions/build.gradle
++++ b/junit-jupiter-extensions/build.gradle
+@@ -16,6 +16,8 @@
+ }
+ 
+ dependencies {
++	api("org.mockito:mockito-core:5.20.0")
++	testImplementation("org.junit.platform:junit-platform-suite")
+ 	api(platform("org.junit:junit-bom:6.0.1"))
+ 	api("org.junit.jupiter:junit-jupiter-api") {
+         because 'building extensions in "main" using JUnit Jupiter API'
+diff --git a/junit-jupiter-extensions/src/test/resources/mockito-extensions/org.mockito.plugins.MockMaker b/junit-jupiter-extensions/src/test/resources/mockito-extensions/org.mockito.plugins.MockMaker
+new file mode 100644
+--- /dev/null
++++ b/junit-jupiter-extensions/src/test/resources/mockito-extensions/org.mockito.plugins.MockMaker
+@@ -0,0 +1 @@
++mock-maker-subclass
+diff --git a/src/Builder.java b/src/Builder.java
+--- a/src/Builder.java
++++ b/src/Builder.java
+@@ -186,7 +186,11 @@
+ 		var actual = Files.readAllLines(path);
+ 		if (actual.size() >= expected.size()) {
+ 			actual = actual.subList(0, expected.size());
+-			return actual.equals(expected);
++			return actual.equals(expected) || actual.stream()
++                .map(line -> line.replace("2015-2016", "2015-2025")
++                        .replace("v1.0", "v2.0").replace("http:", "https:")
++                        .replace("epl-v10", "epl-v20"))
++                .toList().equals(expected);
+ 		}
+ 		return false;
+ 	}

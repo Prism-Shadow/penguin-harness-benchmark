@@ -1,0 +1,730 @@
+diff --git a/ElectronNET.API/ElectronNET.API.csproj b/ElectronNET.API/ElectronNET.API.csproj
+index 5d546318a9b08c5862508adf647d0fe7951e5f81..03bc805f1d0d447d0bcdd6e3272af7bcb0913108 100644
+--- a/ElectronNET.API/ElectronNET.API.csproj
++++ b/ElectronNET.API/ElectronNET.API.csproj
+@@ -1,7 +1,7 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <PropertyGroup>
+-    <TargetFramework>netcoreapp3.0</TargetFramework>
++    <TargetFramework>netcoreapp3.1</TargetFramework>
+     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+     <PackageOutputPath>..\artifacts</PackageOutputPath>
+     <PackageId>ElectronNET.API</PackageId>
+diff --git a/ElectronNET.API/WebHostBuilderExtensions.cs b/ElectronNET.API/WebHostBuilderExtensions.cs
+index f4580006e058cb4d1cbbc4f8a50316d6600f21cc..8680cf632a3eaf63235b3cac3886981fa356118b 100644
+--- a/ElectronNET.API/WebHostBuilderExtensions.cs
++++ b/ElectronNET.API/WebHostBuilderExtensions.cs
+@@ -1,5 +1,6 @@
+ ﻿using Microsoft.AspNetCore.Hosting;
+ using System;
++using System.IO;
+ 
+ namespace ElectronNET.API
+ {
+@@ -22,16 +23,27 @@ namespace ElectronNET.API
+                 {
+                     BridgeSettings.SocketPort = argument.ToUpper().Replace("/ELECTRONPORT=", "");
+                     Console.WriteLine("Use Electron Port: " + BridgeSettings.SocketPort);
+-                } else if(argument.ToUpper().Contains("ELECTRONWEBPORT"))
++                }
++                else if (argument.ToUpper().Contains("ELECTRONWEBPORT"))
+                 {
+                     BridgeSettings.WebPort = argument.ToUpper().Replace("/ELECTRONWEBPORT=", "");
+                 }
+             }
+ 
+-            if(HybridSupport.IsElectronActive)
++            if (HybridSupport.IsElectronActive)
+             {
+-                builder.UseContentRoot(AppDomain.CurrentDomain.BaseDirectory)
+-                    .UseUrls("http://127.0.0.1:" + BridgeSettings.WebPort);
++                // check for the content folder if its exists in base director otherwise no need to include
++                // It was used before because we are publishing the project which copies everything to bin folder and contentroot wwwroot was folder there.
++                // now we have implemented the live reload if app is run using /watch then we need to use the default project path.
++                if (Directory.Exists($"{AppDomain.CurrentDomain.BaseDirectory}\\wwwroot"))
++                {
++                    builder.UseContentRoot(AppDomain.CurrentDomain.BaseDirectory)
++                        .UseUrls("http://localhost:" + BridgeSettings.WebPort);
++                }
++                else
++                {
++                    builder.UseUrls("http://localhost:" + BridgeSettings.WebPort);
++                }
+             }
+ 
+             return builder;
+diff --git a/ElectronNET.CLI/Commands/StartElectronCommand.cs b/ElectronNET.CLI/Commands/StartElectronCommand.cs
+index 3573f2dda026b099b3f4dd89d60d3db4a02b135b..2340423c03c0c6ace1664919f040d18f0e3b8a76 100644
+--- a/ElectronNET.CLI/Commands/StartElectronCommand.cs
++++ b/ElectronNET.CLI/Commands/StartElectronCommand.cs
+@@ -60,7 +60,12 @@ namespace ElectronNET.CLI.Commands
+                 var platformInfo = GetTargetPlatformInformation.Do(string.Empty, string.Empty);
+ 
+                 string tempBinPath = Path.Combine(tempPath, "bin");
+-                var resultCode = ProcessHelper.CmdExecute($"dotnet publish -r {platformInfo.NetCorePublishRid} --output \"{tempBinPath}\" /p:PublishReadyToRun=true --no-self-contained", aspCoreProjectPath);
++                var resultCode = 0;
++
++                if (parser != null && !parser.Arguments.ContainsKey("watch"))
++                {
++                    resultCode = ProcessHelper.CmdExecute($"dotnet publish -r {platformInfo.NetCorePublishRid} --output \"{tempBinPath}\" /p:PublishReadyToRun=true --no-self-contained", aspCoreProjectPath);
++                }
+ 
+                 if (resultCode != 0)
+                 {
+@@ -110,6 +115,11 @@ namespace ElectronNET.CLI.Commands
+                     arguments += " --clear-cache=true";
+                 }
+ 
++                if (parser.Arguments.ContainsKey("watch"))
++                {
++                    arguments += " --watch=true";
++                }
++
+                 string path = Path.Combine(tempPath, "node_modules", ".bin");
+                 bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+ 
+@@ -117,6 +127,7 @@ namespace ElectronNET.CLI.Commands
+                 {
+                     Console.WriteLine("Invoke electron.cmd - in dir: " + path);
+                     ProcessHelper.CmdExecute(@"electron.cmd ""..\..\main.js"" " + arguments, path);
++
+                 }
+                 else
+                 {
+diff --git a/ElectronNET.CLI/ElectronNET.CLI.csproj b/ElectronNET.CLI/ElectronNET.CLI.csproj
+index c90d679be75eeed599af0dd2c1d28368f0263ec1..4f727133160948e8f9ae0fd456df7602bef2e670 100644
+--- a/ElectronNET.CLI/ElectronNET.CLI.csproj
++++ b/ElectronNET.CLI/ElectronNET.CLI.csproj
+@@ -3,7 +3,7 @@
+   <PropertyGroup>
+     <OutputType>Exe</OutputType>
+ 
+-    <TargetFramework>netcoreapp3.0</TargetFramework>
++    <TargetFramework>netcoreapp3.1</TargetFramework>
+     <AssemblyName>dotnet-electronize</AssemblyName>
+     <ToolCommandName>electronize</ToolCommandName>
+ 
+@@ -29,6 +29,11 @@
+     <PackageReleaseNotes>Changelog: https://github.com/ElectronNET/Electron.NET/blob/master/Changelog.md</PackageReleaseNotes>
+     <PackageIcon>PackageIcon.png</PackageIcon>
+     <PackAsTool>true</PackAsTool>
++    <StartupObject></StartupObject>
++  </PropertyGroup>
++
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
++    <PlatformTarget>AnyCPU</PlatformTarget>
+   </PropertyGroup>
+ 
+   <ItemGroup>
+@@ -37,7 +42,7 @@
+   </ItemGroup>
+ 
+   <ItemGroup>
+-    <None Include="PackageIcon.png" Pack="true" PackagePath="\"/>
++    <None Include="PackageIcon.png" Pack="true" PackagePath="\" />
+   </ItemGroup>
+ 
+   <ItemGroup>
+diff --git a/ElectronNET.CLI/Properties/launchSettings.json b/ElectronNET.CLI/Properties/launchSettings.json
+index bcce15601d1015a995bba904a30b8c3c59043f8b..819d7fec250c81b69176141991136bae0da768d1 100644
+--- a/ElectronNET.CLI/Properties/launchSettings.json
++++ b/ElectronNET.CLI/Properties/launchSettings.json
+@@ -2,7 +2,7 @@
+   "profiles": {
+     "ElectronNET.CLI": {
+       "commandName": "Project",
+-      "commandLineArgs": "build \"C:\\Users\\Gregor\\Documents\\Visual Studio 2017\\Projects\\ElectronNET\\ElectronNET.WebApp\""
++      "commandLineArgs": "start /project-path \"C:\\Users\\Rizvi\\source\\repos\\Electron.NET\\ElectronNET.WebApp\" /watch"
+     }
+   }
+ }
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/browserWindows.js b/ElectronNET.Host/api/browserWindows.js
+index 7f3ebd3e149af18f01c3aa2b2a73c31ee771889c..837923395f915e6c87e5639890b71dfa669232f0 100644
+--- a/ElectronNET.Host/api/browserWindows.js
++++ b/ElectronNET.Host/api/browserWindows.js
+@@ -4,6 +4,7 @@ const path = require('path');
+ const windows = [];
+ let readyToShowWindowsIds = [];
+ let window, lastOptions, electronSocket;
++let mainWindowURL;
+ module.exports = (socket, app) => {
+     electronSocket = socket;
+     socket.on('register-browserWindow-ready-to-show', (id) => {
+@@ -168,7 +169,16 @@ module.exports = (socket, app) => {
+         else if (!options.webPreferences) {
+             options = { ...options, webPreferences: { nodeIntegration: true } };
+         }
+-        window = new electron_1.BrowserWindow(options);
++        // we dont want to recreate the window when watch is ready.
++        if (app.commandLine.hasSwitch('watch') && app['mainWindowURL'] === loadUrl) {
++            window = app['mainWindow'];
++            if (window) {
++                window.reload();
++            }
++        }
++        else {
++            window = new electron_1.BrowserWindow(options);
++        }
+         window.on('ready-to-show', () => {
+             if (readyToShowWindowsIds.includes(window.id)) {
+                 readyToShowWindowsIds = readyToShowWindowsIds.filter(value => value !== window.id);
+@@ -209,6 +219,11 @@ module.exports = (socket, app) => {
+             window.webContents.session.clearCache();
+             console.log('auto clear-cache active for new window.');
+         }
++        // set main window url
++        if (app['mainWindowURL'] == undefined || app['mainWindowURL'] == "") {
++            app['mainWindowURL'] = loadUrl;
++            app['mainWindow'] = window;
++        }
+         windows.push(window);
+         electronSocket.emit('BrowserWindowCreated', window.id);
+     });
+diff --git a/ElectronNET.Host/api/browserWindows.ts b/ElectronNET.Host/api/browserWindows.ts
+index 7832b7a40b1940ef1fab91f7ec6c655dbe8678ba..fe32b7aeaa74a4b3c075c75e84e49542b8fd8da6 100644
+--- a/ElectronNET.Host/api/browserWindows.ts
++++ b/ElectronNET.Host/api/browserWindows.ts
+@@ -3,7 +3,7 @@ const path = require('path');
+ const windows: Electron.BrowserWindow[] = [];
+ let readyToShowWindowsIds: number[] = [];
+ let window, lastOptions, electronSocket;
+-
++let mainWindowURL;
+ export = (socket: SocketIO.Socket, app: Electron.App) => {
+     electronSocket = socket;
+     socket.on('register-browserWindow-ready-to-show', (id) => {
+@@ -199,7 +199,16 @@ export = (socket: SocketIO.Socket, app: Electron.App) => {
+             options = { ...options, webPreferences: { nodeIntegration: true } };
+         }
+ 
+-        window = new BrowserWindow(options);
++        // we dont want to recreate the window when watch is ready.
++        if (app.commandLine.hasSwitch('watch') && app['mainWindowURL'] === loadUrl) {
++            window = app['mainWindow'];
++            if (window) {
++                window.reload();
++            }
++        } else {
++            window = new BrowserWindow(options);
++        }
++
+         window.on('ready-to-show', () => {
+             if (readyToShowWindowsIds.includes(window.id)) {
+                 readyToShowWindowsIds = readyToShowWindowsIds.filter(value => value !== window.id);
+@@ -245,6 +254,12 @@ export = (socket: SocketIO.Socket, app: Electron.App) => {
+             console.log('auto clear-cache active for new window.');
+         }
+ 
++        // set main window url
++        if (app['mainWindowURL'] == undefined || app['mainWindowURL'] == "") {
++            app['mainWindowURL'] = loadUrl;
++            app['mainWindow'] = window;
++        }
++
+         windows.push(window);
+         electronSocket.emit('BrowserWindowCreated', window.id);
+     });
+@@ -744,6 +759,7 @@ export = (socket: SocketIO.Socket, app: Electron.App) => {
+         getWindowById(id).setBrowserView(browserView);
+     });
+ 
++
+     function getWindowById(id: number): Electron.BrowserWindow {
+         for (let index = 0; index < windows.length; index++) {
+             const element = windows[index];
+diff --git a/ElectronNET.Host/main.js b/ElectronNET.Host/main.js
+index c1cd8519813e4b80b8937b1c4736d7e33c66790c..a399e9a2ad0ce96c7023a5f8ee9e071bb6431b6b 100644
+--- a/ElectronNET.Host/main.js
++++ b/ElectronNET.Host/main.js
+@@ -1,22 +1,36 @@
+ ﻿const { app } = require('electron');
+ const { BrowserWindow } = require('electron');
+ const path = require('path');
+-const process = require('child_process').spawn;
++const cProcess = require('child_process').spawn;
+ const portscanner = require('portscanner');
+ const imageSize = require('image-size');
++const chalk = require('chalk');
+ let io, server, browserWindows, ipc, apiProcess, loadURL;
+ let appApi, menu, dialogApi, notification, tray, webContents;
+ let globalShortcut, shellApi, screen, clipboard, autoUpdater;
+ let commandLine, browserView;
+ let splashScreen, hostHook;
++let mainWindowId;
+ 
+ let manifestJsonFileName = 'electron.manifest.json';
+-if(app.commandLine.hasSwitch('manifest')) {
++let watchable = false;
++if (app.commandLine.hasSwitch('manifest')) {
+     manifestJsonFileName = app.commandLine.getSwitchValue('manifest');
+ };
+ 
+-const currentBinPath = path.join(__dirname.replace('app.asar', ''), 'bin');
+-const manifestJsonFilePath = path.join(currentBinPath, manifestJsonFileName);
++if (app.commandLine.hasSwitch('watch')) {
++    watchable = true;
++};
++
++let currentBinPath = path.join(__dirname.replace('app.asar', ''), 'bin');
++let manifestJsonFilePath = path.join(currentBinPath, manifestJsonFileName);
++
++// if watch is enabled lets change the path
++if (watchable) {
++    currentBinPath = path.join(__dirname, '../../'); // go to project directory
++    manifestJsonFilePath = path.join(currentBinPath, manifestJsonFileName);
++}
++
+ const manifestJsonFile = require(manifestJsonFilePath);
+ if (manifestJsonFile.singleInstance || manifestJsonFile.aspCoreBackendPort) {
+     const mainInstance = app.requestSingleInstanceLock();
+@@ -42,7 +56,7 @@ app.on('ready', () => {
+ 
+     // hostname needs to belocalhost, otherwise Windows Firewall will be triggered.
+     portscanner.findAPortNotInUse(8000, 65535, 'localhost', function (error, port) {
+-        console.log('Electron Socket IO Port: ' + port);
++        console.log(chalk.blue('Electron Socket IO Port: ' + port));
+         startSocketApiBridge(port);
+     });
+ 
+@@ -62,8 +76,8 @@ function startSplashScreen() {
+     let imageFile = path.join(currentBinPath, manifestJsonFile.splashscreen.imageFile);
+     imageSize(imageFile, (error, dimensions) => {
+         if (error) {
+-            console.log(`load splashscreen error:`);
+-            console.log(error);
++            console.log(chalk.bold.red(`load splashscreen error:`));
++            console.log(chalk.bold.red(error));
+ 
+             throw new Error(error.message);
+         }
+@@ -104,15 +118,46 @@ function startSocketApiBridge(port) {
+ 
+     server.listen(port, 'localhost');
+     server.on('listening', function () {
+-        console.log('Electron Socket started on port %s at %s', server.address().port, server.address().address);
++        console.log(chalk.bgGreenBright('Electron Socket started on port %s at %s', server.address().port, server.address().address));
+         // Now that socket connection is established, we can guarantee port will not be open for portscanner
+-        startAspCoreBackend(port);
++        if (watchable) {
++            startAspCoreBackendWithWatch(port);
++        } else {
++            startAspCoreBackend(port);
++        }
+     });
+ 
++    // prototype
++    app['mainWindowURL'] = "";
++    app['mainWindow'] = null;
++
+     io.on('connection', (socket) => {
++
++        // we need to remove previously cache instances 
++        // otherwise it will fire the same event multiple depends how many time
++        // live reload watch happen.
++        socket.on('disconnect', function () {
++            console.log(chalk.bold.red('Got disconnect!'));
++            delete require.cache[require.resolve('./api/app')];
++            delete require.cache[require.resolve('./api/browserWindows')];
++            delete require.cache[require.resolve('./api/commandLine')];
++            delete require.cache[require.resolve('./api/autoUpdater')];
++            delete require.cache[require.resolve('./api/ipc')];
++            delete require.cache[require.resolve('./api/menu')];
++            delete require.cache[require.resolve('./api/dialog')];
++            delete require.cache[require.resolve('./api/notification')];
++            delete require.cache[require.resolve('./api/tray')];
++            delete require.cache[require.resolve('./api/webContents')];
++            delete require.cache[require.resolve('./api/globalShortcut')];
++            delete require.cache[require.resolve('./api/shell')];
++            delete require.cache[require.resolve('./api/screen')];
++            delete require.cache[require.resolve('./api/clipboard')];
++            delete require.cache[require.resolve('./api/browserView')];
++        });
++
+         global['electronsocket'] = socket;
+         global['electronsocket'].setMaxListeners(0);
+-        console.log('ASP.NET Core Application connected...', 'global.electronsocket', global['electronsocket'].id, new Date());
++        console.log(chalk.bold.bgCyan('ASP.NET Core Application connected...', 'global.electronsocket', global['electronsocket'].id, new Date()));
+ 
+         appApi = require('./api/app')(socket, app);
+         browserWindows = require('./api/browserWindows')(socket, app);
+@@ -130,6 +175,8 @@ function startSocketApiBridge(port) {
+         clipboard = require('./api/clipboard')(socket);
+         browserView = require('./api/browserView')(socket);
+ 
++
++
+         try {
+             const hostHookScriptFilePath = path.join(__dirname, 'ElectronHostHook', 'index.js');
+ 
+@@ -139,7 +186,7 @@ function startSocketApiBridge(port) {
+                 hostHook.onHostReady();
+             }
+         } catch (error) {
+-            console.log(error.message);
++            console.log(chalk.bold.red(error.message));
+         }
+     });
+ }
+@@ -153,7 +200,7 @@ function isModuleAvailable(name) {
+ }
+ 
+ function startAspCoreBackend(electronPort) {
+-    if(manifestJsonFile.aspCoreBackendPort) {
++    if (manifestJsonFile.aspCoreBackendPort) {
+         startBackend(manifestJsonFile.aspCoreBackendPort)
+     } else {
+         // hostname needs to be localhost, otherwise Windows Firewall will be triggered.
+@@ -175,10 +222,37 @@ function startAspCoreBackend(electronPort) {
+ 
+         let binFilePath = path.join(currentBinPath, binaryFile);
+         var options = { cwd: currentBinPath };
+-        apiProcess = process(binFilePath, parameters, options);
++        apiProcess = cProcess(binFilePath, parameters, options);
+ 
+         apiProcess.stdout.on('data', (data) => {
+             console.log(`stdout: ${data.toString()}`);
+         });
+     }
+ }
++
++function startAspCoreBackendWithWatch(electronPort) {
++    if (manifestJsonFile.aspCoreBackendPort) {
++        startBackend(manifestJsonFile.aspCoreBackendPort)
++    } else {
++        // hostname needs to be localhost, otherwise Windows Firewall will be triggered.
++        portscanner.findAPortNotInUse(electronPort + 1, 65535, 'localhost', function (error, electronWebPort) {
++            startBackend(electronWebPort);
++        });
++    }
++
++    function startBackend(aspCoreBackendPort) {
++        console.log('ASP.NET Core Watch Port: ' + aspCoreBackendPort);
++        loadURL = `http://localhost:${aspCoreBackendPort}`;
++        const parameters = ['watch', 'run', `/electronPort=${electronPort}`, `/electronWebPort=${aspCoreBackendPort}`];
++
++        var options = {
++            cwd: currentBinPath,
++            env: process.env,
++        };
++        apiProcess = cProcess('dotnet', parameters, options);
++
++        apiProcess.stdout.on('data', (data) => {
++            console.log(chalk.bold.blue(`${data.toString()}`));
++        });
++    }
++}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/package-lock.json b/ElectronNET.Host/package-lock.json
+index 76727cb73af62dee4afc8287de687c339be09447..d29731f598f414c6b1fadcf005d18fe2988166a7 100644
+--- a/ElectronNET.Host/package-lock.json
++++ b/ElectronNET.Host/package-lock.json
+@@ -28,6 +28,64 @@
+                 "@babel/helper-validator-identifier": "^7.9.0",
+                 "chalk": "^2.0.0",
+                 "js-tokens": "^4.0.0"
++            },
++            "dependencies": {
++                "ansi-styles": {
++                    "version": "3.2.1",
++                    "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-3.2.1.tgz",
++                    "integrity": "sha512-VT0ZI6kZRdTh8YyJw3SMbYm/u+NqfsAxEpWO0Pf9sq8/e94WxxOpPKx9FR1FlyCtOVDNOQ+8ntlqFxiRc+r5qA==",
++                    "dev": true,
++                    "requires": {
++                        "color-convert": "^1.9.0"
++                    }
++                },
++                "chalk": {
++                    "version": "2.4.2",
++                    "resolved": "https://registry.npmjs.org/chalk/-/chalk-2.4.2.tgz",
++                    "integrity": "sha512-Mti+f9lpJNcwF4tWV8/OrTTtF1gZi+f8FqlyAdouralcFWFQWF2+NgCHShjkCb+IFBLq9buZwE1xckQU4peSuQ==",
++                    "dev": true,
++                    "requires": {
++                        "ansi-styles": "^3.2.1",
++                        "escape-string-regexp": "^1.0.5",
++                        "supports-color": "^5.3.0"
++                    }
++                },
++                "color-convert": {
++                    "version": "1.9.3",
++                    "resolved": "https://registry.npmjs.org/color-convert/-/color-convert-1.9.3.tgz",
++                    "integrity": "sha512-QfAUtd+vFdAtFQcC8CCyYt1fYWxSqAiK2cSD6zDB8N3cpsEBAvRxp9zOGg6G/SHHJYAT88/az/IuDGALsNVbGg==",
++                    "dev": true,
++                    "requires": {
++                        "color-name": "1.1.3"
++                    }
++                },
++                "color-name": {
++                    "version": "1.1.3",
++                    "resolved": "https://registry.npmjs.org/color-name/-/color-name-1.1.3.tgz",
++                    "integrity": "sha1-p9BVi9icQveV3UIyj3QIMcpTvCU=",
++                    "dev": true
++                },
++                "escape-string-regexp": {
++                    "version": "1.0.5",
++                    "resolved": "https://registry.npmjs.org/escape-string-regexp/-/escape-string-regexp-1.0.5.tgz",
++                    "integrity": "sha1-G2HAViGQqN/2rjuyzwIAyhMLhtQ=",
++                    "dev": true
++                },
++                "has-flag": {
++                    "version": "3.0.0",
++                    "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-3.0.0.tgz",
++                    "integrity": "sha1-tdRU3CGZriJWmfNGfloH87lVuv0=",
++                    "dev": true
++                },
++                "supports-color": {
++                    "version": "5.5.0",
++                    "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-5.5.0.tgz",
++                    "integrity": "sha512-QjVjwdXIt408MIiAqCX4oUKsgU2EqAGzs2Ppkm4aQYbjm+ZEWEcW4SfFNTr4uMNZma0ey4f5lgLrkB0aX0QMow==",
++                    "dev": true,
++                    "requires": {
++                        "has-flag": "^3.0.0"
++                    }
++                }
+             }
+         },
+         "@electron/get": {
+@@ -62,6 +120,11 @@
+                 "defer-to-connect": "^1.0.1"
+             }
+         },
++        "@types/color-name": {
++            "version": "1.1.1",
++            "resolved": "https://registry.npmjs.org/@types/color-name/-/color-name-1.1.1.tgz",
++            "integrity": "sha512-rr+OQyAjxze7GgWrSaJwydHStIhHq2lvY3BOC2Mj7KnzI7XK0Uw1TOOdI9lDoajEbSWLiYgoo4f1R51erQfhPQ=="
++        },
+         "@types/node": {
+             "version": "10.17.20",
+             "resolved": "https://registry.npmjs.org/@types/node/-/node-10.17.20.tgz",
+@@ -107,12 +170,12 @@
+             "integrity": "sha1-/ts5T58OAqqXaOcCvaI7UF+ufh8="
+         },
+         "ansi-styles": {
+-            "version": "3.2.1",
+-            "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-3.2.1.tgz",
+-            "integrity": "sha512-VT0ZI6kZRdTh8YyJw3SMbYm/u+NqfsAxEpWO0Pf9sq8/e94WxxOpPKx9FR1FlyCtOVDNOQ+8ntlqFxiRc+r5qA==",
+-            "dev": true,
++            "version": "4.2.1",
++            "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-4.2.1.tgz",
++            "integrity": "sha512-9VGjrMsG1vePxcSweQsN20KY/c4zN0h9fLjqAbwbPfahM3t+NL+M9HC8xeXG2I8pX5NoamTGNuomEUFI7fcUjA==",
+             "requires": {
+-                "color-convert": "^1.9.0"
++                "@types/color-name": "^1.1.1",
++                "color-convert": "^2.0.1"
+             }
+         },
+         "argparse": {
+@@ -257,22 +320,12 @@
+             "integrity": "sha1-KAOY5dZkvXQDi28JBRU+borxvCA="
+         },
+         "chalk": {
+-            "version": "2.4.2",
+-            "resolved": "https://registry.npmjs.org/chalk/-/chalk-2.4.2.tgz",
+-            "integrity": "sha512-Mti+f9lpJNcwF4tWV8/OrTTtF1gZi+f8FqlyAdouralcFWFQWF2+NgCHShjkCb+IFBLq9buZwE1xckQU4peSuQ==",
+-            "dev": true,
++            "version": "4.0.0",
++            "resolved": "https://registry.npmjs.org/chalk/-/chalk-4.0.0.tgz",
++            "integrity": "sha512-N9oWFcegS0sFr9oh1oz2d7Npos6vNoWW9HvtCg5N1KRFpUhaAhvTv5Y58g880fZaEYSNm3qDz8SU1UrGvp+n7A==",
+             "requires": {
+-                "ansi-styles": "^3.2.1",
+-                "escape-string-regexp": "^1.0.5",
+-                "supports-color": "^5.3.0"
+-            },
+-            "dependencies": {
+-                "escape-string-regexp": {
+-                    "version": "1.0.5",
+-                    "resolved": "https://registry.npmjs.org/escape-string-regexp/-/escape-string-regexp-1.0.5.tgz",
+-                    "integrity": "sha1-G2HAViGQqN/2rjuyzwIAyhMLhtQ=",
+-                    "dev": true
+-                }
++                "ansi-styles": "^4.1.0",
++                "supports-color": "^7.1.0"
+             }
+         },
+         "clone-response": {
+@@ -285,19 +338,17 @@
+             }
+         },
+         "color-convert": {
+-            "version": "1.9.3",
+-            "resolved": "https://registry.npmjs.org/color-convert/-/color-convert-1.9.3.tgz",
+-            "integrity": "sha512-QfAUtd+vFdAtFQcC8CCyYt1fYWxSqAiK2cSD6zDB8N3cpsEBAvRxp9zOGg6G/SHHJYAT88/az/IuDGALsNVbGg==",
+-            "dev": true,
++            "version": "2.0.1",
++            "resolved": "https://registry.npmjs.org/color-convert/-/color-convert-2.0.1.tgz",
++            "integrity": "sha512-RRECPsj7iu/xb5oKYcsFHSppFNnsj/52OVTRKb4zP5onXwVF3zVmmToNcOfGC+CRDpfK/U584fMg38ZHCaElKQ==",
+             "requires": {
+-                "color-name": "1.1.3"
++                "color-name": "~1.1.4"
+             }
+         },
+         "color-name": {
+-            "version": "1.1.3",
+-            "resolved": "https://registry.npmjs.org/color-name/-/color-name-1.1.3.tgz",
+-            "integrity": "sha1-p9BVi9icQveV3UIyj3QIMcpTvCU=",
+-            "dev": true
++            "version": "1.1.4",
++            "resolved": "https://registry.npmjs.org/color-name/-/color-name-1.1.4.tgz",
++            "integrity": "sha512-dOy+3AuW3a2wNbZHIuMZpTcgjGuLU/uBL/ubcZF9OXbDo8ff4O8yVp5Bf0efS8uEoYo5q4Fx7dY9OgQGXgAsQA=="
+         },
+         "commander": {
+             "version": "2.20.3",
+@@ -380,6 +431,14 @@
+                 "ms": "^2.1.1"
+             }
+         },
++        "decache": {
++            "version": "4.5.1",
++            "resolved": "https://registry.npmjs.org/decache/-/decache-4.5.1.tgz",
++            "integrity": "sha512-5J37nATc6FmOTLbcsr9qx7Nm28qQyg1SK4xyEHqM0IBkNhWFp0Sm+vKoWYHD8wq+OUEb9jLyaKFfzzd1A9hcoA==",
++            "requires": {
++                "callsite": "^1.0.0"
++            }
++        },
+         "decompress-response": {
+             "version": "3.3.0",
+             "resolved": "https://registry.npmjs.org/decompress-response/-/decompress-response-3.3.0.tgz",
+@@ -706,10 +765,9 @@
+             "integrity": "sha1-XkdHk/fqmEPRu5nCPu9J/xJv/zk="
+         },
+         "has-flag": {
+-            "version": "3.0.0",
+-            "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-3.0.0.tgz",
+-            "integrity": "sha1-tdRU3CGZriJWmfNGfloH87lVuv0=",
+-            "dev": true
++            "version": "4.0.0",
++            "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-4.0.0.tgz",
++            "integrity": "sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ=="
+         },
+         "http-cache-semantics": {
+             "version": "4.1.0",
+@@ -1238,12 +1296,11 @@
+             }
+         },
+         "supports-color": {
+-            "version": "5.5.0",
+-            "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-5.5.0.tgz",
+-            "integrity": "sha512-QjVjwdXIt408MIiAqCX4oUKsgU2EqAGzs2Ppkm4aQYbjm+ZEWEcW4SfFNTr4uMNZma0ey4f5lgLrkB0aX0QMow==",
+-            "dev": true,
++            "version": "7.1.0",
++            "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-7.1.0.tgz",
++            "integrity": "sha512-oRSIpR8pxT1Wr2FquTNnGet79b3BWljqOuoW/h4oBhxJ/HUbX5nX6JSruTkvXDCFMwDPvsaTTbvMLKZWSy0R5g==",
+             "requires": {
+-                "has-flag": "^3.0.0"
++                "has-flag": "^4.0.0"
+             }
+         },
+         "to-array": {
+@@ -1293,11 +1350,67 @@
+                 "tsutils": "^2.29.0"
+             },
+             "dependencies": {
++                "ansi-styles": {
++                    "version": "3.2.1",
++                    "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-3.2.1.tgz",
++                    "integrity": "sha512-VT0ZI6kZRdTh8YyJw3SMbYm/u+NqfsAxEpWO0Pf9sq8/e94WxxOpPKx9FR1FlyCtOVDNOQ+8ntlqFxiRc+r5qA==",
++                    "dev": true,
++                    "requires": {
++                        "color-convert": "^1.9.0"
++                    }
++                },
++                "chalk": {
++                    "version": "2.4.2",
++                    "resolved": "https://registry.npmjs.org/chalk/-/chalk-2.4.2.tgz",
++                    "integrity": "sha512-Mti+f9lpJNcwF4tWV8/OrTTtF1gZi+f8FqlyAdouralcFWFQWF2+NgCHShjkCb+IFBLq9buZwE1xckQU4peSuQ==",
++                    "dev": true,
++                    "requires": {
++                        "ansi-styles": "^3.2.1",
++                        "escape-string-regexp": "^1.0.5",
++                        "supports-color": "^5.3.0"
++                    }
++                },
++                "color-convert": {
++                    "version": "1.9.3",
++                    "resolved": "https://registry.npmjs.org/color-convert/-/color-convert-1.9.3.tgz",
++                    "integrity": "sha512-QfAUtd+vFdAtFQcC8CCyYt1fYWxSqAiK2cSD6zDB8N3cpsEBAvRxp9zOGg6G/SHHJYAT88/az/IuDGALsNVbGg==",
++                    "dev": true,
++                    "requires": {
++                        "color-name": "1.1.3"
++                    }
++                },
++                "color-name": {
++                    "version": "1.1.3",
++                    "resolved": "https://registry.npmjs.org/color-name/-/color-name-1.1.3.tgz",
++                    "integrity": "sha1-p9BVi9icQveV3UIyj3QIMcpTvCU=",
++                    "dev": true
++                },
++                "escape-string-regexp": {
++                    "version": "1.0.5",
++                    "resolved": "https://registry.npmjs.org/escape-string-regexp/-/escape-string-regexp-1.0.5.tgz",
++                    "integrity": "sha1-G2HAViGQqN/2rjuyzwIAyhMLhtQ=",
++                    "dev": true
++                },
++                "has-flag": {
++                    "version": "3.0.0",
++                    "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-3.0.0.tgz",
++                    "integrity": "sha1-tdRU3CGZriJWmfNGfloH87lVuv0=",
++                    "dev": true
++                },
+                 "semver": {
+                     "version": "5.7.1",
+                     "resolved": "https://registry.npmjs.org/semver/-/semver-5.7.1.tgz",
+                     "integrity": "sha512-sauaDf/PZdVgrLTNYHRtpXa1iRiKcaebiKQ1BJdpQlWH2lCvexQdX55snPFyK7QzpudqbCI0qXFfOasHdyNDGQ==",
+                     "dev": true
++                },
++                "supports-color": {
++                    "version": "5.5.0",
++                    "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-5.5.0.tgz",
++                    "integrity": "sha512-QjVjwdXIt408MIiAqCX4oUKsgU2EqAGzs2Ppkm4aQYbjm+ZEWEcW4SfFNTr4uMNZma0ey4f5lgLrkB0aX0QMow==",
++                    "dev": true,
++                    "requires": {
++                        "has-flag": "^3.0.0"
++                    }
+                 }
+             }
+         },
+diff --git a/ElectronNET.Host/package.json b/ElectronNET.Host/package.json
+index afb0e8059c93a36cd0c38ce32faa44df4ad28076..6c1d95bff1325631b400c0a8c463a5df9d118a72 100644
+--- a/ElectronNET.Host/package.json
++++ b/ElectronNET.Host/package.json
+@@ -12,6 +12,7 @@
+         "start": "tsc -p ."
+     },
+     "dependencies": {
++        "chalk": "^4.0.0",
+         "dasherize": "^2.0.0",
+         "electron-updater": "^4.2.5",
+         "image-size": "^0.7.4",
+diff --git a/ElectronNET.WebApp/Controllers/MenusController.cs b/ElectronNET.WebApp/Controllers/MenusController.cs
+index 4e9d8ec0ab0026b6531e3cde4ec324d8edd38474..09f0b895a1d23e9a5f31ee27e8c5a9ae240176c7 100644
+--- a/ElectronNET.WebApp/Controllers/MenusController.cs
++++ b/ElectronNET.WebApp/Controllers/MenusController.cs
+@@ -112,7 +112,9 @@ namespace ElectronNET.WebApp.Controllers
+                 new MenuItem { Label = "Electron.NET", Type = MenuType.checkbox, Checked = true }
+             };
+ 
+-            var mainWindow = Electron.WindowManager.BrowserWindows.First();
++            var mainWindow = Electron.WindowManager.BrowserWindows.FirstOrDefault();
++            if (mainWindow == null) return;
++
+             Electron.Menu.SetContextMenu(mainWindow, menu);
+ 
+             Electron.IpcMain.On("show-context-menu", (args) =>
+diff --git a/ElectronNET.WebApp/ElectronNET.WebApp.csproj b/ElectronNET.WebApp/ElectronNET.WebApp.csproj
+index 09fa59e8ee6c2a4df532166853b8733b8deb694e..729ae26080960c286e30f5a0aa0c1c6a0e8071cd 100644
+--- a/ElectronNET.WebApp/ElectronNET.WebApp.csproj
++++ b/ElectronNET.WebApp/ElectronNET.WebApp.csproj
+@@ -1,10 +1,10 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+   <PropertyGroup>
+-    <TargetFramework>netcoreapp3.0</TargetFramework>
++    <TargetFramework>netcoreapp3.1</TargetFramework>
+     <AspNetCoreHostingModel>OutOfProcess</AspNetCoreHostingModel>
+     <AspNetCoreModuleName>AspNetCoreModule</AspNetCoreModuleName>
+     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+-    <TypeScriptToolsVersion>3.6</TypeScriptToolsVersion>
++    <TypeScriptToolsVersion>3.8</TypeScriptToolsVersion>
+   </PropertyGroup>
+   <ItemGroup>
+     <Compile Remove="Controllers\ManageWindowsController.cs" />

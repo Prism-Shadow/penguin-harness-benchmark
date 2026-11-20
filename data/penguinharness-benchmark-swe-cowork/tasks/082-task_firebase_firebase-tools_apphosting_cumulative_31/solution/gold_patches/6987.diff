@@ -1,0 +1,782 @@
+diff --git a/package.json b/package.json
+index 43ea9f37..4ab07d39 100644
+--- a/package.json
++++ b/package.json
+@@ -122,7 +122,6 @@
+     "google-auth-library": "^7.11.0",
+     "inquirer": "^8.2.6",
+     "inquirer-autocomplete-prompt": "^2.0.1",
+-    "js-yaml": "^3.13.1",
+     "jsonwebtoken": "^9.0.0",
+     "leven": "^3.1.0",
+     "libsodium-wrappers": "^0.7.10",
+@@ -155,7 +154,8 @@
+     "uuid": "^8.3.2",
+     "winston": "^3.0.0",
+     "winston-transport": "^4.4.0",
+-    "ws": "^7.2.3"
++    "ws": "^7.2.3",
++    "yaml": "^2.4.1"
+   },
+   "devDependencies": {
+     "@angular-devkit/architect": "^0.1402.2",
+diff --git a/src/apphosting/config.ts b/src/apphosting/config.ts
+index 2d525918..deceb2d0 100644
+--- a/src/apphosting/config.ts
++++ b/src/apphosting/config.ts
+@@ -1,8 +1,11 @@
+-import * as path from "path";
++import { resolve, join, dirname } from "path";
+ import { writeFileSync } from "fs";
+-import * as yaml from "js-yaml";
++import * as yaml from "yaml";
+ 
+ import * as fs from "../fsutils";
++import { NodeType } from "yaml/dist/nodes/Node";
++import * as prompt from "../prompt";
++import * as dialogs from "./secrets/dialogs";
+ 
+ export interface RunConfig {
+   concurrency?: number;
+@@ -38,29 +41,115 @@ export interface Config {
+ export function yamlPath(cwd: string): string | null {
+   let dir = cwd;
+ 
+-  while (!fs.fileExistsSync(path.resolve(dir, "apphosting.yaml"))) {
++  while (!fs.fileExistsSync(resolve(dir, "apphosting.yaml"))) {
+     // We've hit project root
+-    if (fs.fileExistsSync(path.resolve(dir, "firebase.json"))) {
++    if (fs.fileExistsSync(resolve(dir, "firebase.json"))) {
+       return null;
+     }
+ 
+-    const parent = path.dirname(dir);
++    const parent = dirname(dir);
+     // We've hit the filesystem root
+     if (parent === dir) {
+       return null;
+     }
+     dir = parent;
+   }
+-  return path.resolve(dir, "apphosting.yaml");
++  return resolve(dir, "apphosting.yaml");
+ }
+ 
+ /** Load apphosting.yaml */
+-export function load(yamlPath: string): Config {
++export function load(yamlPath: string): yaml.Document {
+   const raw = fs.readFile(yamlPath);
+-  return yaml.load(raw, yaml.DEFAULT_FULL_SCHEMA) as Config;
++  return yaml.parseDocument(raw);
+ }
+ 
+ /** Save apphosting.yaml */
+-export function store(yamlPath: string, config: Config): void {
+-  writeFileSync(yamlPath, yaml.dump(config));
++export function store(yamlPath: string, document: yaml.Document): void {
++  writeFileSync(yamlPath, document.toString());
++}
++
++/** Gets the first Env with a given variable name. */
++export function findEnv(document: yaml.Document, variable: string): Env | undefined {
++  if (!document.has("env")) {
++    return undefined;
++  }
++  const envs = document.get("env") as yaml.YAMLSeq;
++  for (const env of envs.items as Array<NodeType<Env>>) {
++    if ((env.get("variable") as unknown) === variable) {
++      return env.toJSON() as Env;
++    }
++  }
++  return undefined;
++}
++
++/** Inserts or overwrites the first Env with the env.variable name. */
++export function upsertEnv(document: yaml.Document, env: Env): void {
++  if (!document.has("env")) {
++    document.set("env", document.createNode([env]));
++    return;
++  }
++  const envs = document.get("env") as yaml.YAMLSeq<NodeType<Env>>;
++
++  // The type system in this library is... not great at propagating type info
++  const envYaml = document.createNode(env);
++  for (let i = 0; i < envs.items.length; i++) {
++    if ((envs.items[i].get("variable") as unknown) === env.variable) {
++      // Note to reviewers: Should we instead set per each field so that we preserve comments?
++      envs.set(i, envYaml);
++      return;
++    }
++  }
++
++  envs.add(envYaml);
++}
++
++/**
++ * Given a secret name, guides the user whether they want to add that secret to apphosting.yaml.
++ * If an apphosting.yaml exists and includes the secret already is used as a variable name, exist early.
++ * If apphosting.yaml does not exist, offers to create it.
++ * If env does not exist, offers to add it.
++ * If secretName is not a valid env var name, prompts for an env var name.
++ */
++export async function maybeAddSecretToYaml(secretName: string): Promise<void> {
++  // We must go through the exports object for stubbing to work in tests.
++  const dynamicDispatch = exports as {
++    yamlPath: typeof yamlPath;
++    load: typeof load;
++    findEnv: typeof findEnv;
++    upsertEnv: typeof upsertEnv;
++    store: typeof store;
++  };
++  // Note: The API proposal suggested that we would check if the env exists. This is stupidly hard because the YAML may not exist yet.
++  let path = dynamicDispatch.yamlPath(process.cwd());
++  let projectYaml: yaml.Document;
++  if (path) {
++    projectYaml = dynamicDispatch.load(path);
++  } else {
++    projectYaml = new yaml.Document();
++  }
++  // TODO: Should we search for any env where it has secret: secretName rather than variable: secretName?
++  if (dynamicDispatch.findEnv(projectYaml, secretName)) {
++    return;
++  }
++  const addToYaml = await prompt.confirm({
++    message: "Would you like to add this secret to apphosting.yaml?",
++    default: true,
++  });
++  if (!addToYaml) {
++    return;
++  }
++  if (!path) {
++    path = await prompt.promptOnce({
++      message:
++        "It looks like you don't have an apphosting.yaml yet. Where would you like to store it?",
++      default: process.cwd(),
++    });
++    path = join(path, "apphosting.yaml");
++  }
++  const envName = await dialogs.envVarForSecret(secretName);
++  dynamicDispatch.upsertEnv(projectYaml, {
++    variable: envName,
++    secret: secretName,
++  });
++  dynamicDispatch.store(path, projectYaml);
+ }
+diff --git a/src/commands/apphosting-secrets-set.ts b/src/commands/apphosting-secrets-set.ts
+index 07308c1e..cee2a1c8 100644
+--- a/src/commands/apphosting-secrets-set.ts
++++ b/src/commands/apphosting-secrets-set.ts
+@@ -1,20 +1,16 @@
+-import * as tty from "tty";
+ import * as clc from "colorette";
+-import { join } from "path";
+ 
+ import { Command } from "../command";
+ import { Options } from "../options";
+ import { needProjectId, needProjectNumber } from "../projectUtils";
+ import { requireAuth } from "../requireAuth";
+-import * as fs from "fs";
+ import * as gcsm from "../gcp/secretManager";
+ import * as apphosting from "../gcp/apphosting";
+ import { requirePermissions } from "../requirePermissions";
+-import { confirm, promptOnce } from "../prompt";
+ import * as secrets from "../apphosting/secrets";
+ import * as dialogs from "../apphosting/secrets/dialogs";
+ import * as config from "../apphosting/config";
+-import { logSuccess, logWarning, logBullet } from "../utils";
++import * as utils from "../utils";
+ 
+ export const command = new Command("apphosting:secrets:set <secretName>")
+   .description("create or update a secret for use in Firebase App Hosting")
+@@ -45,25 +41,18 @@ export const command = new Command("apphosting:secrets:set <secretName>")
+     const created = await secrets.upsertSecret(projectId, secretName, options.location as string);
+     if (created === null) {
+       return;
++    } else if (created) {
++      utils.logSuccess(`Created new secret projects/${projectId}/secrets/${secretName}`);
+     }
+ 
+-    let secretValue;
+-    if ((!options.dataFile || options.dataFile === "-") && tty.isatty(0)) {
+-      secretValue = await promptOnce({
+-        type: "password",
+-        message: `Enter a value for ${secretName}`,
+-      });
+-    } else {
+-      let dataFile: string | number = 0;
+-      if (options.dataFile && options.dataFile !== "-") {
+-        dataFile = options.dataFile as string;
+-      }
+-      secretValue = fs.readFileSync(dataFile, "utf-8");
+-    }
++    const secretValue = await utils.readSecretValue(
++      `Enter a value for ${secretName}`,
++      options.dataFile as string | undefined,
++    );
+ 
+     const version = await gcsm.addVersion(projectId, secretName, secretValue);
+-    logSuccess(`Created new secret version ${gcsm.toSecretVersionResourceName(version)}`);
+-    logBullet(
++    utils.logSuccess(`Created new secret version ${gcsm.toSecretVersionResourceName(version)}`);
++    utils.logBullet(
+       `You can access the contents of the secret's latest value with ${clc.bold(`firebase apphosting:secrets:access ${secretName}\n`)}`,
+     );
+ 
+@@ -76,7 +65,7 @@ export const command = new Command("apphosting:secrets:set <secretName>")
+ 
+     // If we're not granting permissions, there's no point in adding to YAML either.
+     if (!accounts.buildServiceAccounts.length && !accounts.runServiceAccounts.length) {
+-      logWarning(
++      utils.logWarning(
+         `To use this secret in your backend, you must grant access. You can do so in the future with ${clc.bold("firebase apphosting:secrets:grantaccess")}`,
+       );
+ 
+@@ -85,35 +74,5 @@ export const command = new Command("apphosting:secrets:set <secretName>")
+       await secrets.grantSecretAccess(projectId, secretName, accounts);
+     }
+ 
+-    // Note: The API proposal suggested that we would check if the env exists. This is stupidly hard because the YAML may not exist yet.
+-    let path = config.yamlPath(process.cwd());
+-    let yaml: config.Config = {};
+-    if (path) {
+-      yaml = config.load(path);
+-      if (yaml.env?.find((env) => env.variable === secretName)) {
+-        return;
+-      }
+-    }
+-    const addToYaml = await confirm({
+-      message: "Would you like to add this secret to apphosting.yaml?",
+-      default: true,
+-    });
+-    if (!addToYaml) {
+-      return;
+-    }
+-    if (!path) {
+-      path = await promptOnce({
+-        message:
+-          "It looks like you don't have an apphosting.yaml yet. Where would you like to store it?",
+-        default: process.cwd(),
+-      });
+-      path = join(path, "apphosting.yaml");
+-    }
+-    const envName = await dialogs.envVarForSecret(secretName);
+-    yaml.env = yaml.env || [];
+-    yaml.env.push({
+-      variable: envName,
+-      secret: secretName,
+-    });
+-    config.store(path, yaml);
++    await config.maybeAddSecretToYaml(secretName);
+   });
+diff --git a/src/commands/functions-secrets-set.ts b/src/commands/functions-secrets-set.ts
+index b830d0c0..5a212931 100644
+--- a/src/commands/functions-secrets-set.ts
++++ b/src/commands/functions-secrets-set.ts
+@@ -1,6 +1,3 @@
+-import * as tty from "tty";
+-import * as fs from "fs";
+-
+ import * as clc from "colorette";
+ 
+ import { logger } from "../logger";
+@@ -9,7 +6,7 @@ import { Command } from "../command";
+ import { requirePermissions } from "../requirePermissions";
+ import { Options } from "../options";
+ import { promptOnce } from "../prompt";
+-import { logBullet, logSuccess, logWarning } from "../utils";
++import { logBullet, logSuccess, logWarning, readSecretValue } from "../utils";
+ import { needProjectId, needProjectNumber } from "../projectUtils";
+ import {
+   addVersion,
+@@ -44,22 +41,10 @@ export const command = new Command("functions:secrets:set <KEY>")
+     const projectNumber = await needProjectNumber(options);
+     const key = await ensureValidKey(unvalidatedKey, options);
+     const secret = await ensureSecret(projectId, key, options);
+-    let secretValue;
+-
+-    if ((!options.dataFile || options.dataFile === "-") && tty.isatty(0)) {
+-      secretValue = await promptOnce({
+-        name: key,
+-        type: "password",
+-        message: `Enter a value for ${key}`,
+-      });
+-    } else {
+-      let dataFile: string | number = 0;
+-      if (options.dataFile && options.dataFile !== "-") {
+-        dataFile = options.dataFile as string;
+-      }
+-      secretValue = fs.readFileSync(dataFile, "utf-8");
+-    }
+-
++    const secretValue = await readSecretValue(
++      `Enter a value for ${key}`,
++      options.dataFile as string | undefined,
++    );
+     const secretVersion = await addVersion(projectId, key, secretValue);
+     logSuccess(`Created a new secret version ${toSecretVersionResourceName(secretVersion)}`);
+ 
+diff --git a/src/deploy/functions/runtimes/discovery/index.ts b/src/deploy/functions/runtimes/discovery/index.ts
+index f95b4f8f..0e3552e6 100644
+--- a/src/deploy/functions/runtimes/discovery/index.ts
++++ b/src/deploy/functions/runtimes/discovery/index.ts
+@@ -1,7 +1,7 @@
+ import fetch, { Response } from "node-fetch";
+ import * as fs from "fs";
+ import * as path from "path";
+-import * as yaml from "js-yaml";
++import * as yaml from "yaml";
+ import { promisify } from "util";
+ 
+ import { logger } from "../../../../logger";
+@@ -58,7 +58,7 @@ export async function detectFromYaml(
+   }
+ 
+   logger.debug("Found functions.yaml. Got spec:", text);
+-  const parsed = yaml.load(text);
++  const parsed = yaml.parse(text);
+   return yamlToBuild(parsed, project, api.functionsDefaultRegion(), runtime);
+ }
+ 
+@@ -104,7 +104,7 @@ export async function detectFromPort(
+ 
+   let parsed: any;
+   try {
+-    parsed = yaml.load(text);
++    parsed = yaml.parse(text);
+   } catch (err: any) {
+     logger.debug("Failed to parse functions.yaml", err);
+     throw new FirebaseError(`Failed to load function definition from source: ${text}`);
+diff --git a/src/deploy/functions/runtimes/supported.ts b/src/deploy/functions/runtimes/supported/index.ts
+similarity index 51%
+rename from src/deploy/functions/runtimes/supported.ts
+rename to src/deploy/functions/runtimes/supported/index.ts
+index c41c755e..c74e2968 100644
+--- a/src/deploy/functions/runtimes/supported.ts
++++ b/src/deploy/functions/runtimes/supported/index.ts
+@@ -1,116 +1,8 @@
+-import { FirebaseError } from "../../../error";
+-import * as utils from "../../../utils";
++import { FirebaseError } from "../../../../error";
++import * as utils from "../../../../utils";
++import { Language, RUNTIMES, Runtime, RuntimeOf } from "./types";
+ 
+-// N.B. The status "deprecated" and "decommmissioned" is informational only.
+-// The deprecationDate and decommmissionDate are the canonical values.
+-// Updating the definition to "decommissioned", however, will omit the runtime
+-// name from firebaseConfig's json schema.
+-export type RuntimeStatus = "experimental" | "beta" | "GA" | "deprecated" | "decommissioned";
+-
+-type Day = `${number}-${number}-${number}`;
+-
+-/** Supported languages. All Runtime are a language + version. */
+-export type Language = "nodejs" | "python";
+-
+-/**
+- * Helper type that is more friendlier than string interpolation everywhere.
+- * Unfortunately, as Runtime has literal numbers and RuntimeOf accepts any
+- * number, RuntimeOf<L> and Runtime must be intersected. It might help
+- * readability to rename Runtime to KnownRuntime so that it reads better to see
+- * KnownRuntime & RuntimeOf<"python">.
+- */
+-export type RuntimeOf<T extends Language> = `${T}${number}`;
+-
+-export interface RuntimeData {
+-  friendly: string;
+-  status: RuntimeStatus;
+-  deprecationDate: Day;
+-  decommissionDate: Day;
+-}
+-
+-// We can neither use the "satisfies" keyword nor the metaprogramming library
+-// in this file to ensure RUNTIMES implements the right interfaces, so we must
+-// use the copied assertImplements below. Some day these hacks will go away.
+-function runtimes<T extends Record<RuntimeOf<Language>, RuntimeData>>(r: T): T {
+-  return r;
+-}
+-
+-export const RUNTIMES = runtimes({
+-  nodejs6: {
+-    friendly: "Node.js 6",
+-    status: "decommissioned",
+-    deprecationDate: "2019-04-17",
+-    decommissionDate: "2020-08-01",
+-  },
+-  nodejs8: {
+-    friendly: "Node.js 8",
+-    status: "decommissioned",
+-    deprecationDate: "2020-06-05",
+-    decommissionDate: "2021-02-01",
+-  },
+-  nodejs10: {
+-    friendly: "Node.js 10",
+-    status: "GA",
+-    deprecationDate: "2024-01-30",
+-    decommissionDate: "2025-01-30",
+-  },
+-  nodejs12: {
+-    friendly: "Node.js 12",
+-    status: "GA",
+-    deprecationDate: "2024-01-30",
+-    decommissionDate: "2025-01-30",
+-  },
+-  nodejs14: {
+-    friendly: "Node.js 14",
+-    status: "GA",
+-    deprecationDate: "2024-01-30",
+-    decommissionDate: "2025-01-30",
+-  },
+-  nodejs16: {
+-    friendly: "Node.js 16",
+-    status: "GA",
+-    deprecationDate: "2024-01-30",
+-    decommissionDate: "2025-01-30",
+-  },
+-  nodejs18: {
+-    friendly: "Node.js 18",
+-    status: "GA",
+-    deprecationDate: "2025-04-30",
+-    decommissionDate: "2025-10-31",
+-  },
+-  nodejs20: {
+-    friendly: "Node.js 20",
+-    status: "GA",
+-    deprecationDate: "2026-04-30",
+-    decommissionDate: "2026-10-31",
+-  },
+-  python310: {
+-    friendly: "Python 3.10",
+-    status: "GA",
+-    deprecationDate: "2026-10-04",
+-    decommissionDate: "2027-04-30",
+-  },
+-  python311: {
+-    friendly: "Python 3.11",
+-    status: "GA",
+-    deprecationDate: "2027-10-24",
+-    decommissionDate: "2028-04-30",
+-  },
+-  python312: {
+-    friendly: "Python 3.12",
+-    status: "GA",
+-    deprecationDate: "2028-10-02",
+-    decommissionDate: "2029-04-30",
+-  },
+-});
+-
+-export type Runtime = keyof typeof RUNTIMES & RuntimeOf<Language>;
+-
+-export type DecommissionedRuntime = {
+-  [R in keyof typeof RUNTIMES]: (typeof RUNTIMES)[R] extends { status: "decommissioned" }
+-    ? R
+-    : never;
+-}[keyof typeof RUNTIMES];
++export * from "./types";
+ 
+ /** Type deduction helper for a runtime string. */
+ export function isRuntime(maybe: string): maybe is Runtime {
+diff --git a/src/deploy/functions/runtimes/supported/types.ts b/src/deploy/functions/runtimes/supported/types.ts
+new file mode 100644
+index 00000000..e44c3883
+--- /dev/null
++++ b/src/deploy/functions/runtimes/supported/types.ts
+@@ -0,0 +1,112 @@
++// N.B. This file contains no imports so that it can't break the very fragile firebaseConfig.ts
++
++// N.B. The status "deprecated" and "decommmissioned" is informational only.
++// The deprecationDate and decommmissionDate are the canonical values.
++// Updating the definition to "decommissioned", however, will omit the runtime
++// name from firebaseConfig's json schema.
++export type RuntimeStatus = "experimental" | "beta" | "GA" | "deprecated" | "decommissioned";
++
++type Day = `${number}-${number}-${number}`;
++
++/** Supported languages. All Runtime are a language + version. */
++export type Language = "nodejs" | "python";
++
++/**
++ * Helper type that is more friendlier than string interpolation everywhere.
++ * Unfortunately, as Runtime has literal numbers and RuntimeOf accepts any
++ * number, RuntimeOf<L> and Runtime must be intersected. It might help
++ * readability to rename Runtime to KnownRuntime so that it reads better to see
++ * KnownRuntime & RuntimeOf<"python">.
++ */
++export type RuntimeOf<T extends Language> = `${T}${number}`;
++
++export interface RuntimeData {
++  friendly: string;
++  status: RuntimeStatus;
++  deprecationDate: Day;
++  decommissionDate: Day;
++}
++
++// We can neither use the "satisfies" keyword nor the metaprogramming library
++// in this file to ensure RUNTIMES implements the right interfaces, so we must
++// use the copied assertImplements below. Some day these hacks will go away.
++function runtimes<T extends Record<RuntimeOf<Language>, RuntimeData>>(r: T): T {
++  return r;
++}
++
++export const RUNTIMES = runtimes({
++  nodejs6: {
++    friendly: "Node.js 6",
++    status: "decommissioned",
++    deprecationDate: "2019-04-17",
++    decommissionDate: "2020-08-01",
++  },
++  nodejs8: {
++    friendly: "Node.js 8",
++    status: "decommissioned",
++    deprecationDate: "2020-06-05",
++    decommissionDate: "2021-02-01",
++  },
++  nodejs10: {
++    friendly: "Node.js 10",
++    status: "GA",
++    deprecationDate: "2024-01-30",
++    decommissionDate: "2025-01-30",
++  },
++  nodejs12: {
++    friendly: "Node.js 12",
++    status: "GA",
++    deprecationDate: "2024-01-30",
++    decommissionDate: "2025-01-30",
++  },
++  nodejs14: {
++    friendly: "Node.js 14",
++    status: "GA",
++    deprecationDate: "2024-01-30",
++    decommissionDate: "2025-01-30",
++  },
++  nodejs16: {
++    friendly: "Node.js 16",
++    status: "GA",
++    deprecationDate: "2024-01-30",
++    decommissionDate: "2025-01-30",
++  },
++  nodejs18: {
++    friendly: "Node.js 18",
++    status: "GA",
++    deprecationDate: "2025-04-30",
++    decommissionDate: "2025-10-31",
++  },
++  nodejs20: {
++    friendly: "Node.js 20",
++    status: "GA",
++    deprecationDate: "2026-04-30",
++    decommissionDate: "2026-10-31",
++  },
++  python310: {
++    friendly: "Python 3.10",
++    status: "GA",
++    deprecationDate: "2026-10-04",
++    decommissionDate: "2027-04-30",
++  },
++  python311: {
++    friendly: "Python 3.11",
++    status: "GA",
++    deprecationDate: "2027-10-24",
++    decommissionDate: "2028-04-30",
++  },
++  python312: {
++    friendly: "Python 3.12",
++    status: "GA",
++    deprecationDate: "2028-10-02",
++    decommissionDate: "2029-04-30",
++  },
++});
++
++export type Runtime = keyof typeof RUNTIMES & RuntimeOf<Language>;
++
++export type DecommissionedRuntime = {
++  [R in keyof typeof RUNTIMES]: (typeof RUNTIMES)[R] extends { status: "decommissioned" }
++    ? R
++    : never;
++}[keyof typeof RUNTIMES];
+diff --git a/src/extensions/emulator/specHelper.ts b/src/extensions/emulator/specHelper.ts
+index 2ef3c495..f12d0f48 100644
+--- a/src/extensions/emulator/specHelper.ts
++++ b/src/extensions/emulator/specHelper.ts
+@@ -1,4 +1,4 @@
+-import * as yaml from "js-yaml";
++import * as yaml from "yaml";
+ import * as path from "path";
+ import * as fs from "fs-extra";
+ 
+@@ -22,9 +22,9 @@ const validFunctionTypes = [
+  */
+ function wrappedSafeLoad(source: string): any {
+   try {
+-    return yaml.safeLoad(source);
++    return yaml.parse(source);
+   } catch (err: any) {
+-    if (err instanceof yaml.YAMLException) {
++    if (err instanceof yaml.YAMLParseError) {
+       throw new FirebaseError(`YAML Error: ${err.message}`, { original: err });
+     }
+     throw err;
+diff --git a/src/extensions/extensionsApi.ts b/src/extensions/extensionsApi.ts
+index c726ff77..5d1a9a65 100644
+--- a/src/extensions/extensionsApi.ts
++++ b/src/extensions/extensionsApi.ts
+@@ -1,4 +1,4 @@
+-import * as yaml from "js-yaml";
++import * as yaml from "yaml";
+ import * as clc from "colorette";
+ 
+ import { Client } from "../apiv2";
+@@ -375,7 +375,7 @@ export function populateSpec(spec: ExtensionSpec): void {
+     for (const r of spec.resources) {
+       try {
+         if (r.propertiesYaml) {
+-          r.properties = yaml.safeLoad(r.propertiesYaml);
++          r.properties = yaml.parse(r.propertiesYaml);
+         }
+       } catch (err: any) {
+         logger.debug(`[ext] failed to parse resource properties yaml: ${err}`);
+diff --git a/src/extensions/localHelper.ts b/src/extensions/localHelper.ts
+index e77f0695..44dcca74 100644
+--- a/src/extensions/localHelper.ts
++++ b/src/extensions/localHelper.ts
+@@ -1,6 +1,6 @@
+ import * as fs from "fs-extra";
+ import * as path from "path";
+-import * as yaml from "js-yaml";
++import * as yaml from "yaml";
+ 
+ import { fileExistsSync } from "../fsutils";
+ import { FirebaseError } from "../error";
+@@ -73,15 +73,15 @@ export function isLocalExtension(extensionName: string): boolean {
+ }
+ 
+ /**
+- * Wraps `yaml.safeLoad` with an error handler to present better YAML parsing
++ * Wraps `yaml.parse` with an error handler to present better YAML parsing
+  * errors.
+  * @param source an unparsed YAML string
+  */
+ function parseYAML(source: string): any {
+   try {
+-    return yaml.safeLoad(source);
++    return yaml.parse(source);
+   } catch (err: any) {
+-    if (err instanceof yaml.YAMLException) {
++    if (err instanceof yaml.YAMLParseError) {
+       throw new FirebaseError(`YAML Error: ${err.message}`, { original: err });
+     }
+     throw new FirebaseError(err.message);
+diff --git a/src/firebaseConfig.ts b/src/firebaseConfig.ts
+index 58c0b601..87271926 100644
+--- a/src/firebaseConfig.ts
++++ b/src/firebaseConfig.ts
+@@ -7,7 +7,7 @@
+ 
+ import type { HttpsOptions } from "firebase-functions/v2/https";
+ import { IngressSetting, MemoryOption, VpcEgressSetting } from "firebase-functions/v2/options";
+-import { Runtime, DecommissionedRuntime } from "./deploy/functions/runtimes/supported";
++import { Runtime, DecommissionedRuntime } from "./deploy/functions/runtimes/supported/types";
+ 
+ /**
+  * Creates a type that requires at least one key to be present in an interface
+diff --git a/src/frameworks/flutter/index.ts b/src/frameworks/flutter/index.ts
+index 46be9630..283a737d 100644
+--- a/src/frameworks/flutter/index.ts
++++ b/src/frameworks/flutter/index.ts
+@@ -1,7 +1,7 @@
+ import { sync as spawnSync } from "cross-spawn";
+ import { copy, pathExists } from "fs-extra";
+ import { join } from "path";
+-import { load as loadYaml } from "js-yaml";
++import * as yaml from "yaml";
+ import { readFile } from "fs/promises";
+ 
+ import { BuildResult, Discovery, FrameworkType, SupportLevel } from "../interfaces";
+@@ -17,7 +17,7 @@ export async function discover(dir: string): Promise<Discovery | undefined> {
+   if (!(await pathExists(join(dir, "pubspec.yaml")))) return;
+   if (!(await pathExists(join(dir, "web")))) return;
+   const pubSpecBuffer = await readFile(join(dir, "pubspec.yaml"));
+-  const pubSpec = loadYaml(pubSpecBuffer.toString());
++  const pubSpec = yaml.parse(pubSpecBuffer.toString());
+   const usingFlutter = pubSpec.dependencies?.flutter;
+   if (!usingFlutter) return;
+   return { mayWantBackend: false };
+diff --git a/src/init/features/hosting/github.ts b/src/init/features/hosting/github.ts
+index e2918d66..46bf98cd 100644
+--- a/src/init/features/hosting/github.ts
++++ b/src/init/features/hosting/github.ts
+@@ -1,7 +1,6 @@
+ import { bold, underline } from "colorette";
+ import * as fs from "fs";
+-import * as yaml from "js-yaml";
+-import { safeLoad } from "js-yaml";
++import * as yaml from "yaml";
+ import * as ora from "ora";
+ import * as path from "path";
+ import * as libsodium from "libsodium-wrappers";
+@@ -264,7 +263,7 @@ function loadYMLDeploy(): { exists: boolean; branch?: string } {
+ }
+ 
+ function loadYML(ymlPath: string) {
+-  return safeLoad(fs.readFileSync(ymlPath, "utf8"));
++  return yaml.parse(fs.readFileSync(ymlPath, "utf8"));
+ }
+ 
+ function mkdirNotExists(dir: string): void {
+@@ -333,7 +332,7 @@ function writeChannelActionYMLFile(
+   const ymlContents = `# This file was auto-generated by the Firebase CLI
+ # https://github.com/firebase/firebase-tools
+ 
+-${yaml.safeDump(workflowConfig)}`;
++${yaml.stringify(workflowConfig)}`;
+ 
+   mkdirNotExists(GITHUB_DIR);
+   mkdirNotExists(WORKFLOW_DIR);
+@@ -377,7 +376,7 @@ function writeDeployToProdActionYMLFile(
+   const ymlContents = `# This file was auto-generated by the Firebase CLI
+ # https://github.com/firebase/firebase-tools
+ 
+-${yaml.safeDump(workflowConfig)}`;
++${yaml.stringify(workflowConfig)}`;
+ 
+   mkdirNotExists(GITHUB_DIR);
+   mkdirNotExists(WORKFLOW_DIR);
+diff --git a/src/utils.ts b/src/utils.ts
+index b2b75ce2..ff5a9773 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -1,4 +1,5 @@
+ import * as fs from "node:fs";
++import * as tty from "tty";
+ import * as path from "node:path";
+ import { Socket } from "node:net";
+ 
+@@ -20,6 +21,7 @@ import { configstore } from "./configstore";
+ import { FirebaseError } from "./error";
+ import { logger, LogLevel } from "./logger";
+ import { LogDataOrUndefined } from "./emulator/loggingEmulator";
++import { promptOnce } from "./prompt";
+ 
+ const IS_WINDOWS = process.platform === "win32";
+ const SUCCESS_CHAR = IS_WINDOWS ? "+" : "✔";
+@@ -821,3 +823,22 @@ export function getHostnameFromUrl(url: string): string | null {
+     return null;
+   }
+ }
++
++/**
++ * Reads a secret value from either a file or a prompt.
++ * If dataFile is falsy and this is a tty, uses prompty. Otherwise reads from dataFile.
++ * If dataFile is - or falsy, this means reading from file descriptor 0 (e.g. pipe in)
++ */
++export function readSecretValue(prompt: string, dataFile?: string): Promise<string> {
++  if ((!dataFile || dataFile === "-") && tty.isatty(0)) {
++    return promptOnce({
++      type: "password",
++      message: prompt,
++    });
++  }
++  let input: string | number = 0;
++  if (dataFile && dataFile !== "-") {
++    input = dataFile;
++  }
++  return Promise.resolve(fs.readFileSync(input, "utf-8"));
++}

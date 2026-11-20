@@ -1,0 +1,203 @@
+diff --git a/src/build/build_step.go b/src/build/build_step.go
+--- a/src/build/build_step.go
++++ b/src/build/build_step.go
+@@ -478,7 +478,7 @@
+ 	if len(outs) != 1 {
+ 		return fmt.Errorf("text_file %s should have a single output, has %d", target.Label, len(outs))
+ 	}
+-	outFile := filepath.Join(target.TmpDir(), outs[0])
++	outFile := filepath.Join(target.TmpDir(), target.GetTmpOutput(outs[0]))
+ 	return ioutil.WriteFile(outFile, []byte(target.FileContent), target.OutMode())
+ }
+ 
+diff --git a/src/build/incrementality_test.go b/src/build/incrementality_test.go
+--- a/src/build/incrementality_test.go
++++ b/src/build/incrementality_test.go
+@@ -14,6 +14,7 @@
+ )
+ 
+ var KnownFields = map[string]bool{
++	"outputDeclarationOrder": true,
+ 	// These fields are explicitly hashed.
+ 	"Label":                       true,
+ 	"dependencies":                true,
+diff --git a/src/core/build_target.go b/src/core/build_target.go
+--- a/src/core/build_target.go
++++ b/src/core/build_target.go
+@@ -76,6 +76,7 @@
+ 	namedData map[string][]BuildInput `name:"data"`
+ 	// Output files of this rule. All are paths relative to this package.
+ 	outputs []string `name:"outs"`
++	outputDeclarationOrder []string `print:"false"`
+ 	// Named output subsets of this rule. All are paths relative to this package but can be
+ 	// captured separately; for example something producing C code might separate its outputs
+ 	// into sources and headers.
+@@ -607,11 +608,10 @@
+ }
+ 
+ // AllOutputs returns a slice of all the outputs of this rule, including any output directories.
+-// Outs are passed through GetTmpOutput as appropriate.
+ func (target *BuildTarget) AllOutputs() []string {
+-	outs := target.Outputs()
+-	for i, out := range outs {
+-		outs[i] = target.GetTmpOutput(out)
++	outs := append([]string{}, target.outputDeclarationOrder...)
++	if target.IsFilegroup {
++		outs = target.Outputs()
+ 	}
+ 	for _, out := range target.OutputDirectories {
+ 		outs = append(outs, out.Dir())
+@@ -1406,6 +1406,17 @@
+ // AddOutput adds a new output to the target if it's not already there.
+ func (target *BuildTarget) AddOutput(output string) {
+ 	target.outputs = target.insert(target.outputs, output)
++	target.recordOutputDeclaration(output)
++}
++
++func (target *BuildTarget) recordOutputDeclaration(output string) {
++	output = strings.TrimPrefix(output, "./")
++	for _, existing := range target.outputDeclarationOrder {
++		if existing == output {
++			return
++		}
++	}
++	target.outputDeclarationOrder = append(target.outputDeclarationOrder, output)
+ }
+ 
+ // AddOptionalOutput adds a new optional output to the target if it's not already there.
+@@ -1423,9 +1434,11 @@
+ func (target *BuildTarget) AddNamedOutput(name, output string) {
+ 	if target.namedOutputs == nil {
+ 		target.namedOutputs = map[string][]string{name: target.insert(nil, output)}
++		target.recordOutputDeclaration(output)
+ 		return
+ 	}
+ 	target.namedOutputs[name] = target.insert(target.namedOutputs[name], output)
++	target.recordOutputDeclaration(output)
+ }
+ 
+ // insert adds a string into a slice if it's not already there. Sorted order is maintained.
+diff --git a/src/core/build_target_test.go b/src/core/build_target_test.go
+--- a/src/core/build_target_test.go
++++ b/src/core/build_target_test.go
+@@ -202,7 +202,7 @@
+ 	target.AddOutput("please")
+ 	target.AddOutput("plz")
+ 	target.AddOutputDirectory("dir")
+-	assert.Equal(t, []string{"please.out", "plz", "dir"}, target.AllOutputs())
++	assert.Equal(t, []string{"please", "plz", "dir"}, target.AllOutputs())
+ }
+ 
+ func TestProvideFor(t *testing.T) {
+diff --git a/src/parse/asp/targets.go b/src/parse/asp/targets.go
+--- a/src/parse/asp/targets.go
++++ b/src/parse/asp/targets.go
+@@ -99,7 +99,7 @@
+ 	target.TestOnly = test || isTruthy(testOnlyBuildRuleArgIdx)
+ 	target.ShowProgress = isTruthy(progressBuildRuleArgIdx)
+ 	target.IsRemoteFile = isTruthy(urlsBuildRuleArgIdx)
+-	target.IsTextFile = isTruthy(fileContentArgIdx)
++	target.IsTextFile = args[fileContentArgIdx] != None
+ 	target.Local = isTruthy(localBuildRuleArgIdx)
+ 	target.ExitOnError = isTruthy(exitOnErrorArgIdx)
+ 	for _, o := range asStringList(s, args[outDirsBuildRuleArgIdx], "output_dirs") {
+diff --git a/src/query/changes.go b/src/query/changes.go
+--- a/src/query/changes.go
++++ b/src/query/changes.go
+@@ -44,7 +44,11 @@
+ 	for _, filename := range files {
+ 		for dir := filename; dir != "." && dir != "/"; {
+ 			dir = path.Dir(dir)
+-			if pkg := state.Graph.Package(dir, ""); pkg != nil {
++			packageName := dir
++			if packageName == "." {
++				packageName = ""
++			}
++			if pkg := state.Graph.Package(packageName, ""); pkg != nil {
+ 				// This is the package closest to the file; it is the only one allowed to consume it directly.
+ 				for _, t := range pkg.AllTargets() {
+ 					if t.HasAbsoluteSource(filename) {
+diff --git a/src/remote/action.go b/src/remote/action.go
+--- a/src/remote/action.go
++++ b/src/remote/action.go
+@@ -90,7 +90,10 @@
+ 		commandPrefix += fmt.Sprintf("export %s=\"%s\" && ", k, v)
+ 	}
+ 
+-	outs := target.AllOutputs()
++	outs := target.GetTmpOutputAll(target.Outputs())
++	for _, directory := range target.OutputDirectories {
++		outs = append(outs, directory.Dir())
++	}
+ 	if len(outs) == 1 { // $OUT is relative when running remotely; make it absolute
+ 		commandPrefix += `export OUT="$TMP_DIR/$OUT" && `
+ 	}
+diff --git a/bootstrap.sh b/bootstrap.sh
+--- a/bootstrap.sh
++++ b/bootstrap.sh
+@@ -11,6 +11,12 @@
+ 
+ # PLZ_ARGS can be set to pass arguments to all plz invocations in this script.
+ PLZ_ARGS="${PLZ_ARGS:-}"
++
++GO_VERSION="$(go version)"
++if [[ ! "$GO_VERSION" =~ go([0-9]+)\.([0-9]+) ]] || (( BASH_REMATCH[1] < 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] < 16) )); then
++    echo "Bootstrap requires Go 1.16 or newer; found: $GO_VERSION" >&2
++    exit 1
++fi
+ 
+ # Now invoke Go to run Please to build itself.
+ notice "Bootstrapping please..."
+diff --git a/tools/please_go/install/install.go b/tools/please_go/install/install.go
+--- a/tools/please_go/install/install.go
++++ b/tools/please_go/install/install.go
+@@ -210,6 +210,10 @@
+ 	}
+ 
+ 	goFiles := pkg.GoFiles
++	importPath := target
++	if pkg.Name == "main" {
++		importPath = "main"
++	}
+ 
+ 	var objFiles []string
+ 
+@@ -238,7 +242,7 @@
+ 			return err
+ 		}
+ 
+-		if err := install.tc.GoAsmCompile(workDir, install.importConfig, out, goFiles, asmH, symabis); err != nil {
++		if err := install.tc.GoAsmCompile(workDir, install.importConfig, out, importPath, goFiles, asmH, symabis); err != nil {
+ 			return err
+ 		}
+ 
+@@ -249,7 +253,7 @@
+ 
+ 		objFiles = append(objFiles, asmObjFiles...)
+ 	} else {
+-		err := install.tc.GoCompile(workDir, install.importConfig, out, goFiles)
++		err := install.tc.GoCompile(workDir, install.importConfig, out, importPath, goFiles)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/tools/please_go/install/toolchain/toolchain.go b/tools/please_go/install/toolchain/toolchain.go
+--- a/tools/please_go/install/toolchain/toolchain.go
++++ b/tools/please_go/install/toolchain/toolchain.go
+@@ -46,13 +46,13 @@
+ }
+ 
+ // GoCompile will compile the go sources and the generated .cgo1.go sources for the CGO files (if any)
+-func (tc *Toolchain) GoCompile(dir, importcfg, out string, goFiles []string) error {
+-	return tc.Exec.Exec("%s tool compile -pack -importcfg %s -o %s %s", tc.GoTool, importcfg, out, FullPaths(goFiles, dir))
++func (tc *Toolchain) GoCompile(dir, importcfg, out, importPath string, goFiles []string) error {
++	return tc.Exec.Exec("%s tool compile -p %s -pack -importcfg %s -o %s %s", tc.GoTool, importPath, importcfg, out, FullPaths(goFiles, dir))
+ }
+ 
+ // GoAsmCompile will compile the go sources linking to the the abi symbols generated from symabis()
+-func (tc *Toolchain) GoAsmCompile(dir, importcfg, out string, goFiles []string, asmH, symabys string) error {
+-	return tc.Exec.Exec("%s tool compile -pack -importcfg %s -asmhdr %s -symabis %s -o %s %s", tc.GoTool, importcfg, asmH, symabys, out, FullPaths(goFiles, dir))
++func (tc *Toolchain) GoAsmCompile(dir, importcfg, out, importPath string, goFiles []string, asmH, symabys string) error {
++	return tc.Exec.Exec("%s tool compile -p %s -pack -importcfg %s -asmhdr %s -symabis %s -o %s %s", tc.GoTool, importPath, importcfg, asmH, symabys, out, FullPaths(goFiles, dir))
+ }
+ 
+ // CCompile will compile c sources and return the object files that will be generated

@@ -1,0 +1,166 @@
+diff --git a/ElectronNET.API/App.cs b/ElectronNET.API/App.cs
+index c3888190154bbe73622152a8e0063ca98095f91b..cd10028b1ab6266a65c20edea55adb8e5f3694c7 100644
+--- a/ElectronNET.API/App.cs
++++ b/ElectronNET.API/App.cs
+@@ -398,6 +398,70 @@ namespace ElectronNET.API
+         }
+         private bool _isReady = false;
+ 
++        /// <summary>
++        /// Emitted when a MacOS user wants to open a file with the application. The open-file event is usually emitted
++        /// when the application is already open and the OS wants to reuse the application to open the file.
++        /// open-file is also emitted when a file is dropped onto the dock and the application is not yet running.
++        /// <para/>
++        /// On Windows, you have to parse the arguments using App.CommandLine to get the filepath.
++        /// </summary>
++        public event Action<string> OpenFile
++        {
++            add
++            {
++                if (_openFile == null)
++                {
++                    BridgeConnector.Socket.On("app-open-file" + GetHashCode(), (file) =>
++                    {
++                        _openFile(file.ToString());
++                    });
++
++                    BridgeConnector.Socket.Emit("register-app-open-file-event", GetHashCode());
++                }
++                _openFile += value;
++            }
++            remove
++            {
++                _openFile -= value;
++
++                if (_openFile == null)
++                    BridgeConnector.Socket.Off("app-open-file" + GetHashCode());
++            }
++        }
++
++        private event Action<string> _openFile;
++
++
++        /// <summary>
++        /// Emitted when a MacOS user wants to open a URL with the application. Your application's Info.plist file must
++        /// define the URL scheme within the CFBundleURLTypes key, and set NSPrincipalClass to AtomApplication.
++        /// </summary>
++        public event Action<string> OpenUrl
++        {
++            add
++            {
++                if (_openUrl == null)
++                {
++                    BridgeConnector.Socket.On("app-open-url" + GetHashCode(), (url) =>
++                    {
++                        _openUrl(url.ToString());
++                    });
++
++                    BridgeConnector.Socket.Emit("register-app-open-url-event", GetHashCode());
++                }
++                _openUrl += value;
++            }
++            remove
++            {
++                _openUrl -= value;
++
++                if (_openUrl == null)
++                    BridgeConnector.Socket.Off("app-open-url" + GetHashCode());
++            }
++        }
++
++        private event Action<string> _openUrl;
++
+         /// <summary>
+         /// A <see cref="string"/> property that indicates the current application's name, which is the name in the
+         /// application's package.json file.
+diff --git a/ElectronNET.Host/main.js b/ElectronNET.Host/main.js
+index 6ea9875820a6c6cf18c42f45dc7474e4f29d7fec..e09be06412bec1c29ea1938876b233579c64d311 100644
+--- a/ElectronNET.Host/main.js
++++ b/ElectronNET.Host/main.js
+@@ -13,6 +13,8 @@ let powerMonitor;
+ let splashScreen, hostHook;
+ let mainWindowId, nativeTheme;
+ let dock;
++let launchFile;
++let launchUrl;
+ 
+ let manifestJsonFileName = 'electron.manifest.json';
+ let watchable = false;
+@@ -33,6 +35,18 @@ if (watchable) {
+     manifestJsonFilePath = path.join(currentBinPath, manifestJsonFileName);
+ }
+ 
++//  handle macOS events for opening the app with a file, etc
++app.on('will-finish-launching', () => {
++	app.on('open-file', (evt, file) => {
++		evt.preventDefault();
++		launchFile = file;
++	})
++	app.on('open-url', (evt, url) => {
++		evt.preventDefault();
++		launchUrl = url;
++	})
++});
++
+ const manifestJsonFile = require(manifestJsonFilePath);
+ if (manifestJsonFile.singleInstance || manifestJsonFile.aspCoreBackendPort) {
+     const mainInstance = app.requestSingleInstanceLock();
+@@ -177,7 +191,7 @@ function startSocketApiBridge(port) {
+         global['electronsocket'].setMaxListeners(0);
+         console.log('ASP.NET Core Application connected...', 'global.electronsocket', global['electronsocket'].id, new Date());
+ 
+-        appApi = require('./api/app')(socket, app);
++		appApi = require('./api/app')(socket, app);
+         browserWindows = require('./api/browserWindows')(socket, app);
+         commandLine = require('./api/commandLine')(socket, app);
+         autoUpdater = require('./api/autoUpdater')(socket);
+@@ -194,7 +208,35 @@ function startSocketApiBridge(port) {
+         browserView = require('./api/browserView')(socket);
+         powerMonitor = require('./api/powerMonitor')(socket);
+         nativeTheme = require('./api/nativeTheme')(socket);
+-        dock = require('./api/dock')(socket);
++		dock = require('./api/dock')(socket);
++		
++		socket.on('register-app-open-file-event', (id) => {
++			electronSocket = socket;
++
++			app.on('open-file', (event, file) => {
++				event.preventDefault();
++	
++				electronSocket.emit('app-open-file' + id, file);
++			});
++			
++			if (launchFile) {
++				electronSocket.emit('app-open-file' + id, launchFile);
++			}
++		});
++		
++		socket.on('register-app-open-url-event', (id) => {
++			electronSocket = socket;
++
++			app.on('open-url', (event, url) => {
++				event.preventDefault();
++	
++				electronSocket.emit('app-open-url' + id, url);
++			});
++			
++			if (launchUrl) {
++				electronSocket.emit('app-open-url' + id, launchUrl);
++			}
++		});
+ 
+         try {
+             const hostHookScriptFilePath = path.join(__dirname, 'ElectronHostHook', 'index.js');
+diff --git a/buildAll.sh b/buildAll.sh
+index a02959a19fa7f72acc912f69cc246a1eb3f64a58..f85e4f028cb2878af836a17efe0eb674514babab 100755
+--- a/buildAll.sh
++++ b/buildAll.sh
+@@ -17,7 +17,7 @@ echo "Restore & Build CLI"
+ pushd $dir/ElectronNET.CLI
+     dotnet restore
+     dotnet build
+-podp
++popd
+ 
+ echo "Restore & Build WebApp Demo"
+ pushd $dir/ElectronNET.WebApp

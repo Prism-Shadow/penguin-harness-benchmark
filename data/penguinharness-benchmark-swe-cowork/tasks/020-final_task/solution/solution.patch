@@ -1,0 +1,1471 @@
+diff --git a/boto3/crt.py b/boto3/crt.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b8df3140e07cc555cc57da1ca40a3b5832be042
+--- /dev/null
++++ b/boto3/crt.py
+@@ -0,0 +1,167 @@
++# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License"). You
++# may not use this file except in compliance with the License. A copy of
++# the License is located at
++#
++# https://aws.amazon.com/apache2.0/
++#
++# or in the "license" file accompanying this file. This file is
++# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
++# ANY KIND, either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++"""
++This file contains private functionality for interacting with the AWS
++Common Runtime library (awscrt) in boto3.
++
++All code contained within this file is for internal usage within this
++project and is not intended for external consumption. All interfaces
++contained within are subject to abrupt breaking changes.
++"""
++
++import threading
++
++import botocore.exceptions
++from botocore.session import Session
++from s3transfer.crt import (
++    BotocoreCRTCredentialsWrapper,
++    BotocoreCRTRequestSerializer,
++    CRTTransferManager,
++    acquire_crt_s3_process_lock,
++    create_s3_crt_client,
++)
++
++# Singletons for CRT-backed transfers
++CRT_S3_CLIENT = None
++BOTOCORE_CRT_SERIALIZER = None
++
++CLIENT_CREATION_LOCK = threading.Lock()
++PROCESS_LOCK_NAME = 'boto3'
++
++
++def _create_crt_client(session, config, region_name, cred_provider):
++    """Create a CRT S3 Client for file transfer.
++
++    Instantiating many of these may lead to degraded performance or
++    system resource exhaustion.
++    """
++    create_crt_client_kwargs = {
++        'region': region_name,
++        'use_ssl': True,
++        'crt_credentials_provider': cred_provider,
++    }
++    return create_s3_crt_client(**create_crt_client_kwargs)
++
++
++def _create_crt_request_serializer(session, region_name):
++    return BotocoreCRTRequestSerializer(
++        session, {'region_name': region_name, 'endpoint_url': None}
++    )
++
++
++def _create_crt_s3_client(
++    session, config, region_name, credentials, lock, **kwargs
++):
++    """Create boto3 wrapper class to manage crt lock reference and S3 client."""
++    cred_wrapper = BotocoreCRTCredentialsWrapper(credentials)
++    cred_provider = cred_wrapper.to_crt_credentials_provider()
++    return CRTS3Client(
++        _create_crt_client(session, config, region_name, cred_provider),
++        lock,
++        region_name,
++        cred_wrapper,
++    )
++
++
++def _initialize_crt_transfer_primatives(client, config):
++    lock = acquire_crt_s3_process_lock(PROCESS_LOCK_NAME)
++    if lock is None:
++        # If we're unable to acquire the lock, we cannot
++        # use the CRT in this process and should default to
++        # the classic s3transfer manager.
++        return None, None
++
++    session = Session()
++    region_name = client.meta.region_name
++    credentials = client._get_credentials()
++
++    serializer = _create_crt_request_serializer(session, region_name)
++    s3_client = _create_crt_s3_client(
++        session, config, region_name, credentials, lock
++    )
++    return serializer, s3_client
++
++
++def get_crt_s3_client(client, config):
++    global CRT_S3_CLIENT
++    global BOTOCORE_CRT_SERIALIZER
++
++    with CLIENT_CREATION_LOCK:
++        if CRT_S3_CLIENT is None:
++            serializer, s3_client = _initialize_crt_transfer_primatives(
++                client, config
++            )
++            BOTOCORE_CRT_SERIALIZER = serializer
++            CRT_S3_CLIENT = s3_client
++
++    return CRT_S3_CLIENT
++
++
++class CRTS3Client:
++    """
++    This wrapper keeps track of our underlying CRT client, the lock used to
++    acquire it and the region we've used to instantiate the client.
++
++    Due to limitations in the existing CRT interfaces, we can only make calls
++    in a single region and does not support redirects. We track the region to
++    ensure we don't use the CRT client when a successful request cannot be made.
++    """
++
++    def __init__(self, crt_client, process_lock, region, cred_provider):
++        self.crt_client = crt_client
++        self.process_lock = process_lock
++        self.region = region
++        self.cred_provider = cred_provider
++
++
++def is_crt_compatible_request(client, crt_s3_client):
++    """
++    Boto3 client must use same signing region and credentials
++    as the CRT_S3_CLIENT singleton. Otherwise fallback to classic.
++    """
++    if crt_s3_client is None:
++        return False
++
++    boto3_creds = client._get_credentials()
++    if boto3_creds is None:
++        return False
++
++    is_same_identity = compare_identity(
++        boto3_creds.get_frozen_credentials(), crt_s3_client.cred_provider
++    )
++    is_same_region = client.meta.region_name == crt_s3_client.region
++    return is_same_region and is_same_identity
++
++
++def compare_identity(boto3_creds, crt_s3_creds):
++    try:
++        crt_creds = crt_s3_creds()
++    except botocore.exceptions.NoCredentialsError:
++        return False
++
++    is_matching_identity = (
++        boto3_creds.access_key == crt_creds.access_key_id
++        and boto3_creds.secret_key == crt_creds.secret_access_key
++        and boto3_creds.token == crt_creds.session_token
++    )
++    return is_matching_identity
++
++
++def create_crt_transfer_manager(client, config):
++    """Create a CRTTransferManager for optimized data transfer."""
++    crt_s3_client = get_crt_s3_client(client, config)
++    if is_crt_compatible_request(client, crt_s3_client):
++        return CRTTransferManager(
++            crt_s3_client.crt_client, BOTOCORE_CRT_SERIALIZER
++        )
++    return None
+diff --git a/boto3/docs/__init__.py b/boto3/docs/__init__.py
+index d1cd8b52f4ece783bb42c9eb36ead5e002d4ba05..261747b42f26ae37919d7c820fd7cd7fa0b00f55 100644
+--- a/boto3/docs/__init__.py
++++ b/boto3/docs/__init__.py
+@@ -32,7 +32,9 @@ def generate_docs(root_dir, session):
+         os.makedirs(services_doc_path)
+ 
+     for service_name in session.get_available_services():
+-        docs = ServiceDocumenter(service_name, session).document_service()
++        docs = ServiceDocumenter(
++            service_name, session, services_doc_path
++        ).document_service()
+         service_doc_path = os.path.join(
+             services_doc_path, service_name + '.rst'
+         )
+diff --git a/boto3/docs/action.py b/boto3/docs/action.py
+index 907f428663850fa0d606774c2c68e62d97e287eb..a6e76d474a6652b97b71a71a65355f6b9c4e017e 100644
+--- a/boto3/docs/action.py
++++ b/boto3/docs/action.py
+@@ -10,7 +10,10 @@
+ # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
++import os
++
+ from botocore import xform_name
++from botocore.docs.bcdoc.restdoc import DocumentStructure
+ from botocore.docs.method import (
+     document_custom_method,
+     document_model_driven_method,
+@@ -18,7 +21,7 @@ from botocore.docs.method import (
+ from botocore.model import OperationModel
+ from botocore.utils import get_service_module_name
+ 
+-from boto3.docs.base import BaseDocumenter
++from boto3.docs.base import NestedDocumenter
+ from boto3.docs.method import document_model_driven_resource_method
+ from boto3.docs.utils import (
+     add_resource_type_overview,
+@@ -27,7 +30,7 @@ from boto3.docs.utils import (
+ )
+ 
+ 
+-class ActionDocumenter(BaseDocumenter):
++class ActionDocumenter(NestedDocumenter):
+     def document_actions(self, section):
+         modeled_actions_list = self._resource_model.actions
+         modeled_actions = {}
+@@ -49,7 +52,13 @@ class ActionDocumenter(BaseDocumenter):
+         )
+ 
+         for action_name in sorted(resource_actions):
+-            action_section = section.add_new_section(action_name)
++            # Create a new DocumentStructure for each action and add contents.
++            action_doc = DocumentStructure(action_name, target='html')
++            action_doc.add_title_section(action_name)
++            action_section = action_doc.add_new_section(
++                action_name,
++                context={'qualifier': f'{self.class_name}.'},
++            )
+             if action_name in ['load', 'reload'] and self._resource_model.load:
+                 document_load_reload_action(
+                     section=action_section,
+@@ -71,6 +80,14 @@ class ActionDocumenter(BaseDocumenter):
+                 document_custom_method(
+                     action_section, action_name, resource_actions[action_name]
+                 )
++            # Write actions in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<action_name>.rst
++            actions_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{self._resource_sub_path}',
++            )
++            action_doc.write_to_file(actions_dir_path, action_name)
+ 
+ 
+ def document_action(
+@@ -110,9 +127,12 @@ def document_action(
+     example_prefix = '{} = {}.{}'.format(
+         example_return_value, example_resource_name, action_model.name
+     )
++    full_action_name = (
++        f"{section.context.get('qualifier', '')}{action_model.name}"
++    )
+     document_model_driven_resource_method(
+         section=section,
+-        method_name=action_model.name,
++        method_name=full_action_name,
+         operation_model=operation_model,
+         event_emitter=event_emitter,
+         method_description=operation_model.documentation,
+@@ -162,9 +182,10 @@ def document_load_reload_action(
+     if service_model.service_name == resource_name:
+         example_resource_name = resource_name
+     example_prefix = f'{example_resource_name}.{action_name}'
++    full_action_name = f"{section.context.get('qualifier', '')}{action_name}"
+     document_model_driven_method(
+         section=section,
+-        method_name=action_name,
++        method_name=full_action_name,
+         operation_model=OperationModel({}, service_model),
+         event_emitter=event_emitter,
+         method_description=description,
+diff --git a/boto3/docs/attr.py b/boto3/docs/attr.py
+index ced8bc287a0ebb45573c054e0c6ad860c64c532c..a968da2901d8b52373cb0732186e499a83767884 100644
+--- a/boto3/docs/attr.py
++++ b/boto3/docs/attr.py
+@@ -29,7 +29,8 @@ def document_attribute(
+     include_signature=True,
+ ):
+     if include_signature:
+-        section.style.start_sphinx_py_attr(attr_name)
++        full_attr_name = f"{section.context.get('qualifier', '')}{attr_name}"
++        section.style.start_sphinx_py_attr(full_attr_name)
+     # Note that an attribute may have one, may have many, or may have no
+     # operations that back the resource's shape. So we just set the
+     # operation_name to the resource name if we ever to hook in and modify
+@@ -42,10 +43,16 @@ def document_attribute(
+ 
+ 
+ def document_identifier(
+-    section, resource_name, identifier_model, include_signature=True
++    section,
++    resource_name,
++    identifier_model,
++    include_signature=True,
+ ):
+     if include_signature:
+-        section.style.start_sphinx_py_attr(identifier_model.name)
++        full_identifier_name = (
++            f"{section.context.get('qualifier', '')}{identifier_model.name}"
++        )
++        section.style.start_sphinx_py_attr(full_identifier_name)
+     description = get_identifier_description(
+         resource_name, identifier_model.name
+     )
+@@ -54,7 +61,10 @@ def document_identifier(
+ 
+ def document_reference(section, reference_model, include_signature=True):
+     if include_signature:
+-        section.style.start_sphinx_py_attr(reference_model.name)
++        full_reference_name = (
++            f"{section.context.get('qualifier', '')}{reference_model.name}"
++        )
++        section.style.start_sphinx_py_attr(full_reference_name)
+     reference_type = f'(:py:class:`{reference_model.resource.type}`) '
+     section.write(reference_type)
+     section.include_doc_string(
+diff --git a/boto3/docs/base.py b/boto3/docs/base.py
+index a12d94543f81f68294ccd6ef901a1025feabcce1..6e072fb9fb72e6a21b5dd16eab489f2439ca9f52 100644
+--- a/boto3/docs/base.py
++++ b/boto3/docs/base.py
+@@ -30,3 +30,19 @@ class BaseDocumenter:
+     @property
+     def class_name(self):
+         return f'{self._service_docs_name}.{self._resource_name}'
++
++
++class NestedDocumenter(BaseDocumenter):
++    def __init__(self, resource, root_docs_path):
++        super().__init__(resource)
++        self._root_docs_path = root_docs_path
++        self._resource_sub_path = self._resource_name.lower()
++        if self._resource_name == self._service_name:
++            self._resource_sub_path = 'service-resource'
++
++    @property
++    def class_name(self):
++        resource_class_name = self._resource_name
++        if self._resource_name == self._service_name:
++            resource_class_name = 'ServiceResource'
++        return f'{self._service_docs_name}.{resource_class_name}'
+diff --git a/boto3/docs/collection.py b/boto3/docs/collection.py
+index a1f9ca7faa944562d4f889ac1bda5664ff697a83..bedc5006e8d3ce4f99f8bdd9cfa9d7a32f045a23 100644
+--- a/boto3/docs/collection.py
++++ b/boto3/docs/collection.py
+@@ -10,11 +10,14 @@
+ # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
++import os
++
+ from botocore import xform_name
++from botocore.docs.bcdoc.restdoc import DocumentStructure
+ from botocore.docs.method import get_instance_public_methods
+ from botocore.docs.utils import DocumentedShape
+ 
+-from boto3.docs.base import BaseDocumenter
++from boto3.docs.base import NestedDocumenter
+ from boto3.docs.method import document_model_driven_resource_method
+ from boto3.docs.utils import (
+     add_resource_type_overview,
+@@ -22,7 +25,7 @@ from boto3.docs.utils import (
+ )
+ 
+ 
+-class CollectionDocumenter(BaseDocumenter):
++class CollectionDocumenter(NestedDocumenter):
+     def document_collections(self, section):
+         collections = self._resource.meta.resource_model.collections
+         collections_list = []
+@@ -37,10 +40,25 @@ class CollectionDocumenter(BaseDocumenter):
+         )
+         self.member_map['collections'] = collections_list
+         for collection in collections:
+-            collection_section = section.add_new_section(collection.name)
+             collections_list.append(collection.name)
++            # Create a new DocumentStructure for each collection and add contents.
++            collection_doc = DocumentStructure(collection.name, target='html')
++            collection_doc.add_title_section(collection.name)
++            collection_section = collection_doc.add_new_section(
++                collection.name,
++                context={'qualifier': f'{self.class_name}.'},
++            )
+             self._document_collection(collection_section, collection)
+ 
++            # Write collections in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<collection_name>.rst
++            collections_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{self._resource_sub_path}',
++            )
++            collection_doc.write_to_file(collections_dir_path, collection.name)
++
+     def _document_collection(self, section, collection):
+         methods = get_instance_public_methods(
+             getattr(self._resource, collection.name)
+@@ -73,7 +91,9 @@ class CollectionDocumenter(BaseDocumenter):
+ 
+ 
+ def document_collection_object(
+-    section, collection_model, include_signature=True
++    section,
++    collection_model,
++    include_signature=True,
+ ):
+     """Documents a collection resource object
+ 
+@@ -85,7 +105,10 @@ def document_collection_object(
+         It is useful for generating docstrings.
+     """
+     if include_signature:
+-        section.style.start_sphinx_py_attr(collection_model.name)
++        full_collection_name = (
++            f"{section.context.get('qualifier', '')}{collection_model.name}"
++        )
++        section.style.start_sphinx_py_attr(full_collection_name)
+     section.include_doc_string(
+         f'A collection of {collection_model.resource.type} resources.'
+     )
+diff --git a/boto3/docs/resource.py b/boto3/docs/resource.py
+index 7d5516e9c15d155f71891b03a87db990e8269112..e669c6e6b1650d0e428ac22d8f42c1a30d926103 100644
+--- a/boto3/docs/resource.py
++++ b/boto3/docs/resource.py
+@@ -10,7 +10,10 @@
+ # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
++import os
++
+ from botocore import xform_name
++from botocore.docs.bcdoc.restdoc import DocumentStructure
+ from botocore.docs.utils import get_official_service_name
+ 
+ from boto3.docs.action import ActionDocumenter
+@@ -32,14 +35,18 @@ from boto3.docs.waiter import WaiterResourceDocumenter
+ 
+ 
+ class ResourceDocumenter(BaseDocumenter):
+-    def __init__(self, resource, botocore_session):
++    def __init__(self, resource, botocore_session, root_docs_path):
+         super().__init__(resource)
+         self._botocore_session = botocore_session
++        self._root_docs_path = root_docs_path
++        self._resource_sub_path = self._resource_name.lower()
++        if self._resource_name == self._service_name:
++            self._resource_sub_path = 'service-resource'
+ 
+     def document_resource(self, section):
+         self._add_title(section)
++        self._add_resource_note(section)
+         self._add_intro(section)
+-        overview_section = section.add_new_section('member-overview')
+         self._add_identifiers(section)
+         self._add_attributes(section)
+         self._add_references(section)
+@@ -47,7 +54,6 @@ class ResourceDocumenter(BaseDocumenter):
+         self._add_sub_resources(section)
+         self._add_collections(section)
+         self._add_waiters(section)
+-        self._add_overview_of_members(overview_section)
+ 
+     def _add_title(self, section):
+         section.style.h2(self._resource_name)
+@@ -60,23 +66,27 @@ class ResourceDocumenter(BaseDocumenter):
+ 
+         # Write out the class signature.
+         class_args = get_identifier_args_for_signature(identifier_names)
+-        section.style.start_sphinx_py_class(
++        start_class = section.add_new_section('start_class')
++        start_class.style.start_sphinx_py_class(
+             class_name=f'{self.class_name}({class_args})'
+         )
+ 
+         # Add as short description about the resource
+-        description_section = section.add_new_section('description')
++        description_section = start_class.add_new_section('description')
+         self._add_description(description_section)
+ 
+         # Add an example of how to instantiate the resource
+-        example_section = section.add_new_section('example')
++        example_section = start_class.add_new_section('example')
+         self._add_example(example_section, identifier_names)
+ 
+         # Add the description for the parameters to instantiate the
+         # resource.
+-        param_section = section.add_new_section('params')
++        param_section = start_class.add_new_section('params')
+         self._add_params_description(param_section, identifier_names)
+ 
++        end_class = section.add_new_section('end_class')
++        end_class.style.end_sphinx_py_class()
++
+     def _add_description(self, section):
+         official_service_name = get_official_service_name(self._service_model)
+         section.write(
+@@ -118,23 +128,15 @@ class ResourceDocumenter(BaseDocumenter):
+             section.write(f':param {identifier_name}: {description}')
+             section.style.new_line()
+ 
+-    def _add_overview_of_members(self, section):
+-        for resource_member_type in self.member_map:
+-            section.style.new_line()
+-            section.write(
+-                f'These are the resource\'s available {resource_member_type}:'
+-            )
+-            section.style.new_line()
+-            for member in self.member_map[resource_member_type]:
+-                if resource_member_type in (
+-                    'attributes',
+-                    'collections',
+-                    'identifiers',
+-                    'references',
+-                ):
+-                    section.style.li(f':py:attr:`{member}`')
+-                else:
+-                    section.style.li(f':py:meth:`{member}()`')
++    def _add_overview_of_member_type(self, section, resource_member_type):
++        section.style.new_line()
++        section.write(
++            f'These are the resource\'s available {resource_member_type}:'
++        )
++        section.style.new_line()
++        section.style.toctree()
++        for member in self.member_map[resource_member_type]:
++            section.style.tocitem(f'{member}')
+ 
+     def _add_identifiers(self, section):
+         identifiers = self._resource.meta.resource_model.identifiers
+@@ -152,13 +154,30 @@ class ResourceDocumenter(BaseDocumenter):
+                 intro_link='identifiers_attributes_intro',
+             )
+         for identifier in identifiers:
+-            identifier_section = section.add_new_section(identifier.name)
+             member_list.append(identifier.name)
++            # Create a new DocumentStructure for each identifier and add contents.
++            identifier_doc = DocumentStructure(identifier.name, target='html')
++            identifier_doc.add_title_section(identifier.name)
++            identifier_section = identifier_doc.add_new_section(
++                identifier.name,
++                context={'qualifier': f'{self.class_name}.'},
++            )
+             document_identifier(
+                 section=identifier_section,
+                 resource_name=self._resource_name,
+                 identifier_model=identifier,
+             )
++            # Write identifiers in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<identifier_name>.rst
++            identifiers_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{self._resource_sub_path}',
++            )
++            identifier_doc.write_to_file(identifiers_dir_path, identifier.name)
++
++        if identifiers:
++            self._add_overview_of_member_type(section, 'identifiers')
+ 
+     def _add_attributes(self, section):
+         service_model = self._resource.meta.client.meta.service_model
+@@ -187,8 +206,14 @@ class ResourceDocumenter(BaseDocumenter):
+             self.member_map['attributes'] = attribute_list
+         for attr_name in sorted(attributes):
+             _, attr_shape = attributes[attr_name]
+-            attribute_section = section.add_new_section(attr_name)
+             attribute_list.append(attr_name)
++            # Create a new DocumentStructure for each attribute and add contents.
++            attribute_doc = DocumentStructure(attr_name, target='html')
++            attribute_doc.add_title_section(attr_name)
++            attribute_section = attribute_doc.add_new_section(
++                attr_name,
++                context={'qualifier': f'{self.class_name}.'},
++            )
+             document_attribute(
+                 section=attribute_section,
+                 service_name=self._service_name,
+@@ -197,6 +222,16 @@ class ResourceDocumenter(BaseDocumenter):
+                 event_emitter=self._resource.meta.client.meta.events,
+                 attr_model=attr_shape,
+             )
++            # Write attributes in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<attribute_name>.rst
++            attributes_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{self._resource_sub_path}',
++            )
++            attribute_doc.write_to_file(attributes_dir_path, attr_name)
++        if attributes:
++            self._add_overview_of_member_type(section, 'attributes')
+ 
+     def _add_references(self, section):
+         section = section.add_new_section('references')
+@@ -213,36 +248,61 @@ class ResourceDocumenter(BaseDocumenter):
+                 intro_link='references_intro',
+             )
+             self.member_map['references'] = reference_list
++            self._add_overview_of_member_type(section, 'references')
+         for reference in references:
+-            reference_section = section.add_new_section(reference.name)
+             reference_list.append(reference.name)
++            # Create a new DocumentStructure for each reference and add contents.
++            reference_doc = DocumentStructure(reference.name, target='html')
++            reference_doc.add_title_section(reference.name)
++            reference_section = reference_doc.add_new_section(
++                reference.name,
++                context={'qualifier': f'{self.class_name}.'},
++            )
+             document_reference(
+-                section=reference_section, reference_model=reference
++                section=reference_section,
++                reference_model=reference,
++            )
++            # Write references in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<reference_name>.rst
++            references_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{self._resource_sub_path}',
+             )
++            reference_doc.write_to_file(references_dir_path, reference.name)
++        if references:
++            self._add_overview_of_member_type(section, 'references')
+ 
+     def _add_actions(self, section):
+         section = section.add_new_section('actions')
+         actions = self._resource.meta.resource_model.actions
+         if actions:
+-            documenter = ActionDocumenter(self._resource)
++            documenter = ActionDocumenter(self._resource, self._root_docs_path)
+             documenter.member_map = self.member_map
+             documenter.document_actions(section)
++            self._add_overview_of_member_type(section, 'actions')
+ 
+     def _add_sub_resources(self, section):
+         section = section.add_new_section('sub-resources')
+         sub_resources = self._resource.meta.resource_model.subresources
+         if sub_resources:
+-            documenter = SubResourceDocumenter(self._resource)
++            documenter = SubResourceDocumenter(
++                self._resource, self._root_docs_path
++            )
+             documenter.member_map = self.member_map
+             documenter.document_sub_resources(section)
++            self._add_overview_of_member_type(section, 'sub-resources')
+ 
+     def _add_collections(self, section):
+         section = section.add_new_section('collections')
+         collections = self._resource.meta.resource_model.collections
+         if collections:
+-            documenter = CollectionDocumenter(self._resource)
++            documenter = CollectionDocumenter(
++                self._resource, self._root_docs_path
++            )
+             documenter.member_map = self.member_map
+             documenter.document_collections(section)
++            self._add_overview_of_member_type(section, 'collections')
+ 
+     def _add_waiters(self, section):
+         section = section.add_new_section('waiters')
+@@ -252,10 +312,21 @@ class ResourceDocumenter(BaseDocumenter):
+                 self._service_name
+             )
+             documenter = WaiterResourceDocumenter(
+-                self._resource, service_waiter_model
++                self._resource, service_waiter_model, self._root_docs_path
+             )
+             documenter.member_map = self.member_map
+             documenter.document_resource_waiters(section)
++            self._add_overview_of_member_type(section, 'waiters')
++
++    def _add_resource_note(self, section):
++        section = section.add_new_section('feature-freeze')
++        section.style.start_note()
++        section.write(
++            "Before using anything on this page, please refer to the resources "
++            ":doc:`user guide <../../../../guide/resources>` for the most recent "
++            "guidance on using resources."
++        )
++        section.style.end_note()
+ 
+ 
+ class ServiceResourceDocumenter(ResourceDocumenter):
+diff --git a/boto3/docs/service.py b/boto3/docs/service.py
+index 56a4e6360d05337142b9b08b34d0b9391cb2de33..84fc9e5310e699b9d2c6f2479f0199ba64a94f3b 100644
+--- a/boto3/docs/service.py
++++ b/boto3/docs/service.py
+@@ -26,12 +26,13 @@ class ServiceDocumenter(BaseServiceDocumenter):
+     # The path used to find examples
+     EXAMPLE_PATH = os.path.join(os.path.dirname(boto3.__file__), 'examples')
+ 
+-    def __init__(self, service_name, session):
++    def __init__(self, service_name, session, root_docs_path):
+         super().__init__(
+             service_name=service_name,
+             # I know that this is an internal attribute, but the botocore session
+             # is needed to load the paginator and waiter models.
+             session=session._session,
++            root_docs_path=root_docs_path,
+         )
+         self._boto3_session = session
+         self._client = self._boto3_session.client(service_name)
+@@ -44,10 +45,15 @@ class ServiceDocumenter(BaseServiceDocumenter):
+             'client',
+             'paginators',
+             'waiters',
+-            'service-resource',
+             'resources',
+             'examples',
++            'context-params',
+         ]
++        self._root_docs_path = root_docs_path
++        self._USER_GUIDE_LINK = (
++            'https://boto3.amazonaws.com/'
++            'v1/documentation/api/latest/guide/resources.html'
++        )
+ 
+     def document_service(self):
+         """Documents an entire service.
+@@ -64,11 +70,10 @@ class ServiceDocumenter(BaseServiceDocumenter):
+         self.paginator_api(doc_structure.get_section('paginators'))
+         self.waiter_api(doc_structure.get_section('waiters'))
+         if self._service_resource:
+-            self._document_service_resource(
+-                doc_structure.get_section('service-resource')
+-            )
+-            self._document_resources(doc_structure.get_section('resources'))
++            self.resource_section(doc_structure.get_section('resources'))
+         self._document_examples(doc_structure.get_section('examples'))
++        context_params_section = doc_structure.get_section('context-params')
++        self.client_context_params(context_params_section)
+         return doc_structure.flush_structure()
+ 
+     def client_api(self, section):
+@@ -78,12 +83,52 @@ class ServiceDocumenter(BaseServiceDocumenter):
+         except DataNotFoundError:
+             pass
+ 
+-        Boto3ClientDocumenter(self._client, examples).document_client(section)
++        Boto3ClientDocumenter(
++            self._client, self._root_docs_path, examples
++        ).document_client(section)
++
++    def resource_section(self, section):
++        section.style.h2('Resources')
++        section.style.new_line()
++        section.write(
++            'Resources are available in boto3 via the '
++            '``resource`` method. For more detailed instructions '
++            'and examples on the usage of resources, see the '
++            'resources '
++        )
++        section.style.external_link(
++            title='user guide',
++            link=self._USER_GUIDE_LINK,
++        )
++        section.write('.')
++        section.style.new_line()
++        section.style.new_line()
++        section.write('The available resources are:')
++        section.style.new_line()
++        section.style.toctree()
++        self._document_service_resource(section)
++        self._document_resources(section)
+ 
+     def _document_service_resource(self, section):
++        # Create a new DocumentStructure for each Service Resource and add contents.
++        service_resource_doc = DocumentStructure(
++            'service-resource', target='html'
++        )
+         ServiceResourceDocumenter(
+-            self._service_resource, self._session
+-        ).document_resource(section)
++            self._service_resource, self._session, self._root_docs_path
++        ).document_resource(service_resource_doc)
++        # Write collections in individual/nested files.
++        # Path: <root>/reference/services/<service>/<resource_name>/<collection_name>.rst
++        resource_name = self._service_resource.meta.resource_model.name
++        if resource_name == self._service_name:
++            resource_name = 'service-resource'
++        service_resource_dir_path = os.path.join(
++            self._root_docs_path,
++            f'{self._service_name}',
++            f'{resource_name.lower()}',
++        )
++        service_resource_doc.write_to_file(service_resource_dir_path, 'index')
++        section.style.tocitem(f'{self._service_name}/{resource_name}/index')
+ 
+     def _document_resources(self, section):
+         temp_identifier_value = 'foo'
+@@ -113,8 +158,24 @@ class ServiceDocumenter(BaseServiceDocumenter):
+             for _ in identifiers:
+                 args.append(temp_identifier_value)
+             resource = resource_cls(*args, client=self._client)
+-            ResourceDocumenter(resource, self._session).document_resource(
+-                section.add_new_section(resource.meta.resource_model.name)
++            # Create a new DocumentStructure for each Resource and add contents.
++            resource_name = resource.meta.resource_model.name.lower()
++            resource_doc = DocumentStructure(resource_name, target='html')
++            ResourceDocumenter(
++                resource, self._session, self._root_docs_path
++            ).document_resource(
++                resource_doc.add_new_section(resource.meta.resource_model.name)
++            )
++            # Write collections in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<index>.rst
++            service_resource_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{resource_name}',
++            )
++            resource_doc.write_to_file(service_resource_dir_path, 'index')
++            section.style.tocitem(
++                f'{self._service_name}/{resource_name}/index'
+             )
+ 
+     def _get_example_file(self):
+@@ -127,8 +188,5 @@ class ServiceDocumenter(BaseServiceDocumenter):
+         if os.path.isfile(examples_file):
+             section.style.h2('Examples')
+             section.style.new_line()
+-            section.write(".. contents::\n    :local:\n    :depth: 1")
+-            section.style.new_line()
+-            section.style.new_line()
+             with open(examples_file) as f:
+                 section.write(f.read())
+diff --git a/boto3/docs/subresource.py b/boto3/docs/subresource.py
+index e22311c814e0b8cd0ee93f65752f5645cacb3cca..d4af78cf5ee4b5ab99a79e92bfe6a782f5c6776d 100644
+--- a/boto3/docs/subresource.py
++++ b/boto3/docs/subresource.py
+@@ -10,10 +10,13 @@
+ # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
++import os
++
+ from botocore import xform_name
++from botocore.docs.bcdoc.restdoc import DocumentStructure
+ from botocore.utils import get_service_module_name
+ 
+-from boto3.docs.base import BaseDocumenter
++from boto3.docs.base import NestedDocumenter
+ from boto3.docs.utils import (
+     add_resource_type_overview,
+     get_identifier_args_for_signature,
+@@ -22,7 +25,7 @@ from boto3.docs.utils import (
+ )
+ 
+ 
+-class SubResourceDocumenter(BaseDocumenter):
++class SubResourceDocumenter(NestedDocumenter):
+     def document_sub_resources(self, section):
+         add_resource_type_overview(
+             section=section,
+@@ -41,8 +44,16 @@ class SubResourceDocumenter(BaseDocumenter):
+         sub_resources_list = []
+         self.member_map['sub-resources'] = sub_resources_list
+         for sub_resource in sub_resources:
+-            sub_resource_section = section.add_new_section(sub_resource.name)
+             sub_resources_list.append(sub_resource.name)
++            # Create a new DocumentStructure for each sub_resource and add contents.
++            sub_resource_doc = DocumentStructure(
++                sub_resource.name, target='html'
++            )
++            sub_resource_doc.add_title_section(sub_resource.name)
++            sub_resource_section = sub_resource_doc.add_new_section(
++                sub_resource.name,
++                context={'qualifier': f'{self.class_name}.'},
++            )
+             document_sub_resource(
+                 section=sub_resource_section,
+                 resource_name=self._resource_name,
+@@ -50,6 +61,17 @@ class SubResourceDocumenter(BaseDocumenter):
+                 service_model=self._service_model,
+             )
+ 
++            # Write sub_resources in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<sub_resource_name>.rst
++            sub_resources_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{self._resource_sub_path}',
++            )
++            sub_resource_doc.write_to_file(
++                sub_resources_dir_path, sub_resource.name
++            )
++
+ 
+ def document_sub_resource(
+     section,
+@@ -78,8 +100,11 @@ def document_sub_resource(
+ 
+     if include_signature:
+         signature_args = get_identifier_args_for_signature(identifiers_needed)
++        full_sub_resource_name = (
++            f"{section.context.get('qualifier', '')}{sub_resource_model.name}"
++        )
+         section.style.start_sphinx_py_method(
+-            sub_resource_model.name, signature_args
++            full_sub_resource_name, signature_args
+         )
+ 
+     method_intro_section = section.add_new_section('method-intro')
+diff --git a/boto3/docs/utils.py b/boto3/docs/utils.py
+index 13a098dd61520dba525d6271d50e22630aab0981..0830af5052fbffe5fa9156042038762b619b0fa4 100644
+--- a/boto3/docs/utils.py
++++ b/boto3/docs/utils.py
+@@ -71,10 +71,7 @@ def add_resource_type_overview(
+     section, resource_type, description, intro_link=None
+ ):
+     section.style.new_line()
+-    section.write('.. rst-class:: admonition-title')
+-    section.style.new_line()
+-    section.style.new_line()
+-    section.write(resource_type)
++    section.style.h3(resource_type)
+     section.style.new_line()
+     section.style.new_line()
+     section.write(description)
+diff --git a/boto3/docs/waiter.py b/boto3/docs/waiter.py
+index 255d850bc3377565b87cc1abfd5bfdd3e8b739c4..65bfe1d6e270c2f763fff256786a43ec86a4f03c 100644
+--- a/boto3/docs/waiter.py
++++ b/boto3/docs/waiter.py
+@@ -10,20 +10,23 @@
+ # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
++import os
++
+ from botocore import xform_name
++from botocore.docs.bcdoc.restdoc import DocumentStructure
+ from botocore.docs.method import document_model_driven_method
+ from botocore.utils import get_service_module_name
+ 
+-from boto3.docs.base import BaseDocumenter
++from boto3.docs.base import NestedDocumenter
+ from boto3.docs.utils import (
+     add_resource_type_overview,
+     get_resource_ignore_params,
+ )
+ 
+ 
+-class WaiterResourceDocumenter(BaseDocumenter):
+-    def __init__(self, resource, service_waiter_model):
+-        super().__init__(resource)
++class WaiterResourceDocumenter(NestedDocumenter):
++    def __init__(self, resource, service_waiter_model, root_docs_path):
++        super().__init__(resource, root_docs_path)
+         self._service_waiter_model = service_waiter_model
+ 
+     def document_resource_waiters(self, section):
+@@ -40,8 +43,14 @@ class WaiterResourceDocumenter(BaseDocumenter):
+         waiter_list = []
+         self.member_map['waiters'] = waiter_list
+         for waiter in waiters:
+-            waiter_section = section.add_new_section(waiter.name)
+             waiter_list.append(waiter.name)
++            # Create a new DocumentStructure for each waiter and add contents.
++            waiter_doc = DocumentStructure(waiter.name, target='html')
++            waiter_doc.add_title_section(waiter.name)
++            waiter_section = waiter_doc.add_new_section(
++                waiter.name,
++                context={'qualifier': f'{self.class_name}.'},
++            )
+             document_resource_waiter(
+                 section=waiter_section,
+                 resource_name=self._resource_name,
+@@ -50,6 +59,14 @@ class WaiterResourceDocumenter(BaseDocumenter):
+                 resource_waiter_model=waiter,
+                 service_waiter_model=self._service_waiter_model,
+             )
++            # Write waiters in individual/nested files.
++            # Path: <root>/reference/services/<service>/<resource_name>/<waiter_name>.rst
++            waiters_dir_path = os.path.join(
++                self._root_docs_path,
++                f'{self._service_name}',
++                f'{self._resource_sub_path}',
++            )
++            waiter_doc.write_to_file(waiters_dir_path, waiter.name)
+ 
+ 
+ def document_resource_waiter(
+@@ -72,7 +89,7 @@ def document_resource_waiter(
+         'Waits until this {} is {}. This method calls '
+         ':py:meth:`{}.Waiter.{}.wait` which polls. '
+         ':py:meth:`{}.Client.{}` every {} seconds until '
+-        'a successful state is reached. An error is returned '
++        'a successful state is reached. An error is raised '
+         'after {} failed checks.'.format(
+             resource_name,
+             ' '.join(resource_waiter_model.name.split('_')[2:]),
+@@ -87,9 +104,12 @@ def document_resource_waiter(
+     example_prefix = '{}.{}'.format(
+         xform_name(resource_name), resource_waiter_model.name
+     )
++    full_waiter_name = (
++        f"{section.context.get('qualifier', '')}{resource_waiter_model.name}"
++    )
+     document_model_driven_method(
+         section=section,
+-        method_name=resource_waiter_model.name,
++        method_name=full_waiter_name,
+         operation_model=operation_model,
+         event_emitter=event_emitter,
+         example_prefix=example_prefix,
+diff --git a/boto3/dynamodb/table.py b/boto3/dynamodb/table.py
+index d96ec8f5ee25f356a175faa87ee564b1a24aa0ca..931296bc094f1702b2a168a8de2d79327592855a 100644
+--- a/boto3/dynamodb/table.py
++++ b/boto3/dynamodb/table.py
+@@ -145,13 +145,12 @@ class BatchWriter:
+             RequestItems={self._table_name: items_to_send}
+         )
+         unprocessed_items = response['UnprocessedItems']
+-
+-        if unprocessed_items and unprocessed_items[self._table_name]:
+-            # Any unprocessed_items are immediately added to the
+-            # next batch we send.
+-            self._items_buffer.extend(unprocessed_items[self._table_name])
+-        else:
+-            self._items_buffer = []
++        if not unprocessed_items:
++            unprocessed_items = {}
++        item_list = unprocessed_items.get(self._table_name, [])
++        # Any unprocessed_items are immediately added to the
++        # next batch we send.
++        self._items_buffer.extend(item_list)
+         logger.debug(
+             "Batch write sent %s, unprocessed: %s",
+             len(items_to_send),
+diff --git a/boto3/dynamodb/transform.py b/boto3/dynamodb/transform.py
+index eef3aae625e3323289f02596567e3f189c7cc87a..3944f3151fa1a87d5454523f37459b0511f32ced 100644
+--- a/boto3/dynamodb/transform.py
++++ b/boto3/dynamodb/transform.py
+@@ -22,8 +22,18 @@ def register_high_level_interface(base_classes, **kwargs):
+     base_classes.insert(0, DynamoDBHighLevelResource)
+ 
+ 
++class _ForgetfulDict(dict):
++    """A dictionary that discards any items set on it. For use as `memo` in
++    `copy.deepcopy()` when every instance of a repeated object in the deepcopied
++    data structure should result in a separate copy.
++    """
++
++    def __setitem__(self, key, value):
++        pass
++
++
+ def copy_dynamodb_params(params, **kwargs):
+-    return copy.deepcopy(params)
++    return copy.deepcopy(params, memo=_ForgetfulDict())
+ 
+ 
+ class DynamoDBHighLevelResource:
+diff --git a/boto3/exceptions.py b/boto3/exceptions.py
+index 0068de9cedfc7bb12402ed82b120fa59b0fcf575..7d9ceaf18dff04f1082cede679bf2f1c223ca8e5 100644
+--- a/boto3/exceptions.py
++++ b/boto3/exceptions.py
+@@ -40,7 +40,7 @@ class UnknownAPIVersionError(
+ ):
+     def __init__(self, service_name, bad_api_version, available_api_versions):
+         msg = (
+-            f"The '{service_name}' resource does not an API version of: {bad_api_version}\n"
++            f"The '{service_name}' resource does not support an API version of: {bad_api_version}\n"
+             f"Valid API versions are: {available_api_versions}"
+         )
+         # Not using super because we don't want the DataNotFoundError
+diff --git a/boto3/resources/model.py b/boto3/resources/model.py
+index 29371ee661d3de4d1b576b61e79aef1dfa6d69f2..14b1d2df8904759c258b05d87e3700538f5a4151 100644
+--- a/boto3/resources/model.py
++++ b/boto3/resources/model.py
+@@ -366,7 +366,7 @@ class ResourceModel:
+             name = xform_name(name)
+ 
+         if name in names:
+-            logger.debug(f'Renaming {self.name} {category} {name}')
++            logger.debug('Renaming %s %s %s', self.name, category, name)
+             self._renamed[(category, name)] = name + '_' + category
+             name += '_' + category
+ 
+diff --git a/boto3/s3/constants.py b/boto3/s3/constants.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7f691fc2181fa0bf05069951e7d7fe8d85686b1
+--- /dev/null
++++ b/boto3/s3/constants.py
+@@ -0,0 +1,17 @@
++# Copyright 2023 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License"). You
++# may not use this file except in compliance with the License. A copy of
++# the License is located at
++#
++# https://aws.amazon.com/apache2.0/
++#
++# or in the "license" file accompanying this file. This file is
++# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
++# ANY KIND, either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++
++
++# TransferConfig preferred_transfer_client settings
++CLASSIC_TRANSFER_CLIENT = "classic"
++AUTO_RESOLVE_TRANSFER_CLIENT = "auto"
+diff --git a/boto3/s3/inject.py b/boto3/s3/inject.py
+index d57e308358c94574a0dcc69a4ecd588a9be5e814..38c1c9d4aa2625cbaf8a0910d26c1c64af1d6292 100644
+--- a/boto3/s3/inject.py
++++ b/boto3/s3/inject.py
+@@ -10,6 +10,8 @@
+ # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+ # ANY KIND, either express or implied. See the License for the specific
+ # language governing permissions and limitations under the License.
++import copy as python_copy
++
+ from botocore.exceptions import ClientError
+ 
+ from boto3 import utils
+@@ -432,7 +434,11 @@ def copy(
+     if config is None:
+         config = TransferConfig()
+ 
+-    with create_transfer_manager(self, config) as manager:
++    # copy is not supported in the CRT
++    new_config = python_copy.copy(config)
++    new_config.preferred_transfer_client = "classic"
++
++    with create_transfer_manager(self, new_config) as manager:
+         future = manager.copy(
+             copy_source=CopySource,
+             bucket=Bucket,
+diff --git a/boto3/s3/transfer.py b/boto3/s3/transfer.py
+index 3d572981e0dfed7f5c0183b2be9d1d7cbefbf3cd..61d512f9d18bd2804173bfcfe195299c3e0afece 100644
+--- a/boto3/s3/transfer.py
++++ b/boto3/s3/transfer.py
+@@ -122,6 +122,12 @@ transfer.  For example:
+ 
+ 
+ """
++import logging
++import re
++import threading
++from os import PathLike, fsdecode, getpid
++
++from botocore.compat import HAS_CRT
+ from botocore.exceptions import ClientError
+ from s3transfer.exceptions import (
+     RetriesExceededError as S3TransferRetriesExceededError,
+@@ -132,11 +138,19 @@ from s3transfer.manager import TransferManager
+ from s3transfer.subscribers import BaseSubscriber
+ from s3transfer.utils import OSUtils
+ 
++import boto3.s3.constants as constants
+ from boto3.exceptions import RetriesExceededError, S3UploadFailedError
+ 
++if HAS_CRT:
++    import awscrt.s3
++
++    from boto3.crt import create_crt_transfer_manager
++
+ KB = 1024
+ MB = KB * KB
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def create_transfer_manager(client, config, osutil=None):
+     """Creates a transfer manager based on configuration
+@@ -153,6 +167,78 @@ def create_transfer_manager(client, config, osutil=None):
+     :rtype: s3transfer.manager.TransferManager
+     :returns: A transfer manager based on parameters provided
+     """
++    if _should_use_crt(config):
++        crt_transfer_manager = create_crt_transfer_manager(client, config)
++        if crt_transfer_manager is not None:
++            logger.debug(
++                "Using CRT client. pid: %s, thread: %s",
++                getpid(),
++                threading.get_ident(),
++            )
++            return crt_transfer_manager
++
++    # If we don't resolve something above, fallback to the default.
++    logger.debug(
++        "Using default client. pid: %s, thread: %s",
++        getpid(),
++        threading.get_ident(),
++    )
++    return _create_default_transfer_manager(client, config, osutil)
++
++
++def _should_use_crt(config):
++    # This feature requires awscrt>=0.19.18
++    if HAS_CRT and has_minimum_crt_version((0, 19, 18)):
++        is_optimized_instance = awscrt.s3.is_optimized_for_system()
++    else:
++        is_optimized_instance = False
++    pref_transfer_client = config.preferred_transfer_client.lower()
++
++    if (
++        is_optimized_instance
++        and pref_transfer_client == constants.AUTO_RESOLVE_TRANSFER_CLIENT
++    ):
++        logger.debug(
++            "Attempting to use CRTTransferManager. Config settings may be ignored."
++        )
++        return True
++
++    logger.debug(
++        "Opting out of CRT Transfer Manager. "
++        "Preferred client: %s, CRT available: %s, Instance Optimized: %s",
++        pref_transfer_client,
++        HAS_CRT,
++        is_optimized_instance,
++    )
++    return False
++
++
++def has_minimum_crt_version(minimum_version):
++    """Not intended for use outside boto3."""
++    if not HAS_CRT:
++        return False
++
++    crt_version_str = awscrt.__version__
++    if not isinstance(crt_version_str, str):
++        return False
++    # Semantic versions use numeric precedence; build metadata is ignored.
++    numeric = r"(?:0|[1-9][0-9]*)"
++    identifier = rf"(?:{numeric}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
++    match = re.fullmatch(
++        rf"({numeric})\.({numeric})\.({numeric})"
++        rf"(?:-({identifier}(?:\.{identifier})*))?"
++        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
++        crt_version_str,
++    )
++    if match is None:
++        return False
++    release = tuple(int(value) for value in match.group(1, 2, 3))
++    minimum = tuple(minimum_version)
++    return release > minimum or (release == minimum and match.group(4) is None)
++
++
++def _create_default_transfer_manager(client, config, osutil):
++    """Create the default TransferManager implementation for s3transfer."""
+     executor_cls = None
+     if not config.use_threads:
+         executor_cls = NonThreadedExecutor
+@@ -175,6 +261,7 @@ class TransferConfig(S3TransferConfig):
+         io_chunksize=256 * KB,
+         use_threads=True,
+         max_bandwidth=None,
++        preferred_transfer_client=constants.AUTO_RESOLVE_TRANSFER_CLIENT,
+     ):
+         """Configuration object for managed S3 transfers
+ 
+@@ -215,6 +302,15 @@ class TransferConfig(S3TransferConfig):
+         :param max_bandwidth: The maximum bandwidth that will be consumed
+             in uploading and downloading file content. The value is an integer
+             in terms of bytes per second.
++
++        :param preferred_transfer_client: String specifying preferred transfer
++            client for transfer operations.
++
++            Current supported settings are:
++              * auto (default) - Use the CRTTransferManager when calls
++                  are made with supported environment and settings.
++              * classic - Only use the origin S3TransferManager with
++                  requests. Disables possible CRT upgrade on requests.
+         """
+         super().__init__(
+             multipart_threshold=multipart_threshold,
+@@ -231,6 +327,7 @@ class TransferConfig(S3TransferConfig):
+         for alias in self.ALIAS:
+             setattr(self, alias, getattr(self, self.ALIAS[alias]))
+         self.use_threads = use_threads
++        self.preferred_transfer_client = preferred_transfer_client
+ 
+     def __setattr__(self, name, value):
+         # If the alias name is used, make sure we set the name that it points
+@@ -277,8 +374,10 @@ class S3Transfer:
+             :py:meth:`S3.Client.upload_file`
+             :py:meth:`S3.Client.upload_fileobj`
+         """
++        if isinstance(filename, PathLike):
++            filename = fsdecode(filename)
+         if not isinstance(filename, str):
+-            raise ValueError('Filename must be a string')
++            raise ValueError('Filename must be a string or a path-like object')
+ 
+         subscribers = self._get_subscribers(callback)
+         future = self._manager.upload(
+@@ -309,8 +408,10 @@ class S3Transfer:
+             :py:meth:`S3.Client.download_file`
+             :py:meth:`S3.Client.download_fileobj`
+         """
++        if isinstance(filename, PathLike):
++            filename = fsdecode(filename)
+         if not isinstance(filename, str):
+-            raise ValueError('Filename must be a string')
++            raise ValueError('Filename must be a string or a path-like object')
+ 
+         subscribers = self._get_subscribers(callback)
+         future = self._manager.download(
+diff --git a/boto3/session.py b/boto3/session.py
+index bdda65ad4164e82741deb35fd2d3ec7205dbe985..bc523ac01f5b97c779b43925a4186f261848094f 100644
+--- a/boto3/session.py
++++ b/boto3/session.py
+@@ -16,7 +16,11 @@ import os
+ 
+ import botocore.session
+ from botocore.client import Config
+-from botocore.exceptions import DataNotFoundError, UnknownServiceError
++from botocore.exceptions import (
++    DataNotFoundError,
++    NoCredentialsError,
++    UnknownServiceError,
++)
+ 
+ import boto3
+ import boto3.utils
+@@ -44,6 +48,8 @@ class Session:
+     :type profile_name: string
+     :param profile_name: The name of a profile to use. If not given, then
+                          the default profile is used.
++    :type aws_account_id: string
++    :param aws_account_id: AWS account ID
+     """
+ 
+     def __init__(
+@@ -54,6 +60,7 @@ class Session:
+         region_name=None,
+         botocore_session=None,
+         profile_name=None,
++        aws_account_id=None,
+     ):
+         if botocore_session is not None:
+             self._session = botocore_session
+@@ -76,9 +83,25 @@ class Session:
+         if profile_name is not None:
+             self._session.set_config_variable('profile', profile_name)
+ 
+-        if aws_access_key_id or aws_secret_access_key or aws_session_token:
++        creds = (
++            aws_access_key_id,
++            aws_secret_access_key,
++            aws_session_token,
++            aws_account_id,
++        )
++        if any(creds):
++            if self._account_id_set_without_credentials(
++                aws_account_id, aws_access_key_id, aws_secret_access_key
++            ):
++                raise NoCredentialsError()
++            account_kwargs = {}
++            if aws_account_id is not None:
++                account_kwargs['account_id'] = aws_account_id
+             self._session.set_credentials(
+-                aws_access_key_id, aws_secret_access_key, aws_session_token
++                aws_access_key_id,
++                aws_secret_access_key,
++                aws_session_token,
++                **account_kwargs,
+             )
+ 
+         if region_name is not None:
+@@ -226,6 +249,7 @@ class Session:
+         aws_secret_access_key=None,
+         aws_session_token=None,
+         config=None,
++        aws_account_id=None,
+     ):
+         """
+         Create a low-level service client by name.
+@@ -293,9 +317,16 @@ class Session:
+             <https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html>`_
+             for more details.
+ 
++        :type aws_account_id: string
++        :param aws_account_id: The account id to use when creating
++            the client.  Same semantics as aws_access_key_id above.
++
+         :return: Service client instance
+ 
+         """
++        account_kwargs = {}
++        if aws_account_id is not None:
++            account_kwargs['aws_account_id'] = aws_account_id
+         return self._session.create_client(
+             service_name,
+             region_name=region_name,
+@@ -307,6 +338,7 @@ class Session:
+             aws_secret_access_key=aws_secret_access_key,
+             aws_session_token=aws_session_token,
+             config=config,
++            **account_kwargs,
+         )
+ 
+     def resource(
+@@ -410,7 +442,7 @@ class Session:
+                 service_name, 'resources-1'
+             )
+             raise UnknownAPIVersionError(
+-                service_name, api_version, ', '.join(available_api_versions)
++                service_name, api_version, available_api_versions
+             )
+ 
+         if api_version is None:
+@@ -530,3 +562,12 @@ class Session:
+                 event_emitter=self.events,
+             ),
+         )
++
++    def _account_id_set_without_credentials(
++        self, account_id, access_key, secret_key
++    ):
++        if account_id is None:
++            return False
++        elif access_key is None or secret_key is None:
++            return True
++        return False
+diff --git a/docs/source/conf.py b/docs/source/conf.py
+index 818f6c0a0dc102f9e09678fd9ab243f0e1c32e07..bf13cbfb6a91c7a747b99e36139b7f216f81677c 100644
+--- a/docs/source/conf.py
++++ b/docs/source/conf.py
+@@ -97,19 +97,23 @@ pygments_style = 'sphinx'
+ #modindex_common_prefix = []
+ 
+ 
+-import guzzle_sphinx_theme
+-
+-extensions.append("guzzle_sphinx_theme")
+-html_translator_class = 'guzzle_sphinx_theme.HTMLTranslator'
+-html_theme_path = guzzle_sphinx_theme.html_theme_path()
+-html_theme = 'guzzle_sphinx_theme'
+-# Guzzle theme options (see theme.conf for more information)
+-
+-html_theme_options = {
+-    # hack to add tracking
+-    "google_analytics_account": os.getenv('TRACKING', False),
+-    "base_url": "http://docs.aws.amazon.com/aws-sdk-php/guide/latest/"
+-}
++try:
++    import guzzle_sphinx_theme
++except ImportError:
++    # Reference generation is also used in minimal, offline SDK environments.
++    # The optional presentation theme must not prevent that entry point from
++    # working; Sphinx itself supplies the basic theme.
++    html_theme = 'basic'
++    html_theme_options = {}
++else:
++    extensions.append("guzzle_sphinx_theme")
++    html_translator_class = 'guzzle_sphinx_theme.HTMLTranslator'
++    html_theme_path = guzzle_sphinx_theme.html_theme_path()
++    html_theme = 'guzzle_sphinx_theme'
++    html_theme_options = {
++        "google_analytics_account": os.getenv('TRACKING', False),
++        "base_url": "http://docs.aws.amazon.com/aws-sdk-php/guide/latest/"
++    }
+ 
+ # -- Options for HTML output ---------------------------------------------------
+ 
+@@ -270,4 +274,4 @@ texinfo_documents = [
+ # How to display URL addresses: 'footnote', 'no', or 'inline'.
+ #texinfo_show_urls = 'footnote'
+ 
+-autoclass_content = 'both'
+\ No newline at end of file
++autoclass_content = 'both'

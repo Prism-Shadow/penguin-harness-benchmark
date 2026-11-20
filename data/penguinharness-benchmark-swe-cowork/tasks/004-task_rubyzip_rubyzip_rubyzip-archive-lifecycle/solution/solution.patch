@@ -1,0 +1,5311 @@
+diff --git a/lib/zip/central_directory.rb b/lib/zip/central_directory.rb
+--- a/lib/zip/central_directory.rb
++++ b/lib/zip/central_directory.rb
+@@ -1,24 +1,47 @@
++# frozen_string_literal: true
++
++require 'forwardable'
++
++require_relative 'dirtyable'
++
+ module Zip
+   class CentralDirectory
+-    include Enumerable
+-
+-    END_OF_CDS             = 0x06054b50
+-    ZIP64_END_OF_CDS       = 0x06064b50
+-    ZIP64_EOCD_LOCATOR     = 0x07064b50
+-    MAX_END_OF_CDS_SIZE    = 65_536 + 18
++    extend Forwardable
++    include Dirtyable
++
++    END_OF_CD_SIG          = 0x06054b50
++    ZIP64_END_OF_CD_SIG    = 0x06064b50
++    ZIP64_EOCD_LOCATOR_SIG = 0x07064b50
++
+     STATIC_EOCD_SIZE       = 22
+-
+-    attr_reader :comment
+-
+-    # Returns an Enumerable containing the entries.
+-    def entries
+-      @entry_set.entries
+-    end
++    ZIP64_STATIC_EOCD_SIZE = 56
++    ZIP64_EOCD_LOC_SIZE    = 20
++    MAX_FILE_COMMENT_SIZE  = (1 << 16) - 1
++    MAX_END_OF_CD_SIZE     =
++      MAX_FILE_COMMENT_SIZE + STATIC_EOCD_SIZE + ZIP64_EOCD_LOC_SIZE
++
++    attr_accessor :comment
++
++    def_delegators :@entry_set,
++                   :<<, :delete, :each, :entries, :find_entry, :glob,
++                   :include?, :size
++
++    mark_dirty :<<, :comment=, :delete
+ 
+     def initialize(entries = EntrySet.new, comment = '') #:nodoc:
+-      super()
++      super(dirty_on_create: false)
+       @entry_set = entries.kind_of?(EntrySet) ? entries : EntrySet.new(entries)
+       @comment   = comment
++    end
++
++    def read_from_stream(io)
++      read_eocds(io)
++      read_central_directory_entries(io)
++      self
++    end
++
++    def self.read_from_stream(io)
++      new.read_from_stream(io)
+     end
+ 
+     def write_to_stream(io) #:nodoc:
+@@ -26,20 +49,35 @@
+       @entry_set.each { |entry| entry.write_c_dir_entry(io) }
+       eocd_offset = io.tell
+       cdir_size = eocd_offset - cdir_offset
+-      if ::Zip.write_zip64_support
+-        need_zip64_eocd = cdir_offset > 0xFFFFFFFF || cdir_size > 0xFFFFFFFF || @entry_set.size > 0xFFFF
+-        need_zip64_eocd ||= @entry_set.any? { |entry| entry.extra['Zip64'] }
+-        if need_zip64_eocd
+-          write_64_e_o_c_d(io, cdir_offset, cdir_size)
+-          write_64_eocd_locator(io, eocd_offset)
+-        end
++      if Zip.write_zip64_support &&
++         (cdir_offset >= 0xFFFFFFFF || cdir_size >= 0xFFFFFFFF || @entry_set.size >= 0xFFFF ||
++          @entry_set.any?(&:zip64?))
++        write_64_e_o_c_d(io, cdir_offset, cdir_size)
++        write_64_eocd_locator(io, eocd_offset)
+       end
+       write_e_o_c_d(io, cdir_offset, cdir_size)
+     end
++
++    # Reads the End of Central Directory Record (and the Zip64 equivalent if
++    # needs be) and returns the number of entries in the archive. This is a
++    # convenience method that avoids reading in all of the entry data to get a
++    # very quick entry count.
++    def count_entries(io)
++      read_eocds(io)
++      @size
++    end
++
++    def ==(other) #:nodoc:
++      return false unless other.kind_of?(CentralDirectory)
++
++      @entry_set.entries.sort == other.entries.sort && comment == other.comment
++    end
++
++    private
+ 
+     def write_e_o_c_d(io, offset, cdir_size) #:nodoc:
+       tmp = [
+-        END_OF_CDS,
++        END_OF_CD_SIG,
+         0, # @numberOfThisDisk
+         0, # @numberOfDiskWithStartOfCDir
+         @entry_set ? [@entry_set.size, 0xFFFF].min : 0,
+@@ -52,11 +90,9 @@
+       io << @comment
+     end
+ 
+-    private :write_e_o_c_d
+-
+     def write_64_e_o_c_d(io, offset, cdir_size) #:nodoc:
+       tmp = [
+-        ZIP64_END_OF_CDS,
++        ZIP64_END_OF_CD_SIG,
+         44, # size of zip64 end of central directory record (excludes signature and field itself)
+         VERSION_MADE_BY,
+         VERSION_NEEDED_TO_EXTRACT_ZIP64,
+@@ -65,16 +101,14 @@
+         @entry_set ? @entry_set.size : 0, # number of entries on this disk
+         @entry_set ? @entry_set.size : 0, # number of entries total
+         cdir_size, # size of central directory
+-        offset, # offset of start of central directory in its disk
++        offset # offset of start of central directory in its disk
+       ]
+       io << tmp.pack('VQ<vvVVQ<Q<Q<Q<')
+     end
+ 
+-    private :write_64_e_o_c_d
+-
+     def write_64_eocd_locator(io, zip64_eocd_offset)
+       tmp = [
+-        ZIP64_EOCD_LOCATOR,
++        ZIP64_EOCD_LOCATOR_SIG,
+         0, # number of disk containing the start of zip64 eocd record
+         zip64_eocd_offset, # offset of the start of zip64 eocd record in its disk
+         1 # total number of disks
+@@ -82,123 +116,181 @@
+       io << tmp.pack('VVQ<V')
+     end
+ 
+-    private :write_64_eocd_locator
+-
+-    def read_64_e_o_c_d(buf) #:nodoc:
+-      buf                                           = get_64_e_o_c_d(buf)
+-      @size_of_zip64_e_o_c_d                        = Entry.read_zip_64_long(buf)
+-      @version_made_by                              = Entry.read_zip_short(buf)
+-      @version_needed_for_extract                   = Entry.read_zip_short(buf)
+-      @number_of_this_disk                          = Entry.read_zip_long(buf)
+-      @number_of_disk_with_start_of_cdir            = Entry.read_zip_long(buf)
+-      @total_number_of_entries_in_cdir_on_this_disk = Entry.read_zip_64_long(buf)
+-      @size                                         = Entry.read_zip_64_long(buf)
+-      @size_in_bytes                                = Entry.read_zip_64_long(buf)
+-      @cdir_offset                                  = Entry.read_zip_64_long(buf)
+-      @zip_64_extensible                            = buf.slice!(0, buf.bytesize)
+-      raise Error, 'Zip consistency problem while reading eocd structure' unless buf.empty?
+-    end
+-
+-    def read_e_o_c_d(buf) #:nodoc:
+-      buf                                           = get_e_o_c_d(buf)
+-      @number_of_this_disk                          = Entry.read_zip_short(buf)
+-      @number_of_disk_with_start_of_cdir            = Entry.read_zip_short(buf)
+-      @total_number_of_entries_in_cdir_on_this_disk = Entry.read_zip_short(buf)
+-      @size                                         = Entry.read_zip_short(buf)
+-      @size_in_bytes                                = Entry.read_zip_long(buf)
+-      @cdir_offset                                  = Entry.read_zip_long(buf)
+-      comment_length                                = Entry.read_zip_short(buf)
+-      @comment                                      = if comment_length.to_i <= 0
+-                                                        buf.slice!(0, buf.size)
+-                                                      else
+-                                                        buf.read(comment_length)
+-                                                      end
+-      raise Error, 'Zip consistency problem while reading eocd structure' unless buf.empty?
++    def unpack_64_e_o_c_d(buffer) #:nodoc:
++      _, # ZIP64_END_OF_CD_SIG. We know we have this at this point.
++      @size_of_zip64_e_o_c_d,
++      @version_made_by,
++      @version_needed_for_extract,
++      @number_of_this_disk,
++      @number_of_disk_with_start_of_cdir,
++      @total_number_of_entries_in_cdir_on_this_disk,
++      @size,
++      @size_in_bytes,
++      @cdir_offset = buffer.unpack('VQ<vvVVQ<Q<Q<Q<')
++
++      zip64_extensible_data_size =
++        @size_of_zip64_e_o_c_d - ZIP64_STATIC_EOCD_SIZE + 12
++      @zip64_extensible_data = if zip64_extensible_data_size.zero?
++                                 ''
++                               else
++                                 buffer.slice(
++                                   ZIP64_STATIC_EOCD_SIZE,
++                                   zip64_extensible_data_size
++                                 )
++                               end
++    end
++
++    def unpack_64_eocd_locator(buffer) #:nodoc:
++      _, # ZIP64_EOCD_LOCATOR_SIG. We know we have this at this point.
++      _, zip64_eocd_offset, = buffer.unpack('VVQ<V')
++
++      zip64_eocd_offset
++    end
++
++    def unpack_e_o_c_d(buffer) #:nodoc:
++      raise Error, 'Truncated end of central directory record' if buffer.bytesize < STATIC_EOCD_SIZE
++
++      _, # END_OF_CD_SIG. We know we have this at this point.
++      num_disk,
++      num_disk_cdir,
++      num_cdir_disk,
++      num_entries,
++      size_in_bytes,
++      cdir_offset,
++      comment_length = buffer.unpack('VvvvvVVv')
++
++      if buffer.bytesize < STATIC_EOCD_SIZE + comment_length
++        raise Error, 'Truncated end of central directory comment'
++      end
++
++      @number_of_this_disk = num_disk unless num_disk == 0xFFFF
++      @number_of_disk_with_start_of_cdir = num_disk_cdir unless num_disk_cdir == 0xFFFF
++      @total_number_of_entries_in_cdir_on_this_disk = num_cdir_disk unless num_cdir_disk == 0xFFFF
++      @size = num_entries unless num_entries == 0xFFFF
++      @size_in_bytes = size_in_bytes unless size_in_bytes == 0xFFFFFFFF
++      @cdir_offset = cdir_offset unless cdir_offset == 0xFFFFFFFF
++
++      @comment = if comment_length.positive?
++                   buffer.slice(STATIC_EOCD_SIZE, comment_length)
++                 else
++                   ''
++                 end
+     end
+ 
+     def read_central_directory_entries(io) #:nodoc:
++      # `StringIO` doesn't raise `EINVAL` if you seek beyond the current end,
++      # so we need to catch that *and* query `io#eof?` here.
++      eof = false
+       begin
+         io.seek(@cdir_offset, IO::SEEK_SET)
+       rescue Errno::EINVAL
+-        raise Error, 'Zip consistency problem while reading central directory entry'
+-      end
++        eof = true
++      end
++      raise Error, 'Zip consistency problem while reading central directory entry' if eof || io.eof?
++
+       @entry_set = EntrySet.new
+       @size.times do
+-        @entry_set << Entry.read_c_dir_entry(io)
+-      end
+-    end
+-
+-    def read_from_stream(io) #:nodoc:
+-      buf = start_buf(io)
+-      if zip64_file?(buf)
+-        read_64_e_o_c_d(buf)
+-      else
+-        read_e_o_c_d(buf)
+-      end
+-      read_central_directory_entries(io)
+-    end
+-
+-    def get_e_o_c_d(buf) #:nodoc:
+-      sig_index = buf.rindex([END_OF_CDS].pack('V'))
+-      raise Error, 'Zip end of central directory signature not found' unless sig_index
+-      buf = buf.slice!((sig_index + 4)..(buf.bytesize))
+-
+-      def buf.read(count)
+-        slice!(0, count)
+-      end
+-
+-      buf
+-    end
+-
+-    def zip64_file?(buf)
+-      buf.rindex([ZIP64_END_OF_CDS].pack('V')) && buf.rindex([ZIP64_EOCD_LOCATOR].pack('V'))
+-    end
+-
+-    def start_buf(io)
++        entry = Entry.read_c_dir_entry(io)
++        next unless entry
++
++        offset = if entry.zip64?
++                   entry.extra['Zip64'].relative_header_offset
++                 else
++                   entry.local_header_offset
++                 end
++
++        unless offset.nil?
++          io_save = io.tell
++          io.seek(offset, IO::SEEK_SET)
++          local_extra = ExtraField.new(read_local_extra_field(io), local: true)
++          if local_extra['Unknown']
++            entry.extra['Unknown'] ||= ExtraField::Unknown.new
++            entry.extra['Unknown'].merge(local_extra['Unknown'].to_local_bin, local: true)
++          end
++          io.seek(io_save, IO::SEEK_SET)
++        end
++
++        @entry_set << entry
++      end
++    end
++
++    def read_local_extra_field(io)
++      buf = io.read(::Zip::LOCAL_ENTRY_STATIC_HEADER_LENGTH) || ''
++      return '' unless buf.bytesize == ::Zip::LOCAL_ENTRY_STATIC_HEADER_LENGTH
++
++      head, _, _, _, _, _, _, _, _, _, n_len, e_len = buf.unpack('VCCvvvvVVVvv')
++      return '' unless head == ::Zip::LOCAL_ENTRY_SIGNATURE
++
++      io.seek(n_len, IO::SEEK_CUR) # Skip over the entry name.
++      io.read(e_len)
++    end
++
++    def read_eocds(io) #:nodoc:
++      base_location, data = eocd_data(io)
++
++      search_offset = 0
++      candidates = []
++      while (eocd_location = data.index([END_OF_CD_SIG].pack('V'), search_offset))
++        search_offset = eocd_location + 4
++        next if eocd_location + STATIC_EOCD_SIZE > data.bytesize
++
++        comment_length = data.byteslice(eocd_location + 20, 2).unpack1('v')
++        record_end = eocd_location + STATIC_EOCD_SIZE + comment_length
++        next if record_end > data.bytesize
++
++        candidates << [eocd_location, record_end]
++      end
++      candidates.sort_by { |location, record_end| [record_end == data.bytesize ? 0 : 1, location] }.each do |eocd_location, _record_end|
++
++        begin
++          directory_end = base_location + eocd_location
++          fields = data.byteslice(eocd_location, STATIC_EOCD_SIZE).unpack('VvvvvVVv')
++          needs_zip64 = fields[1..4].include?(0xFFFF) || fields[5..6].include?(0xFFFFFFFF)
++          locator_location = eocd_location - ZIP64_EOCD_LOC_SIZE
++          has_zip64 = locator_location >= 0 &&
++                      data.byteslice(locator_location, 4).unpack1('V') == ZIP64_EOCD_LOCATOR_SIG &&
++                      (needs_zip64 || fields[5] + fields[6] < directory_end)
++          if has_zip64
++            zip64_offset = unpack_64_eocd_locator(data.byteslice(locator_location, ZIP64_EOCD_LOC_SIZE))
++            record_size = base_location + locator_location - zip64_offset
++            raise Error, 'Invalid Zip64 end record offset' if zip64_offset.negative? || record_size < ZIP64_STATIC_EOCD_SIZE
++
++            io.seek(zip64_offset, IO::SEEK_SET)
++            zip64_header = io.read(12)
++            signature, declared_size = zip64_header.to_s.unpack('VQ<')
++            unless signature == ZIP64_END_OF_CD_SIG && declared_size && declared_size + 12 == record_size
++              raise Error, 'Invalid Zip64 end record size or signature'
++            end
++            zip64_data = zip64_header + io.read(record_size - 12).to_s
++            raise Error, 'Truncated Zip64 end record' unless zip64_data.bytesize == record_size
++
++            unpack_64_e_o_c_d(zip64_data)
++            directory_end = zip64_offset
++          else
++            if needs_zip64
++              raise Error, 'Zip64 end record locator not found'
++            end
++          end
++
++          unpack_e_o_c_d(data.byteslice(eocd_location..-1))
++          next if @cdir_offset + @size_in_bytes > directory_end
++
++          return
++        rescue Error
++          next
++        end
++      end
++      raise Error, 'Valid zip end of central directory record not found'
++    end
++
++    def eocd_data(io)
+       begin
+-        io.seek(-MAX_END_OF_CDS_SIZE, IO::SEEK_END)
++        io.seek(-MAX_END_OF_CD_SIZE, IO::SEEK_END)
+       rescue Errno::EINVAL
+         io.seek(0, IO::SEEK_SET)
+       end
+-      io.read
+-    end
+-
+-    def get_64_e_o_c_d(buf) #:nodoc:
+-      zip_64_start = buf.rindex([ZIP64_END_OF_CDS].pack('V'))
+-      raise Error, 'Zip64 end of central directory signature not found' unless zip_64_start
+-      zip_64_locator = buf.rindex([ZIP64_EOCD_LOCATOR].pack('V'))
+-      raise Error, 'Zip64 end of central directory signature locator not found' unless zip_64_locator
+-      buf = buf.slice!((zip_64_start + 4)..zip_64_locator)
+-
+-      def buf.read(count)
+-        slice!(0, count)
+-      end
+-
+-      buf
+-    end
+-
+-    # For iterating over the entries.
+-    def each(&proc)
+-      @entry_set.each(&proc)
+-    end
+-
+-    # Returns the number of entries in the central directory (and
+-    # consequently in the zip archive).
+-    def size
+-      @entry_set.size
+-    end
+-
+-    def self.read_from_stream(io) #:nodoc:
+-      cdir = new
+-      cdir.read_from_stream(io)
+-      return cdir
+-    rescue Error
+-      return nil
+-    end
+-
+-    def ==(other) #:nodoc:
+-      return false unless other.kind_of?(CentralDirectory)
+-      @entry_set.entries.sort == other.entries.sort && comment == other.comment
++
++      [io.tell, io.read.b]
+     end
+   end
+ end
+diff --git a/lib/zip/compressor.rb b/lib/zip/compressor.rb
+index 079c1cb070781d32f7ebb6f83dc6df83a9f928fe..8c0680e03d9e2cf91492cbc09cf8844e4ecf5649 100644
+--- a/lib/zip/compressor.rb
++++ b/lib/zip/compressor.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   class Compressor #:nodoc:all
+     def finish; end
+diff --git a/lib/zip/constants.rb b/lib/zip/constants.rb
+index 5eb5c1da34d08e99d66c98505f6c308ae67d828c..d0c5927e3d331fafc959900d08f3df63ef603867 100644
+--- a/lib/zip/constants.rb
++++ b/lib/zip/constants.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   RUNNING_ON_WINDOWS = RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/i
+ 
+@@ -11,6 +13,8 @@ module Zip
+   VERSION_NEEDED_TO_EXTRACT              = 20
+   VERSION_NEEDED_TO_EXTRACT_ZIP64        = 45
+ 
++  SPLIT_FILE_SIGNATURE = 0x08074b50
++
+   FILE_TYPE_FILE    = 0o10
+   FILE_TYPE_DIR     = 0o04
+   FILE_TYPE_SYMLINK = 0o12
+@@ -38,26 +42,78 @@ module Zip
+   FSTYPE_ATHEOS   = 30
+ 
+   FSTYPES = {
+-    FSTYPE_FAT      => 'FAT'.freeze,
+-    FSTYPE_AMIGA    => 'Amiga'.freeze,
+-    FSTYPE_VMS      => 'VMS (Vax or Alpha AXP)'.freeze,
+-    FSTYPE_UNIX     => 'Unix'.freeze,
+-    FSTYPE_VM_CMS   => 'VM/CMS'.freeze,
+-    FSTYPE_ATARI    => 'Atari ST'.freeze,
+-    FSTYPE_HPFS     => 'OS/2 or NT HPFS'.freeze,
+-    FSTYPE_MAC      => 'Macintosh'.freeze,
+-    FSTYPE_Z_SYSTEM => 'Z-System'.freeze,
+-    FSTYPE_CPM      => 'CP/M'.freeze,
+-    FSTYPE_TOPS20   => 'TOPS-20'.freeze,
+-    FSTYPE_NTFS     => 'NTFS'.freeze,
+-    FSTYPE_QDOS     => 'SMS/QDOS'.freeze,
+-    FSTYPE_ACORN    => 'Acorn RISC OS'.freeze,
+-    FSTYPE_VFAT     => 'Win32 VFAT'.freeze,
+-    FSTYPE_MVS      => 'MVS'.freeze,
+-    FSTYPE_BEOS     => 'BeOS'.freeze,
+-    FSTYPE_TANDEM   => 'Tandem NSK'.freeze,
+-    FSTYPE_THEOS    => 'Theos'.freeze,
+-    FSTYPE_MAC_OSX  => 'Mac OS/X (Darwin)'.freeze,
+-    FSTYPE_ATHEOS   => 'AtheOS'.freeze
++    FSTYPE_FAT      => 'FAT',
++    FSTYPE_AMIGA    => 'Amiga',
++    FSTYPE_VMS      => 'VMS (Vax or Alpha AXP)',
++    FSTYPE_UNIX     => 'Unix',
++    FSTYPE_VM_CMS   => 'VM/CMS',
++    FSTYPE_ATARI    => 'Atari ST',
++    FSTYPE_HPFS     => 'OS/2 or NT HPFS',
++    FSTYPE_MAC      => 'Macintosh',
++    FSTYPE_Z_SYSTEM => 'Z-System',
++    FSTYPE_CPM      => 'CP/M',
++    FSTYPE_TOPS20   => 'TOPS-20',
++    FSTYPE_NTFS     => 'NTFS',
++    FSTYPE_QDOS     => 'SMS/QDOS',
++    FSTYPE_ACORN    => 'Acorn RISC OS',
++    FSTYPE_VFAT     => 'Win32 VFAT',
++    FSTYPE_MVS      => 'MVS',
++    FSTYPE_BEOS     => 'BeOS',
++    FSTYPE_TANDEM   => 'Tandem NSK',
++    FSTYPE_THEOS    => 'Theos',
++    FSTYPE_MAC_OSX  => 'Mac OS/X (Darwin)',
++    FSTYPE_ATHEOS   => 'AtheOS'
++  }.freeze
++
++  COMPRESSION_METHOD_STORE = 0
++  COMPRESSION_METHOD_SHRINK = 1
++  COMPRESSION_METHOD_REDUCE_1 = 2
++  COMPRESSION_METHOD_REDUCE_2 = 3
++  COMPRESSION_METHOD_REDUCE_3 = 4
++  COMPRESSION_METHOD_REDUCE_4 = 5
++  COMPRESSION_METHOD_IMPLODE = 6
++  # RESERVED = 7
++  COMPRESSION_METHOD_DEFLATE = 8
++  COMPRESSION_METHOD_DEFLATE_64 = 9
++  COMPRESSION_METHOD_PKWARE_DCLI = 10
++  # RESERVED = 11
++  COMPRESSION_METHOD_BZIP2 = 12
++  # RESERVED = 13
++  COMPRESSION_METHOD_LZMA = 14
++  # RESERVED = 15
++  COMPRESSION_METHOD_IBM_CMPSC = 16
++  # RESERVED = 17
++  COMPRESSION_METHOD_IBM_TERSE = 18
++  COMPRESSION_METHOD_IBM_LZ77 = 19
++  COMPRESSION_METHOD_JPEG = 96
++  COMPRESSION_METHOD_WAVPACK = 97
++  COMPRESSION_METHOD_PPMD = 98
++  COMPRESSION_METHOD_AES = 99
++
++  COMPRESSION_METHODS = {
++    COMPRESSION_METHOD_STORE       => 'Store (no compression)',
++    COMPRESSION_METHOD_SHRINK      => 'Shrink',
++    COMPRESSION_METHOD_REDUCE_1    => 'Reduce with compression factor 1',
++    COMPRESSION_METHOD_REDUCE_2    => 'Reduce with compression factor 2',
++    COMPRESSION_METHOD_REDUCE_3    => 'Reduce with compression factor 3',
++    COMPRESSION_METHOD_REDUCE_4    => 'Reduce with compression factor 4',
++    COMPRESSION_METHOD_IMPLODE     => 'Implode',
++    # RESERVED = 7
++    COMPRESSION_METHOD_DEFLATE     => 'Deflate',
++    COMPRESSION_METHOD_DEFLATE_64  => 'Deflate64(tm)',
++    COMPRESSION_METHOD_PKWARE_DCLI => 'PKWARE Data Compression Library Imploding (old IBM TERSE)',
++    # RESERVED = 11
++    COMPRESSION_METHOD_BZIP2       => 'BZIP2',
++    # RESERVED = 13
++    COMPRESSION_METHOD_LZMA        => 'LZMA',
++    # RESERVED = 15
++    COMPRESSION_METHOD_IBM_CMPSC   => 'IBM z/OS CMPSC Compression',
++    # RESERVED = 17
++    COMPRESSION_METHOD_IBM_TERSE   => 'IBM TERSE (new)',
++    COMPRESSION_METHOD_IBM_LZ77    => 'IBM LZ77 z Architecture (PFS)',
++    COMPRESSION_METHOD_JPEG        => 'JPEG variant',
++    COMPRESSION_METHOD_WAVPACK     => 'WavPack compressed data',
++    COMPRESSION_METHOD_PPMD        => 'PPMd version I, Rev 1',
++    COMPRESSION_METHOD_AES         => 'AES encryption'
+   }.freeze
+ end
+diff --git a/lib/zip/crypto/decrypted_io.rb b/lib/zip/crypto/decrypted_io.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..85d66de8711330bcb5969a50a4ece9ab9ebeb54a
+--- /dev/null
++++ b/lib/zip/crypto/decrypted_io.rb
+@@ -0,0 +1,42 @@
++# frozen_string_literal: true
++
++module Zip
++  class DecryptedIo #:nodoc:all
++    CHUNK_SIZE = 32_768
++
++    def initialize(io, decrypter)
++      @io = io
++      @decrypter = decrypter
++    end
++
++    def read(length = nil, outbuf = +'')
++      return (length.nil? || length.zero? ? '' : nil) if eof
++
++      while length.nil? || (buffer.bytesize < length)
++        break if input_finished?
++
++        buffer << produce_input
++      end
++
++      outbuf.replace(buffer.slice!(0...(length || buffer.bytesize)))
++    end
++
++    private
++
++    def eof
++      buffer.empty? && input_finished?
++    end
++
++    def buffer
++      @buffer ||= +''
++    end
++
++    def input_finished?
++      @io.eof
++    end
++
++    def produce_input
++      @decrypter.decrypt(@io.read(CHUNK_SIZE))
++    end
++  end
++end
+diff --git a/lib/zip/crypto/encryption.rb b/lib/zip/crypto/encryption.rb
+index 4351be1c3b9d88069939b352a8eec0e535a6234f..c792e38b055b70ce8a7c9ddaecbd246e3f9d1920 100644
+--- a/lib/zip/crypto/encryption.rb
++++ b/lib/zip/crypto/encryption.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   class Encrypter #:nodoc:all
+   end
+diff --git a/lib/zip/crypto/null_encryption.rb b/lib/zip/crypto/null_encryption.rb
+index a93f707c4c084c2f8721a78b82bea844a4436dac..ae33c40cc97ad5b5742de02ce30ce1ed949281d9 100644
+--- a/lib/zip/crypto/null_encryption.rb
++++ b/lib/zip/crypto/null_encryption.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   module NullEncryption
+     def header_bytesize
+diff --git a/lib/zip/crypto/traditional_encryption.rb b/lib/zip/crypto/traditional_encryption.rb
+index 91e6ce16fe01355ff29c5ebafe060a1f39506c29..eef3b18d71d29dacd2f86d4e8030cb7f07fc67ae 100644
+--- a/lib/zip/crypto/traditional_encryption.rb
++++ b/lib/zip/crypto/traditional_encryption.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   module TraditionalEncryption
+     def initialize(password)
+@@ -24,8 +26,8 @@ module Zip
+       end
+     end
+ 
+-    def update_keys(n)
+-      @key0 = ~Zlib.crc32(n, ~@key0)
++    def update_keys(num)
++      @key0 = ~Zlib.crc32(num, ~@key0)
+       @key1 = ((@key1 + (@key0 & 0xff)) * 134_775_813 + 1) & 0xffffffff
+       @key2 = ~Zlib.crc32((@key1 >> 24).chr, ~@key2)
+     end
+@@ -63,10 +65,10 @@ module Zip
+ 
+     private
+ 
+-    def encode(n)
++    def encode(num)
+       t = decrypt_byte
+-      update_keys(n.chr)
+-      t ^ n
++      update_keys(num.chr)
++      t ^ num
+     end
+   end
+ 
+@@ -86,10 +88,10 @@ module Zip
+ 
+     private
+ 
+-    def decode(n)
+-      n ^= decrypt_byte
+-      update_keys(n.chr)
+-      n
++    def decode(num)
++      num ^= decrypt_byte
++      update_keys(num.chr)
++      num
+     end
+   end
+ end
+diff --git a/lib/zip/decompressor.rb b/lib/zip/decompressor.rb
+index 047ed5e71e6dc3f7615ecfe096fdd6c444fccc85..b6bb9cc89bfb3df347a153ab3264b10cdef01365 100644
+--- a/lib/zip/decompressor.rb
++++ b/lib/zip/decompressor.rb
+@@ -1,9 +1,28 @@
++# frozen_string_literal: true
++
+ module Zip
+   class Decompressor #:nodoc:all
+     CHUNK_SIZE = 32_768
+-    def initialize(input_stream)
++
++    def self.decompressor_classes
++      @decompressor_classes ||= {}
++    end
++
++    def self.register(compression_method, decompressor_class)
++      decompressor_classes[compression_method] = decompressor_class
++    end
++
++    def self.find_by_compression_method(compression_method)
++      decompressor_classes[compression_method]
++    end
++
++    attr_reader :decompressed_size, :input_stream
++
++    def initialize(input_stream, decompressed_size = nil)
+       super()
++
+       @input_stream = input_stream
++      @decompressed_size = decompressed_size
+     end
+   end
+ end
+diff --git a/lib/zip/deflater.rb b/lib/zip/deflater.rb
+index 8509cf474186fd495564784fa15cf6e967a51c80..fb5ef10e2ce9d87d7281244661e281fdb5ac8737 100644
+--- a/lib/zip/deflater.rb
++++ b/lib/zip/deflater.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   class Deflater < Compressor #:nodoc:all
+     def initialize(output_stream, level = Zip.default_compression, encrypter = NullEncrypter.new)
+@@ -14,15 +16,15 @@ module Zip
+       @crc  = Zlib.crc32(val, @crc)
+       @size += val.bytesize
+       buffer = @zlib_deflater.deflate(data)
+-      if buffer.empty?
+-        @output_stream
+-      else
+-        @output_stream << @encrypter.encrypt(buffer)
+-      end
++      return @output_stream if buffer.empty?
++
++      @output_stream << @encrypter.encrypt(buffer)
+     end
+ 
+     def finish
+-      @output_stream << @encrypter.encrypt(@zlib_deflater.finish) until @zlib_deflater.finished?
++      buffer = @zlib_deflater.finish
++      @output_stream << @encrypter.encrypt(buffer) unless buffer.empty?
++      @zlib_deflater.close
+     end
+ 
+     attr_reader :size, :crc
+diff --git a/lib/zip/dirtyable.rb b/lib/zip/dirtyable.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..78b1c86a9dde0d35a879311aac7034c85a9f5393
+--- /dev/null
++++ b/lib/zip/dirtyable.rb
+@@ -0,0 +1,32 @@
++# frozen_string_literal: true
++
++module Zip
++  module Dirtyable # :nodoc:
++    def initialize(dirty_on_create: true)
++      @dirty = dirty_on_create
++    end
++
++    def dirty?
++      @dirty
++    end
++
++    module ClassMethods
++      def mark_dirty(*symbols) # :nodoc:
++        # Move the original method and call it after we've set the dirty flag.
++        symbols.each do |symbol|
++          orig_name = "orig_#{symbol}"
++          alias_method orig_name, symbol
++
++          define_method(symbol) do |param|
++            @dirty = true
++            send(orig_name, param)
++          end
++        end
++      end
++    end
++
++    def self.included(base)
++      base.extend(ClassMethods)
++    end
++  end
++end
+diff --git a/lib/zip/dos_time.rb b/lib/zip/dos_time.rb
+index c912b7731219024382b61753a7a957120b5bdbc7..27b5ace7407c8c46f6fe984889780c5fa8b34142 100644
+--- a/lib/zip/dos_time.rb
++++ b/lib/zip/dos_time.rb
+@@ -1,3 +1,7 @@
++# frozen_string_literal: true
++
++require 'rubygems'
++
+ module Zip
+   class DOSTime < Time #:nodoc:all
+     # MS-DOS File Date and Time format as used in Interrupt 21H Function 57H:
+@@ -24,26 +28,58 @@ module Zip
+         ((year - 1980) << 9)
+     end
+ 
+-    # Dos time is only stored with two seconds accuracy
+     def dos_equals(other)
+-      to_i / 2 == other.to_i / 2
++      warn 'Zip::DOSTime#dos_equals is deprecated. Use `==` instead.'
++      self == other
++    end
++
++    # Dos time is only stored with two seconds accuracy.
++    def <=>(other)
++      return unless other.kind_of?(Time)
++
++      (to_i / 2) <=> (other.to_i / 2)
+     end
+ 
+     # Create a DOSTime instance from a vanilla Time instance.
+     def self.from_time(time)
+-      local(time.year, time.month, time.day, time.hour, time.min, time.sec)
++      at(time.to_r).getlocal(time.utc_offset)
+     end
+ 
+-    def self.parse_binary_dos_format(binaryDosDate, binaryDosTime)
+-      second = 2 * (0b11111 & binaryDosTime)
+-      minute = (0b11111100000 & binaryDosTime) >> 5
+-      hour   = (0b1111100000000000 & binaryDosTime) >> 11
+-      day    = (0b11111 & binaryDosDate)
+-      month  = (0b111100000 & binaryDosDate) >> 5
+-      year   = ((0b1111111000000000 & binaryDosDate) >> 9) + 1980
+-      begin
+-        local(year, month, day, hour, minute, second)
++    def self.parse_binary_dos_format(bin_dos_date, bin_dos_time)
++      second = 2 * (0b11111 & bin_dos_time)
++      minute = (0b11111100000 & bin_dos_time) >> 5
++      hour   = (0b1111100000000000 & bin_dos_time) >> 11
++      day    = (0b11111 & bin_dos_date)
++      month  = (0b111100000 & bin_dos_date) >> 5
++      year   = ((0b1111111000000000 & bin_dos_date) >> 9) + 1980
++
++      local(year, month, day, hour, minute, second)
++    end
++
++    if defined? JRUBY_VERSION && Gem::Version.new(JRUBY_VERSION) < '9.2.18.0'
++      module JRubyCMP # :nodoc:
++        def ==(other)
++          (self <=> other).zero?
++        end
++
++        def <(other)
++          (self <=> other).negative?
++        end
++
++        def <=(other)
++          (self <=> other) <= 0
++        end
++
++        def >(other)
++          (self <=> other).positive?
++        end
++
++        def >=(other)
++          (self <=> other) >= 0
++        end
+       end
++
++      include JRubyCMP
+     end
+   end
+ end
+diff --git a/lib/zip/entry.rb b/lib/zip/entry.rb
+--- a/lib/zip/entry.rb
++++ b/lib/zip/entry.rb
+@@ -1,19 +1,38 @@
++# frozen_string_literal: true
++
+ require 'pathname'
++
++require_relative 'dirtyable'
++
+ module Zip
+   class Entry
+-    STORED   = 0
+-    DEFLATED = 8
++    include Dirtyable
++
++    STORED   = ::Zip::COMPRESSION_METHOD_STORE
++    DEFLATED = ::Zip::COMPRESSION_METHOD_DEFLATE
++
+     # Language encoding flag (EFS) bit
+     EFS = 0b100000000000
+ 
+-    attr_accessor :comment, :compressed_size, :crc, :extra, :compression_method,
+-                  :name, :size, :local_header_offset, :zipfile, :fstype, :external_file_attributes,
+-                  :internal_file_attributes,
+-                  :gp_flags, :header_signature, :follow_symlinks,
+-                  :restore_times, :restore_permissions, :restore_ownership,
+-                  :unix_uid, :unix_gid, :unix_perms,
+-                  :dirty
+-    attr_reader :ftype, :filepath # :nodoc:
++    # Compression level flags (used as part of the gp flags).
++    COMPRESSION_LEVEL_SUPERFAST_GPFLAG = 0b110
++    COMPRESSION_LEVEL_FAST_GPFLAG = 0b100
++    COMPRESSION_LEVEL_MAX_GPFLAG = 0b010
++
++    attr_accessor :comment, :compressed_size, :follow_symlinks, :name,
++                  :restore_ownership, :restore_permissions, :restore_times,
++                  :unix_gid, :unix_perms, :unix_uid
++
++    attr_accessor :crc, :external_file_attributes, :fstype, :gp_flags,
++                  :internal_file_attributes, :local_header_offset # :nodoc:
++
++    attr_reader :extra, :compression_level, :filepath # :nodoc:
++
++    attr_writer :size # :nodoc:
++
++    mark_dirty :comment=, :compressed_size=, :external_file_attributes=,
++               :fstype=, :gp_flags=, :name=, :size=,
++               :unix_gid=, :unix_perms=, :unix_uid=
+ 
+     def set_default_vars_values
+       @local_header_offset      = 0
+@@ -34,69 +53,134 @@
+       end
+       @follow_symlinks = false
+ 
+-      @restore_times       = false
+-      @restore_permissions = false
+-      @restore_ownership   = false
++      @restore_times       = DEFAULT_RESTORE_OPTIONS[:restore_times]
++      @restore_permissions = DEFAULT_RESTORE_OPTIONS[:restore_permissions]
++      @restore_ownership   = DEFAULT_RESTORE_OPTIONS[:restore_ownership]
+       # BUG: need an extra field to support uid/gid's
+       @unix_uid            = nil
+       @unix_gid            = nil
+       @unix_perms          = nil
+-      # @posix_acl = nil
+-      # @ntfs_acl = nil
+-      @dirty               = false
+     end
+ 
+     def check_name(name)
+-      return unless name.start_with?('/')
+-      raise ::Zip::EntryNameError, "Illegal ZipEntry name '#{name}', name must not start with /"
+-    end
+-
+-    def initialize(*args)
+-      name = args[1] || ''
+-      check_name(name)
++      raise EntryNameError, name if name.start_with?('/')
++      raise EntryNameError if name.length > 65_535
++    end
++
++    def initialize(
++      zipfile = '', name = '',
++      comment: '', size: nil, compressed_size: 0, crc: 0,
++      compression_method: DEFLATED,
++      compression_level: ::Zip.default_compression,
++      time: ::Zip::DOSTime.now, extra: ::Zip::ExtraField.new
++    )
++      super()
++      @name = name
++      check_name(@name)
+ 
+       set_default_vars_values
+       @fstype = ::Zip::RUNNING_ON_WINDOWS ? ::Zip::FSTYPE_FAT : ::Zip::FSTYPE_UNIX
+ 
+-      @zipfile            = args[0] || ''
+-      @name               = name
+-      @comment            = args[2] || ''
+-      @extra              = args[3] || ''
+-      @compressed_size    = args[4] || 0
+-      @crc                = args[5] || 0
+-      @compression_method = args[6] || ::Zip::Entry::DEFLATED
+-      @size               = args[7] || 0
+-      @time               = args[8] || ::Zip::DOSTime.now
+-
+-      @ftype = name_is_directory? ? :directory : :file
+-      @extra = ::Zip::ExtraField.new(@extra.to_s) unless @extra.is_a?(::Zip::ExtraField)
+-    end
+-
+-    def time
+-      if @extra['UniversalTime']
+-        @extra['UniversalTime'].mtime
+-      elsif @extra['NTFS']
+-        @extra['NTFS'].mtime
+-      else
+-        # Standard time field in central directory has local time
+-        # under archive creator. Then, we can't get timezone.
+-        @time
+-      end
++      @zipfile            = zipfile
++      @comment            = comment || ''
++      @compression_method = compression_method || DEFLATED
++      @compression_level  = compression_level || ::Zip.default_compression
++      @compressed_size    = compressed_size || 0
++      @crc                = crc || 0
++      @size               = size
++      @time               = case time
++                            when ::Zip::DOSTime
++                              time
++                            when Time
++                              ::Zip::DOSTime.from_time(time)
++                            else
++                              ::Zip::DOSTime.now
++                            end
++      @extra              =
++        extra.kind_of?(ExtraField) ? extra : ExtraField.new(extra.to_s)
++
++      set_compression_level_flags
++    end
++
++    def encrypted?
++      gp_flags & 1 == 1
++    end
++
++    def incomplete?
++      gp_flags & 8 == 8
++    end
++
++    def size
++      @size || 0
++    end
++
++    def time(component: :mtime)
++      time =
++        if @extra['UniversalTime']
++          @extra['UniversalTime'].send(component)
++        elsif @extra['NTFS']
++          @extra['NTFS'].send(component)
++        end
++
++      # Standard time field in central directory has local time
++      # under archive creator. Then, we can't get timezone.
++      time || (@time if component == :mtime)
+     end
+ 
+     alias mtime time
+ 
+-    def time=(value)
+-      unless @extra.member?('UniversalTime') || @extra.member?('NTFS')
++    def atime
++      time(component: :atime)
++    end
++
++    def ctime
++      time(component: :ctime)
++    end
++
++    def time=(value, component: :mtime)
++      @dirty = true
++      unless component == :mtime || @extra.member?('UniversalTime') || @extra.member?('NTFS')
+         @extra.create('UniversalTime')
+       end
+-      (@extra['UniversalTime'] || @extra['NTFS']).mtime = value
+-      @time                         = value
++
++      value = DOSTime.from_time(value)
++      comp = "#{component}=" unless component.to_s.end_with?('=')
++      extra_time = @extra['UniversalTime'] || @extra['NTFS']
++      extra_time.send(comp, value) if extra_time
++      @time = value if component == :mtime
++    end
++
++    alias mtime= time=
++
++    def atime=(value)
++      send(:time=, value, component: :atime)
++    end
++
++    def ctime=(value)
++      send(:time=, value, component: :ctime)
++    end
++
++    def compression_method
++      return STORED if ftype == :directory || @compression_level == 0
++
++      @compression_method
++    end
++
++    def compression_method=(method)
++      @dirty = true
++      @compression_method = (ftype == :directory ? STORED : method)
++    end
++
++    def zip64?
++      !@extra['Zip64'].nil?
+     end
+ 
+     def file_type_is?(type)
+-      raise InternalError, "current filetype is unknown: #{inspect}" unless @ftype
+-      @ftype == type
++      ftype == type
++    end
++
++    def ftype # :nodoc:
++      @ftype ||= name_is_directory? ? :directory : :file
+     end
+ 
+     # Dynamic checkers
+@@ -116,9 +200,11 @@
+     def name_safe?
+       cleanpath = Pathname.new(@name).cleanpath
+       return false unless cleanpath.relative?
++
+       root = ::File::SEPARATOR
+-      naive_expanded_path = ::File.join(root, cleanpath.to_s)
+-      ::File.absolute_path(cleanpath.to_s, root) == naive_expanded_path
++      naive = ::File.join(root, cleanpath.to_s)
++      # Allow for Windows drive mappings at the root.
++      ::File.absolute_path(cleanpath.to_s, root).match?(/([A-Z]:)?#{naive}/i)
+     end
+ 
+     def local_entry_offset #:nodoc:all
+@@ -145,8 +231,12 @@
+     # that we didn't change the header size (and thus clobber file data or something)
+     def verify_local_header_size!
+       return if @local_header_size.nil?
++
+       new_size = calculate_local_header_size
+-      raise Error, "local header size changed (#{@local_header_size} -> #{new_size})" if @local_header_size != new_size
++      return unless @local_header_size != new_size
++
++      raise Error,
++            "Local header size changed (#{@local_header_size} -> #{new_size})"
+     end
+ 
+     def cdir_header_size #:nodoc:all
+@@ -155,27 +245,35 @@
+     end
+ 
+     def next_header_offset #:nodoc:all
+-      local_entry_offset + compressed_size + data_descriptor_size
+-    end
+-
+-    # Extracts entry to file dest_path (defaults to @name).
+-    # NB: The caller is responsible for making sure dest_path is safe, if it
+-    # is passed.
+-    def extract(dest_path = nil, &block)
+-      if dest_path.nil? && !name_safe?
+-        warn "WARNING: skipped '#{@name}' as unsafe."
++      local_entry_offset + compressed_size
++    end
++
++    # Extracts this entry to a file at `entry_path`, with
++    # `destination_directory` as the base location in the filesystem.
++    #
++    # NB: The caller is responsible for making sure `destination_directory` is
++    # safe, if it is passed.
++    def extract(entry_path = @name, destination_directory: '.', &block)
++      dest_dir = ::File.realpath(destination_directory || '.')
++      extract_path = ::File.absolute_path(entry_path, dest_dir)
++      boundary = dest_dir.end_with?(::File::SEPARATOR) ? dest_dir : dest_dir + ::File::SEPARATOR
++      contained = extract_path.start_with?(boundary) && extract_path != dest_dir
++      cursor = extract_path
++      while contained && cursor != dest_dir
++        contained = false if ::File.symlink?(cursor)
++        cursor = ::File.dirname(cursor)
++      end
++
++      unless contained
++        warn "WARNING: skipped '#{@name}' to '#{extract_path}' as unsafe."
+         return self
+       end
+ 
+-      dest_path ||= @name
+       block ||= proc { ::Zip.on_exists_proc }
+ 
+-      if directory? || file? || symlink?
+-        __send__("create_#{@ftype}", dest_path, &block)
+-      else
+-        raise "unknown file type #{inspect}"
+-      end
+-
++      raise "unknown file type #{inspect}" unless directory? || file? || symlink?
++
++      __send__("create_#{ftype}", extract_path, &block)
+       self
+     end
+ 
+@@ -184,18 +282,6 @@
+     end
+ 
+     class << self
+-      def read_zip_short(io) # :nodoc:
+-        io.read(2).unpack('v')[0]
+-      end
+-
+-      def read_zip_long(io) # :nodoc:
+-        io.read(4).unpack('V')[0]
+-      end
+-
+-      def read_zip_64_long(io) # :nodoc:
+-        io.read(8).unpack('Q<')[0]
+-      end
+-
+       def read_c_dir_entry(io) #:nodoc:all
+         path = if io.respond_to?(:path)
+                  io.path
+@@ -213,12 +299,12 @@
+         entry = new(io)
+         entry.read_local_entry(io)
+         entry
++      rescue SplitArchiveError
++        raise
+       rescue Error
+         nil
+       end
+     end
+-
+-    public
+ 
+     def unpack_local_entry(buf)
+       @header_signature,
+@@ -236,6 +322,7 @@
+     end
+ 
+     def read_local_entry(io) #:nodoc:all
++      @dirty = false # No changes at this point.
+       @local_header_offset = io.tell
+ 
+       static_sized_fields_buf = io.read(::Zip::LOCAL_ENTRY_STATIC_HEADER_LENGTH) || ''
+@@ -246,28 +333,35 @@
+ 
+       unpack_local_entry(static_sized_fields_buf)
+ 
+-      unless @header_signature == ::Zip::LOCAL_ENTRY_SIGNATURE
+-        raise ::Zip::Error, "Zip local header magic not found at location '#{local_header_offset}'"
+-      end
++      unless @header_signature == LOCAL_ENTRY_SIGNATURE
++        if @header_signature == SPLIT_FILE_SIGNATURE
++          raise SplitArchiveError
++        end
++
++        raise Error, "Zip local header magic not found at location '#{local_header_offset}'"
++      end
++
+       set_time(@last_mod_date, @last_mod_time)
+ 
+       @name = io.read(@name_length)
+-      extra = io.read(@extra_length)
+-
+-      @name.tr!('\\', '/')
++      unless @name && @name.bytesize == @name_length
++        raise Error, 'Truncated local zip entry name'
++      end
+       if ::Zip.force_entry_names_encoding
+         @name.force_encoding(::Zip.force_entry_names_encoding)
+       end
+-
+-      if extra && extra.bytesize != @extra_length
++      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
++
++      # We need to do this here because `initialize` has so many side-effects.
++      # :-(
++      @ftype = name_is_directory? ? :directory : :file
++
++      extra = io.read(@extra_length)
++      unless extra && extra.bytesize == @extra_length
+         raise ::Zip::Error, 'Truncated local zip entry header'
+-      else
+-        if @extra.is_a?(::Zip::ExtraField)
+-          @extra.merge(extra) if extra
+-        else
+-          @extra = ::Zip::ExtraField.new(extra)
+-        end
+-      end
++      end
++
++      read_extra_field(extra, local: true)
+       parse_zip64_extra(true)
+       @local_header_size = calculate_local_header_size
+     end
+@@ -277,18 +371,18 @@
+       [::Zip::LOCAL_ENTRY_SIGNATURE,
+        @version_needed_to_extract, # version needed to extract
+        @gp_flags, # @gp_flags
+-       @compression_method,
++       compression_method,
+        @time.to_binary_dos_time, # @last_mod_time
+        @time.to_binary_dos_date, # @last_mod_date
+        @crc,
+        zip64 && zip64.compressed_size ? 0xFFFFFFFF : @compressed_size,
+-       zip64 && zip64.original_size ? 0xFFFFFFFF : @size,
++       zip64 && zip64.original_size ? 0xFFFFFFFF : (@size || 0),
+        name_size,
+        @extra ? @extra.local_size : 0].pack('VvvvvvVVVvv')
+     end
+ 
+-    def write_local_entry(io, rewrite = false) #:nodoc:all
+-      prep_zip64_extra(true)
++    def write_local_entry(io, rewrite: false) #:nodoc:all
++      prep_local_zip64_extra
+       verify_local_header_size! if rewrite
+       @local_header_offset = io.tell
+ 
+@@ -335,8 +429,9 @@
+                  when ::Zip::FILE_TYPE_SYMLINK
+                    :symlink
+                  else
+-                   # best case guess for whether it is a file or not
+-                   # Otherwise this would be set to unknown and that entry would never be able to extracted
++                   # Best case guess for whether it is a file or not.
++                   # Otherwise this would be set to unknown and that
++                   # entry would never be able to be extracted.
+                    if name_is_directory?
+                      :directory
+                    else
+@@ -353,39 +448,46 @@
+     end
+ 
+     def check_c_dir_entry_static_header_length(buf)
+-      return if buf.bytesize == ::Zip::CDIR_ENTRY_STATIC_HEADER_LENGTH
++      return unless buf.nil? || buf.bytesize != ::Zip::CDIR_ENTRY_STATIC_HEADER_LENGTH
++
+       raise Error, 'Premature end of file. Not enough data for zip cdir entry header'
+     end
+ 
+     def check_c_dir_entry_signature
+-      return if header_signature == ::Zip::CENTRAL_DIRECTORY_ENTRY_SIGNATURE
++      return if @header_signature == ::Zip::CENTRAL_DIRECTORY_ENTRY_SIGNATURE
++
+       raise Error, "Zip local header magic not found at location '#{local_header_offset}'"
+     end
+ 
+     def check_c_dir_entry_comment_size
+       return if @comment && @comment.bytesize == @comment_length
++
+       raise ::Zip::Error, 'Truncated cdir zip entry header'
+     end
+ 
+-    def read_c_dir_extra_field(io)
+-      if @extra.is_a?(::Zip::ExtraField)
+-        @extra.merge(io.read(@extra_length))
++    def read_extra_field(buf, local: false)
++      if @extra.kind_of?(::Zip::ExtraField)
++        @extra.merge(buf, local: local) if buf
+       else
+-        @extra = ::Zip::ExtraField.new(io.read(@extra_length))
++        @extra = ::Zip::ExtraField.new(buf, local: local)
+       end
+     end
+ 
+     def read_c_dir_entry(io) #:nodoc:all
++      @dirty = false # No changes at this point.
+       static_sized_fields_buf = io.read(::Zip::CDIR_ENTRY_STATIC_HEADER_LENGTH)
+       check_c_dir_entry_static_header_length(static_sized_fields_buf)
+       unpack_c_dir_entry(static_sized_fields_buf)
+       check_c_dir_entry_signature
+       set_time(@last_mod_date, @last_mod_time)
++
+       @name = io.read(@name_length)
+       if ::Zip.force_entry_names_encoding
+         @name.force_encoding(::Zip.force_entry_names_encoding)
+       end
+-      read_c_dir_extra_field(io)
++      @name.tr!('\\', '/') # Normalise filepath separators after encoding set.
++
++      read_extra_field(io.read(@extra_length))
+       @comment = io.read(@comment_length)
+       check_c_dir_entry_comment_size
+       set_ftype_from_c_dir_entry
+@@ -401,34 +503,40 @@
+     end
+ 
+     def get_extra_attributes_from_path(path) # :nodoc:
+-      return if Zip::RUNNING_ON_WINDOWS
+-      stat        = file_stat(path)
++      stat = file_stat(path)
++      @time = DOSTime.from_time(stat.mtime)
++      return if ::Zip::RUNNING_ON_WINDOWS
++
+       @unix_uid   = stat.uid
+       @unix_gid   = stat.gid
+       @unix_perms = stat.mode & 0o7777
+-      @time = ::Zip::DOSTime.from_time(stat.mtime)
+-    end
+-
++    end
++
++    # rubocop:disable Style/GuardClause
+     def set_unix_attributes_on_path(dest_path)
+-      # ignore setuid/setgid bits by default.  honor if @restore_ownership
+-      unix_perms_mask = 0o1777
+-      unix_perms_mask = 0o7777 if @restore_ownership
+-      ::FileUtils.chmod(@unix_perms & unix_perms_mask, dest_path) if @restore_permissions && @unix_perms
+-      ::FileUtils.chown(@unix_uid, @unix_gid, dest_path) if @restore_ownership && @unix_uid && @unix_gid && ::Process.egid == 0
++      # Ignore setuid/setgid bits by default. Honour if @restore_ownership.
++      unix_perms_mask = (@restore_ownership ? 0o7777 : 0o1777)
++      if @restore_permissions && @unix_perms
++        ::FileUtils.chmod(@unix_perms & unix_perms_mask, dest_path)
++      end
++      if @restore_ownership && @unix_uid && @unix_gid && ::Process.egid == 0
++        ::FileUtils.chown(@unix_uid, @unix_gid, dest_path)
++      end
++    end
++    # rubocop:enable Style/GuardClause
++
++    def set_extra_attributes_on_path(dest_path) # :nodoc:
++      return unless file? || directory?
++
++      case @fstype
++      when ::Zip::FSTYPE_UNIX
++        set_unix_attributes_on_path(dest_path)
++      end
+ 
+       # Restore the timestamp on a file. This will either have come from the
+       # original source file that was copied into the archive, or from the
+       # creation date of the archive if there was no original source file.
+       ::FileUtils.touch(dest_path, mtime: time) if @restore_times
+-    end
+-
+-    def set_extra_attributes_on_path(dest_path) # :nodoc:
+-      return unless file? || directory?
+-
+-      case @fstype
+-      when ::Zip::FSTYPE_UNIX
+-        set_unix_attributes_on_path(dest_path)
+-      end
+     end
+ 
+     def pack_c_dir_entry
+@@ -439,12 +547,12 @@
+         @fstype, # filesystem type
+         @version_needed_to_extract, # @versionNeededToExtract
+         @gp_flags, # @gp_flags
+-        @compression_method,
++        compression_method,
+         @time.to_binary_dos_time, # @last_mod_time
+         @time.to_binary_dos_date, # @last_mod_date
+         @crc,
+         zip64 && zip64.compressed_size ? 0xFFFFFFFF : @compressed_size,
+-        zip64 && zip64.original_size ? 0xFFFFFFFF : @size,
++        zip64 && zip64.original_size ? 0xFFFFFFFF : (@size || 0),
+         name_size,
+         @extra ? @extra.c_dir_size : 0,
+         comment_size,
+@@ -459,10 +567,11 @@
+     end
+ 
+     def write_c_dir_entry(io) #:nodoc:all
+-      prep_zip64_extra(false)
++      prep_cdir_zip64_extra
++
+       case @fstype
+       when ::Zip::FSTYPE_UNIX
+-        ft = case @ftype
++        ft = case ftype
+              when :file
+                @unix_perms ||= 0o644
+                ::Zip::FILE_TYPE_FILE
+@@ -488,11 +597,11 @@
+ 
+     def ==(other)
+       return false unless other.class == self.class
++
+       # Compares contents of local entry and exposed fields
+-      keys_equal = %w[compression_method crc compressed_size size name extra filepath].all? do |k|
++      %w[compression_method crc compressed_size size name extra filepath time].all? do |k|
+         other.__send__(k.to_sym) == __send__(k.to_sym)
+       end
+-      keys_equal && time.dos_equals(other.time)
+     end
+ 
+     def <=>(other)
+@@ -502,26 +611,26 @@
+     # Returns an IO like object for the given ZipEntry.
+     # Warning: may behave weird with symlinks.
+     def get_input_stream(&block)
+-      if @ftype == :directory
+-        yield ::Zip::NullInputStream if block_given?
++      if ftype == :directory
++        yield ::Zip::NullInputStream if block
+         ::Zip::NullInputStream
+       elsif @filepath
+-        case @ftype
++        case ftype
+         when :file
+           ::File.open(@filepath, 'rb', &block)
+         when :symlink
+           linkpath = ::File.readlink(@filepath)
+           stringio = ::StringIO.new(linkpath)
+-          yield(stringio) if block_given?
++          yield(stringio) if block
+           stringio
+         else
+-          raise "unknown @file_type #{@ftype}"
++          raise "unknown @file_type #{ftype}"
+         end
+       else
+-        zis = ::Zip::InputStream.new(@zipfile, local_header_offset)
++        zis = ::Zip::InputStream.new(@zipfile, offset: local_header_offset)
+         zis.instance_variable_set(:@complete_entry, self)
+         zis.get_next_entry
+-        if block_given?
++        if block
+           begin
+             yield(zis)
+           ensure
+@@ -558,15 +667,18 @@
+                end
+ 
+       @filepath = src_path
++      @size = stat.size
+       get_extra_attributes_from_path(@filepath)
+     end
+ 
+     def write_to_zip_output_stream(zip_output_stream) #:nodoc:all
+-      if @ftype == :directory
+-        zip_output_stream.put_next_entry(self, nil, nil, ::Zip::Entry::STORED)
++      if ftype == :directory
++        zip_output_stream.put_next_entry(self)
+       elsif @filepath
+-        zip_output_stream.put_next_entry(self, nil, nil, compression_method || ::Zip::Entry::DEFLATED)
+-        get_input_stream { |is| ::Zip::IOExtras.copy_stream(zip_output_stream, is) }
++        zip_output_stream.put_next_entry(self)
++        get_input_stream do |is|
++          ::Zip::IOExtras.copy_stream(zip_output_stream, is)
++        end
+       else
+         zip_output_stream.copy_raw_entry(self)
+       end
+@@ -587,7 +699,7 @@
+     end
+ 
+     def clean_up
+-      # By default, do nothing
++      @dirty = false # Any changes are written at this point.
+     end
+ 
+     private
+@@ -600,26 +712,24 @@
+ 
+     def create_file(dest_path, _continue_on_exists_proc = proc { Zip.continue_on_exists_proc })
+       if ::File.exist?(dest_path) && !yield(self, dest_path)
+-        raise ::Zip::DestinationFileExistsError,
+-              "Destination '#{dest_path}' already exists"
+-      end
++        raise ::Zip::DestinationExistsError, dest_path
++      end
++
+       ::File.open(dest_path, 'wb') do |os|
+         get_input_stream do |is|
+           bytes_written = 0
+           warned = false
+-          buf = ''.dup
++          buf = +''
+           while (buf = is.sysread(::Zip::Decompressor::CHUNK_SIZE, buf))
+             os << buf
+             bytes_written += buf.bytesize
+-            if bytes_written > size && !warned
+-              message = "entry '#{name}' should be #{size}B, but is larger when inflated."
+-              if ::Zip.validate_entry_sizes
+-                raise ::Zip::EntrySizeError, message
+-              else
+-                warn "WARNING: #{message}"
+-                warned = true
+-              end
+-            end
++            next unless bytes_written > size && !warned
++
++            error = ::Zip::EntrySizeError.new(self)
++            raise error if ::Zip.validate_entry_sizes
++
++            warn "WARNING: #{error.message}"
++            warned = true
+           end
+         end
+       end
+@@ -629,15 +739,13 @@
+ 
+     def create_directory(dest_path)
+       return if ::File.directory?(dest_path)
++
+       if ::File.exist?(dest_path)
+-        if block_given? && yield(self, dest_path)
+-          ::FileUtils.rm_f dest_path
+-        else
+-          raise ::Zip::DestinationFileExistsError,
+-                "Cannot create directory '#{dest_path}'. " \
+-                    'A file already exists with that name'
+-        end
+-      end
++        raise ::Zip::DestinationExistsError, dest_path unless block_given? && yield(self, dest_path)
++
++        ::FileUtils.rm_f dest_path
++      end
++
+       ::FileUtils.mkdir_p(dest_path)
+       set_extra_attributes_on_path(dest_path)
+     end
+@@ -646,56 +754,80 @@
+     def create_symlink(dest_path)
+       # TODO: Symlinks pose security challenges. Symlink support temporarily
+       # removed in view of https://github.com/rubyzip/rubyzip/issues/369 .
+-      warn "WARNING: skipped symlink '#{dest_path}'."
++      warn "WARNING: skipped symlink '#{@name}'."
+     end
+ 
+     # apply missing data from the zip64 extra information field, if present
+     # (required when file sizes exceed 2**32, but can be used for all files)
+     def parse_zip64_extra(for_local_header) #:nodoc:all
+-      return if @extra['Zip64'].nil?
++      return unless zip64?
++
+       if for_local_header
+         @size, @compressed_size = @extra['Zip64'].parse(@size, @compressed_size)
+       else
+-        @size, @compressed_size, @local_header_offset = @extra['Zip64'].parse(@size, @compressed_size, @local_header_offset)
+-      end
+-    end
+-
+-    def data_descriptor_size
+-      (@gp_flags & 0x0008) > 0 ? 16 : 0
+-    end
+-
+-    # create a zip64 extra information field if we need one
+-    def prep_zip64_extra(for_local_header) #:nodoc:all
++        @size, @compressed_size, @local_header_offset = @extra['Zip64'].parse(
++          @size, @compressed_size, @local_header_offset
++        )
++      end
++    end
++
++    # For DEFLATED compression *only*: set the general purpose flags 1 and 2 to
++    # indicate compression level. This seems to be mainly cosmetic but they are
++    # generally set by other tools - including in docx files. It is these flags
++    # that are used by commandline tools (and elsewhere) to give an indication
++    # of how compressed a file is. See the PKWARE APPNOTE for more information:
++    # https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
++    #
++    # It's safe to simply OR these flags here as compression_level is read only.
++    def set_compression_level_flags
++      return unless compression_method == DEFLATED
++
++      case @compression_level
++      when 1
++        @gp_flags |= COMPRESSION_LEVEL_SUPERFAST_GPFLAG
++      when 2
++        @gp_flags |= COMPRESSION_LEVEL_FAST_GPFLAG
++      when 8, 9
++        @gp_flags |= COMPRESSION_LEVEL_MAX_GPFLAG
++      end
++    end
++
++    # rubocop:disable Style/GuardClause
++    def prep_local_zip64_extra
+       return unless ::Zip.write_zip64_support
+-      need_zip64 = @size >= 0xFFFFFFFF || @compressed_size >= 0xFFFFFFFF
+-      need_zip64 ||= @local_header_offset >= 0xFFFFFFFF unless for_local_header
+-      if need_zip64
++      return unless file?
++
++      if size >= 0xFFFFFFFF || @compressed_size >= 0xFFFFFFFF
+         @version_needed_to_extract = VERSION_NEEDED_TO_EXTRACT_ZIP64
+         @extra.delete('Zip64Placeholder')
+-        zip64 = @extra.create('Zip64')
+-        if for_local_header
+-          # local header always includes size and compressed size
+-          zip64.original_size = @size
+-          zip64.compressed_size = @compressed_size
+-        else
+-          # central directory entry entries include whichever fields are necessary
+-          zip64.original_size = @size if @size >= 0xFFFFFFFF
+-          zip64.compressed_size = @compressed_size if @compressed_size >= 0xFFFFFFFF
+-          zip64.relative_header_offset = @local_header_offset if @local_header_offset >= 0xFFFFFFFF
+-        end
++        zip64 = @extra['Zip64'] || @extra.create('Zip64')
++
++        # Local header always includes size and compressed size.
++        zip64.original_size = @size || 0
++        zip64.compressed_size = @compressed_size
+       else
+         @extra.delete('Zip64')
+-
+-        # if this is a local header entry, create a placeholder
+-        # so we have room to write a zip64 extra field afterward
+-        # (we won't know if it's needed until the file data is written)
+-        if for_local_header
+-          @extra.create('Zip64Placeholder')
+-        else
+-          @extra.delete('Zip64Placeholder')
+-        end
+-      end
+-    end
++        @extra.create('Zip64Placeholder')
++      end
++    end
++
++    def prep_cdir_zip64_extra
++      return unless ::Zip.write_zip64_support
++
++      @extra.delete('Zip64Placeholder')
++      @extra.delete('Zip64')
++      if (@size && @size >= 0xFFFFFFFF) || @compressed_size >= 0xFFFFFFFF ||
++         @local_header_offset >= 0xFFFFFFFF
++        @version_needed_to_extract = VERSION_NEEDED_TO_EXTRACT_ZIP64
++        zip64 = @extra['Zip64'] || @extra.create('Zip64')
++
++        # Central directory entry entries include whichever fields are necessary.
++        zip64.original_size = @size if @size && @size >= 0xFFFFFFFF
++        zip64.compressed_size = @compressed_size if @compressed_size >= 0xFFFFFFFF
++        zip64.relative_header_offset = @local_header_offset if @local_header_offset >= 0xFFFFFFFF
++      end
++    end
++    # rubocop:enable Style/GuardClause
+   end
+ end
+ 
+diff --git a/lib/zip/entry_set.rb b/lib/zip/entry_set.rb
+index 3272b2a4b7fa9de52b33e890d9c7cdf63798c502..11db9518f377cd32129e6839aef371cef45e8fc5 100644
+--- a/lib/zip/entry_set.rb
++++ b/lib/zip/entry_set.rb
+@@ -1,7 +1,11 @@
++# frozen_string_literal: true
++
+ module Zip
+   class EntrySet #:nodoc:all
+     include Enumerable
+-    attr_accessor :entry_set, :entry_order
++
++    attr_reader :entry_set
++    protected   :entry_set
+ 
+     def initialize(an_enumerable = [])
+       super()
+@@ -33,10 +37,8 @@ module Zip
+       entry if @entry_set.delete(to_key(entry))
+     end
+ 
+-    def each
+-      @entry_set = sorted_entries.dup.each do |_, value|
+-        yield(value)
+-      end
++    def each(&block)
++      entries.each(&block)
+     end
+ 
+     def entries
+@@ -50,6 +52,7 @@ module Zip
+ 
+     def ==(other)
+       return false unless other.kind_of?(EntrySet)
++
+       @entry_set.values == other.entry_set.values
+     end
+ 
+@@ -60,6 +63,7 @@ module Zip
+     def glob(pattern, flags = ::File::FNM_PATHNAME | ::File::FNM_DOTMATCH | ::File::FNM_EXTGLOB)
+       entries.map do |entry|
+         next nil unless ::File.fnmatch(pattern, entry.name.chomp('/'), flags)
++
+         yield(entry) if block_given?
+         entry
+       end.compact
+@@ -68,7 +72,7 @@ module Zip
+     protected
+ 
+     def sorted_entries
+-      ::Zip.sort_entries ? Hash[@entry_set.sort] : @entry_set
++      ::Zip.sort_entries ? @entry_set.sort.to_h : @entry_set
+     end
+ 
+     private
+diff --git a/lib/zip/errors.rb b/lib/zip/errors.rb
+index 364c6eee0674a4b99bc6d00b87e824d113579b22..4d829af173e3cc88ec65254acaf7714c695aea15 100644
+--- a/lib/zip/errors.rb
++++ b/lib/zip/errors.rb
+@@ -1,18 +1,104 @@
++# frozen_string_literal: true
++
+ module Zip
+   class Error < StandardError; end
+-  class EntryExistsError < Error; end
+-  class DestinationFileExistsError < Error; end
+-  class CompressionMethodError < Error; end
+-  class EntryNameError < Error; end
+-  class EntrySizeError < Error; end
+-  class InternalError < Error; end
+-  class GPFBit3Error < Error; end
+-
+-  # Backwards compatibility with v1 (delete in v2)
+-  ZipError = Error
+-  ZipEntryExistsError = EntryExistsError
+-  ZipDestinationFileExistsError = DestinationFileExistsError
+-  ZipCompressionMethodError = CompressionMethodError
+-  ZipEntryNameError = EntryNameError
+-  ZipInternalError = InternalError
++
++  class CompressionMethodError < Error
++    attr_reader :compression_method
++
++    def initialize(method = nil)
++      super()
++      @compression_method = method
++    end
++
++    def message
++      "Unsupported compression method: #{COMPRESSION_METHODS[@compression_method]}."
++    end
++  end
++
++  class DecompressionError < Error
++    attr_reader :zlib_error
++
++    def initialize(zlib_error)
++      super()
++      @zlib_error = zlib_error
++    end
++
++    def message
++      "Zlib error ('#{@zlib_error.message}') while inflating."
++    end
++  end
++
++  class DestinationExistsError < Error
++    def initialize(destination = nil)
++      super()
++      @destination = destination
++    end
++
++    def message
++      "Cannot create file or directory '#{@destination}'. " \
++      'A file already exists with that name.'
++    end
++  end
++
++  class EntryExistsError < Error
++    def initialize(source = nil, name = nil)
++      super()
++      @source = source
++      @name = name
++    end
++
++    def message
++      "'#{@source}' failed. Entry #{@name} already exists."
++    end
++  end
++
++  class EntryNameError < Error
++    def initialize(name = nil)
++      super()
++      @name = name
++    end
++
++    def message
++      if @name.nil?
++        'Illegal entry name. Names must have fewer than 65,536 characters.'
++      else
++        "Illegal entry name '#{@name}'. Names must not start with '/'."
++      end
++    end
++  end
++
++  class EntrySizeError < Error
++    attr_reader :entry
++
++    def initialize(entry)
++      super()
++      @entry = entry
++    end
++
++    def message
++      "entry '#{@entry.name}' should be #{@entry.size}B, but is larger when inflated."
++    end
++  end
++
++  class SplitArchiveError < Error
++    def message
++      'Rubyzip cannot extract from split archives at this time.'
++    end
++  end
++
++  class StreamingError < Error
++    attr_reader :entry
++
++    def initialize(entry)
++      super()
++      @entry = entry
++    end
++
++    def message
++      "The local header of this entry ('#{@entry.name}') does not contain " \
++      'the correct metadata for `Zip::InputStream` to be able to ' \
++      'uncompress it. Please use `Zip::File` instead of `Zip::InputStream`.'
++    end
++  end
+ end
+diff --git a/lib/zip/extra_field/generic.rb b/lib/zip/extra_field/generic.rb
+index d61137fe2ce02d29a8e3d00a353755dcd3900127..b3db791a46280d2c94ebd5b08c49fb745b92fc67 100644
+--- a/lib/zip/extra_field/generic.rb
++++ b/lib/zip/extra_field/generic.rb
+@@ -1,9 +1,11 @@
++# frozen_string_literal: true
++
+ module Zip
+   class ExtraField::Generic
+     def self.register_map
+-      if const_defined?(:HEADER_ID)
+-        ::Zip::ExtraField::ID_MAP[const_get(:HEADER_ID)] = self
+-      end
++      return unless const_defined?(:HEADER_ID)
++
++      ::Zip::ExtraField::ID_MAP[const_get(:HEADER_ID)] = self
+     end
+ 
+     def self.name
+@@ -12,22 +14,14 @@ module Zip
+ 
+     # return field [size, content] or false
+     def initial_parse(binstr)
+-      if !binstr
+-        # If nil, start with empty.
+-        return false
+-      elsif binstr[0, 2] != self.class.const_get(:HEADER_ID)
++      return false unless binstr
++
++      if binstr[0, 2] != self.class.const_get(:HEADER_ID)
+         warn 'WARNING: weird extra field header ID. Skip parsing it.'
+         return false
+       end
+-      [binstr[2, 2].unpack('v')[0], binstr[4..-1]]
+-    end
+ 
+-    def ==(other)
+-      return false if self.class != other.class
+-      each do |k, v|
+-        return false if v != other[k]
+-      end
+-      true
++      [binstr[2, 2].unpack1('v'), binstr[4..-1]]
+     end
+ 
+     def to_local_bin
+diff --git a/lib/zip/extra_field/ntfs.rb b/lib/zip/extra_field/ntfs.rb
+index 687704d85c2854f201447cb1d24406ecdd827753..cd691b1de846dbe3c6c88d9f6d9ae8bc694d819a 100644
+--- a/lib/zip/extra_field/ntfs.rb
++++ b/lib/zip/extra_field/ntfs.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   # PKWARE NTFS Extra Field (0x000a)
+   # Only Tag 0x0001 is supported
+@@ -19,6 +21,7 @@ module Zip
+ 
+     def merge(binstr)
+       return if binstr.empty?
++
+       size, content = initial_parse(binstr)
+       (size && content) || return
+ 
+@@ -27,6 +30,7 @@ module Zip
+ 
+       tag1 = tags[1]
+       return unless tag1
++
+       ntfs_mtime, ntfs_atime, ntfs_ctime = tag1.unpack('Q<Q<Q<')
+       ntfs_mtime && @mtime ||= from_ntfs_time(ntfs_mtime)
+       ntfs_atime && @atime ||= from_ntfs_time(ntfs_atime)
+@@ -49,7 +53,7 @@ module Zip
+       # reserved 0 and tag 1
+       s = [0, 1].pack('Vv')
+ 
+-      tag1 = ''.force_encoding(Encoding::BINARY)
++      tag1 = (+'').force_encoding(Encoding::BINARY)
+       if @mtime
+         tag1 << [to_ntfs_time(@mtime)].pack('Q<')
+         if @atime
+@@ -65,12 +69,14 @@ module Zip
+ 
+     def parse_tags(content)
+       return {} if content.nil?
++
+       tags = {}
+       i = 0
+       while i < content.bytesize
+         tag, size = content[i, 4].unpack('vv')
+         i += 4
+         break unless tag && size
++
+         value = content[i, size]
+         i += size
+         tags[tag] = value
+diff --git a/lib/zip/extra_field/old_unix.rb b/lib/zip/extra_field/old_unix.rb
+index 5a97c616505cede7ca578c33cc8f01d436e7e90b..351339fe604ebad156a9f41cb508e4fcd68d34b4 100644
+--- a/lib/zip/extra_field/old_unix.rb
++++ b/lib/zip/extra_field/old_unix.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   # Olf Info-ZIP Extra for UNIX uid/gid and file timestampes
+   class ExtraField::OldUnix < ExtraField::Generic
+@@ -16,14 +18,16 @@ module Zip
+ 
+     def merge(binstr)
+       return if binstr.empty?
++
+       size, content = initial_parse(binstr)
+       # size: 0 for central directory. 4 for local header
+       return if !size || size == 0
++
+       atime, mtime, uid, gid = content.unpack('VVvv')
+       @uid ||= uid
+       @gid ||= gid
+       @atime ||= atime
+-      @mtime ||= mtime
++      @mtime ||= mtime # rubocop:disable Naming/MemoizedInstanceVariableName
+     end
+ 
+     def ==(other)
+diff --git a/lib/zip/extra_field/universal_time.rb b/lib/zip/extra_field/universal_time.rb
+index 5c3b1c161595560ee29bc090181962deccc5865e..63ef070e70ffcb0fdf4131ce009478edd8d653be 100644
+--- a/lib/zip/extra_field/universal_time.rb
++++ b/lib/zip/extra_field/universal_time.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   # Info-ZIP Additional timestamp field
+   class ExtraField::UniversalTime < ExtraField::Generic
+@@ -44,10 +46,13 @@ module Zip
+ 
+       # Parse the timestamps, in order, based on which flags are set.
+       return if times[0].nil?
++
+       @mtime ||= ::Zip::DOSTime.at(times.shift) unless @flag & MTIME_MASK == 0
+       return if times[0].nil?
++
+       @atime ||= ::Zip::DOSTime.at(times.shift) unless @flag & ATIME_MASK == 0
+       return if times[0].nil?
++
+       @ctime ||= ::Zip::DOSTime.at(times.shift) unless @flag & CTIME_MASK == 0
+     end
+ 
+diff --git a/lib/zip/extra_field/unix.rb b/lib/zip/extra_field/unix.rb
+index a3e6396303601bfaf9707505bf92b39b89bd1a8f..f88f1355b2e0911b63e4066c7efb80d945db194c 100644
+--- a/lib/zip/extra_field/unix.rb
++++ b/lib/zip/extra_field/unix.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   # Info-ZIP Extra for UNIX uid/gid
+   class ExtraField::IUnix < ExtraField::Generic
+@@ -14,12 +16,14 @@ module Zip
+ 
+     def merge(binstr)
+       return if binstr.empty?
++
+       size, content = initial_parse(binstr)
+       # size: 0 for central directory. 4 for local header
+       return if !size || size == 0
++
+       uid, gid = content.unpack('vv')
+-      @uid ||= uid
+-      @gid ||= gid
++      @uid = uid
++      @gid = gid
+     end
+ 
+     def ==(other)
+diff --git a/lib/zip/extra_field/unknown.rb b/lib/zip/extra_field/unknown.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..938e3ce1049e533d2fd85084a6191f1fb82748e5
+--- /dev/null
++++ b/lib/zip/extra_field/unknown.rb
+@@ -0,0 +1,49 @@
++# frozen_string_literal: true
++
++module Zip
++  # A class to hold unknown extra fields so that they are preserved.
++  class ExtraField::Unknown
++    def initialize
++      @local_bin = +''
++      @cdir_bin = +''
++    end
++
++    def merge(binstr, local: false)
++      return if binstr.empty?
++
++      if local.nil?
++        @legacy = true
++        @local_bin << binstr
++        @cdir_bin << binstr
++      elsif local
++        @local_bin << binstr
++      else
++        @cdir_bin << binstr
++      end
++    end
++
++    def to_local_bin
++      @local_bin
++    end
++
++    def to_c_dir_bin
++      @cdir_bin
++    end
++
++    def ==(other)
++      return @local_bin == other && @cdir_bin == other if other.kind_of?(String)
++      return false unless other.kind_of?(self.class)
++
++      if @legacy || other.legacy?
++        values = [@local_bin, @cdir_bin, other.to_local_bin, other.to_c_dir_bin].reject(&:empty?)
++        return values.uniq.length <= 1
++      end
++
++      @local_bin == other.to_local_bin && @cdir_bin == other.to_c_dir_bin
++    end
++
++    def legacy?
++      @legacy
++    end
++  end
++end
+diff --git a/lib/zip/extra_field/zip64.rb b/lib/zip/extra_field/zip64.rb
+index 962038d8ceb374ccdf26a0b53559f39b24cfaf1d..ba7b5110866905ca57d683cc848287270b3a9e0d 100644
+--- a/lib/zip/extra_field/zip64.rb
++++ b/lib/zip/extra_field/zip64.rb
+@@ -1,7 +1,11 @@
++# frozen_string_literal: true
++
+ module Zip
+   # Info-ZIP Extra for Zip64 size
+   class ExtraField::Zip64 < ExtraField::Generic
+-    attr_accessor :original_size, :compressed_size, :relative_header_offset, :disk_start_number
++    attr_accessor :compressed_size, :disk_start_number,
++                  :original_size, :relative_header_offset
++
+     HEADER_ID = ['0100'].pack('H*')
+     register_map
+ 
+@@ -9,7 +13,7 @@ module Zip
+       # unparsed binary; we don't actually know what this contains
+       # without looking for FFs in the associated file header
+       # call parse after initializing with a binary string
+-      @content = nil
++      @content                = nil
+       @original_size          = nil
+       @compressed_size        = nil
+       @relative_header_offset = nil
+@@ -26,6 +30,7 @@ module Zip
+ 
+     def merge(binstr)
+       return if binstr.empty?
++
+       _, @content = initial_parse(binstr)
+     end
+ 
+@@ -35,7 +40,9 @@ module Zip
+     def parse(original_size, compressed_size, relative_header_offset = nil, disk_start_number = nil)
+       @original_size = extract(8, 'Q<') if original_size == 0xFFFFFFFF
+       @compressed_size = extract(8, 'Q<') if compressed_size == 0xFFFFFFFF
+-      @relative_header_offset = extract(8, 'Q<') if relative_header_offset && relative_header_offset == 0xFFFFFFFF
++      if relative_header_offset && relative_header_offset == 0xFFFFFFFF
++        @relative_header_offset = extract(8, 'Q<')
++      end
+       @disk_start_number = extract(4, 'V') if disk_start_number && disk_start_number == 0xFFFF
+       @content = nil
+       [@original_size || original_size,
+@@ -45,19 +52,21 @@ module Zip
+     end
+ 
+     def extract(size, format)
+-      @content.slice!(0, size).unpack(format)[0]
++      @content.slice!(0, size).unpack1(format)
+     end
+     private :extract
+ 
+     def pack_for_local
+-      # local header entries must contain original size and compressed size; other fields do not apply
++      # Local header entries must contain original size and compressed size;
++      # other fields do not apply.
+       return '' unless @original_size && @compressed_size
++
+       [@original_size, @compressed_size].pack('Q<Q<')
+     end
+ 
+     def pack_for_c_dir
+       # central directory entries contain only fields that didn't fit in the main entry part
+-      packed = ''.force_encoding('BINARY')
++      packed = (+'').force_encoding('BINARY')
+       packed << [@original_size].pack('Q<') if @original_size
+       packed << [@compressed_size].pack('Q<') if @compressed_size
+       packed << [@relative_header_offset].pack('Q<') if @relative_header_offset
+diff --git a/lib/zip/extra_field/zip64_placeholder.rb b/lib/zip/extra_field/zip64_placeholder.rb
+index dfaa56e8f387a596862328a51453b6b530f91e15..c795d07f5826ae932b905b9f9cc154b7459c91cf 100644
+--- a/lib/zip/extra_field/zip64_placeholder.rb
++++ b/lib/zip/extra_field/zip64_placeholder.rb
+@@ -1,9 +1,6 @@
+ module Zip
+-  # placeholder to reserve space for a Zip64 extra information record, for the
+-  # local file header only, that we won't know if we'll need until after
+-  # we write the file data
+   class ExtraField::Zip64Placeholder < ExtraField::Generic
+-    HEADER_ID = ['9999'].pack('H*') # this ID is used by other libraries such as .NET's Ionic.zip
++    HEADER_ID = ['9999'].pack('H*')
+     register_map
+ 
+     def initialize(_binstr = nil); end
+diff --git a/lib/zip/extra_field.rb b/lib/zip/extra_field.rb
+index 72c367643d65a43b8f9ec5299773039a6bc58bb2..dceb8448397e8f2f8cdde1baa0341ccc13fac3ad 100644
+--- a/lib/zip/extra_field.rb
++++ b/lib/zip/extra_field.rb
+@@ -1,50 +1,45 @@
++# frozen_string_literal: true
++
+ module Zip
+   class ExtraField < Hash
+     ID_MAP = {}
+ 
+-    def initialize(binstr = nil)
+-      merge(binstr) if binstr
++    def initialize(binstr = nil, local: nil)
++      merge(binstr, local: local) if binstr
+     end
+ 
+-    def extra_field_type_exist(binstr, id, len, i)
++    def extra_field_type_exist(binstr, id, len, index)
+       field_name = ID_MAP[id].name
+       if member?(field_name)
+-        self[field_name].merge(binstr[i, len + 4])
++        self[field_name].merge(binstr[index, len + 4])
+       else
+-        field_obj        = ID_MAP[id].new(binstr[i, len + 4])
++        field_obj        = ID_MAP[id].new(binstr[index, len + 4])
+         self[field_name] = field_obj
+       end
+     end
+ 
+-    def extra_field_type_unknown(binstr, len, i)
+-      create_unknown_item unless self['Unknown']
+-      if !len || len + 4 > binstr[i..-1].bytesize
+-        self['Unknown'] << binstr[i..-1]
++    def extra_field_type_unknown(binstr, len, index, local)
++      self['Unknown'] ||= Unknown.new
++
++      if !len || len + 4 > binstr[index..-1].bytesize
++        self['Unknown'].merge(binstr[index..-1], local: local)
+         return
+       end
+-      self['Unknown'] << binstr[i, len + 4]
+-    end
+ 
+-    def create_unknown_item
+-      s = ''.dup
+-      class << s
+-        alias_method :to_c_dir_bin, :to_s
+-        alias_method :to_local_bin, :to_s
+-      end
+-      self['Unknown'] = s
++      self['Unknown'].merge(binstr[index, len + 4], local: local)
+     end
+ 
+-    def merge(binstr)
++    def merge(binstr, local: nil)
+       return if binstr.empty?
++
+       i = 0
+       while i < binstr.bytesize
+         id  = binstr[i, 2]
+-        len = binstr[i + 2, 2].to_s.unpack('v').first
++        len = binstr[i + 2, 2].to_s.unpack1('v')
+         if id && ID_MAP.member?(id)
+           extra_field_type_exist(binstr, id, len, i)
+         elsif id
+-          create_unknown_item unless self['Unknown']
+-          break unless extra_field_type_unknown(binstr, len, i)
++          break unless extra_field_type_unknown(binstr, len, i, local)
+         end
+         i += len + 4
+       end
+@@ -54,11 +49,12 @@ module Zip
+       unless (field_class = ID_MAP.values.find { |k| k.name == name })
+         raise Error, "Unknown extra field '#{name}'"
+       end
++
+       self[name] = field_class.new
+     end
+ 
+-    # place Unknown last, so "extra" data that is missing the proper signature/size
+-    # does not prevent known fields from being read back in
++    # Place Unknown last, so "extra" data that is missing the proper
++    # signature/size does not prevent known fields from being read back in.
+     def ordered_values
+       result = []
+       each { |k, v| k == 'Unknown' ? result.push(v) : result.unshift(v) }
+@@ -88,6 +84,7 @@ module Zip
+   end
+ end
+ 
++require 'zip/extra_field/unknown'
+ require 'zip/extra_field/generic'
+ require 'zip/extra_field/universal_time'
+ require 'zip/extra_field/old_unix'
+diff --git a/lib/zip/file.rb b/lib/zip/file.rb
+index e0c624439e00e57e796b2aba05169f4e1b3a6b5a..86f024a3d8b6396bc66c779c06a69f49eabe7330 100644
+--- a/lib/zip/file.rb
++++ b/lib/zip/file.rb
+@@ -1,3 +1,9 @@
++# frozen_string_literal: true
++
++require 'forwardable'
++
++require_relative 'file_split'
++
+ module Zip
+   # ZipFile is modeled after java.util.zip.ZipFile from the Java SDK.
+   # The most important methods are those inherited from
+@@ -21,7 +27,7 @@ module Zip
+   #
+   #   require 'zip'
+   #
+-  #   Zip::File.open("my.zip", Zip::File::CREATE) {
++  #   Zip::File.open("my.zip", create: true) {
+   #    |zipfile|
+   #     zipfile.get_output_stream("first.txt") { |f| f.puts "Hello from ZipFile" }
+   #     zipfile.mkdir("a_dir")
+@@ -33,7 +39,7 @@ module Zip
+   #
+   #   require 'zip'
+   #
+-  #   Zip::File.open("my.zip", Zip::File::CREATE) {
++  #   Zip::File.open("my.zip", create: true) {
+   #     |zipfile|
+   #     puts zipfile.read("first.txt")
+   #     zipfile.remove("first.txt")
+@@ -41,85 +47,51 @@ module Zip
+   #
+   # ZipFileSystem offers an alternative API that emulates ruby's
+   # interface for accessing the filesystem, ie. the File and Dir classes.
++  class File
++    extend Forwardable
++    extend FileSplit
+ 
+-  class File < CentralDirectory
+-    CREATE               = true
+-    SPLIT_SIGNATURE      = 0x08074b50
+-    ZIP64_EOCD_SIGNATURE = 0x06064b50
+-    MAX_SEGMENT_SIZE     = 3_221_225_472
+-    MIN_SEGMENT_SIZE     = 65_536
+-    DATA_BUFFER_SIZE     = 8192
+-    IO_METHODS           = [:tell, :seek, :read, :close]
+-
+-    DEFAULT_OPTIONS = {
+-      restore_ownership:   false,
+-      restore_permissions: false,
+-      restore_times:       false
+-    }.freeze
++    IO_METHODS = [:tell, :seek, :read, :eof, :close].freeze
+ 
+     attr_reader :name
+ 
+     # default -> false.
+     attr_accessor :restore_ownership
+ 
+-    # default -> false, but will be set to true in a future version.
++    # default -> true.
+     attr_accessor :restore_permissions
+ 
+-    # default -> false, but will be set to true in a future version.
++    # default -> true.
+     attr_accessor :restore_times
+ 
+-    # Returns the zip files comment, if it has one
+-    attr_accessor :comment
++    def_delegators :@cdir, :comment, :comment=, :each, :entries, :glob, :size
+ 
+-    # Opens a zip archive. Pass true as the second parameter to create
++    # Opens a zip archive. Pass create: true to create
+     # a new archive if it doesn't exist already.
+-    def initialize(path_or_io, create = false, buffer = false, options = {})
++    def initialize(path_or_io, create: false, buffer: false, **options)
+       super()
+-      options = DEFAULT_OPTIONS.merge(options)
++      options  = DEFAULT_RESTORE_OPTIONS
++                 .merge(compression_level: ::Zip.default_compression)
++                 .merge(options)
+       @name    = path_or_io.respond_to?(:path) ? path_or_io.path : path_or_io
+-      @comment = ''
+       @create  = create ? true : false # allow any truthy value to mean true
+ 
+-      if ::File.size?(@name.to_s)
+-        # There is a file, which exists, that is associated with this zip.
+-        @create = false
+-        @file_permissions = ::File.stat(@name).mode
++      initialize_cdir(path_or_io, buffer: buffer)
+ 
+-        if buffer
+-          read_from_stream(path_or_io)
+-        else
+-          ::File.open(@name, 'rb') do |f|
+-            read_from_stream(f)
+-          end
+-        end
+-      elsif buffer && path_or_io.size > 0
+-        # This zip is probably a non-empty StringIO.
+-        read_from_stream(path_or_io)
+-      elsif @create
+-        # This zip is completely new/empty and is to be created.
+-        @entry_set = EntrySet.new
+-      elsif ::File.zero?(@name)
+-        # A file exists, but it is empty.
+-        raise Error, "File #{@name} has zero size. Did you mean to pass the create flag?"
+-      else
+-        # Everything is wrong.
+-        raise Error, "File #{@name} not found"
+-      end
+-
+-      @stored_entries      = @entry_set.dup
+-      @stored_comment      = @comment
+       @restore_ownership   = options[:restore_ownership]
+       @restore_permissions = options[:restore_permissions]
+       @restore_times       = options[:restore_times]
++      @compression_level   = options[:compression_level]
+     end
+ 
+     class << self
+       # Similar to ::new. If a block is passed the Zip::File object is passed
+       # to the block and is automatically closed afterwards, just as with
+       # ruby's builtin File::open method.
+-      def open(file_name, create = false, options = {})
+-        zf = ::Zip::File.new(file_name, create, false, options)
++      def open(file_name, create: false, **options)
++        zf = ::Zip::File.new(file_name, create: create, **options)
+         return zf unless block_given?
++
+         begin
+           yield zf
+         ensure
+@@ -127,30 +99,21 @@ module Zip
+         end
+       end
+ 
+-      # Same as #open. But outputs data to a buffer instead of a file
+-      def add_buffer
+-        io = ::StringIO.new('')
+-        zf = ::Zip::File.new(io, true, true)
+-        yield zf
+-        zf.write_buffer(io)
+-      end
+-
+       # Like #open, but reads zip archive contents from a String or open IO
+       # stream, and outputs data to a buffer.
+       # (This can be used to extract data from a
+       # downloaded zip archive without first saving it to disk.)
+-      def open_buffer(io, options = {})
+-        unless IO_METHODS.map { |method| io.respond_to?(method) }.all? || io.is_a?(String)
+-          raise "Zip::File.open_buffer expects a String or IO-like argument (responds to #{IO_METHODS.join(', ')}). Found: #{io.class}"
++      def open_buffer(io = ::StringIO.new, create: false, **options)
++        unless IO_METHODS.map { |method| io.respond_to?(method) }.all? || io.kind_of?(String)
++          raise 'Zip::File.open_buffer expects a String or IO-like argument' \
++                "(responds to #{IO_METHODS.join(', ')}). Found: #{io.class}"
+         end
+ 
+-        io = ::StringIO.new(io) if io.is_a?(::String)
++        io = ::StringIO.new(io) if io.kind_of?(::String)
+ 
+-        # https://github.com/rubyzip/rubyzip/issues/119
+-        io.binmode if io.respond_to?(:binmode)
+-
+-        zf = ::Zip::File.new(io, true, true, options)
++        zf = ::Zip::File.new(io, create: create, buffer: true, **options)
+         return zf unless block_given?
++
+         yield zf
+ 
+         begin
+@@ -166,93 +129,32 @@ module Zip
+       # whereas ZipInputStream jumps through the entire archive accessing the
+       # local entry headers (which contain the same information as the
+       # central directory).
+-      def foreach(aZipFileName, &block)
+-        open(aZipFileName) do |zipFile|
+-          zipFile.each(&block)
+-        end
+-      end
+-
+-      def get_segment_size_for_split(segment_size)
+-        if MIN_SEGMENT_SIZE > segment_size
+-          MIN_SEGMENT_SIZE
+-        elsif MAX_SEGMENT_SIZE < segment_size
+-          MAX_SEGMENT_SIZE
+-        else
+-          segment_size
++      def foreach(zip_file_name, &block)
++        ::Zip::File.open(zip_file_name) do |zip_file|
++          zip_file.each(&block)
+         end
+       end
+ 
+-      def get_partial_zip_file_name(zip_file_name, partial_zip_file_name)
+-        unless partial_zip_file_name.nil?
+-          partial_zip_file_name = zip_file_name.sub(/#{::File.basename(zip_file_name)}\z/,
+-                                                    partial_zip_file_name + ::File.extname(zip_file_name))
+-        end
+-        partial_zip_file_name ||= zip_file_name
+-        partial_zip_file_name
+-      end
+-
+-      def get_segment_count_for_split(zip_file_size, segment_size)
+-        (zip_file_size / segment_size).to_i + (zip_file_size % segment_size == 0 ? 0 : 1)
+-      end
+-
+-      def put_split_signature(szip_file, segment_size)
+-        signature_packed = [SPLIT_SIGNATURE].pack('V')
+-        szip_file << signature_packed
+-        segment_size - signature_packed.size
+-      end
+-
+-      #
+-      # TODO: Make the code more understandable
+-      #
+-      def save_splited_part(zip_file, partial_zip_file_name, zip_file_size, szip_file_index, segment_size, segment_count)
+-        ssegment_size  = zip_file_size - zip_file.pos
+-        ssegment_size  = segment_size if ssegment_size > segment_size
+-        szip_file_name = "#{partial_zip_file_name}.#{format('%03d', szip_file_index)}"
+-        ::File.open(szip_file_name, 'wb') do |szip_file|
+-          if szip_file_index == 1
+-            ssegment_size = put_split_signature(szip_file, segment_size)
+-          end
+-          chunk_bytes = 0
+-          until ssegment_size == chunk_bytes || zip_file.eof?
+-            segment_bytes_left = ssegment_size - chunk_bytes
+-            buffer_size        = segment_bytes_left < DATA_BUFFER_SIZE ? segment_bytes_left : DATA_BUFFER_SIZE
+-            chunk              = zip_file.read(buffer_size)
+-            chunk_bytes += buffer_size
+-            szip_file << chunk
+-            # Info for track splitting
+-            yield segment_count, szip_file_index, chunk_bytes, ssegment_size if block_given?
+-          end
+-        end
+-      end
++      # Count the entries in a zip archive without reading the whole set of
++      # entry data into memory.
++      def count_entries(path_or_io)
++        cdir = ::Zip::CentralDirectory.new
+ 
+-      # Splits an archive into parts with segment size
+-      def split(zip_file_name, segment_size = MAX_SEGMENT_SIZE, delete_zip_file = true, partial_zip_file_name = nil)
+-        raise Error, "File #{zip_file_name} not found" unless ::File.exist?(zip_file_name)
+-        raise Errno::ENOENT, zip_file_name unless ::File.readable?(zip_file_name)
+-        zip_file_size = ::File.size(zip_file_name)
+-        segment_size  = get_segment_size_for_split(segment_size)
+-        return if zip_file_size <= segment_size
+-        segment_count = get_segment_count_for_split(zip_file_size, segment_size)
+-        # Checking for correct zip structure
+-        open(zip_file_name) {}
+-        partial_zip_file_name = get_partial_zip_file_name(zip_file_name, partial_zip_file_name)
+-        szip_file_index       = 0
+-        ::File.open(zip_file_name, 'rb') do |zip_file|
+-          until zip_file.eof?
+-            szip_file_index += 1
+-            save_splited_part(zip_file, partial_zip_file_name, zip_file_size, szip_file_index, segment_size, segment_count)
++        if path_or_io.kind_of?(String)
++          ::File.open(path_or_io, 'rb') do |f|
++            cdir.count_entries(f)
+           end
++        else
++          cdir.count_entries(path_or_io)
+         end
+-        ::File.delete(zip_file_name) if delete_zip_file
+-        szip_file_index
+       end
+     end
+ 
+     # Returns an input stream to the specified entry. If a block is passed
+     # the stream object is passed to the block and the stream is automatically
+     # closed afterwards just as with ruby's builtin File.open method.
+-    def get_input_stream(entry, &aProc)
+-      get_entry(entry).get_input_stream(&aProc)
++    def get_input_stream(entry, &a_proc)
++      get_entry(entry).get_input_stream(&a_proc)
+     end
+ 
+     # Returns an output stream to the specified entry. If entry is not an instance
+@@ -260,21 +162,30 @@ module Zip
+     # specified. If a block is passed the stream object is passed to the block and
+     # the stream is automatically closed afterwards just as with ruby's builtin
+     # File.open method.
+-    def get_output_stream(entry, permission_int = nil, comment = nil, extra = nil, compressed_size = nil, crc = nil, compression_method = nil, size = nil, time = nil, &aProc)
++    def get_output_stream(entry, permissions: nil, comment: nil,
++                          extra: nil, compressed_size: nil, crc: nil,
++                          compression_method: nil, compression_level: nil,
++                          size: nil, time: nil, &a_proc)
++
+       new_entry =
+         if entry.kind_of?(Entry)
+           entry
+         else
+-          Entry.new(@name, entry.to_s, comment, extra, compressed_size, crc, compression_method, size, time)
++          Entry.new(
++            @name, entry.to_s, comment: comment, extra: extra,
++            compressed_size: compressed_size, crc: crc, size: size,
++            compression_method: compression_method,
++            compression_level: compression_level, time: time
++          )
+         end
+       if new_entry.directory?
+         raise ArgumentError,
+               "cannot open stream to directory entry - '#{new_entry}'"
+       end
+-      new_entry.unix_perms = permission_int
++      new_entry.unix_perms = permissions
+       zip_streamable_entry = StreamableStream.new(new_entry)
+-      @entry_set << zip_streamable_entry
+-      zip_streamable_entry.get_output_stream(&aProc)
++      @cdir << zip_streamable_entry
++      zip_streamable_entry.get_output_stream(&a_proc)
+     end
+ 
+     # Returns the name of the zip archive
+@@ -284,77 +195,92 @@ module Zip
+ 
+     # Returns a string containing the contents of the specified entry
+     def read(entry)
+-      get_input_stream(entry) { |is| is.read }
++      get_input_stream(entry, &:read)
+     end
+ 
+     # Convenience method for adding the contents of a file to the archive
+     def add(entry, src_path, &continue_on_exists_proc)
+       continue_on_exists_proc ||= proc { ::Zip.continue_on_exists_proc }
+       check_entry_exists(entry, continue_on_exists_proc, 'add')
+-      new_entry = entry.kind_of?(::Zip::Entry) ? entry : ::Zip::Entry.new(@name, entry.to_s)
++      new_entry = if entry.kind_of?(::Zip::Entry)
++                    entry
++                  else
++                    ::Zip::Entry.new(
++                      @name, entry.to_s,
++                      compression_level: @compression_level
++                    )
++                  end
+       new_entry.gather_fileinfo_from_srcpath(src_path)
+-      new_entry.dirty = true
+-      @entry_set << new_entry
++      @cdir << new_entry
+     end
+ 
+     # Convenience method for adding the contents of a file to the archive
+     # in Stored format (uncompressed)
+     def add_stored(entry, src_path, &continue_on_exists_proc)
+-      entry = ::Zip::Entry.new(@name, entry.to_s, nil, nil, nil, nil, ::Zip::Entry::STORED)
++      entry = ::Zip::Entry.new(
++        @name, entry.to_s, compression_method: ::Zip::Entry::STORED
++      )
+       add(entry, src_path, &continue_on_exists_proc)
+     end
+ 
+     # Removes the specified entry.
+     def remove(entry)
+-      @entry_set.delete(get_entry(entry))
++      @cdir.delete(get_entry(entry))
+     end
+ 
+     # Renames the specified entry.
+     def rename(entry, new_name, &continue_on_exists_proc)
+-      foundEntry = get_entry(entry)
++      found_entry = get_entry(entry)
+       check_entry_exists(new_name, continue_on_exists_proc, 'rename')
+-      @entry_set.delete(foundEntry)
+-      foundEntry.name = new_name
+-      @entry_set << foundEntry
++      @cdir.delete(found_entry)
++      found_entry.name = new_name
++      @cdir << found_entry
+     end
+ 
+-    # Replaces the specified entry with the contents of srcPath (from
++    # Replaces the specified entry with the contents of src_path (from
+     # the file system).
+-    def replace(entry, srcPath)
+-      check_file(srcPath)
++    def replace(entry, src_path)
++      check_file(src_path)
+       remove(entry)
+-      add(entry, srcPath)
++      add(entry, src_path)
+     end
+ 
+-    # Extracts entry to file dest_path.
+-    def extract(entry, dest_path, &block)
++    # Extracts `entry` to a file at `entry_path`, with `destination_directory`
++    # as the base location in the filesystem.
++    #
++    # NB: The caller is responsible for making sure `destination_directory` is
++    # safe, if it is passed.
++    def extract(entry, entry_path = nil, destination_directory: '.', &block)
+       block ||= proc { ::Zip.on_exists_proc }
+       found_entry = get_entry(entry)
+-      found_entry.extract(dest_path, &block)
++      entry_path ||= found_entry.name
++      found_entry.extract(entry_path, destination_directory: destination_directory, &block)
+     end
+ 
+     # Commits changes that has been made since the previous commit to
+     # the zip archive.
+     def commit
+-      return if name.is_a?(StringIO) || !commit_required?
++      return if name.kind_of?(StringIO) || !commit_required?
++
+       on_success_replace do |tmp_file|
+         ::Zip::OutputStream.open(tmp_file) do |zos|
+-          @entry_set.each do |e|
++          @cdir.each do |e|
+             e.write_to_zip_output_stream(zos)
+-            e.dirty = false
+             e.clean_up
+           end
+           zos.comment = comment
+         end
+         true
+       end
+-      initialize(name)
++      initialize_cdir(@name)
+     end
+ 
+     # Write buffer write changes to buffer and return
+-    def write_buffer(io = ::StringIO.new(''))
++    def write_buffer(io = ::StringIO.new)
++      return unless commit_required?
++
+       ::Zip::OutputStream.write_buffer(io) do |zos|
+-        @entry_set.each { |e| e.write_to_zip_output_stream(zos) }
++        @cdir.each { |e| e.write_to_zip_output_stream(zos) }
+         zos.comment = comment
+       end
+     end
+@@ -367,16 +293,19 @@ module Zip
+     # Returns true if any changes has been made to this archive since
+     # the previous commit
+     def commit_required?
+-      @entry_set.each do |e|
+-        return true if e.dirty
++      return true if @create || @cdir.dirty?
++
++      @cdir.each do |e|
++        return true if e.dirty? && entry_state(e) != @stored_entry_states[e.object_id]
+       end
+-      @comment != @stored_comment || @entry_set != @stored_entries || @create
++
++      false
+     end
+ 
+     # Searches for entry with the specified name. Returns nil if
+     # no entry is found. See also get_entry
+     def find_entry(entry_name)
+-      selected_entry = @entry_set.find_entry(entry_name)
++      selected_entry = @cdir.find_entry(entry_name)
+       return if selected_entry.nil?
+ 
+       selected_entry.restore_ownership   = @restore_ownership
+@@ -385,11 +314,6 @@ module Zip
+       selected_entry
+     end
+ 
+-    # Searches for entries given a glob
+-    def glob(*args, &block)
+-      @entry_set.glob(*args, &block)
+-    end
+-
+     # Searches for an entry just as find_entry, but throws Errno::ENOENT
+     # if no entry is found.
+     def get_entry(entry)
+@@ -400,36 +324,65 @@ module Zip
+     end
+ 
+     # Creates a directory
+-    def mkdir(entryName, permissionInt = 0o755)
+-      raise Errno::EEXIST, "File exists - #{entryName}" if find_entry(entryName)
+-      entryName = entryName.dup.to_s
+-      entryName << '/' unless entryName.end_with?('/')
+-      @entry_set << ::Zip::StreamableDirectory.new(@name, entryName, nil, permissionInt)
++    def mkdir(entry_name, permission = 0o755)
++      raise Errno::EEXIST, "File exists - #{entry_name}" if find_entry(entry_name)
++
++      entry_name = entry_name.dup.to_s
++      entry_name << '/' unless entry_name.end_with?('/')
++      @cdir << ::Zip::StreamableDirectory.new(@name, entry_name, nil, permission)
+     end
+ 
+     private
+ 
+-    def directory?(newEntry, srcPath)
+-      srcPathIsDirectory = ::File.directory?(srcPath)
+-      if newEntry.directory? && !srcPathIsDirectory
+-        raise ArgumentError,
+-              "entry name '#{newEntry}' indicates directory entry, but " \
+-                  "'#{srcPath}' is not a directory"
+-      elsif !newEntry.directory? && srcPathIsDirectory
+-        newEntry.name += '/'
++    def initialize_cdir(path_or_io, buffer: false)
++      @cdir = ::Zip::CentralDirectory.new
++
++      if ::File.size?(@name.to_s)
++        # There is a file, which exists, that is associated with this zip.
++        @create = false
++        @file_permissions = ::File.stat(@name).mode
++
++        if buffer
++          # https://github.com/rubyzip/rubyzip/issues/119
++          path_or_io.binmode if path_or_io.respond_to?(:binmode)
++          @cdir.read_from_stream(path_or_io)
++        else
++          ::File.open(@name, 'rb') do |f|
++            @cdir.read_from_stream(f)
++          end
++        end
++      elsif buffer && path_or_io.size > 0
++        # This zip is probably a non-empty StringIO.
++        @create = false
++        @cdir.read_from_stream(path_or_io)
++      elsif !@create && ::File.zero?(@name)
++        # A file exists, but it is empty, and we've said we're
++        # NOT creating a new zip.
++        raise Error, "File #{@name} has zero size. Did you mean to pass the create flag?"
++      elsif !@create
++        # If we get here, and we're not creating a new zip, then
++        # everything is wrong.
++        raise Error, "File #{@name} not found"
+       end
+-      newEntry.directory? && srcPathIsDirectory
++      @stored_entry_states = @cdir.entries.to_h { |entry| [entry.object_id, entry_state(entry)] }
++    end
++
++    def entry_state(entry)
++      fields = [:name, :comment, :compressed_size, :crc, :size, :compression_method,
++                :external_file_attributes, :internal_file_attributes, :fstype, :gp_flags,
++                :local_header_offset, :unix_uid, :unix_gid, :unix_perms, :time]
++      values = fields.map { |field| entry.public_send(field) }
++      values[-1] = values[-1].to_r if values[-1]
++      Marshal.dump(values + [entry.extra.to_local_bin, entry.extra.to_c_dir_bin])
+     end
+ 
+-    def check_entry_exists(entryName, continue_on_exists_proc, procedureName)
++    def check_entry_exists(entry_name, continue_on_exists_proc, proc_name)
++      return unless @cdir.include?(entry_name)
++
+       continue_on_exists_proc ||= proc { Zip.continue_on_exists_proc }
+-      return unless @entry_set.include?(entryName)
+-      if continue_on_exists_proc.call
+-        remove get_entry(entryName)
+-      else
+-        raise ::Zip::EntryExistsError,
+-              procedureName + " failed. Entry #{entryName} already exists"
+-      end
++      raise ::Zip::EntryExistsError.new proc_name, entry_name unless continue_on_exists_proc.call
++
++      remove get_entry(entry_name)
+     end
+ 
+     def check_file(path)
+@@ -439,14 +392,12 @@ module Zip
+     def on_success_replace
+       dirname, basename = ::File.split(name)
+       ::Dir::Tmpname.create(basename, dirname) do |tmp_filename|
+-        begin
+-          if yield tmp_filename
+-            ::File.rename(tmp_filename, name)
+-            ::File.chmod(@file_permissions, name) unless @create
+-          end
+-        ensure
+-          ::File.unlink(tmp_filename) if ::File.exist?(tmp_filename)
++        if yield tmp_filename
++          ::File.rename(tmp_filename, name)
++          ::File.chmod(@file_permissions, name) unless @create
+         end
++      ensure
++        ::File.unlink(tmp_filename) if ::File.exist?(tmp_filename)
+       end
+     end
+   end
+diff --git a/lib/zip/file_split.rb b/lib/zip/file_split.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..606d2e6b0a5a8e15210ff02f9289e61b6087adb9
+--- /dev/null
++++ b/lib/zip/file_split.rb
+@@ -0,0 +1,97 @@
++# frozen_string_literal: true
++
++module Zip
++  module FileSplit #:nodoc:
++    MAX_SEGMENT_SIZE = 3_221_225_472
++    MIN_SEGMENT_SIZE = 65_536
++    DATA_BUFFER_SIZE = 8192
++
++    def get_segment_size_for_split(segment_size)
++      if MIN_SEGMENT_SIZE > segment_size
++        MIN_SEGMENT_SIZE
++      elsif MAX_SEGMENT_SIZE < segment_size
++        MAX_SEGMENT_SIZE
++      else
++        segment_size
++      end
++    end
++
++    def get_partial_zip_file_name(zip_file_name, partial_zip_file_name)
++      unless partial_zip_file_name.nil?
++        partial_zip_file_name = zip_file_name.sub(
++          /#{::File.basename(zip_file_name)}\z/,
++          partial_zip_file_name + ::File.extname(zip_file_name)
++        )
++      end
++      partial_zip_file_name ||= zip_file_name
++      partial_zip_file_name
++    end
++
++    def get_segment_count_for_split(zip_file_size, segment_size)
++      (zip_file_size / segment_size).to_i +
++        ((zip_file_size % segment_size).zero? ? 0 : 1)
++    end
++
++    def put_split_signature(szip_file, segment_size)
++      signature_packed = [SPLIT_FILE_SIGNATURE].pack('V')
++      szip_file << signature_packed
++      segment_size - signature_packed.size
++    end
++
++    #
++    # TODO: Make the code more understandable
++    #
++    def save_splited_part(
++      zip_file, partial_zip_file_name, zip_file_size,
++      szip_file_index, segment_size, segment_count
++    )
++      ssegment_size  = zip_file_size - zip_file.pos
++      ssegment_size  = segment_size if ssegment_size > segment_size
++      szip_file_name = "#{partial_zip_file_name}.#{format('%03d', szip_file_index)}"
++      ::File.open(szip_file_name, 'wb') do |szip_file|
++        if szip_file_index == 1
++          ssegment_size = put_split_signature(szip_file, segment_size)
++        end
++        chunk_bytes = 0
++        until ssegment_size == chunk_bytes || zip_file.eof?
++          segment_bytes_left = ssegment_size - chunk_bytes
++          buffer_size        = [segment_bytes_left, DATA_BUFFER_SIZE].min
++          chunk              = zip_file.read(buffer_size)
++          chunk_bytes += buffer_size
++          szip_file << chunk
++          # Info for track splitting
++          yield segment_count, szip_file_index, chunk_bytes, ssegment_size if block_given?
++        end
++      end
++    end
++
++    # Splits an archive into parts with segment size
++    def split(
++      zip_file_name, segment_size: MAX_SEGMENT_SIZE,
++      delete_original: true, partial_zip_file_name: nil
++    )
++      raise Error, "File #{zip_file_name} not found" unless ::File.exist?(zip_file_name)
++      raise Errno::ENOENT, zip_file_name unless ::File.readable?(zip_file_name)
++
++      zip_file_size = ::File.size(zip_file_name)
++      segment_size  = get_segment_size_for_split(segment_size)
++      return if zip_file_size <= segment_size
++
++      segment_count = get_segment_count_for_split(zip_file_size, segment_size)
++      ::Zip::File.open(zip_file_name) {} # Check for correct zip structure.
++      partial_zip_file_name = get_partial_zip_file_name(zip_file_name, partial_zip_file_name)
++      szip_file_index       = 0
++      ::File.open(zip_file_name, 'rb') do |zip_file|
++        until zip_file.eof?
++          szip_file_index += 1
++          save_splited_part(
++            zip_file, partial_zip_file_name, zip_file_size,
++            szip_file_index, segment_size, segment_count
++          )
++        end
++      end
++      ::File.delete(zip_file_name) if delete_original
++      szip_file_index
++    end
++  end
++end
+diff --git a/lib/zip/filesystem/dir.rb b/lib/zip/filesystem/dir.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5e1ef9ea51c0f3afb6c10ebd10cff17471d1665
+--- /dev/null
++++ b/lib/zip/filesystem/dir.rb
+@@ -0,0 +1,86 @@
++# frozen_string_literal: true
++
++module Zip
++  module FileSystem
++    class Dir # :nodoc:all
++      def initialize(mapped_zip)
++        @mapped_zip = mapped_zip
++      end
++
++      attr_writer :file
++
++      def new(directory_name)
++        DirectoryIterator.new(entries(directory_name))
++      end
++
++      def open(directory_name)
++        dir_iter = new(directory_name)
++        if block_given?
++          begin
++            yield(dir_iter)
++            return nil
++          ensure
++            dir_iter.close
++          end
++        end
++        dir_iter
++      end
++
++      def pwd
++        @mapped_zip.pwd
++      end
++      alias getwd pwd
++
++      def chdir(directory_name)
++        unless @file.stat(directory_name).directory?
++          raise Errno::EINVAL, "Invalid argument - #{directory_name}"
++        end
++
++        @mapped_zip.pwd = @file.expand_path(directory_name)
++      end
++
++      def entries(directory_name)
++        entries = []
++        foreach(directory_name) { |e| entries << e }
++        entries
++      end
++
++      def glob(*args, &block)
++        @mapped_zip.glob(*args, &block)
++      end
++
++      def foreach(directory_name)
++        unless @file.stat(directory_name).directory?
++          raise Errno::ENOTDIR, directory_name
++        end
++
++        path = @file.expand_path(directory_name)
++        path << '/' unless path.end_with?('/')
++        path = Regexp.escape(path)
++        subdir_entry_regex = Regexp.new("^#{path}([^/]+)$")
++        @mapped_zip.each do |filename|
++          match = subdir_entry_regex.match(filename)
++          yield(match[1]) unless match.nil?
++        end
++      end
++
++      def delete(entry_name)
++        unless @file.stat(entry_name).directory?
++          raise Errno::EINVAL, "Invalid argument - #{entry_name}"
++        end
++
++        @mapped_zip.remove(entry_name)
++      end
++      alias rmdir delete
++      alias unlink delete
++
++      def mkdir(entry_name, permissions = 0o755)
++        @mapped_zip.mkdir(entry_name, permissions)
++      end
++
++      def chroot(*_args)
++        raise NotImplementedError, 'The chroot() function is not implemented'
++      end
++    end
++  end
++end
+diff --git a/lib/zip/filesystem/directory_iterator.rb b/lib/zip/filesystem/directory_iterator.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..77d2fbcad57d79375b40f299d82b44eb990c31a6
+--- /dev/null
++++ b/lib/zip/filesystem/directory_iterator.rb
+@@ -0,0 +1,50 @@
++# frozen_string_literal: true
++
++module Zip
++  module FileSystem
++    class DirectoryIterator # :nodoc:all
++      include Enumerable
++
++      def initialize(filenames)
++        @filenames = filenames
++        @index = 0
++      end
++
++      def close
++        @filenames = nil
++      end
++
++      def each(&a_proc)
++        raise IOError, 'closed directory' if @filenames.nil?
++
++        @filenames.each(&a_proc)
++      end
++
++      def read
++        raise IOError, 'closed directory' if @filenames.nil?
++
++        @filenames[(@index += 1) - 1]
++      end
++
++      def rewind
++        raise IOError, 'closed directory' if @filenames.nil?
++
++        @index = 0
++      end
++
++      def seek(position)
++        raise IOError, 'closed directory' if @filenames.nil?
++
++        @index = position
++      end
++
++      def tell
++        raise IOError, 'closed directory' if @filenames.nil?
++
++        @index
++      end
++    end
++
++    ZipFsDirIterator = DirectoryIterator
++  end
++end
+diff --git a/lib/zip/filesystem/file.rb b/lib/zip/filesystem/file.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cac3cfb674f7f907ec55dc9dabcb66e3e1b2169
+--- /dev/null
++++ b/lib/zip/filesystem/file.rb
+@@ -0,0 +1,263 @@
++# frozen_string_literal: true
++
++require_relative 'file_stat'
++
++module Zip
++  module FileSystem
++    # Instances of this class are normally accessed via the accessor
++    # Zip::File::file. An instance of File behaves like ruby's
++    # builtin File (class) object, except it works on Zip::File entries.
++    #
++    # The individual methods are not documented due to their
++    # similarity with the methods in File
++    class File # :nodoc:all
++      attr_writer :dir
++
++      def initialize(mapped_zip)
++        @mapped_zip = mapped_zip
++      end
++
++      def find_entry(filename)
++        unless exists?(filename)
++          raise Errno::ENOENT, "No such file or directory - #{filename}"
++        end
++
++        @mapped_zip.find_entry(filename)
++      end
++
++      def unix_mode_cmp(filename, mode)
++        e = find_entry(filename)
++        e.fstype == FSTYPE_UNIX && ((e.external_file_attributes >> 16) & mode) != 0
++      rescue Errno::ENOENT
++        false
++      end
++      private :unix_mode_cmp
++
++      def exists?(filename)
++        expand_path(filename) == '/' || !@mapped_zip.find_entry(filename).nil?
++      end
++      alias exist? exists?
++
++      # Permissions not implemented, so if the file exists it is accessible
++      alias owned? exists?
++      alias grpowned? exists?
++
++      def readable?(filename)
++        unix_mode_cmp(filename, 0o444)
++      end
++      alias readable_real? readable?
++
++      def writable?(filename)
++        unix_mode_cmp(filename, 0o222)
++      end
++      alias writable_real? writable?
++
++      def executable?(filename)
++        unix_mode_cmp(filename, 0o111)
++      end
++      alias executable_real? executable?
++
++      def setuid?(filename)
++        unix_mode_cmp(filename, 0o4000)
++      end
++
++      def setgid?(filename)
++        unix_mode_cmp(filename, 0o2000)
++      end
++
++      def sticky?(filename)
++        unix_mode_cmp(filename, 0o1000)
++      end
++
++      def umask(*args)
++        ::File.umask(*args)
++      end
++
++      def truncate(_filename, _len)
++        raise StandardError, 'truncate not supported'
++      end
++
++      def directory?(filename)
++        entry = @mapped_zip.find_entry(filename)
++        expand_path(filename) == '/' || (!entry.nil? && entry.directory?)
++      end
++
++      def open(filename, mode = 'r', permissions = 0o644, &block)
++        mode = mode.tr('b', '') # ignore b option
++        case mode
++        when 'r'
++          @mapped_zip.get_input_stream(filename, &block)
++        when 'w'
++          @mapped_zip.get_output_stream(filename, permissions, &block)
++        else
++          raise StandardError, "openmode '#{mode} not supported" unless mode == 'r'
++        end
++      end
++
++      def new(filename, mode = 'r')
++        self.open(filename, mode)
++      end
++
++      def size(filename)
++        @mapped_zip.get_entry(filename).size
++      end
++
++      # Returns nil for not found and nil for directories
++      def size?(filename)
++        entry = @mapped_zip.find_entry(filename)
++        entry.nil? || entry.directory? ? nil : entry.size
++      end
++
++      def chown(owner, group, *filenames)
++        filenames.each do |filename|
++          e = find_entry(filename)
++          e.extra.create('IUnix') unless e.extra.member?('IUnix')
++          e.extra['IUnix'].uid = owner
++          e.extra['IUnix'].gid = group
++        end
++        filenames.size
++      end
++
++      def chmod(mode, *filenames)
++        filenames.each do |filename|
++          e = find_entry(filename)
++          e.fstype = FSTYPE_UNIX # Force conversion filesystem type to unix.
++          e.unix_perms = mode
++          e.external_file_attributes = mode << 16
++        end
++        filenames.size
++      end
++
++      def zero?(filename)
++        sz = size(filename)
++        sz.nil? || sz == 0
++      rescue Errno::ENOENT
++        false
++      end
++
++      def file?(filename)
++        entry = @mapped_zip.find_entry(filename)
++        !entry.nil? && entry.file?
++      end
++
++      def dirname(filename)
++        ::File.dirname(filename)
++      end
++
++      def basename(filename)
++        ::File.basename(filename)
++      end
++
++      def split(filename)
++        ::File.split(filename)
++      end
++
++      def join(*fragments)
++        ::File.join(*fragments)
++      end
++
++      def utime(modified_time, *filenames)
++        filenames.each do |filename|
++          find_entry(filename).time = modified_time
++        end
++      end
++
++      def mtime(filename)
++        @mapped_zip.get_entry(filename).mtime
++      end
++
++      def atime(filename)
++        @mapped_zip.get_entry(filename).atime
++      end
++
++      def ctime(filename)
++        @mapped_zip.get_entry(filename).ctime
++      end
++
++      def pipe?(_filename)
++        false
++      end
++
++      def blockdev?(_filename)
++        false
++      end
++
++      def chardev?(_filename)
++        false
++      end
++
++      def symlink?(filename)
++        entry = @mapped_zip.find_entry(filename)
++        !entry.nil? && entry.symlink?
++      end
++
++      def socket?(_filename)
++        false
++      end
++
++      def ftype(filename)
++        @mapped_zip.get_entry(filename).directory? ? 'directory' : 'file'
++      end
++
++      def readlink(_filename)
++        raise NotImplementedError, 'The readlink() function is not implemented'
++      end
++
++      def symlink(_filename, _symlink_name)
++        raise NotImplementedError, 'The symlink() function is not implemented'
++      end
++
++      def link(_filename, _symlink_name)
++        raise NotImplementedError, 'The link() function is not implemented'
++      end
++
++      def pipe
++        raise NotImplementedError, 'The pipe() function is not implemented'
++      end
++
++      def stat(filename)
++        raise Errno::ENOENT, filename unless exists?(filename)
++
++        Stat.new(self, filename)
++      end
++
++      alias lstat stat
++
++      def readlines(filename)
++        self.open(filename, &:readlines)
++      end
++
++      def read(filename)
++        @mapped_zip.read(filename)
++      end
++
++      def popen(*args, &a_proc)
++        ::File.popen(*args, &a_proc)
++      end
++
++      def foreach(filename, sep = $INPUT_RECORD_SEPARATOR, &a_proc)
++        self.open(filename) { |is| is.each_line(sep, &a_proc) }
++      end
++
++      def delete(*args)
++        args.each do |filename|
++          if directory?(filename)
++            raise Errno::EISDIR, "Is a directory - \"#{filename}\""
++          end
++
++          @mapped_zip.remove(filename)
++        end
++      end
++
++      def rename(file_to_rename, new_name)
++        @mapped_zip.rename(file_to_rename, new_name) { true }
++      end
++
++      alias unlink delete
++
++      def expand_path(path)
++        @mapped_zip.expand_path(path)
++      end
++    end
++  end
++end
+diff --git a/lib/zip/filesystem/file_stat.rb b/lib/zip/filesystem/file_stat.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..6117bb7c6fa1c2d693ce3c9415b001e9f7e961b0
+--- /dev/null
++++ b/lib/zip/filesystem/file_stat.rb
+@@ -0,0 +1,110 @@
++# frozen_string_literal: true
++
++module Zip
++  module FileSystem
++    class File # :nodoc:all
++      class Stat # :nodoc:all
++        class << self
++          def delegate_to_fs_file(*methods)
++            methods.each do |method|
++              class_exec do
++                define_method(method) do
++                  @zip_fs_file.__send__(method, @entry_name)
++                end
++              end
++            end
++          end
++        end
++
++        def initialize(zip_fs_file, entry_name)
++          @zip_fs_file = zip_fs_file
++          @entry_name = entry_name
++        end
++
++        def kind_of?(type)
++          super || type == ::File::Stat
++        end
++
++        delegate_to_fs_file :file?, :directory?, :pipe?, :chardev?, :symlink?,
++                            :socket?, :blockdev?, :readable?, :readable_real?, :writable?, :ctime,
++                            :writable_real?, :executable?, :executable_real?, :sticky?, :owned?,
++                            :grpowned?, :setuid?, :setgid?, :zero?, :size, :size?, :mtime, :atime
++
++        def blocks
++          nil
++        end
++
++        def gid
++          e = find_entry
++          if e.extra.member? 'IUnix'
++            e.extra['IUnix'].gid || 0
++          else
++            0
++          end
++        end
++
++        def uid
++          e = find_entry
++          if e.extra.member? 'IUnix'
++            e.extra['IUnix'].uid || 0
++          else
++            0
++          end
++        end
++
++        def ino
++          0
++        end
++
++        def dev
++          0
++        end
++
++        def rdev
++          0
++        end
++
++        def rdev_major
++          0
++        end
++
++        def rdev_minor
++          0
++        end
++
++        def ftype
++          if file?
++            'file'
++          elsif directory?
++            'directory'
++          else
++            raise StandardError, 'Unknown file type'
++          end
++        end
++
++        def nlink
++          1
++        end
++
++        def blksize
++          nil
++        end
++
++        def mode
++          e = find_entry
++          if e.fstype == FSTYPE_UNIX
++            e.external_file_attributes >> 16
++          else
++            0o100_666 # Equivalent to -rw-rw-rw-.
++          end
++        end
++
++        private
++
++        def find_entry
++          @zip_fs_file.find_entry(@entry_name)
++        end
++      end
++    end
++  end
++end
+diff --git a/lib/zip/filesystem/zip_file_name_mapper.rb b/lib/zip/filesystem/zip_file_name_mapper.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b9c7f51869f168bdc59f9d52788c1dbc52689b3
+--- /dev/null
++++ b/lib/zip/filesystem/zip_file_name_mapper.rb
+@@ -0,0 +1,81 @@
++# frozen_string_literal: true
++
++module Zip
++  module FileSystem
++    # All access to Zip::File from FileSystem::File and FileSystem::Dir
++    # goes through a ZipFileNameMapper, which has one responsibility: ensure
++    class ZipFileNameMapper # :nodoc:all
++      include Enumerable
++
++      def initialize(zip_file)
++        @zip_file = zip_file
++        @pwd = '/'
++      end
++
++      attr_accessor :pwd
++
++      def find_entry(filename)
++        @zip_file.find_entry(expand_to_entry(filename))
++      end
++
++      def get_entry(filename)
++        @zip_file.get_entry(expand_to_entry(filename))
++      end
++
++      def get_input_stream(filename, &a_proc)
++        @zip_file.get_input_stream(expand_to_entry(filename), &a_proc)
++      end
++
++      def get_output_stream(filename, permissions = nil, &a_proc)
++        @zip_file.get_output_stream(
++          expand_to_entry(filename), permissions: permissions, &a_proc
++        )
++      end
++
++      def glob(pattern, *flags, &block)
++        @zip_file.glob(expand_to_entry(pattern), *flags, &block)
++      end
++
++      def read(filename)
++        @zip_file.read(expand_to_entry(filename))
++      end
++
++      def remove(filename)
++        @zip_file.remove(expand_to_entry(filename))
++      end
++
++      def rename(filename, new_name, &continue_on_exists_proc)
++        @zip_file.rename(
++          expand_to_entry(filename),
++          expand_to_entry(new_name),
++          &continue_on_exists_proc
++        )
++      end
++
++      def mkdir(filename, permissions = 0o755)
++        @zip_file.mkdir(expand_to_entry(filename), permissions)
++      end
++
++      # Turns entries into strings and adds leading /
++      # and removes trailing slash on directories
++      def each
++        @zip_file.each do |e|
++          yield("/#{e.to_s.chomp('/')}")
++        end
++      end
++
++      def expand_path(path)
++        expanded = path.start_with?('/') ? path.dup : ::File.join(@pwd, path)
++        expanded.gsub!(/\/\.(\/|$)/, '')
++        expanded.gsub!(/[^\/]+\/\.\.(\/|$)/, '')
++        expanded.empty? ? '/' : expanded
++      end
++
++      private
++
++      def expand_to_entry(path)
++        expand_path(path)[1..-1]
++      end
++    end
++  end
++end
+diff --git a/lib/zip/filesystem.rb b/lib/zip/filesystem.rb
+index 81ad1a18c28582b0dd34bdd015a79b175142a281..e223b3c0dc822a4dca6b08de7cb01d60c40699bb 100644
+--- a/lib/zip/filesystem.rb
++++ b/lib/zip/filesystem.rb
+@@ -1,4 +1,10 @@
++# frozen_string_literal: true
++
+ require 'zip'
++require_relative 'filesystem/zip_file_name_mapper'
++require_relative 'filesystem/directory_iterator'
++require_relative 'filesystem/dir'
++require_relative 'filesystem/file'
+ 
+ module Zip
+   # The ZipFileSystem API provides an API for accessing entries in
+@@ -15,7 +21,7 @@ module Zip
+   #
+   #   require 'zip/filesystem'
+   #
+-  #   Zip::File.open("my.zip", Zip::File::CREATE) {
++  #   Zip::File.open("my.zip", create: true) {
+   #     |zipfile|
+   #     zipfile.file.open("first.txt", "w") { |f| f.puts "Hello world" }
+   #     zipfile.dir.mkdir("mydir")
+@@ -32,588 +38,27 @@ module Zip
+   #     |zipfile|
+   #     puts zipfile.file.read("first.txt")
+   #   }
+-
+   module FileSystem
+     def initialize # :nodoc:
+-      mappedZip = ZipFileNameMapper.new(self)
+-      @zipFsDir  = ZipFsDir.new(mappedZip)
+-      @zipFsFile = ZipFsFile.new(mappedZip)
+-      @zipFsDir.file = @zipFsFile
+-      @zipFsFile.dir = @zipFsDir
++      mapped_zip       = ZipFileNameMapper.new(self)
++      @zip_fs_dir      = Dir.new(mapped_zip)
++      @zip_fs_file     = File.new(mapped_zip)
++      @zip_fs_dir.file = @zip_fs_file
++      @zip_fs_file.dir = @zip_fs_dir
+     end
+ 
+-    # Returns a ZipFsDir which is much like ruby's builtin Dir (class)
++    # Returns a FileSystem::Dir which is much like ruby's builtin Dir (class)
+     # object, except it works on the Zip::File on which this method is
+     # invoked
+     def dir
+-      @zipFsDir
++      @zip_fs_dir
+     end
+ 
+-    # Returns a ZipFsFile which is much like ruby's builtin File (class)
+-    # object, except it works on the Zip::File on which this method is
++    # Returns a FileSystem::File which is much like ruby's builtin File
++    # (class) object, except it works on the Zip::File on which this method is
+     # invoked
+     def file
+-      @zipFsFile
+-    end
+-
+-    # Instances of this class are normally accessed via the accessor
+-    # Zip::File::file. An instance of ZipFsFile behaves like ruby's
+-    # builtin File (class) object, except it works on Zip::File entries.
+-    #
+-    # The individual methods are not documented due to their
+-    # similarity with the methods in File
+-    class ZipFsFile
+-      attr_writer :dir
+-      # protected :dir
+-
+-      class ZipFsStat
+-        class << self
+-          def delegate_to_fs_file(*methods)
+-            methods.each do |method|
+-              class_eval <<-end_eval, __FILE__, __LINE__ + 1
+-                def #{method}                      # def file?
+-                  @zipFsFile.#{method}(@entryName) #   @zipFsFile.file?(@entryName)
+-                end                                # end
+-              end_eval
+-            end
+-          end
+-        end
+-
+-        def initialize(zipFsFile, entryName)
+-          @zipFsFile = zipFsFile
+-          @entryName = entryName
+-        end
+-
+-        def kind_of?(t)
+-          super || t == ::File::Stat
+-        end
+-
+-        delegate_to_fs_file :file?, :directory?, :pipe?, :chardev?, :symlink?,
+-                            :socket?, :blockdev?, :readable?, :readable_real?, :writable?, :ctime,
+-                            :writable_real?, :executable?, :executable_real?, :sticky?, :owned?,
+-                            :grpowned?, :setuid?, :setgid?, :zero?, :size, :size?, :mtime, :atime
+-
+-        def blocks
+-          nil
+-        end
+-
+-        def get_entry
+-          @zipFsFile.__send__(:get_entry, @entryName)
+-        end
+-        private :get_entry
+-
+-        def gid
+-          e = get_entry
+-          if e.extra.member? 'IUnix'
+-            e.extra['IUnix'].gid || 0
+-          else
+-            0
+-          end
+-        end
+-
+-        def uid
+-          e = get_entry
+-          if e.extra.member? 'IUnix'
+-            e.extra['IUnix'].uid || 0
+-          else
+-            0
+-          end
+-        end
+-
+-        def ino
+-          0
+-        end
+-
+-        def dev
+-          0
+-        end
+-
+-        def rdev
+-          0
+-        end
+-
+-        def rdev_major
+-          0
+-        end
+-
+-        def rdev_minor
+-          0
+-        end
+-
+-        def ftype
+-          if file?
+-            'file'
+-          elsif directory?
+-            'directory'
+-          else
+-            raise StandardError, 'Unknown file type'
+-          end
+-        end
+-
+-        def nlink
+-          1
+-        end
+-
+-        def blksize
+-          nil
+-        end
+-
+-        def mode
+-          e = get_entry
+-          if e.fstype == 3
+-            e.external_file_attributes >> 16
+-          else
+-            33_206 # 33206 is equivalent to -rw-rw-rw-
+-          end
+-        end
+-      end
+-
+-      def initialize(mappedZip)
+-        @mappedZip = mappedZip
+-      end
+-
+-      def get_entry(fileName)
+-        unless exists?(fileName)
+-          raise Errno::ENOENT, "No such file or directory - #{fileName}"
+-        end
+-        @mappedZip.find_entry(fileName)
+-      end
+-      private :get_entry
+-
+-      def unix_mode_cmp(fileName, mode)
+-        e = get_entry(fileName)
+-        e.fstype == 3 && ((e.external_file_attributes >> 16) & mode) != 0
+-      rescue Errno::ENOENT
+-        false
+-      end
+-      private :unix_mode_cmp
+-
+-      def exists?(fileName)
+-        expand_path(fileName) == '/' || !@mappedZip.find_entry(fileName).nil?
+-      end
+-      alias exist? exists?
+-
+-      # Permissions not implemented, so if the file exists it is accessible
+-      alias owned? exists?
+-      alias grpowned? exists?
+-
+-      def readable?(fileName)
+-        unix_mode_cmp(fileName, 0o444)
+-      end
+-      alias readable_real? readable?
+-
+-      def writable?(fileName)
+-        unix_mode_cmp(fileName, 0o222)
+-      end
+-      alias writable_real? writable?
+-
+-      def executable?(fileName)
+-        unix_mode_cmp(fileName, 0o111)
+-      end
+-      alias executable_real? executable?
+-
+-      def setuid?(fileName)
+-        unix_mode_cmp(fileName, 0o4000)
+-      end
+-
+-      def setgid?(fileName)
+-        unix_mode_cmp(fileName, 0o2000)
+-      end
+-
+-      def sticky?(fileName)
+-        unix_mode_cmp(fileName, 0o1000)
+-      end
+-
+-      def umask(*args)
+-        ::File.umask(*args)
+-      end
+-
+-      def truncate(_fileName, _len)
+-        raise StandardError, 'truncate not supported'
+-      end
+-
+-      def directory?(fileName)
+-        entry = @mappedZip.find_entry(fileName)
+-        expand_path(fileName) == '/' || (!entry.nil? && entry.directory?)
+-      end
+-
+-      def open(fileName, openMode = 'r', permissionInt = 0o644, &block)
+-        openMode.delete!('b') # ignore b option
+-        case openMode
+-        when 'r'
+-          @mappedZip.get_input_stream(fileName, &block)
+-        when 'w'
+-          @mappedZip.get_output_stream(fileName, permissionInt, &block)
+-        else
+-          raise StandardError, "openmode '#{openMode} not supported" unless openMode == 'r'
+-        end
+-      end
+-
+-      def new(fileName, openMode = 'r')
+-        open(fileName, openMode)
+-      end
+-
+-      def size(fileName)
+-        @mappedZip.get_entry(fileName).size
+-      end
+-
+-      # Returns nil for not found and nil for directories
+-      def size?(fileName)
+-        entry = @mappedZip.find_entry(fileName)
+-        entry.nil? || entry.directory? ? nil : entry.size
+-      end
+-
+-      def chown(ownerInt, groupInt, *filenames)
+-        filenames.each do |fileName|
+-          e = get_entry(fileName)
+-          e.extra.create('IUnix') unless e.extra.member?('IUnix')
+-          e.extra['IUnix'].uid = ownerInt
+-          e.extra['IUnix'].gid = groupInt
+-        end
+-        filenames.size
+-      end
+-
+-      def chmod(modeInt, *filenames)
+-        filenames.each do |fileName|
+-          e = get_entry(fileName)
+-          e.fstype = 3 # force convertion filesystem type to unix
+-          e.unix_perms = modeInt
+-          e.external_file_attributes = modeInt << 16
+-          e.dirty = true
+-        end
+-        filenames.size
+-      end
+-
+-      def zero?(fileName)
+-        sz = size(fileName)
+-        sz.nil? || sz == 0
+-      rescue Errno::ENOENT
+-        false
+-      end
+-
+-      def file?(fileName)
+-        entry = @mappedZip.find_entry(fileName)
+-        !entry.nil? && entry.file?
+-      end
+-
+-      def dirname(fileName)
+-        ::File.dirname(fileName)
+-      end
+-
+-      def basename(fileName)
+-        ::File.basename(fileName)
+-      end
+-
+-      def split(fileName)
+-        ::File.split(fileName)
+-      end
+-
+-      def join(*fragments)
+-        ::File.join(*fragments)
+-      end
+-
+-      def utime(modifiedTime, *fileNames)
+-        fileNames.each do |fileName|
+-          get_entry(fileName).time = modifiedTime
+-        end
+-      end
+-
+-      def mtime(fileName)
+-        @mappedZip.get_entry(fileName).mtime
+-      end
+-
+-      def atime(fileName)
+-        e = get_entry(fileName)
+-        if e.extra.member? 'UniversalTime'
+-          e.extra['UniversalTime'].atime
+-        elsif e.extra.member? 'NTFS'
+-          e.extra['NTFS'].atime
+-        end
+-      end
+-
+-      def ctime(fileName)
+-        e = get_entry(fileName)
+-        if e.extra.member? 'UniversalTime'
+-          e.extra['UniversalTime'].ctime
+-        elsif e.extra.member? 'NTFS'
+-          e.extra['NTFS'].ctime
+-        end
+-      end
+-
+-      def pipe?(_filename)
+-        false
+-      end
+-
+-      def blockdev?(_filename)
+-        false
+-      end
+-
+-      def chardev?(_filename)
+-        false
+-      end
+-
+-      def symlink?(_fileName)
+-        false
+-      end
+-
+-      def socket?(_fileName)
+-        false
+-      end
+-
+-      def ftype(fileName)
+-        @mappedZip.get_entry(fileName).directory? ? 'directory' : 'file'
+-      end
+-
+-      def readlink(_fileName)
+-        raise NotImplementedError, 'The readlink() function is not implemented'
+-      end
+-
+-      def symlink(_fileName, _symlinkName)
+-        raise NotImplementedError, 'The symlink() function is not implemented'
+-      end
+-
+-      def link(_fileName, _symlinkName)
+-        raise NotImplementedError, 'The link() function is not implemented'
+-      end
+-
+-      def pipe
+-        raise NotImplementedError, 'The pipe() function is not implemented'
+-      end
+-
+-      def stat(fileName)
+-        raise Errno::ENOENT, fileName unless exists?(fileName)
+-        ZipFsStat.new(self, fileName)
+-      end
+-
+-      alias lstat stat
+-
+-      def readlines(fileName)
+-        open(fileName) { |is| is.readlines }
+-      end
+-
+-      def read(fileName)
+-        @mappedZip.read(fileName)
+-      end
+-
+-      def popen(*args, &aProc)
+-        ::File.popen(*args, &aProc)
+-      end
+-
+-      def foreach(fileName, aSep = $/, &aProc)
+-        open(fileName) { |is| is.each_line(aSep, &aProc) }
+-      end
+-
+-      def delete(*args)
+-        args.each do |fileName|
+-          if directory?(fileName)
+-            raise Errno::EISDIR, "Is a directory - \"#{fileName}\""
+-          end
+-          @mappedZip.remove(fileName)
+-        end
+-      end
+-
+-      def rename(fileToRename, newName)
+-        @mappedZip.rename(fileToRename, newName) { true }
+-      end
+-
+-      alias unlink delete
+-
+-      def expand_path(aPath)
+-        @mappedZip.expand_path(aPath)
+-      end
+-    end
+-
+-    # Instances of this class are normally accessed via the accessor
+-    # ZipFile::dir. An instance of ZipFsDir behaves like ruby's
+-    # builtin Dir (class) object, except it works on ZipFile entries.
+-    #
+-    # The individual methods are not documented due to their
+-    # similarity with the methods in Dir
+-    class ZipFsDir
+-      def initialize(mappedZip)
+-        @mappedZip = mappedZip
+-      end
+-
+-      attr_writer :file
+-
+-      def new(aDirectoryName)
+-        ZipFsDirIterator.new(entries(aDirectoryName))
+-      end
+-
+-      def open(aDirectoryName)
+-        dirIt = new(aDirectoryName)
+-        if block_given?
+-          begin
+-            yield(dirIt)
+-            return nil
+-          ensure
+-            dirIt.close
+-          end
+-        end
+-        dirIt
+-      end
+-
+-      def pwd
+-        @mappedZip.pwd
+-      end
+-      alias getwd pwd
+-
+-      def chdir(aDirectoryName)
+-        unless @file.stat(aDirectoryName).directory?
+-          raise Errno::EINVAL, "Invalid argument - #{aDirectoryName}"
+-        end
+-        @mappedZip.pwd = @file.expand_path(aDirectoryName)
+-      end
+-
+-      def entries(aDirectoryName)
+-        entries = []
+-        foreach(aDirectoryName) { |e| entries << e }
+-        entries
+-      end
+-
+-      def glob(*args, &block)
+-        @mappedZip.glob(*args, &block)
+-      end
+-
+-      def foreach(aDirectoryName)
+-        unless @file.stat(aDirectoryName).directory?
+-          raise Errno::ENOTDIR, aDirectoryName
+-        end
+-        path = @file.expand_path(aDirectoryName)
+-        path << '/' unless path.end_with?('/')
+-        path = Regexp.escape(path)
+-        subDirEntriesRegex = Regexp.new("^#{path}([^/]+)$")
+-        @mappedZip.each do |fileName|
+-          match = subDirEntriesRegex.match(fileName)
+-          yield(match[1]) unless match.nil?
+-        end
+-      end
+-
+-      def delete(entryName)
+-        unless @file.stat(entryName).directory?
+-          raise Errno::EINVAL, "Invalid argument - #{entryName}"
+-        end
+-        @mappedZip.remove(entryName)
+-      end
+-      alias rmdir delete
+-      alias unlink delete
+-
+-      def mkdir(entryName, permissionInt = 0o755)
+-        @mappedZip.mkdir(entryName, permissionInt)
+-      end
+-
+-      def chroot(*_args)
+-        raise NotImplementedError, 'The chroot() function is not implemented'
+-      end
+-    end
+-
+-    class ZipFsDirIterator # :nodoc:all
+-      include Enumerable
+-
+-      def initialize(arrayOfFileNames)
+-        @fileNames = arrayOfFileNames
+-        @index = 0
+-      end
+-
+-      def close
+-        @fileNames = nil
+-      end
+-
+-      def each(&aProc)
+-        raise IOError, 'closed directory' if @fileNames.nil?
+-        @fileNames.each(&aProc)
+-      end
+-
+-      def read
+-        raise IOError, 'closed directory' if @fileNames.nil?
+-        @fileNames[(@index += 1) - 1]
+-      end
+-
+-      def rewind
+-        raise IOError, 'closed directory' if @fileNames.nil?
+-        @index = 0
+-      end
+-
+-      def seek(anIntegerPosition)
+-        raise IOError, 'closed directory' if @fileNames.nil?
+-        @index = anIntegerPosition
+-      end
+-
+-      def tell
+-        raise IOError, 'closed directory' if @fileNames.nil?
+-        @index
+-      end
+-    end
+-
+-    # All access to Zip::File from ZipFsFile and ZipFsDir goes through a
+-    # ZipFileNameMapper, which has one responsibility: ensure
+-    class ZipFileNameMapper # :nodoc:all
+-      include Enumerable
+-
+-      def initialize(zipFile)
+-        @zipFile = zipFile
+-        @pwd = '/'
+-      end
+-
+-      attr_accessor :pwd
+-
+-      def find_entry(fileName)
+-        @zipFile.find_entry(expand_to_entry(fileName))
+-      end
+-
+-      def get_entry(fileName)
+-        @zipFile.get_entry(expand_to_entry(fileName))
+-      end
+-
+-      def get_input_stream(fileName, &aProc)
+-        @zipFile.get_input_stream(expand_to_entry(fileName), &aProc)
+-      end
+-
+-      def get_output_stream(fileName, permissionInt = nil, &aProc)
+-        @zipFile.get_output_stream(expand_to_entry(fileName), permissionInt, &aProc)
+-      end
+-
+-      def glob(pattern, *flags, &block)
+-        @zipFile.glob(expand_to_entry(pattern), *flags, &block)
+-      end
+-
+-      def read(fileName)
+-        @zipFile.read(expand_to_entry(fileName))
+-      end
+-
+-      def remove(fileName)
+-        @zipFile.remove(expand_to_entry(fileName))
+-      end
+-
+-      def rename(fileName, newName, &continueOnExistsProc)
+-        @zipFile.rename(expand_to_entry(fileName), expand_to_entry(newName),
+-                        &continueOnExistsProc)
+-      end
+-
+-      def mkdir(fileName, permissionInt = 0o755)
+-        @zipFile.mkdir(expand_to_entry(fileName), permissionInt)
+-      end
+-
+-      # Turns entries into strings and adds leading /
+-      # and removes trailing slash on directories
+-      def each
+-        @zipFile.each do |e|
+-          yield('/' + e.to_s.chomp('/'))
+-        end
+-      end
+-
+-      def expand_path(aPath)
+-        expanded = aPath.start_with?('/') ? aPath : ::File.join(@pwd, aPath)
+-        expanded.gsub!(/\/\.(\/|$)/, '')
+-        expanded.gsub!(/[^\/]+\/\.\.(\/|$)/, '')
+-        expanded.empty? ? '/' : expanded
+-      end
+-
+-      private
+-
+-      def expand_to_entry(aPath)
+-        expand_path(aPath)[1..-1]
+-      end
++      @zip_fs_file
+     end
+   end
+ 
+diff --git a/lib/zip/inflater.rb b/lib/zip/inflater.rb
+index f1b26d45f5fcdb2780da90ad1a5f0088e3a02cb5..3b6a4473354b23128927b775c07103181a48f75f 100644
+--- a/lib/zip/inflater.rb
++++ b/lib/zip/inflater.rb
+@@ -1,64 +1,57 @@
++# frozen_string_literal: true
++
+ module Zip
+   class Inflater < Decompressor #:nodoc:all
+-    def initialize(input_stream, decrypter = NullDecrypter.new)
+-      super(input_stream)
+-      @zlib_inflater           = ::Zlib::Inflate.new(-Zlib::MAX_WBITS)
+-      @output_buffer           = ''.dup
+-      @has_returned_empty_string = false
+-      @decrypter = decrypter
+-    end
++    def initialize(*args)
++      super
+ 
+-    def sysread(number_of_bytes = nil, buf = '')
+-      readEverything = number_of_bytes.nil?
+-      while readEverything || @output_buffer.bytesize < number_of_bytes
+-        break if internal_input_finished?
+-        @output_buffer << internal_produce_input(buf)
+-      end
+-      return value_when_finished if @output_buffer.bytesize == 0 && input_finished?
+-      end_index = number_of_bytes.nil? ? @output_buffer.bytesize : number_of_bytes
+-      @output_buffer.slice!(0...end_index)
++      @buffer = +''
++      @zlib_inflater = ::Zlib::Inflate.new(-Zlib::MAX_WBITS)
+     end
+ 
+-    def produce_input
+-      if @output_buffer.empty?
+-        internal_produce_input
+-      else
+-        @output_buffer.slice!(0...(@output_buffer.length))
++    def read(length = nil, outbuf = +'')
++      return (length.nil? || length.zero? ? '' : nil) if eof
++
++      while length.nil? || (@buffer.bytesize < length)
++        break if @zlib_inflater.finished?
++
++        @buffer << inflate_chunk
+       end
++
++      outbuf.replace(@buffer.slice!(0...(length || @buffer.bytesize)))
+     end
+ 
+-    # to be used with produce_input, not read (as read may still have more data cached)
+-    # is data cached anywhere other than @outputBuffer?  the comment above may be wrong
+-    def input_finished?
+-      @output_buffer.empty? && internal_input_finished?
++    def eof
++      @buffer.empty? && @zlib_inflater.finished?
+     end
+ 
+-    alias :eof input_finished?
+-    alias :eof? input_finished?
++    alias eof? eof
++    alias input_finished? eof
++    alias sysread read
++
++    def produce_input
++      read(CHUNK_SIZE)
++    end
+ 
+     private
+ 
+-    def internal_produce_input(buf = '')
++    def inflate_chunk
+       retried = 0
+       begin
+-        @zlib_inflater.inflate(@decrypter.decrypt(@input_stream.read(Decompressor::CHUNK_SIZE, buf)))
++        @zlib_inflater.inflate(input_stream.read(Decompressor::CHUNK_SIZE))
+       rescue Zlib::BufError
+         raise if retried >= 5 # how many times should we retry?
++
+         retried += 1
+         retry
+       end
++    rescue Zlib::Error => e
++      raise ::Zip::DecompressionError, e
+     end
+ 
+-    def internal_input_finished?
+-      @zlib_inflater.finished?
+-    end
+-
+-    def value_when_finished # mimic behaviour of ruby File object.
+-      return if @has_returned_empty_string
+-      @has_returned_empty_string = true
+-      ''
+-    end
+   end
++
++  ::Zip::Decompressor.register(::Zip::COMPRESSION_METHOD_DEFLATE, ::Zip::Inflater)
+ end
+ 
+ # Copyright (C) 2002, 2003 Thomas Sondergaard
+diff --git a/lib/zip/input_stream.rb b/lib/zip/input_stream.rb
+--- a/lib/zip/input_stream.rb
++++ b/lib/zip/input_stream.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   # InputStream is the basic class for reading zip entries in a
+   # zip file. It is possible to create a InputStream object directly,
+@@ -39,6 +41,8 @@
+   # class.
+ 
+   class InputStream
++    CHUNK_SIZE = 32_768
++
+     include ::Zip::IOExtras::AbstractInputStream
+ 
+     # Opens the indicated zip file. An exception is thrown
+@@ -47,30 +51,37 @@
+     #
+     # @param context [String||IO||StringIO] file path or IO/StringIO object
+     # @param offset [Integer] offset in the IO/StringIO
+-    def initialize(context, offset = 0, decrypter = nil)
++    def initialize(context, offset: 0, decrypter: nil)
+       super()
+       @archive_io = get_io(context, offset)
+-      @decompressor  = ::Zip::NullDecompressor
+-      @decrypter     = decrypter || ::Zip::NullDecrypter.new
++      @decompressor = ::Zip::NullDecompressor
++      @decrypter = decrypter || ::Zip::NullDecrypter.new
+       @current_entry = nil
++      @complete_entry = nil
+     end
+ 
+     def close
+       @archive_io.close
+     end
+ 
+-    # Returns a Entry object. It is necessary to call this
+-    # method on a newly created InputStream before reading from
+-    # the first entry in the archive. Returns nil when there are
+-    # no more entries.
++    # Returns an Entry object and positions the stream at the beginning of
++    # the entry data. It is necessary to call this method on a newly created
++    # InputStream before reading from the first entry in the archive.
++    # Returns nil when there are no more entries.
+     def get_next_entry
+-      @archive_io.seek(@current_entry.next_header_offset, IO::SEEK_SET) if @current_entry
++      unless @current_entry.nil?
++        raise StreamingError, @current_entry if @current_entry.incomplete?
++
++        @archive_io.seek(@current_entry.next_header_offset, IO::SEEK_SET)
++      end
++
+       open_entry
+     end
+ 
+     # Rewinds the stream to the beginning of the current entry
+     def rewind
+       return if @current_entry.nil?
++
+       @lineno = 0
+       @pos    = 0
+       @archive_io.seek(@current_entry.local_header_offset, IO::SEEK_SET)
+@@ -78,23 +89,25 @@
+     end
+ 
+     # Modeled after IO.sysread
+-    def sysread(number_of_bytes = nil, buf = nil)
+-      @decompressor.sysread(number_of_bytes, buf)
+-    end
+-
+-    def eof
+-      @output_buffer.empty? && @decompressor.eof
+-    end
+-
+-    alias :eof? eof
++    def sysread(length = nil, outbuf = '')
++      @decompressor.read(length, outbuf)
++    end
++
++    # Returns the size of the current entry, or `nil` if there isn't one.
++    def size
++      return if @current_entry.nil?
++
++      @current_entry.size
++    end
+ 
+     class << self
+       # Same as #initialize but if a block is passed the opened
+       # stream is passed to the block and closed when the block
+       # returns.
+-      def open(filename_or_io, offset = 0, decrypter = nil)
+-        zio = new(filename_or_io, offset, decrypter)
++      def open(filename_or_io, offset: 0, decrypter: nil)
++        zio = new(filename_or_io, offset: offset, decrypter: decrypter)
+         return zio unless block_given?
++
+         begin
+           yield zio
+         ensure
+@@ -102,9 +115,9 @@
+         end
+       end
+ 
+-      def open_buffer(filename_or_io, offset = 0)
++      def open_buffer(filename_or_io, offset: 0)
+         warn 'open_buffer is deprecated!!! Use open instead!'
+-        open(filename_or_io, offset)
++        ::Zip::InputStream.open(filename_or_io, offset: offset)
+       end
+     end
+ 
+@@ -123,47 +136,77 @@
+     end
+ 
+     def open_entry
+-      @current_entry = ::Zip::Entry.read_local_entry(@archive_io)
+-      if @current_entry && @current_entry.gp_flags & 1 == 1 && @decrypter.is_a?(NullEncrypter)
+-        raise Error, 'password required to decode zip file'
+-      end
+-      if @current_entry && @current_entry.gp_flags & 8 == 8 && @current_entry.crc == 0 \
+-        && @current_entry.compressed_size == 0 \
+-        && @current_entry.size == 0 && !@complete_entry
+-        raise GPFBit3Error,
+-              'General purpose flag Bit 3 is set so not possible to get proper info from local header.' \
+-              'Please use ::Zip::File instead of ::Zip::InputStream'
+-      end
++      offset = @archive_io.tell
++      signature = @archive_io.read(4)
++      @archive_io.seek(offset, IO::SEEK_SET)
++      if signature.nil? || signature.empty?
++        @current_entry = nil
++        return
++      end
++
++      if [0x02014b50, 0x06054b50, 0x06064b50].include?(signature.unpack1('V'))
++        begin
++          CentralDirectory.new.count_entries(@archive_io)
++        ensure
++          @archive_io.seek(offset, IO::SEEK_SET)
++        end
++        @current_entry = nil
++        return
++      end
++
++      @current_entry = Entry.new(@archive_io)
++      @current_entry.read_local_entry(@archive_io)
++
++      if @current_entry.encrypted? && @decrypter.kind_of?(NullDecrypter)
++        raise Error,
++              'A password is required to decode this zip file'
++      end
++
++      if @current_entry.incomplete? && @current_entry.compressed_size == 0 \
++        && !@complete_entry
++        raise StreamingError, @current_entry
++      end
++
++      @decrypted_io = get_decrypted_io
+       @decompressor = get_decompressor
+       flush
+       @current_entry
+     end
+ 
++    def get_decrypted_io
++      header = @archive_io.read(@decrypter.header_bytesize)
++      @decrypter.reset!(header)
++
++      ::Zip::DecryptedIo.new(@archive_io, @decrypter)
++    end
++
+     def get_decompressor
+-      if @current_entry.nil?
+-        ::Zip::NullDecompressor
+-      elsif @current_entry.compression_method == ::Zip::Entry::STORED
+-        if @current_entry.gp_flags & 8 == 8 && @current_entry.crc == 0 && @current_entry.size == 0 && @complete_entry
+-          ::Zip::PassThruDecompressor.new(@archive_io, @complete_entry.size)
++      return ::Zip::NullDecompressor if @current_entry.nil?
++
++      decompressed_size =
++        if @current_entry.incomplete? && @current_entry.crc == 0 \
++           && @current_entry.size == 0 && @complete_entry
++          @complete_entry.size
+         else
+-          ::Zip::PassThruDecompressor.new(@archive_io, @current_entry.size)
++          @current_entry.size
+         end
+-      elsif @current_entry.compression_method == ::Zip::Entry::DEFLATED
+-        header = @archive_io.read(@decrypter.header_bytesize)
+-        @decrypter.reset!(header)
+-        ::Zip::Inflater.new(@archive_io, @decrypter)
+-      else
+-        raise ::Zip::CompressionMethodError,
+-              "Unsupported compression method #{@current_entry.compression_method}"
+-      end
++
++      decompressor_class = ::Zip::Decompressor.find_by_compression_method(
++        @current_entry.compression_method
++      )
++      if decompressor_class.nil?
++        raise ::Zip::CompressionMethodError, @current_entry.compression_method
++      end
++
++      decompressor_class.new(@decrypted_io, decompressed_size)
+     end
+ 
+     def produce_input
+-      @decompressor.produce_input
++      @decompressor.read(CHUNK_SIZE)
+     end
+ 
+     def input_finished?
+-      @decompressor.input_finished?
++      @decompressor.eof
+     end
+   end
+ end
+diff --git a/lib/zip/ioextras/abstract_input_stream.rb b/lib/zip/ioextras/abstract_input_stream.rb
+index 7b7fd61db3b54c34cd5973f7e19cb5d0d5580ade..d0ea682562d04a460df3c201c710fc82f6e250fc 100644
+--- a/lib/zip/ioextras/abstract_input_stream.rb
++++ b/lib/zip/ioextras/abstract_input_stream.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   module IOExtras
+     # Implements many of the convenience methods of IO
+@@ -11,15 +13,15 @@ module Zip
+         super
+         @lineno        = 0
+         @pos           = 0
+-        @output_buffer = ''
++        @output_buffer = +''
+       end
+ 
+       attr_accessor :lineno
+       attr_reader :pos
+ 
+-      def read(number_of_bytes = nil, buf = '')
++      def read(number_of_bytes = nil, buf = +'')
+         tbuf = if @output_buffer.bytesize > 0
+-                 if number_of_bytes <= @output_buffer.bytesize
++                 if number_of_bytes && number_of_bytes <= @output_buffer.bytesize
+                    @output_buffer.slice!(0, number_of_bytes)
+                  else
+                    number_of_bytes -= @output_buffer.bytesize if number_of_bytes
+@@ -35,6 +37,7 @@ module Zip
+ 
+         if tbuf.nil? || tbuf.empty?
+           return nil if number_of_bytes
++
+           return ''
+         end
+ 
+@@ -48,13 +51,13 @@ module Zip
+         buf
+       end
+ 
+-      def readlines(a_sep_string = $/)
++      def readlines(a_sep_string = $INPUT_RECORD_SEPARATOR)
+         ret_val = []
+         each_line(a_sep_string) { |line| ret_val << line }
+         ret_val
+       end
+ 
+-      def gets(a_sep_string = $/, number_of_bytes = nil)
++      def gets(a_sep_string = $INPUT_RECORD_SEPARATOR, number_of_bytes = nil)
+         @lineno = @lineno.next
+ 
+         if number_of_bytes.respond_to?(:to_int)
+@@ -62,24 +65,29 @@ module Zip
+           a_sep_string = a_sep_string.to_str if a_sep_string
+         elsif a_sep_string.respond_to?(:to_int)
+           number_of_bytes = a_sep_string.to_int
+-          a_sep_string    = $/
++          a_sep_string    = $INPUT_RECORD_SEPARATOR
+         else
+           number_of_bytes = nil
+           a_sep_string = a_sep_string.to_str if a_sep_string
+         end
+ 
+         return read(number_of_bytes) if a_sep_string.nil?
+-        a_sep_string = "#{$/}#{$/}" if a_sep_string.empty?
++
++        a_sep_string = "#{$INPUT_RECORD_SEPARATOR}#{$INPUT_RECORD_SEPARATOR}" if a_sep_string.empty?
+ 
+         buffer_index = 0
+         over_limit   = (number_of_bytes && @output_buffer.bytesize >= number_of_bytes)
+         while (match_index = @output_buffer.index(a_sep_string, buffer_index)).nil? && !over_limit
+           buffer_index = [buffer_index, @output_buffer.bytesize - a_sep_string.bytesize].max
+           return @output_buffer.empty? ? nil : flush if input_finished?
++
+           @output_buffer << produce_input
+           over_limit = (number_of_bytes && @output_buffer.bytesize >= number_of_bytes)
+         end
+-        sep_index = [match_index + a_sep_string.bytesize, number_of_bytes || @output_buffer.bytesize].min
++        sep_index = [
++          match_index + a_sep_string.bytesize,
++          number_of_bytes || @output_buffer.bytesize
++        ].min
+         @pos += sep_index
+         @output_buffer.slice!(0...sep_index)
+       end
+@@ -90,22 +98,30 @@ module Zip
+ 
+       def flush
+         ret_val        = @output_buffer
+-        @output_buffer = ''
++        @output_buffer = +''
+         ret_val
+       end
+ 
+-      def readline(a_sep_string = $/)
++      def readline(a_sep_string = $INPUT_RECORD_SEPARATOR)
+         ret_val = gets(a_sep_string)
+         raise EOFError unless ret_val
++
+         ret_val
+       end
+ 
+-      def each_line(a_sep_string = $/)
+-        yield readline(a_sep_string) while true
++      def each_line(a_sep_string = $INPUT_RECORD_SEPARATOR)
++        loop { yield readline(a_sep_string) }
+       rescue EOFError
++        # We just need to catch this; we don't need to handle it.
++      end
++
++      alias each each_line
++
++      def eof
++        @output_buffer.empty? && input_finished?
+       end
+ 
+-      alias_method :each, :each_line
++      alias eof? eof
+     end
+   end
+ end
+diff --git a/lib/zip/ioextras/abstract_output_stream.rb b/lib/zip/ioextras/abstract_output_stream.rb
+index 69d0cc7c447b950c04e097317ed3cbbe2a8e1158..28a09090e45d37b33bde8ed399089fc64c516852 100644
+--- a/lib/zip/ioextras/abstract_output_stream.rb
++++ b/lib/zip/ioextras/abstract_output_stream.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   module IOExtras
+     # Implements many of the output convenience methods of IO.
+@@ -11,7 +13,7 @@ module Zip
+       end
+ 
+       def print(*params)
+-        self << params.join($,) << $\.to_s
++        self << params.join << $OUTPUT_RECORD_SEPARATOR.to_s
+       end
+ 
+       def printf(a_format_string, *params)
+diff --git a/lib/zip/ioextras.rb b/lib/zip/ioextras.rb
+index 2412480b74dd869eb9ace3dc1fbdb61ef11b1350..df208da12a8e47145fc3157e5d79ef4fa597f8fb 100644
+--- a/lib/zip/ioextras.rb
++++ b/lib/zip/ioextras.rb
+@@ -1,19 +1,19 @@
++# frozen_string_literal: true
++
+ module Zip
+   module IOExtras #:nodoc:
+     CHUNK_SIZE = 131_072
+ 
+-    RANGE_ALL = 0..-1
+-
+     class << self
+       def copy_stream(ostream, istream)
+-        ostream.write(istream.read(CHUNK_SIZE, '')) until istream.eof?
++        ostream.write(istream.read(CHUNK_SIZE, +'')) until istream.eof?
+       end
+ 
+       def copy_stream_n(ostream, istream, nbytes)
+         toread = nbytes
+         while toread > 0 && !istream.eof?
+           tr = toread > CHUNK_SIZE ? CHUNK_SIZE : toread
+-          ostream.write(istream.read(tr, ''))
++          ostream.write(istream.read(tr, +''))
+           toread -= tr
+         end
+       end
+@@ -25,7 +25,7 @@ module Zip
+         object == IO || super
+       end
+     end
+-  end # IOExtras namespace module
++  end
+ end
+ 
+ require 'zip/ioextras/abstract_input_stream'
+diff --git a/lib/zip/legacy_arguments.rb b/lib/zip/legacy_arguments.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4f1f5d7b8eed9b8121e1dfe0119a87322ef5d6d
+--- /dev/null
++++ b/lib/zip/legacy_arguments.rb
+@@ -0,0 +1,128 @@
++# frozen_string_literal: true
++
++module Zip
++  module LegacyArguments
++    def self.options(values, names, keywords)
++      raise ArgumentError, 'too many positional arguments' if values.length > names.length
++
++      names.zip(values).first(values.length).to_h.merge(keywords)
++    end
++
++    module Archive
++      def initialize(path, *legacy, **keywords)
++        options = legacy.length == 3 ? legacy.pop.dup : {}
++        super(path, **LegacyArguments.options(legacy, [:create, :buffer], options.merge(keywords)))
++      end
++
++      def get_output_stream(entry, *legacy, **keywords, &block)
++        names = [:permissions, :comment, :extra, :compressed_size, :crc, :compression_method, :size, :time]
++        options = LegacyArguments.options(legacy, names, keywords).reject { |_, value| value.nil? }
++        super(entry, **options, &block)
++      end
++
++      def extract(entry, path = nil, **keywords, &block)
++        if path && !keywords.key?(:destination_directory)
++          absolute = ::File.expand_path(path)
++          callback = block && proc { |existing, _destination| block.call(existing, path) }
++          return super(entry, ::File.basename(absolute), destination_directory: ::File.dirname(absolute), &callback)
++        end
++        super(entry, path, **keywords, &block)
++      end
++    end
++
++    module ArchiveClass
++      def split(path, *legacy, **keywords)
++        names = [:segment_size, :delete_original, :partial_zip_file_name]
++        super(path, **LegacyArguments.options(legacy, names, keywords))
++      end
++
++      def open(path, *legacy, **keywords, &block)
++        options = legacy.length == 2 ? legacy.pop.dup : {}
++        super(path, **LegacyArguments.options(legacy, [:create], options.merge(keywords)), &block)
++      end
++
++      def open_buffer(io = ::StringIO.new, *legacy, **keywords, &block)
++        raise ArgumentError, 'too many positional arguments' if legacy.length > 1
++
++        super(io, **(legacy.first || {}).merge(keywords), &block)
++      end
++
++      def add_buffer(&block)
++        open_buffer(::StringIO.new, create: true, &block)
++      end
++    end
++
++    module Input
++      def initialize(context, *legacy, **keywords)
++        super(context, **LegacyArguments.options(legacy, [:offset, :decrypter], keywords))
++      end
++    end
++
++    module InputClass
++      def open(context, *legacy, **keywords, &block)
++        super(context, **LegacyArguments.options(legacy, [:offset, :decrypter], keywords), &block)
++      end
++
++      def open_buffer(context, *legacy, **keywords, &block)
++        super(context, **LegacyArguments.options(legacy, [:offset], keywords), &block)
++      end
++    end
++
++    module Output
++      def initialize(context, *legacy, **keywords)
++        super(context, **LegacyArguments.options(legacy, [:stream, :encrypter], keywords))
++      end
++
++    end
++
++    module OutputClass
++      def open(context, *legacy, **keywords, &block)
++        super(context, **LegacyArguments.options(legacy, [:encrypter], keywords), &block)
++      end
++
++      def write_buffer(context = ::StringIO.new, *legacy, **keywords, &block)
++        super(context, **LegacyArguments.options(legacy, [:encrypter], keywords), &block)
++      end
++    end
++
++    module ArchiveEntry
++      def write_local_entry(io, *legacy, **keywords)
++        super(io, **LegacyArguments.options(legacy, [:rewrite], keywords))
++      end
++
++      def initialize(archive = '', name = '', *legacy, **keywords)
++        names = [:comment, :extra, :compressed_size, :crc, :compression_method, :size, :time]
++        options = LegacyArguments.options(legacy, names, keywords).reject { |_, value| value.nil? }
++        super(archive, name, **options)
++      end
++
++      def extract(path = nil, **keywords, &block)
++        if path && !keywords.key?(:destination_directory)
++          absolute = ::File.expand_path(path)
++          callback = block && proc { |existing, _destination| block.call(existing, path) }
++          return super(::File.basename(absolute), destination_directory: ::File.dirname(absolute), &callback)
++        end
++        super(path || name, **keywords, &block)
++      end
++    end
++  end
++
++  File::CREATE = true
++  File::SPLIT_SIGNATURE = SPLIT_FILE_SIGNATURE
++  class InternalError < Error; end
++  GPFBit3Error = StreamingError
++  DestinationFileExistsError = DestinationExistsError
++  ZipError = Error
++  ZipEntryExistsError = EntryExistsError
++  ZipDestinationFileExistsError = DestinationExistsError
++  ZipCompressionMethodError = CompressionMethodError
++  ZipEntryNameError = EntryNameError
++  ZipInternalError = InternalError
++  File.prepend(LegacyArguments::Archive)
++  File.singleton_class.prepend(LegacyArguments::ArchiveClass)
++  InputStream.prepend(LegacyArguments::Input)
++  InputStream.singleton_class.prepend(LegacyArguments::InputClass)
++  OutputStream.prepend(LegacyArguments::Output)
++  OutputStream.singleton_class.prepend(LegacyArguments::OutputClass)
++  Entry.prepend(LegacyArguments::ArchiveEntry)
++end
+diff --git a/lib/zip/null_compressor.rb b/lib/zip/null_compressor.rb
+index 70fd3294e8992f49618bb6f81e199b7f7a724ead..41da0c61d210d43e681e0ed56180a6b43078da07 100644
+--- a/lib/zip/null_compressor.rb
++++ b/lib/zip/null_compressor.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   class NullCompressor < Compressor #:nodoc:all
+     include Singleton
+diff --git a/lib/zip/null_decompressor.rb b/lib/zip/null_decompressor.rb
+index 1560ef14d5e7d75406d1020b1e26382355a9886e..7b2557d4b51a70f7c68289682519611bdf54f6c1 100644
+--- a/lib/zip/null_decompressor.rb
++++ b/lib/zip/null_decompressor.rb
+@@ -1,19 +1,13 @@
++# frozen_string_literal: true
++
+ module Zip
+   module NullDecompressor #:nodoc:all
+     module_function
+ 
+-    def sysread(_numberOfBytes = nil, _buf = nil)
+-      nil
+-    end
+-
+-    def produce_input
++    def read(_length = nil, _outbuf = nil)
+       nil
+     end
+ 
+-    def input_finished?
+-      true
+-    end
+-
+     def eof
+       true
+     end
+diff --git a/lib/zip/null_input_stream.rb b/lib/zip/null_input_stream.rb
+index 2cd366162d3d901dedef261f26e859326afd554d..69bc38d790183dcc318026b1ffa071a98fc3d902 100644
+--- a/lib/zip/null_input_stream.rb
++++ b/lib/zip/null_input_stream.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module Zip
+   module NullInputStream #:nodoc:all
+     include ::Zip::NullDecompressor
+diff --git a/lib/zip/output_stream.rb b/lib/zip/output_stream.rb
+index d9bbc4df02a1501c5eb1e3590cac89a0e704e00d..0c4e93c8a94d76cd0ec174d32238eaf65f5b523b 100644
+--- a/lib/zip/output_stream.rb
++++ b/lib/zip/output_stream.rb
+@@ -1,3 +1,7 @@
++# frozen_string_literal: true
++
++require 'forwardable'
++
+ module Zip
+   # ZipOutputStream is the basic class for writing zip files. It is
+   # possible to create a ZipOutputStream object directly, passing
+@@ -18,46 +22,48 @@ module Zip
+   # class.
+ 
+   class OutputStream
++    extend Forwardable
+     include ::Zip::IOExtras::AbstractOutputStream
+ 
+-    attr_accessor :comment
++    def_delegators :@cdir, :comment, :comment=
+ 
+     # Opens the indicated zip file. If a file with that name already
+     # exists it will be overwritten.
+-    def initialize(file_name, stream = false, encrypter = nil)
++    def initialize(file_name, stream: false, encrypter: nil)
+       super()
+       @file_name = file_name
+       @output_stream = if stream
+-                         iostream = @file_name.dup
++                         iostream = Zip::RUNNING_ON_WINDOWS ? @file_name : @file_name.dup
+                          iostream.reopen(@file_name)
+                          iostream.rewind
+                          iostream
+                        else
+                          ::File.new(@file_name, 'wb')
+                        end
+-      @entry_set = ::Zip::EntrySet.new
++      @cdir = ::Zip::CentralDirectory.new
+       @compressor = ::Zip::NullCompressor.instance
+       @encrypter = encrypter || ::Zip::NullEncrypter.new
+       @closed = false
+       @current_entry = nil
+-      @comment = nil
+     end
+ 
+     # Same as #initialize but if a block is passed the opened
+     # stream is passed to the block and closed when the block
+     # returns.
+     class << self
+-      def open(file_name, encrypter = nil)
++      def open(file_name, encrypter: nil)
+         return new(file_name) unless block_given?
+-        zos = new(file_name, false, encrypter)
++
++        zos = new(file_name, stream: false, encrypter: encrypter)
+         yield zos
+       ensure
+         zos.close if zos
+       end
+ 
+       # Same as #open but writes to a filestream instead
+-      def write_buffer(io = ::StringIO.new(''), encrypter = nil)
+-        zos = new(io, true, encrypter)
++      def write_buffer(io = ::StringIO.new, encrypter: nil)
++        io.binmode if io.respond_to?(:binmode)
++        zos = new(io, stream: true, encrypter: encrypter)
+         yield zos
+         zos.close_buffer
+       end
+@@ -66,9 +72,10 @@ module Zip
+     # Closes the stream and writes the central directory to the zip file
+     def close
+       return if @closed
++
+       finalize_current_entry
+       update_local_headers
+-      write_central_directory
++      @cdir.write_to_stream(@output_stream)
+       @output_stream.close
+       @closed = true
+     end
+@@ -76,37 +83,44 @@ module Zip
+     # Closes the stream and writes the central directory to the zip file
+     def close_buffer
+       return @output_stream if @closed
++
+       finalize_current_entry
+       update_local_headers
+-      write_central_directory
++      @cdir.write_to_stream(@output_stream)
+       @closed = true
++      @output_stream.flush
+       @output_stream
+     end
+ 
+     # Closes the current entry and opens a new for writing.
+     # +entry+ can be a ZipEntry object or a string.
+-    def put_next_entry(entry_name, comment = nil, extra = nil, compression_method = Entry::DEFLATED, level = Zip.default_compression)
++    def put_next_entry(
++      entry_name, comment = '', extra = ExtraField.new,
++      compression_method = Entry::DEFLATED, level = Zip.default_compression
++    )
+       raise Error, 'zip stream is closed' if @closed
+-      new_entry = if entry_name.kind_of?(Entry)
+-                    entry_name
+-                  else
+-                    Entry.new(@file_name, entry_name.to_s)
+-                  end
+-      new_entry.comment = comment unless comment.nil?
+-      unless extra.nil?
+-        new_entry.extra = extra.is_a?(ExtraField) ? extra : ExtraField.new(extra.to_s)
+-      end
+-      new_entry.compression_method = compression_method unless compression_method.nil?
+-      init_next_entry(new_entry, level)
++
++      new_entry =
++        if entry_name.kind_of?(Entry) || entry_name.kind_of?(StreamableStream)
++          entry_name
++        else
++          Entry.new(
++            @file_name, entry_name.to_s, comment: comment, extra: extra,
++            compression_method: compression_method, compression_level: level
++          )
++        end
++
++      init_next_entry(new_entry)
+       @current_entry = new_entry
+     end
+ 
+     def copy_raw_entry(entry)
+       entry = entry.dup
+       raise Error, 'zip stream is closed' if @closed
+-      raise Error, 'entry is not a ZipEntry' unless entry.is_a?(Entry)
++      raise Error, 'entry is not a ZipEntry' unless entry.kind_of?(Entry)
++
+       finalize_current_entry
+-      @entry_set << entry
++      @cdir << entry
+       src_pos = entry.local_header_offset
+       entry.write_local_entry(@output_stream)
+       @compressor = NullCompressor.instance
+@@ -123,51 +137,52 @@ module Zip
+ 
+     def finalize_current_entry
+       return unless @current_entry
++
+       finish
+-      @current_entry.compressed_size = @output_stream.tell - @current_entry.local_header_offset - @current_entry.calculate_local_header_size
++      @current_entry.compressed_size = @output_stream.tell - \
++                                       @current_entry.local_header_offset - \
++                                       @current_entry.calculate_local_header_size
+       @current_entry.size = @compressor.size
+       @current_entry.crc = @compressor.crc
+-      @output_stream << @encrypter.data_descriptor(@current_entry.crc, @current_entry.compressed_size, @current_entry.size)
++      @output_stream << @encrypter.data_descriptor(
++        @current_entry.crc,
++        @current_entry.compressed_size,
++        @current_entry.size
++      )
+       @current_entry.gp_flags |= @encrypter.gp_flags
+       @current_entry = nil
+       @compressor = ::Zip::NullCompressor.instance
+     end
+ 
+-    def init_next_entry(entry, level = Zip.default_compression)
++    def init_next_entry(entry)
+       finalize_current_entry
+-      @entry_set << entry
++      @cdir << entry
+       entry.write_local_entry(@output_stream)
+       @encrypter.reset!
+       @output_stream << @encrypter.header(entry.mtime)
+-      @compressor = get_compressor(entry, level)
++      @compressor = get_compressor(entry)
+     end
+ 
+-    def get_compressor(entry, level)
++    def get_compressor(entry)
+       case entry.compression_method
+-      when Entry::DEFLATED then
+-        ::Zip::Deflater.new(@output_stream, level, @encrypter)
+-      when Entry::STORED then
++      when Entry::DEFLATED
++        ::Zip::Deflater.new(@output_stream, entry.compression_level, @encrypter)
++      when Entry::STORED
+         ::Zip::PassThruCompressor.new(@output_stream)
+       else
+-        raise ::Zip::CompressionMethodError,
+-              "Invalid compression method: '#{entry.compression_method}'"
++        raise ::Zip::CompressionMethodError, entry.compression_method
+       end
+     end
+ 
+     def update_local_headers
+       pos = @output_stream.pos
+-      @entry_set.each do |entry|
++      @cdir.each do |entry|
+         @output_stream.pos = entry.local_header_offset
+-        entry.write_local_entry(@output_stream, true)
++        entry.write_local_entry(@output_stream, rewrite: true)
+       end
+       @output_stream.pos = pos
+     end
+ 
+-    def write_central_directory
+-      cdir = CentralDirectory.new(@entry_set, @comment)
+-      cdir.write_to_stream(@output_stream)
+-    end
+-
+     protected
+ 
+     def finish
+diff --git a/lib/zip/pass_thru_compressor.rb b/lib/zip/pass_thru_compressor.rb
+index fdca2481ebbc860e2d6fd574603b2c83073698d7..484d0da1883ce7be0f36f8a00cc8760753bd72c5 100644
+--- a/lib/zip/pass_thru_compressor.rb
++++ b/lib/zip/pass_thru_compressor.rb
+@@ -1,8 +1,10 @@
++# frozen_string_literal: true
++
+ module Zip
+   class PassThruCompressor < Compressor #:nodoc:all
+-    def initialize(outputStream)
++    def initialize(output_stream)
+       super()
+-      @output_stream = outputStream
++      @output_stream = output_stream
+       @crc = Zlib.crc32
+       @size = 0
+     end
+diff --git a/lib/zip/pass_thru_decompressor.rb b/lib/zip/pass_thru_decompressor.rb
+index 485462c5815e725127089f55e802cc6bde35ff7d..12eefe896ef83bf816eaea6e0d81c3a86eb626ea 100644
+--- a/lib/zip/pass_thru_decompressor.rb
++++ b/lib/zip/pass_thru_decompressor.rb
+@@ -1,38 +1,37 @@
++# frozen_string_literal: true
++
+ module Zip
+   class PassThruDecompressor < Decompressor #:nodoc:all
+-    def initialize(input_stream, chars_to_read)
+-      super(input_stream)
+-      @chars_to_read = chars_to_read
++    def initialize(*args)
++      super
+       @read_so_far = 0
+-      @has_returned_empty_string = false
+     end
+ 
+-    def sysread(number_of_bytes = nil, buf = '')
+-      if input_finished?
+-        has_returned_empty_string_val = @has_returned_empty_string
+-        @has_returned_empty_string = true
+-        return '' unless has_returned_empty_string_val
+-        return
+-      end
++    def read(length = nil, outbuf = +'')
++      return (length.nil? || length.zero? ? '' : nil) if eof
+ 
+-      if number_of_bytes.nil? || @read_so_far + number_of_bytes > @chars_to_read
+-        number_of_bytes = @chars_to_read - @read_so_far
++      if length.nil? || (@read_so_far + length) > decompressed_size
++        length = decompressed_size - @read_so_far
+       end
+-      @read_so_far += number_of_bytes
+-      @input_stream.read(number_of_bytes, buf)
+-    end
+ 
+-    def produce_input
+-      sysread(::Zip::Decompressor::CHUNK_SIZE)
++      @read_so_far += length
++      input_stream.read(length, outbuf)
+     end
+ 
+-    def input_finished?
+-      @read_so_far >= @chars_to_read
++    def eof
++      @read_so_far >= decompressed_size
+     end
+ 
+-    alias eof input_finished?
+-    alias eof? input_finished?
++    alias eof? eof
++    alias input_finished? eof
++    alias sysread read
++
++    def produce_input
++      read(CHUNK_SIZE)
++    end
+   end
++
++  ::Zip::Decompressor.register(::Zip::COMPRESSION_METHOD_STORE, ::Zip::PassThruDecompressor)
+ end
+ 
+ # Copyright (C) 2002, 2003 Thomas Sondergaard
+diff --git a/lib/zip/streamable_directory.rb b/lib/zip/streamable_directory.rb
+index 4560663cb65236889e1221058b467c4f18fe7bc4..a3c7c93bf90000558b44c6c35b1e4119b4431f5d 100644
+--- a/lib/zip/streamable_directory.rb
++++ b/lib/zip/streamable_directory.rb
+@@ -1,11 +1,13 @@
++# frozen_string_literal: true
++
+ module Zip
+   class StreamableDirectory < Entry
+-    def initialize(zipfile, entry, srcPath = nil, permissionInt = nil)
++    def initialize(zipfile, entry, src_path = nil, permission = nil)
+       super(zipfile, entry)
+ 
+       @ftype = :directory
+-      entry.get_extra_attributes_from_path(srcPath) if srcPath
+-      @unix_perms = permissionInt if permissionInt
++      entry.get_extra_attributes_from_path(src_path) if src_path
++      @unix_perms = permission if permission
+     end
+   end
+ end
+diff --git a/lib/zip/streamable_stream.rb b/lib/zip/streamable_stream.rb
+index 642ddae2d213235833e707c86d8e3941f6fbff14..2fea80c76be0fe6f73dd314b1bb738642a615396 100644
+--- a/lib/zip/streamable_stream.rb
++++ b/lib/zip/streamable_stream.rb
+@@ -1,5 +1,7 @@
++# frozen_string_literal: true
++
+ module Zip
+-  class StreamableStream < DelegateClass(Entry) # nodoc:all
++  class StreamableStream < DelegateClass(Entry) # :nodoc:all
+     def initialize(entry)
+       super(entry)
+       @temp_file = Tempfile.new(::File.basename(name))
+@@ -22,6 +24,7 @@ module Zip
+       unless @temp_file.closed?
+         raise StandardError, "cannot open entry for reading while its open for writing - #{name}"
+       end
++
+       @temp_file.open # reopens tempfile from top
+       @temp_file.binmode
+       if block_given?
+@@ -35,12 +38,13 @@ module Zip
+       end
+     end
+ 
+-    def write_to_zip_output_stream(aZipOutputStream)
+-      aZipOutputStream.put_next_entry(self)
+-      get_input_stream { |is| ::Zip::IOExtras.copy_stream(aZipOutputStream, is) }
++    def write_to_zip_output_stream(output_stream)
++      output_stream.put_next_entry(self)
++      get_input_stream { |is| ::Zip::IOExtras.copy_stream(output_stream, is) }
+     end
+ 
+     def clean_up
++      super
+       @temp_file.unlink
+     end
+   end
+diff --git a/lib/zip.rb b/lib/zip.rb
+index fa382376f384951e9e56fc4d92c01da66214a58e..654c42ea57a84272b8d04b5012dd3969d6e00dc6 100644
+--- a/lib/zip.rb
++++ b/lib/zip.rb
+@@ -1,9 +1,13 @@
++# frozen_string_literal: true
++
++require 'English'
+ require 'delegate'
+ require 'singleton'
+ require 'tempfile'
+ require 'fileutils'
+ require 'stringio'
+ require 'zlib'
++require 'zip/constants'
+ require 'zip/dos_time'
+ require 'zip/ioextras'
+ require 'rbconfig'
+@@ -21,6 +25,7 @@ require 'zip/null_compressor'
+ require 'zip/null_input_stream'
+ require 'zip/pass_thru_compressor'
+ require 'zip/pass_thru_decompressor'
++require 'zip/crypto/decrypted_io'
+ require 'zip/crypto/encryption'
+ require 'zip/crypto/null_encryption'
+ require 'zip/crypto/traditional_encryption'
+@@ -28,7 +33,6 @@ require 'zip/inflater'
+ require 'zip/deflater'
+ require 'zip/streamable_stream'
+ require 'zip/streamable_directory'
+-require 'zip/constants'
+ require 'zip/errors'
+ 
+ module Zip
+@@ -44,6 +48,12 @@ module Zip
+                 :force_entry_names_encoding,
+                 :validate_entry_sizes
+ 
++  DEFAULT_RESTORE_OPTIONS = {
++    restore_ownership:   false,
++    restore_permissions: true,
++    restore_times:       true
++  }.freeze
++
+   def reset!
+     @_ran_once = false
+     @unicode_names = false
+@@ -51,9 +61,10 @@ module Zip
+     @continue_on_exists_proc = false
+     @sort_entries = false
+     @default_compression = ::Zlib::DEFAULT_COMPRESSION
+-    @write_zip64_support = false
++    @write_zip64_support = true
+     @warn_invalid_date = true
+     @case_insensitive_match = false
++    @force_entry_names_encoding = nil
+     @validate_entry_sizes = true
+   end
+ 
+@@ -65,6 +76,8 @@ module Zip
+   reset!
+ end
+ 
++require_relative 'zip/legacy_arguments'
++
+ # Copyright (C) 2002, 2003 Thomas Sondergaard
+ # rubyzip is free software; you can redistribute it and/or
+ # modify it under the terms of the ruby license.

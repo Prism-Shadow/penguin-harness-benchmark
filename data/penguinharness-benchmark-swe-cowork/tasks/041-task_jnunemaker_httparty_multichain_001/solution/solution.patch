@@ -1,0 +1,3118 @@
+diff --git a/bin/httparty b/bin/httparty
+index fde49f206f9bc7e3bd2796e23800c40c32ee567a..3bdb86fccfb7f9f963c7892f64495cf5c107aa9d 100755
+--- a/bin/httparty
++++ b/bin/httparty
+@@ -3,7 +3,7 @@
+ require "optparse"
+ require "pp"
+ 
+-$:.unshift(File.join(File.dirname(__FILE__), "/../lib"))
++$LOAD_PATH.unshift(File.join(File.dirname(__FILE__), "/../lib"))
+ require "httparty"
+ 
+ opts = {
+@@ -13,11 +13,11 @@ opts = {
+ }
+ 
+ OptionParser.new do |o|
+-  o.banner = "USAGE: #{$0} [options] [url]"
++  o.banner = "USAGE: #{$PROGRAM_NAME} [options] [url]"
+ 
+   o.on("-f",
+        "--format [FORMAT]",
+-       "Output format to use instead of pretty-print ruby: " +
++       "Output format to use instead of pretty-print ruby: " \
+        "plain, csv, json or xml") do |f|
+     opts[:output_format] = f.downcase.to_sym
+   end
+@@ -62,18 +62,22 @@ OptionParser.new do |o|
+     puts o
+     exit
+   end
+-end.parse!
+ 
++  o.on("--version", "Show HTTParty version") do |ver|
++    puts "Version: #{HTTParty::VERSION}"
++    exit
++  end
++end.parse!
+ 
+ if ARGV.empty?
+   STDERR.puts "You need to provide a URL"
+-  STDERR.puts "USAGE: #{$0} [options] [url]"
++  STDERR.puts "USAGE: #{$PROGRAM_NAME} [options] [url]"
+ end
+ 
+ def dump_headers(response)
+   resp_type = Net::HTTPResponse::CODE_TO_OBJ[response.code.to_s]
+   puts "#{response.code} #{resp_type.to_s.sub(/^Net::HTTP/, '')}"
+-  response.headers.each do |n,v|
++  response.headers.each do |n, v|
+     puts "#{n}: #{v}"
+   end
+   puts
+@@ -81,7 +85,7 @@ end
+ 
+ if opts[:verbose]
+   puts "#{opts[:action].to_s.upcase} #{ARGV.first}"
+-  opts[:headers].each do |n,v|
++  opts[:headers].each do |n, v|
+     puts "#{n}: #{v}"
+   end
+   puts
+@@ -99,9 +103,11 @@ else
+     when :json
+       begin
+         require 'json'
+-        puts JSON.pretty_generate(response.delegate)
++        puts JSON.pretty_generate(response.parsed_response)
+       rescue LoadError
+-        puts YAML.dump(response.delegate)
++        puts YAML.dump(response)
++      rescue JSON::JSONError
++        puts response.inspect
+       end
+     when :xml
+       require 'rexml/document'
+@@ -109,7 +115,7 @@ else
+       puts
+     when :csv
+       require 'csv'
+-      puts CSV.parse(response.body).map{|row| row.to_s }
++      puts CSV.parse(response.body).map(&:to_s)
+     else
+       puts response
+   end
+diff --git a/httparty.gemspec b/httparty.gemspec
+index b7987d6cc28c728a8a104536965ea7d18178e03c..27866b86c76aa9acdc61f32ed335608a24c19c28 100644
+--- a/httparty.gemspec
++++ b/httparty.gemspec
+@@ -15,8 +15,9 @@ Gem::Specification.new do |s|
+ 
+   s.required_ruby_version     = '>= 1.9.3'
+ 
+-  s.add_dependency 'json',      "~> 1.8"
++  s.add_dependency 'json',      '>= 1.8'
+   s.add_dependency 'multi_xml', ">= 0.5.2"
++  s.add_dependency 'mini_mime', '~> 1.1'
+ 
+   # If this line is removed, all hard partying will cease.
+   s.post_install_message = "When you HTTParty, you must party hard!"
+diff --git a/lib/httparty.rb b/lib/httparty.rb
+index 8b49c584489d5e430dfb11d633567d1dd51ca784..88c10fd2bc92932472301e57dbc176e1d10a0cf6 100644
+--- a/lib/httparty.rb
++++ b/lib/httparty.rb
+@@ -1,11 +1,8 @@
++# frozen_string_literal: true
++
+ require 'pathname'
+ require 'net/http'
+-require 'net/https'
+ require 'uri'
+-require 'zlib'
+-require 'multi_xml'
+-require 'json'
+-require 'csv'
+ 
+ require 'httparty/module_inheritable_attributes'
+ require 'httparty/cookie_hash'
+@@ -13,6 +10,11 @@ require 'httparty/net_digest_auth'
+ require 'httparty/version'
+ require 'httparty/connection_adapter'
+ require 'httparty/logger/logger'
++require 'httparty/request/body'
++require 'httparty/response_fragment'
++require 'httparty/decompressor'
++require 'httparty/text_encoder'
++require 'httparty/headers_processor'
+ 
+ # @see HTTParty::ClassMethods
+ module HTTParty
+@@ -31,26 +33,29 @@ module HTTParty
+ 
+   def self.included(base)
+     base.extend ClassMethods
+-    base.send :include, HTTParty::ModuleInheritableAttributes
++    base.send :include, ModuleInheritableAttributes
+     base.send(:mattr_inheritable, :default_options)
+     base.send(:mattr_inheritable, :default_cookies)
+-    base.instance_variable_set("@default_options", {})
+-    base.instance_variable_set("@default_cookies", CookieHash.new)
++    base.instance_variable_set(:@default_options, {})
++    base.instance_variable_set(:@default_cookies, CookieHash.new)
+   end
+ 
+   # == Common Request Options
+   # Request methods (get, post, patch, put, delete, head, options) all take a common set of options. These are:
+   #
+-  # [:+body+:] Body of the request. If passed a Hash, will try to normalize it first, by default passing it to ActiveSupport::to_params. Any other kind of object will get used as-is.
++  # [:+body+:] Body of the request. If passed an object that responds to #to_hash, will try to normalize it first, by default passing it to ActiveSupport::to_params. Any other kind of object will get used as-is.
+   # [:+http_proxyaddr+:] Address of proxy server to use.
+   # [:+http_proxyport+:]  Port of proxy server to use.
+   # [:+http_proxyuser+:] User for proxy server authentication.
+   # [:+http_proxypass+:] Password for proxy server authentication.
+   # [:+limit+:] Maximum number of redirects to follow. Takes precedences over :+no_follow+.
+-  # [:+query+:] Query string, or a Hash representing it. Normalized according to the same rules as :+body+. If you specify this on a POST, you must use a Hash. See also HTTParty::ClassMethods.default_params.
++  # [:+query+:] Query string, or an object that responds to #to_hash representing it. Normalized according to the same rules as :+body+. If you specify this on a POST, you must use an object which responds to #to_hash. See also HTTParty::ClassMethods.default_params.
+   # [:+timeout+:] Timeout for opening connection and reading data.
+-  # [:+local_host:] Local address to bind to before connecting.
+-  # [:+local_port:] Local port to bind to before connecting.
++  # [:+local_host+:] Local address to bind to before connecting.
++  # [:+local_port+:] Local port to bind to before connecting.
++  # [:+body_stream+:] Allow streaming to a REST server to specify a body_stream.
++  # [:+stream_body+:] Allow for streaming large files without loading them into memory.
++  # [:+multipart+:] Force content-type to be multipart
+   #
+   # There are also another set of options with names corresponding to various class methods. The methods in question are those that let you set a class-wide default, and the options override the defaults on a request-by-request basis. Those options are:
+   # * :+base_uri+: see HTTParty::ClassMethods.base_uri.
+@@ -58,10 +63,11 @@ module HTTParty
+   # * :+debug_output+: see HTTParty::ClassMethods.debug_output.
+   # * :+digest_auth+: see HTTParty::ClassMethods.digest_auth. Only one of :+basic_auth+ and :+digest_auth+ can be used at a time; if you try using both, you'll get an ArgumentError.
+   # * :+format+: see HTTParty::ClassMethods.format.
+-  # * :+headers+: see HTTParty::ClassMethods.headers. Must be a Hash.
++  # * :+headers+: see HTTParty::ClassMethods.headers. Must be a an object which responds to #to_hash.
+   # * :+maintain_method_across_redirects+: see HTTParty::ClassMethods.maintain_method_across_redirects.
+   # * :+no_follow+: see HTTParty::ClassMethods.no_follow.
+   # * :+parser+: see HTTParty::ClassMethods.parser.
++  # * :+uri_adapter+: see HTTParty::ClassMethods.uri_adapter
+   # * :+connection_adapter+: see HTTParty::ClassMethods.connection_adapter.
+   # * :+pem+: see HTTParty::ClassMethods.pem.
+   # * :+query_string_normalizer+: see HTTParty::ClassMethods.query_string_normalizer
+@@ -69,8 +75,16 @@ module HTTParty
+   # * :+ssl_ca_path+: see HTTParty::ClassMethods.ssl_ca_path.
+ 
+   module ClassMethods
+-
+     extend AllowedFormatsDeprecation
++    # Turns on or off the foul option.
++    #
++    #   class Foo
++    #     include HTTParty
++    #     foul true
++    #   end
++    def foul(bool)
++      default_options[:foul] = bool
++    end
+ 
+     # Turns on logging
+     #
+@@ -78,19 +92,29 @@ module HTTParty
+     #     include HTTParty
+     #     logger Logger.new('http_logger'), :info, :apache
+     #   end
+-    def logger(logger, level=:info, format=:apache)
++    def logger(logger, level = :info, format = :apache)
+       default_options[:logger]     = logger
+       default_options[:log_level]  = level
+       default_options[:log_format] = format
+     end
+ 
++    # Raises HTTParty::ResponseError if response's code matches this statuses
++    #
++    #   class Foo
++    #     include HTTParty
++    #     raise_on [404, 500, '5[0-9]*']
++    #   end
++    def raise_on(codes = [])
++      default_options[:raise_on] = *codes
++    end
++
+     # Allows setting http proxy information to be used
+     #
+     #   class Foo
+     #     include HTTParty
+     #     http_proxy 'http://foo.com', 80, 'user', 'pass'
+     #   end
+-    def http_proxy(addr=nil, port=nil, user=nil, pass=nil)
++    def http_proxy(addr = nil, port = nil, user = nil, pass = nil)
+       default_options[:http_proxyaddr] = addr
+       default_options[:http_proxyport] = port
+       default_options[:http_proxyuser] = user
+@@ -104,7 +128,7 @@ module HTTParty
+     #     include HTTParty
+     #     base_uri 'twitter.com'
+     #   end
+-    def base_uri(uri=nil)
++    def base_uri(uri = nil)
+       return default_options[:base_uri] unless uri
+       default_options[:base_uri] = HTTParty.normalize_base_uri(uri)
+     end
+@@ -130,7 +154,7 @@ module HTTParty
+     end
+ 
+     # Do not send rails style query strings.
+-    # Specically, don't use bracket notation when sending an array
++    # Specifically, don't use bracket notation when sending an array
+     #
+     # For a query:
+     #   get '/', query: {selected_ids: [1,2,3]}
+@@ -158,8 +182,8 @@ module HTTParty
+     #     include HTTParty
+     #     default_params api_key: 'secret', another: 'foo'
+     #   end
+-    def default_params(h={})
+-      raise ArgumentError, 'Default params must be a hash' unless h.is_a?(Hash)
++    def default_params(h = {})
++      raise ArgumentError, 'Default params must be an object which responds to #to_hash' unless h.respond_to?(:to_hash)
+       default_options[:default_params] ||= {}
+       default_options[:default_params].merge!(h)
+     end
+@@ -171,9 +195,9 @@ module HTTParty
+     #     include HTTParty
+     #     default_timeout 10
+     #   end
+-    def default_timeout(t)
+-      raise ArgumentError, 'Timeout must be an integer or float' unless t && (t.is_a?(Integer) || t.is_a?(Float))
+-      default_options[:timeout] = t
++    def default_timeout(value)
++      validate_timeout_argument(__method__, value)
++      default_options[:timeout] = value
+     end
+ 
+     # Allows setting a default open_timeout for all HTTP calls in seconds
+@@ -182,9 +206,9 @@ module HTTParty
+     #     include HTTParty
+     #     open_timeout 10
+     #   end
+-    def open_timeout(t)
+-      raise ArgumentError, 'open_timeout must be an integer or float' unless t && (t.is_a?(Integer) || t.is_a?(Float))
+-      default_options[:open_timeout] = t
++    def open_timeout(value)
++      validate_timeout_argument(__method__, value)
++      default_options[:open_timeout] = value
+     end
+ 
+     # Allows setting a default read_timeout for all HTTP calls in seconds
+@@ -193,11 +217,24 @@ module HTTParty
+     #     include HTTParty
+     #     read_timeout 10
+     #   end
+-    def read_timeout(t)
+-      raise ArgumentError, 'read_timeout must be an integer or float' unless t && (t.is_a?(Integer) || t.is_a?(Float))
+-      default_options[:read_timeout] = t
++    def read_timeout(value)
++      validate_timeout_argument(__method__, value)
++      default_options[:read_timeout] = value
+     end
+ 
++    # Allows setting a default write_timeout for all HTTP calls in seconds
++    # Supported by Ruby > 2.6.0
++    #
++    #   class Foo
++    #     include HTTParty
++    #     write_timeout 10
++    #   end
++    def write_timeout(value)
++      validate_timeout_argument(__method__, value)
++      default_options[:write_timeout] = value
++    end
++
++
+     # Set an output stream for debugging, defaults to $stderr.
+     # The output stream is passed on to Net::HTTP#set_debug_output.
+     #
+@@ -215,14 +252,18 @@ module HTTParty
+     #     include HTTParty
+     #     headers 'Accept' => 'text/html'
+     #   end
+-    def headers(h={})
+-      raise ArgumentError, 'Headers must be a hash' unless h.is_a?(Hash)
+-      default_options[:headers] ||= {}
+-      default_options[:headers].merge!(h)
++    def headers(h = nil)
++      if h
++        raise ArgumentError, 'Headers must be an object which responds to #to_hash' unless h.respond_to?(:to_hash)
++        default_options[:headers] ||= {}
++        default_options[:headers].merge!(h.to_hash)
++      else
++        default_options[:headers] || {}
++      end
+     end
+ 
+-    def cookies(h={})
+-      raise ArgumentError, 'Cookies must be a hash' unless h.is_a?(Hash)
++    def cookies(h = {})
++      raise ArgumentError, 'Cookies must be an object which responds to #to_hash' unless h.respond_to?(:to_hash)
+       default_cookies.add_cookies(h)
+     end
+ 
+@@ -280,7 +321,9 @@ module HTTParty
+     end
+ 
+     # Declare that you wish to maintain the chosen HTTP method across redirects.
+-    # The default behavior is to follow redirects via the GET method.
++    # The default behavior is to follow redirects via the GET method, except
++    # if you are making a HEAD request, in which case the default is to
++    # follow all redirects with HEAD requests.
+     # If you wish to maintain the original method, you can set this option to true.
+     #
+     # @example
+@@ -294,13 +337,31 @@ module HTTParty
+       default_options[:maintain_method_across_redirects] = value
+     end
+ 
++    # Declare that you wish to resend the full HTTP request across redirects,
++    # even on redirects that should logically become GET requests.
++    # A 303 redirect in HTTP signifies that the redirected url should normally
++    # retrieved using a GET request, for instance, it is the output of a previous
++    # POST. maintain_method_across_redirects respects this behavior, but you
++    # can force HTTParty to resend_on_redirect even on 303 responses.
++    #
++    # @example
++    #   class Foo
++    #     include HTTParty
++    #     base_uri 'http://google.com'
++    #     resend_on_redirect
++    #   end
++
++    def resend_on_redirect(value = true)
++      default_options[:resend_on_redirect] = value
++    end
++
+     # Allows setting a PEM file to be used
+     #
+     #   class Foo
+     #     include HTTParty
+     #     pem File.read('/home/user/my.pem'), "optional password"
+     #   end
+-    def pem(pem_contents, password=nil)
++    def pem(pem_contents, password = nil)
+       default_options[:pem] = pem_contents
+       default_options[:pem_password] = password
+     end
+@@ -359,6 +420,22 @@ module HTTParty
+       default_options[:ssl_version] = version
+     end
+ 
++    # Deactivate automatic decompression of the response body.
++    # This will require you to explicitly handle body decompression
++    # by inspecting the Content-Encoding response header.
++    #
++    # Refer to docs/README.md "HTTP Compression" section for
++    # further details.
++    #
++    # @example
++    #   class Foo
++    #     include HTTParty
++    #     skip_decompression
++    #   end
++    def skip_decompression(value = true)
++      default_options[:skip_decompression] = !!value
++    end
++
+     # Allows setting of SSL ciphers to use.  This only works in Ruby 1.9+.
+     # You can get a list of valid specific ciphers from OpenSSL::Cipher.ciphers.
+     # You also can specify a cipher suite here, listed here at openssl.org:
+@@ -417,6 +494,17 @@ module HTTParty
+       end
+     end
+ 
++    # Allows setting a custom URI adapter.
++    #
++    #   class Foo
++    #     include HTTParty
++    #     uri_adapter Addressable::URI
++    #   end
++    def uri_adapter(uri_adapter)
++      raise ArgumentError, 'The URI adapter should respond to #parse' unless uri_adapter.respond_to?(:parse)
++      default_options[:uri_adapter] = uri_adapter
++    end
++
+     # Allows setting a custom connection_adapter for the http connections
+     #
+     # @example
+@@ -453,7 +541,7 @@ module HTTParty
+     #   # Simple get with full url and query parameters
+     #   # ie: http://foo.com/resource.json?limit=10
+     #   Foo.get('http://foo.com/resource.json', query: {limit: 10})
+-    def get(path, options={}, &block)
++    def get(path, options = {}, &block)
+       perform_request Net::HTTP::Get, path, options, &block
+     end
+ 
+@@ -467,77 +555,99 @@ module HTTParty
+     #   Foo.post('http://foo.com/resources', body: {bar: 'baz'})
+     #
+     #   # Simple post with full url using :query option,
+-    #   # which gets set as form data on the request.
++    #   # which appends the parameters to the URI.
+     #   Foo.post('http://foo.com/resources', query: {bar: 'baz'})
+-    def post(path, options={}, &block)
++    def post(path, options = {}, &block)
+       perform_request Net::HTTP::Post, path, options, &block
+     end
+ 
+     # Perform a PATCH request to a path
+-    def patch(path, options={}, &block)
++    def patch(path, options = {}, &block)
+       perform_request Net::HTTP::Patch, path, options, &block
+     end
+ 
+     # Perform a PUT request to a path
+-    def put(path, options={}, &block)
++    def put(path, options = {}, &block)
+       perform_request Net::HTTP::Put, path, options, &block
+     end
+ 
+     # Perform a DELETE request to a path
+-    def delete(path, options={}, &block)
++    def delete(path, options = {}, &block)
+       perform_request Net::HTTP::Delete, path, options, &block
+     end
+ 
+     # Perform a MOVE request to a path
+-    def move(path, options={}, &block)
++    def move(path, options = {}, &block)
+       perform_request Net::HTTP::Move, path, options, &block
+     end
+ 
+     # Perform a COPY request to a path
+-    def copy(path, options={}, &block)
++    def copy(path, options = {}, &block)
+       perform_request Net::HTTP::Copy, path, options, &block
+     end
+ 
+     # Perform a HEAD request to a path
+-    def head(path, options={}, &block)
++    def head(path, options = {}, &block)
++      options = options.dup
++      ensure_method_maintained_across_redirects options
+       perform_request Net::HTTP::Head, path, options, &block
+     end
+ 
+     # Perform an OPTIONS request to a path
+-    def options(path, options={}, &block)
++    def options(path, options = {}, &block)
+       perform_request Net::HTTP::Options, path, options, &block
+     end
+ 
+-    def default_options #:nodoc:
+-      @default_options
++    # Perform a MKCOL request to a path
++    def mkcol(path, options = {}, &block)
++      perform_request Net::HTTP::Mkcol, path, options, &block
++    end
++
++    def lock(path, options = {}, &block)
++      perform_request Net::HTTP::Lock, path, options, &block
+     end
+ 
++    def unlock(path, options = {}, &block)
++      perform_request Net::HTTP::Unlock, path, options, &block
++    end
++
++    def build_request(http_method, path, options = {})
++      options = ModuleInheritableAttributes.hash_deep_dup(default_options).merge(options)
++      HeadersProcessor.new(headers, options).call
++      process_cookies(options)
++      Request.new(http_method, path, options)
++    end
++
++    attr_reader :default_options
++
+     private
+ 
+-      def perform_request(http_method, path, options, &block) #:nodoc:
+-        options = ModuleInheritableAttributes.hash_deep_dup(default_options).merge(options)
+-        process_headers(options)
+-        process_cookies(options)
+-        Request.new(http_method, path, options).perform(&block)
+-      end
++    def validate_timeout_argument(timeout_type, value)
++      raise ArgumentError, "#{ timeout_type } must be an integer or float" unless value && (value.is_a?(Integer) || value.is_a?(Float))
++    end
+ 
+-      def process_headers(options)
+-        if options[:headers] && headers.any?
+-          options[:headers] = headers.merge(options[:headers])
+-        end
++    def ensure_method_maintained_across_redirects(options)
++      unless options.key?(:maintain_method_across_redirects)
++        options[:maintain_method_across_redirects] = true
+       end
++    end
+ 
+-      def process_cookies(options) #:nodoc:
+-        return unless options[:cookies] || default_cookies.any?
+-        options[:headers] ||= headers.dup
+-        options[:headers]["cookie"] = cookies.merge(options.delete(:cookies) || {}).to_cookie_string
+-      end
++    def perform_request(http_method, path, options, &block) #:nodoc:
++      build_request(http_method, path, options).perform(&block)
++    end
++
++    def process_cookies(options) #:nodoc:
++      return unless options[:cookies] || default_cookies.any?
++      options[:headers] ||= headers.dup
++      options[:headers]['cookie'] = cookies.merge(options.delete(:cookies) || {}).to_cookie_string
++    end
+ 
+-      def validate_format
+-        if format && parser.respond_to?(:supports_format?) && !parser.supports_format?(format)
+-          raise UnsupportedFormat, "'#{format.inspect}' Must be one of: #{parser.supported_formats.map{|f| f.to_s}.sort.join(', ')}"
+-        end
++    def validate_format
++      if format && parser.respond_to?(:supports_format?) && !parser.supports_format?(format)
++        supported_format_names = parser.supported_formats.map(&:to_s).sort.join(', ')
++        raise UnsupportedFormat, "'#{format.inspect}' Must be one of: #{supported_format_names}"
+       end
++    end
+   end
+ 
+   def self.normalize_base_uri(url) #:nodoc:
+@@ -590,10 +700,14 @@ module HTTParty
+   def self.options(*args, &block)
+     Basement.options(*args, &block)
+   end
++
++  def self.build_request(*args, &block)
++    Basement.build_request(*args, &block)
++  end
+ end
+ 
+-require 'httparty/core_extensions'
+ require 'httparty/hash_conversions'
++require 'httparty/utils'
+ require 'httparty/exceptions'
+ require 'httparty/parser'
+ require 'httparty/request'
+diff --git a/lib/httparty/connection_adapter.rb b/lib/httparty/connection_adapter.rb
+index b770352c9ac177701035c7d96ddcd2a25da1133d..89cfb8ac9e33a14625d64578e4a88d3fc4e5b525 100644
+--- a/lib/httparty/connection_adapter.rb
++++ b/lib/httparty/connection_adapter.rb
+@@ -1,10 +1,12 @@
++# frozen_string_literal: true
++
+ module HTTParty
+   # Default connection adapter that returns a new Net::HTTP each time
+   #
+   # == Custom Connection Factories
+   #
+   # If you like to implement your own connection adapter, subclassing
+-  # HTTPParty::ConnectionAdapter will make it easier. Just override
++  # HTTParty::ConnectionAdapter will make it easier. Just override
+   # the #connection method. The uri and options attributes will have
+   # all the info you need to construct your http connection. Whatever
+   # you return from your connection method needs to adhere to the
+@@ -38,61 +40,105 @@ module HTTParty
+   # in the #options attribute. It is up to you to interpret them within your
+   # connection adapter. Take a look at the implementation of
+   # HTTParty::ConnectionAdapter#connection for examples of how they are used.
+-  # Some things that are probably interesting are as follows:
++  # The keys used in options are
+   # * :+timeout+: timeout in seconds
+   # * :+open_timeout+: http connection open_timeout in seconds, overrides timeout if set
+   # * :+read_timeout+: http connection read_timeout in seconds, overrides timeout if set
++  # * :+write_timeout+: http connection write_timeout in seconds, overrides timeout if set (Ruby >= 2.6.0 required)
+   # * :+debug_output+: see HTTParty::ClassMethods.debug_output.
+-  # * :+pem+: contains pem data. see HTTParty::ClassMethods.pem.
++  # * :+cert_store+: contains certificate data. see method 'attach_ssl_certificates'
++  # * :+pem+: contains pem client certificate data. see method 'attach_ssl_certificates'
++  # * :+p12+: contains PKCS12 client client certificate data.  see method 'attach_ssl_certificates'
+   # * :+verify+: verify the server’s certificate against the ca certificate.
+   # * :+verify_peer+: set to false to turn off server verification but still send client certificate
+   # * :+ssl_ca_file+: see HTTParty::ClassMethods.ssl_ca_file.
+   # * :+ssl_ca_path+: see HTTParty::ClassMethods.ssl_ca_path.
++  # * :+ssl_version+: SSL versions to allow. see method 'attach_ssl_certificates'
++  # * :+ciphers+: The list of SSL ciphers to support
+   # * :+connection_adapter_options+: contains the hash you passed to HTTParty.connection_adapter when you configured your connection adapter
+-  class ConnectionAdapter
++  # * :+local_host+: The local address to bind to
++  # * :+local_port+: The local port to bind to
++  # * :+http_proxyaddr+: HTTP Proxy address
++  # * :+http_proxyport+: HTTP Proxy port
++  # * :+http_proxyuser+: HTTP Proxy user
++  # * :+http_proxypass+: HTTP Proxy password
++  #
++  # === Inherited methods
++  # * :+clean_host+: Method used to sanitize host names
+ 
++  class ConnectionAdapter
+     # Private: Regex used to strip brackets from IPv6 URIs.
+     StripIpv6BracketsRegex = /\A\[(.*)\]\z/
+ 
++    OPTION_DEFAULTS = {
++      verify: true,
++      verify_peer: true
++    }
++
+     # Public
+     def self.call(uri, options)
+       new(uri, options).connection
+     end
+ 
++    def self.default_cert_store
++      @default_cert_store ||= OpenSSL::X509::Store.new.tap do |cert_store|
++        cert_store.set_default_paths
++      end
++    end
++
+     attr_reader :uri, :options
+ 
+-    def initialize(uri, options={})
+-      raise ArgumentError, "uri must be a URI, not a #{uri.class}" unless uri.kind_of? URI
++    def initialize(uri, options = {})
++      uri_adapter = options[:uri_adapter] || URI
++      uri_like = uri.respond_to?(:scheme) && uri.respond_to?(:host) && uri.respond_to?(:port)
++      raise ArgumentError, "uri must be a #{uri_adapter} or URI-like object, not a #{uri.class}" unless uri_like
+ 
+       @uri = uri
+-      @options = options
++      @options = OPTION_DEFAULTS.merge(options)
+     end
+ 
+     def connection
+       host = clean_host(uri.host)
+-      if options[:http_proxyaddr]
+-        http = Net::HTTP.new(host, uri.port, options[:http_proxyaddr], options[:http_proxyport], options[:http_proxyuser], options[:http_proxypass])
++      port = uri.port || (uri.scheme == 'https' ? 443 : 80)
++      if options.key?(:http_proxyaddr)
++        http = Net::HTTP.new(
++          host,
++          port,
++          options[:http_proxyaddr],
++          options[:http_proxyport],
++          options[:http_proxyuser],
++          options[:http_proxypass]
++        )
+       else
+-        http = Net::HTTP.new(host, uri.port)
++        http = Net::HTTP.new(host, port)
+       end
+ 
+       http.use_ssl = ssl_implied?(uri)
+ 
+       attach_ssl_certificates(http, options)
+ 
+-      if options[:timeout] && (options[:timeout].is_a?(Integer) || options[:timeout].is_a?(Float))
++      if add_timeout?(options[:timeout])
+         http.open_timeout = options[:timeout]
+         http.read_timeout = options[:timeout]
++        http.write_timeout = options[:timeout]
+       end
+ 
+-      if options[:read_timeout] && (options[:read_timeout].is_a?(Integer) || options[:read_timeout].is_a?(Float))
++      if add_timeout?(options[:read_timeout])
+         http.read_timeout = options[:read_timeout]
+       end
+ 
+-      if options[:open_timeout] && (options[:open_timeout].is_a?(Integer) || options[:open_timeout].is_a?(Float))
++      if add_timeout?(options[:open_timeout])
+         http.open_timeout = options[:open_timeout]
+       end
+ 
++      if add_timeout?(options[:write_timeout])
++        http.write_timeout = options[:write_timeout]
++      end
++
++      if add_max_retries?(options[:max_retries])
++        http.max_retries = options[:max_retries]
++      end
++
+       if options[:debug_output]
+         http.set_debug_output(options[:debug_output])
+       end
+@@ -105,26 +151,26 @@ module HTTParty
+       #
+       # @see https://bugs.ruby-lang.org/issues/6617
+       if options[:local_host]
+-        if RUBY_VERSION >= "2.0.0"
+-          http.local_host = options[:local_host]
+-        else
+-          Kernel.warn("Warning: option :local_host requires Ruby version 2.0 or later")
+-        end
++        http.local_host = options[:local_host]
+       end
+ 
+       if options[:local_port]
+-        if RUBY_VERSION >= "2.0.0"
+-          http.local_port = options[:local_port]
+-        else
+-          Kernel.warn("Warning: option :local_port requires Ruby version 2.0 or later")
+-        end
++        http.local_port = options[:local_port]
+       end
+ 
+-      return http
++      http
+     end
+ 
+     private
+ 
++    def add_timeout?(timeout)
++      timeout && (timeout.is_a?(Integer) || timeout.is_a?(Float))
++    end
++
++    def add_max_retries?(max_retries)
++      max_retries && max_retries.is_a?(Integer) && max_retries >= 0
++    end
++
+     def clean_host(host)
+       strip_ipv6_brackets(host)
+     end
+@@ -134,7 +180,11 @@ module HTTParty
+     end
+ 
+     def ssl_implied?(uri)
+-      uri.port == 443 || uri.instance_of?(URI::HTTPS)
++      uri.port == 443 || uri.scheme == 'https'
++    end
++
++    def verify_ssl_certificate?
++      !(options[:verify] == false || options[:verify_peer] == false)
+     end
+ 
+     def attach_ssl_certificates(http, options)
+@@ -143,20 +193,24 @@ module HTTParty
+           http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+           if options[:cert_store]
+             http.cert_store = options[:cert_store]
++          elsif options[:ssl_ca_file] || options[:ssl_ca_path]
++            http.cert_store = OpenSSL::X509::Store.new.tap do |cert_store|
++              cert_store.set_default_paths
++            end
+           else
+             # Use the default cert store by default, i.e. system ca certs
+-            http.cert_store = OpenSSL::X509::Store.new
+-            http.cert_store.set_default_paths
++            http.cert_store = self.class.default_cert_store
+           end
+         else
+           http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+         end
+ 
+         # Client certificate authentication
++        # Note: options[:pem] must contain the content of a PEM file having the private key appended
+         if options[:pem]
+           http.cert = OpenSSL::X509::Certificate.new(options[:pem])
+-          http.key = OpenSSL::PKey::RSA.new(options[:pem], options[:pem_password])
+-          http.verify_mode = options[:verify_peer] == false ? OpenSSL::SSL::VERIFY_NONE : OpenSSL::SSL::VERIFY_PEER
++          http.key = OpenSSL::PKey.read(options[:pem], options[:pem_password])
++          http.verify_mode = verify_ssl_certificate? ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE
+         end
+ 
+         # PKCS12 client certificate authentication
+@@ -164,7 +218,7 @@ module HTTParty
+           p12 = OpenSSL::PKCS12.new(options[:p12], options[:p12_password])
+           http.cert = p12.certificate
+           http.key = p12.key
+-          http.verify_mode = options[:verify_peer] == false ? OpenSSL::SSL::VERIFY_NONE : OpenSSL::SSL::VERIFY_PEER
++          http.verify_mode = verify_ssl_certificate? ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE
+         end
+ 
+         # SSL certificate authority file and/or directory
+diff --git a/lib/httparty/cookie_hash.rb b/lib/httparty/cookie_hash.rb
+index 674696edf9d19ab62ba76b5002c85483351d9b17..7d33d17b9d4bdead70eef33afdc822c63eead221 100644
+--- a/lib/httparty/cookie_hash.rb
++++ b/lib/httparty/cookie_hash.rb
+@@ -1,15 +1,16 @@
+-class HTTParty::CookieHash < Hash #:nodoc:
++# frozen_string_literal: true
+ 
+-  CLIENT_COOKIES = %w{path expires domain path secure httponly}
++class HTTParty::CookieHash < Hash #:nodoc:
++  CLIENT_COOKIES = %w(path expires domain path secure httponly samesite)
+ 
+-  def add_cookies(value)
+-    case value
++  def add_cookies(data)
++    case data
+     when Hash
+-      merge!(value)
++      merge!(data)
+     when String
+-      value.split('; ').each do |cookie|
+-        array = cookie.split('=',2)
+-        self[array[0].to_sym] = array[1]
++      data.split('; ').each do |cookie|
++        key, value = cookie.split('=', 2)
++        self[key.to_sym] = value if key
+       end
+     else
+       raise "add_cookies only takes a Hash or a String"
+@@ -17,6 +18,6 @@ class HTTParty::CookieHash < Hash #:nodoc:
+   end
+ 
+   def to_cookie_string
+-    delete_if { |k, v| CLIENT_COOKIES.include?(k.to_s.downcase) }.collect { |k, v| "#{k}=#{v}" }.join("; ")
++    select { |k, v| !CLIENT_COOKIES.include?(k.to_s.downcase) }.collect { |k, v| "#{k}=#{v}" }.join('; ')
+   end
+ end
+diff --git a/lib/httparty/core_extensions.rb b/lib/httparty/core_extensions.rb
+deleted file mode 100644
+index b41c00eae8d4ec3d41fab252510e80daaaa66e73..0000000000000000000000000000000000000000
+--- a/lib/httparty/core_extensions.rb
++++ /dev/null
+@@ -1,32 +0,0 @@
+-module HTTParty
+-  if defined?(::BasicObject)
+-    BasicObject = ::BasicObject #:nodoc:
+-  else
+-    class BasicObject #:nodoc:
+-      instance_methods.each { |m| undef_method m unless m =~ /^__|instance_eval/ }
+-    end
+-  end
+-
+-  unless defined?(Net::HTTP::Patch)
+-    class Net::HTTP
+-      def patch(path, data, initheader = nil, dest = nil, &block) #:nodoc:
+-        res = nil
+-        request(Patch.new(path, initheader), data) {|r|
+-          r.read_body dest, &block
+-          res = r
+-        }
+-        unless @newimpl
+-          res.value
+-          return res, res.body
+-        end
+-        res
+-      end
+-
+-      class Patch < Net::HTTPRequest
+-        METHOD = 'PATCH'
+-        REQUEST_HAS_BODY = true
+-        RESPONSE_HAS_BODY = true
+-      end
+-    end
+-  end
+-end
+diff --git a/lib/httparty/decompressor.rb b/lib/httparty/decompressor.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb503cbcc2069ba212ffc269306a4438e4c656ec
+--- /dev/null
++++ b/lib/httparty/decompressor.rb
+@@ -0,0 +1,106 @@
++# frozen_string_literal: true
++
++module HTTParty
++  # Decompresses the response body based on the Content-Encoding header.
++  #
++  # Net::HTTP automatically decompresses Content-Encoding values "gzip" and "deflate".
++  # This class will handle "br" (Brotli) and "compress" (LZW) if the requisite
++  # gems are installed. Otherwise, it returns nil if the body data cannot be
++  # decompressed.
++  #
++  # @abstract Read the HTTP Compression section for more information.
++  class Decompressor
++
++    def self.call(body, encoding)
++      new(body, encoding).decompress
++    end
++
++    # "gzip" and "deflate" are handled by Net::HTTP
++    # hence they do not need to be handled by HTTParty
++    SupportedEncodings = {
++      'none'     => :none,
++      'identity' => :none,
++      'br'       => :brotli,
++      'compress' => :lzw,
++      'zstd'     => :zstd
++    }.freeze
++
++    # The response body of the request
++    # @return [String]
++    attr_reader :body
++
++    # The Content-Encoding algorithm used to encode the body
++    # @return [Symbol] e.g. :gzip
++    attr_reader :encoding
++
++    # @param [String] body - the response body of the request
++    # @param [Symbol] encoding - the Content-Encoding algorithm used to encode the body
++    def initialize(body, encoding)
++      @body = body
++      @encoding = encoding
++    end
++
++    # Perform decompression on the response body
++    # @return [String] the decompressed body
++    # @return [nil] when the response body is nil or cannot decompressed
++    def decompress
++      return nil if body.nil?
++      return body if encoding.nil? || encoding.strip.empty?
++
++      if supports_encoding?
++        decompress_supported_encoding
++      else
++        nil
++      end
++    end
++
++    protected
++
++    def supports_encoding?
++      SupportedEncodings.keys.include?(encoding)
++    end
++
++    def decompress_supported_encoding
++      method = SupportedEncodings[encoding]
++      if respond_to?(method, true)
++        send(method)
++      else
++        raise NotImplementedError, "#{self.class.name} has not implemented a decompression method for #{encoding.inspect} encoding."
++      end
++    end
++
++    def none
++      body
++    end
++
++    def brotli
++      return nil unless defined?(::Brotli)
++      begin
++        ::Brotli.inflate(body)
++      rescue StandardError
++        nil
++      end
++    end
++
++    def lzw
++      begin
++        if defined?(::LZWS::String)
++          ::LZWS::String.decompress(body)
++        elsif defined?(::LZW::Simple)
++          ::LZW::Simple.new.decompress(body)
++        end
++      rescue StandardError
++        nil
++      end
++    end
++
++    def zstd
++      return nil unless defined?(::Zstd)
++      begin
++        ::Zstd.decompress(body)
++      rescue StandardError
++        nil
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/exceptions.rb b/lib/httparty/exceptions.rb
+index 7451c89d0cf749b42ddfd349f862f1be3eb2c040..ee5ea0155b617f6aec8e6d635bfbf99f19bff070 100644
+--- a/lib/httparty/exceptions.rb
++++ b/lib/httparty/exceptions.rb
+@@ -1,16 +1,42 @@
++# frozen_string_literal: true
++
+ module HTTParty
+-  # @abstact Exceptions raised by HTTParty inherit from Error
++  COMMON_NETWORK_ERRORS = [
++    EOFError,
++    Errno::ECONNABORTED,
++    Errno::ECONNREFUSED,
++    Errno::ECONNRESET,
++    Errno::EHOSTUNREACH,
++    Errno::EINVAL,
++    Errno::ENETUNREACH,
++    Errno::ENOTSOCK,
++    Errno::EPIPE,
++    Errno::ETIMEDOUT,
++    Net::HTTPBadResponse,
++    Net::HTTPHeaderSyntaxError,
++    Net::ProtocolError,
++    Net::ReadTimeout,
++    OpenSSL::SSL::SSLError,
++    SocketError,
++    Timeout::Error # Also covers subclasses like Net::OpenTimeout
++  ].freeze
++
++  # @abstract Exceptions raised by HTTParty inherit from Error
+   class Error < StandardError; end
+ 
+-  # Exception raised when you attempt to set a non-existant format
+-  class UnsupportedFormat < Error; end
++  # @abstract Exceptions raised by HTTParty inherit from this because it is funny
++  # and if you don't like fun you should be using a different library.
++  class Foul < Error; end
++
++  # Exception raised when you attempt to set a non-existent format
++  class UnsupportedFormat < Foul; end
+ 
+   # Exception raised when using a URI scheme other than HTTP or HTTPS
+-  class UnsupportedURIScheme < Error; end
++  class UnsupportedURIScheme < Foul; end
+ 
+   # @abstract Exceptions which inherit from ResponseError contain the Net::HTTP
+   # response object accessible via the {#response} method.
+-  class ResponseError < Error
++  class ResponseError < Foul
+     # Returns the response of the last request
+     # @return [Net::HTTPResponse] A subclass of Net::HTTPResponse, e.g.
+     # Net::HTTPOK
+@@ -20,10 +46,21 @@ module HTTParty
+     # @param [Net::HTTPResponse]
+     def initialize(response)
+       @response = response
++      super(response)
+     end
+   end
+ 
+   # Exception that is raised when request has redirected too many times.
+   # Calling {#response} returns the Net:HTTP response object.
+   class RedirectionTooDeep < ResponseError; end
++
++  # Exception that is raised when request redirects and location header is present more than once
++  class DuplicateLocationHeader < ResponseError; end
++
++  # Exception that is raised when common network errors occur.
++  class NetworkError < Foul; end
++
++  # Exception that is raised when an absolute URI is used that doesn't match
++  # the configured base_uri, which could indicate an SSRF attempt.
++  class UnsafeURIError < Foul; end
+ end
+diff --git a/lib/httparty/hash_conversions.rb b/lib/httparty/hash_conversions.rb
+index 1307a4f7814b32c838d787f4b605b227d46a6787..270effe31780307e17cd297f4457cf3894be1638 100644
+--- a/lib/httparty/hash_conversions.rb
++++ b/lib/httparty/hash_conversions.rb
+@@ -1,3 +1,7 @@
++# frozen_string_literal: true
++
++require 'erb'
++
+ module HTTParty
+   module HashConversions
+     # @return <String> This hash as a query string
+@@ -12,9 +16,7 @@ module HTTParty
+     #   }.to_params
+     #     #=> "name=Bob&address[city]=Ruby Central&address[phones][]=111-111-1111&address[phones][]=222-222-2222&address[street]=111 Ruby Ave."
+     def self.to_params(hash)
+-      params = hash.map { |k,v| normalize_param(k,v) }.join
+-      params.chop! # trailing &
+-      params
++      hash.to_hash.map { |k, v| normalize_param(k, v) }.join.chop
+     end
+ 
+     # @param key<Object> The key for the param.
+@@ -24,28 +26,46 @@ module HTTParty
+     #
+     # @example normalize_param(:name, "Bob Jones") #=> "name=Bob%20Jones&"
+     def self.normalize_param(key, value)
+-      param = ''
++      normalized_keys = normalize_keys(key, value)
++
++      normalized_keys.flatten.each_slice(2).inject(''.dup) do |string, (k, v)|
++        string << "#{ERB::Util.url_encode(k)}=#{ERB::Util.url_encode(v.to_s)}&"
++      end
++    end
++
++    def self.normalize_keys(key, value)
+       stack = []
++      normalized_keys = []
+ 
+-      if value.is_a?(Array)
+-        param << value.map { |element| normalize_param("#{key}[]", element) }.join
+-      elsif value.is_a?(Hash)
+-        stack << [key,value]
++      if value.respond_to?(:to_ary)
++        if value.empty?
++          normalized_keys << ["#{key}[]", '']
++        else
++          normalized_keys = value.to_ary.flat_map do |element|
++            normalize_keys("#{key}[]", element)
++          end
++        end
++      elsif value.respond_to?(:to_hash)
++        stack << [key, value.to_hash]
+       else
+-        param << "#{key}=#{URI.encode(value.to_s, Regexp.new("[^#{URI::PATTERN::UNRESERVED}]"))}&"
++        normalized_keys << [key.to_s, value]
+       end
+ 
+       stack.each do |parent, hash|
+-        hash.each do |k, v|
+-          if v.is_a?(Hash)
+-            stack << ["#{parent}[#{k}]", v]
++        hash.each do |child_key, child_value|
++          if child_value.respond_to?(:to_hash)
++            stack << ["#{parent}[#{child_key}]", child_value.to_hash]
++          elsif child_value.respond_to?(:to_ary)
++            child_value.to_ary.each do |v|
++              normalized_keys << normalize_keys("#{parent}[#{child_key}][]", v).flatten
++            end
+           else
+-            param << normalize_param("#{parent}[#{k}]", v)
++            normalized_keys << normalize_keys("#{parent}[#{child_key}]", child_value).flatten
+           end
+         end
+       end
+ 
+-      param
++      normalized_keys
+     end
+   end
+ end
+diff --git a/lib/httparty/headers_processor.rb b/lib/httparty/headers_processor.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..05b82c6a59ed4fb1c43ff19ae9aa149d7554cee5
+--- /dev/null
++++ b/lib/httparty/headers_processor.rb
+@@ -0,0 +1,32 @@
++# frozen_string_literal: true
++
++module HTTParty
++  class HeadersProcessor
++    attr_reader :headers, :options
++
++    def initialize(headers, options)
++      @headers = headers
++      @options = options
++    end
++
++    def call
++      return unless options[:headers]
++
++      options[:headers] = headers.merge(options[:headers]) if headers.any?
++      options[:headers] = Utils.stringify_keys(process_dynamic_headers)
++    end
++
++    private
++
++    def process_dynamic_headers
++      options[:headers].each_with_object({}) do |header, processed_headers|
++        key, value = header
++        processed_headers[key] = if value.respond_to?(:call)
++                                   value.arity == 0 ? value.call : value.call(options)
++                                 else
++                                   value
++                                 end
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/logger/apache_formatter.rb b/lib/httparty/logger/apache_formatter.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e3fe97f19dd5b333222ed814257d66c98152052
+--- /dev/null
++++ b/lib/httparty/logger/apache_formatter.rb
+@@ -0,0 +1,47 @@
++# frozen_string_literal: true
++
++module HTTParty
++  module Logger
++    class ApacheFormatter #:nodoc:
++      TAG_NAME = HTTParty.name
++
++      attr_accessor :level, :logger
++
++      def initialize(logger, level)
++        @logger = logger
++        @level  = level.to_sym
++      end
++
++      def format(request, response)
++        @request = request
++        @response = response
++
++        logger.public_send level, message
++      end
++
++      private
++
++      attr_reader :request, :response
++
++      def message
++        "[#{TAG_NAME}] [#{current_time}] #{response.code} \"#{http_method} #{path}\" #{content_length || '-'} "
++      end
++
++      def current_time
++        Time.now.strftime('%Y-%m-%d %H:%M:%S %z')
++      end
++
++      def http_method
++        request.http_method.name.split('::').last.upcase
++      end
++
++      def path
++        request.path.to_s
++      end
++
++      def content_length
++        response.respond_to?(:headers) ? response.headers['Content-Length'] : response['Content-Length']
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/logger/apache_logger.rb b/lib/httparty/logger/apache_logger.rb
+deleted file mode 100644
+index b18b37bedaf85984589d3906d06b862d213e9d84..0000000000000000000000000000000000000000
+--- a/lib/httparty/logger/apache_logger.rb
++++ /dev/null
+@@ -1,22 +0,0 @@
+-module HTTParty
+-  module Logger
+-    class ApacheLogger #:nodoc:
+-      TAG_NAME = HTTParty.name
+-
+-      attr_accessor :level, :logger, :current_time
+-
+-      def initialize(logger, level)
+-        @logger = logger
+-        @level  = level.to_sym
+-      end
+-
+-      def format(request, response)
+-        current_time   = Time.now.strftime("%Y-%m-%d %H:%M:%S %z")
+-        http_method    = request.http_method.name.split("::").last.upcase
+-        path           = request.path.to_s
+-        content_length = response.respond_to?(:headers) ? response.headers['Content-Length'] : response['Content-Length']
+-        @logger.send @level, "[#{TAG_NAME}] [#{current_time}] #{response.code} \"#{http_method} #{path}\" #{content_length || "-"} "
+-      end
+-    end
+-  end
+-end
+diff --git a/lib/httparty/logger/curl_formatter.rb b/lib/httparty/logger/curl_formatter.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..eee2aad017759c62b08e46a2121beeb06d9cd111
+--- /dev/null
++++ b/lib/httparty/logger/curl_formatter.rb
+@@ -0,0 +1,93 @@
++# frozen_string_literal: true
++
++module HTTParty
++  module Logger
++    class CurlFormatter #:nodoc:
++      TAG_NAME = HTTParty.name
++      OUT      = '>'
++      IN       = '<'
++
++      attr_accessor :level, :logger
++
++      def initialize(logger, level)
++        @logger   = logger
++        @level    = level.to_sym
++        @messages = []
++      end
++
++      def format(request, response)
++        @request  = request
++        @response = response
++
++        log_request
++        log_response
++
++        logger.public_send level, messages.join("\n")
++      end
++
++      private
++
++      attr_reader :request, :response
++      attr_accessor :messages
++
++      def log_request
++        log_url
++        log_headers
++        log_query
++        log OUT, request.raw_body if request.raw_body
++        log OUT
++      end
++
++      def log_response
++        log IN, "HTTP/#{response.http_version} #{response.code}"
++        log_response_headers
++        log IN, "\n#{response.body}"
++        log IN
++      end
++
++      def log_url
++        http_method = request.http_method.name.split('::').last.upcase
++        uri = if request.options[:base_uri]
++                request.options[:base_uri] + request.path.path
++              else
++                request.path.to_s
++              end
++
++        log OUT, "#{http_method} #{uri}"
++      end
++
++      def log_headers
++        return unless request.options[:headers] && request.options[:headers].size > 0
++
++        log OUT, 'Headers: '
++        log_hash request.options[:headers]
++      end
++
++      def log_query
++        return unless request.options[:query]
++
++        log OUT, 'Query: '
++        log_hash request.options[:query]
++      end
++
++      def log_response_headers
++        headers = response.respond_to?(:headers) ? response.headers : response
++        response.each_header do |response_header|
++          log IN, "#{response_header.capitalize}: #{headers[response_header]}"
++        end
++      end
++
++      def log_hash(hash)
++        hash.each { |k, v| log(OUT, "#{k}: #{v}") }
++      end
++
++      def log(direction, line = '')
++        messages << "[#{TAG_NAME}] [#{current_time}] #{direction} #{line}"
++      end
++
++      def current_time
++        Time.now.strftime("%Y-%m-%d %H:%M:%S %z")
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/logger/curl_logger.rb b/lib/httparty/logger/curl_logger.rb
+deleted file mode 100644
+index 526c590d2f9672e5ec7a64026e7d04970ecf7df4..0000000000000000000000000000000000000000
+--- a/lib/httparty/logger/curl_logger.rb
++++ /dev/null
+@@ -1,48 +0,0 @@
+-module HTTParty
+-  module Logger
+-    class CurlLogger #:nodoc:
+-      TAG_NAME = HTTParty.name
+-      OUT = ">"
+-      IN = "<"
+-
+-      attr_accessor :level, :logger, :current_time
+-
+-      def initialize(logger, level)
+-        @logger = logger
+-        @level  = level.to_sym
+-      end
+-
+-      def format(request, response)
+-        messages        = []
+-        time            = Time.now.strftime("%Y-%m-%d %H:%M:%S %z")
+-        http_method     = request.http_method.name.split("::").last.upcase
+-        path            = request.path.to_s
+-
+-        messages << print(time, OUT, "#{http_method} #{path}")
+-
+-        if request.options[:headers] && request.options[:headers].size > 0
+-          request.options[:headers].each do |k, v|
+-            messages << print(time, OUT, "#{k}: #{v}")
+-          end
+-        end
+-
+-        messages << print(time, OUT, request.raw_body)
+-        messages << print(time, OUT, "")
+-        messages << print(time, IN, "HTTP/#{response.http_version} #{response.code}")
+-
+-        headers = response.respond_to?(:headers) ? response.headers : response
+-        response.each_header do |response_header|
+-          messages << print(time, IN, "#{response_header.capitalize}: #{headers[response_header]}")
+-        end
+-
+-        messages << print(time, IN, "\n#{response.body}")
+-
+-        @logger.send @level, messages.join("\n")
+-      end
+-
+-      def print(time, direction, line)
+-        "[#{TAG_NAME}] [#{time}] #{direction} #{line}"
+-      end
+-    end
+-  end
+-end
+diff --git a/lib/httparty/logger/logger.rb b/lib/httparty/logger/logger.rb
+index 36f96fb3ce98a44d763283156435b748cab1f5f5..b1db7826836677137065f481af098a9094eb27c5 100644
+--- a/lib/httparty/logger/logger.rb
++++ b/lib/httparty/logger/logger.rb
+@@ -1,18 +1,30 @@
+-require 'httparty/logger/apache_logger'
+-require 'httparty/logger/curl_logger'
++# frozen_string_literal: true
++
++require 'httparty/logger/apache_formatter'
++require 'httparty/logger/curl_formatter'
++require 'httparty/logger/logstash_formatter'
+ 
+ module HTTParty
+   module Logger
++    def self.formatters
++      @formatters ||= {
++        :curl => Logger::CurlFormatter,
++        :apache => Logger::ApacheFormatter,
++        :logstash => Logger::LogstashFormatter,
++      }
++    end
++
++    def self.add_formatter(name, formatter)
++      raise HTTParty::Error.new("Log Formatter with name #{name} already exists") if formatters.include?(name)
++      formatters.merge!(name.to_sym => formatter)
++    end
++
+     def self.build(logger, level, formatter)
+-      level  ||= :info
+-      format ||= :apache
++      level ||= :info
++      formatter ||= :apache
+ 
+-      case formatter
+-      when :curl
+-        Logger::CurlLogger.new(logger, level)
+-      else
+-        Logger::ApacheLogger.new(logger, level)
+-      end
++      logger_klass = formatters[formatter] || Logger::ApacheFormatter
++      logger_klass.new(logger, level)
+     end
+   end
+ end
+diff --git a/lib/httparty/logger/logstash_formatter.rb b/lib/httparty/logger/logstash_formatter.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd129ec994b5df8f42fef4590973df2c940a1095
+--- /dev/null
++++ b/lib/httparty/logger/logstash_formatter.rb
+@@ -0,0 +1,62 @@
++# frozen_string_literal: true
++
++module HTTParty
++  module Logger
++    class LogstashFormatter #:nodoc:
++      TAG_NAME = HTTParty.name
++
++      attr_accessor :level, :logger
++
++      def initialize(logger, level)
++        @logger = logger
++        @level  = level.to_sym
++      end
++
++      def format(request, response)
++        @request = request
++        @response = response
++
++        logger.public_send level, logstash_message
++      end
++
++      private
++
++      attr_reader :request, :response
++
++      def logstash_message
++        require 'json'
++        {
++          '@timestamp' => current_time,
++          '@version' => 1,
++          'content_length' => content_length || '-',
++          'http_method' => http_method,
++          'message' => message,
++          'path' => path,
++          'response_code' => response.code,
++          'severity' => level,
++          'tags' => [TAG_NAME],
++        }.to_json
++      end
++
++      def message
++        "[#{TAG_NAME}] #{response.code} \"#{http_method} #{path}\" #{content_length || '-'} "
++      end
++
++      def current_time
++        Time.now.strftime('%Y-%m-%d %H:%M:%S %z')
++      end
++
++      def http_method
++        @http_method ||= request.http_method.name.split('::').last.upcase
++      end
++
++      def path
++        @path ||= request.path.to_s
++      end
++
++      def content_length
++        @content_length ||= response.respond_to?(:headers) ? response.headers['Content-Length'] : response['Content-Length']
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/module_inheritable_attributes.rb b/lib/httparty/module_inheritable_attributes.rb
+index c8012d16d00d5b4feb3aed8df5e94bf48ac14e8c..eb841fae4a2d2f76e99306cfcfcaeae38bec88a2 100644
+--- a/lib/httparty/module_inheritable_attributes.rb
++++ b/lib/httparty/module_inheritable_attributes.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module HTTParty
+   module ModuleInheritableAttributes #:nodoc:
+     def self.included(base)
+@@ -9,12 +11,12 @@ module HTTParty
+       duplicate = hash.dup
+ 
+       duplicate.each_pair do |key, value|
+-        duplicate[key] = if value.is_a?(Hash)
+-          hash_deep_dup(value)
++        if value.is_a?(Hash)
++          duplicate[key] = hash_deep_dup(value)
+         elsif value.is_a?(Proc)
+           duplicate[key] = value.dup
+         else
+-          value
++          duplicate[key] = value
+         end
+       end
+ 
+@@ -27,7 +29,7 @@ module HTTParty
+         @mattr_inheritable_attrs += args
+ 
+         args.each do |arg|
+-          module_eval %(class << self; attr_accessor :#{arg} end)
++          singleton_class.attr_accessor(arg)
+         end
+ 
+         @mattr_inheritable_attrs
+@@ -36,18 +38,16 @@ module HTTParty
+       def inherited(subclass)
+         super
+         @mattr_inheritable_attrs.each do |inheritable_attribute|
+-          ivar = "@#{inheritable_attribute}"
++          ivar = :"@#{inheritable_attribute}"
+           subclass.instance_variable_set(ivar, instance_variable_get(ivar).clone)
+ 
+           if instance_variable_get(ivar).respond_to?(:merge)
+-            method = <<-EOM
++            subclass.class_eval <<~RUBY, __FILE__, __LINE__ + 1
+               def self.#{inheritable_attribute}
+                 duplicate = ModuleInheritableAttributes.hash_deep_dup(#{ivar})
+                 #{ivar} = superclass.#{inheritable_attribute}.merge(duplicate)
+               end
+-            EOM
+-
+-            subclass.class_eval method
++            RUBY
+           end
+         end
+       end
+diff --git a/lib/httparty/net_digest_auth.rb b/lib/httparty/net_digest_auth.rb
+index f10e5dc85d5834b1d039c337c14b4de43ad0f93f..f20f7e0f176f95518150bdbf408af37e8ccb4925 100644
+--- a/lib/httparty/net_digest_auth.rb
++++ b/lib/httparty/net_digest_auth.rb
+@@ -1,13 +1,27 @@
++# frozen_string_literal: true
++
+ require 'digest/md5'
+ require 'net/http'
+ 
+ module Net
+   module HTTPHeader
+     def digest_auth(username, password, response)
+-      @header['Authorization'] = DigestAuthenticator.new(username, password,
+-          @method, @path, response).authorization_header
+-    end
++      authenticator = DigestAuthenticator.new(
++        username,
++        password,
++        @method,
++        @path,
++        response
++      )
+ 
++      authenticator.authorization_header.each do |v|
++        add_field('Authorization', v)
++      end
++
++      authenticator.cookie_header.each do |v|
++        add_field('Cookie', v)
++      end
++    end
+ 
+     class DigestAuthenticator
+       def initialize(username, password, method, path, response_header)
+@@ -16,68 +30,98 @@ module Net
+         @method   = method
+         @path     = path
+         @response = parse(response_header)
++        @cookies  = parse_cookies(response_header)
+       end
+ 
+       def authorization_header
+         @cnonce = md5(random)
+         header = [
+-          %Q(Digest username="#{@username}"),
+-          %Q(realm="#{@response['realm']}"),
+-          %Q(nonce="#{@response['nonce']}"),
+-          %Q(uri="#{@path}"),
+-          %Q(response="#{request_digest}"),
++          %(Digest username="#{@username}"),
++          %(realm="#{@response['realm']}"),
++          %(nonce="#{@response['nonce']}"),
++          %(uri="#{@path}"),
++          %(response="#{request_digest}")
+         ]
+ 
++        header << %(algorithm="#{@response['algorithm']}") if algorithm_present?
++
+         if qop_present?
+-          fields = [
+-            %Q(cnonce="#{@cnonce}"),
+-            %Q(qop="#{@response['qop']}"),
+-            %Q(nc=00000001)
+-          ]
+-          fields.each { |field| header << field }
++          header << %(cnonce="#{@cnonce}")
++          header << %(qop="#{@response['qop']}")
++          header << 'nc=00000001'
+         end
+ 
+-        header << %Q(opaque="#{@response['opaque']}") if opaque_present?
++        header << %(opaque="#{@response['opaque']}") if opaque_present?
+         header
+       end
+ 
+-    private
++      def cookie_header
++        @cookies
++      end
++
++      private
+ 
+       def parse(response_header)
+-        response_header['www-authenticate'] =~ /Digest (.*)/
++        header = response_header['www-authenticate']
++
++        header = header.gsub(/qop=(auth(?:-int)?)/, 'qop="\\1"')
++
++        header =~ /Digest (.*)/
+         params = {}
+-        $1.gsub(/(\w+)="(.*?)"/) { params[$1] = $2 }
++        if $1
++          non_quoted = $1.gsub(/(\w+)="(.*?)"/) { params[$1] = $2 }
++          non_quoted.gsub(/(\w+)=([^,]*)/) { params[$1] = $2 }
++        end
+         params
+       end
+ 
++      def parse_cookies(response_header)
++        return [] unless response_header['Set-Cookie']
++
++        response_header['Set-Cookie'].split(';').map(&:strip)
++      end
++
+       def opaque_present?
+-        @response.has_key?('opaque') and not @response['opaque'].empty?
++        @response.key?('opaque') && !@response['opaque'].empty?
+       end
+ 
+       def qop_present?
+-        @response.has_key?('qop') and not @response['qop'].empty?
++        @response.key?('qop') && !@response['qop'].empty?
+       end
+ 
+       def random
+-        "%x" % (Time.now.to_i + rand(65535))
++        format '%x', (Time.now.to_i + rand(65535))
+       end
+ 
+       def request_digest
+         a = [md5(a1), @response['nonce'], md5(a2)]
+-        a.insert(2, "00000001", @cnonce, @response['qop']) if qop_present?
+-        md5(a.join(":"))
++        a.insert(2, '00000001', @cnonce, @response['qop']) if qop_present?
++        md5(a.join(':'))
+       end
+ 
+       def md5(str)
+         Digest::MD5.hexdigest(str)
+       end
+ 
++      def algorithm_present?
++        @response.key?('algorithm') && !@response['algorithm'].empty?
++      end
++
++      def use_md5_sess?
++        algorithm_present? && @response['algorithm'] == 'MD5-sess'
++      end
++
+       def a1
+-        [@username, @response['realm'], @password].join(":")
++        a1_user_realm_pwd =  [@username, @response['realm'], @password].join(':')
++        if use_md5_sess?
++          [ md5(a1_user_realm_pwd), @response['nonce'], @cnonce ].join(':')
++        else
++          a1_user_realm_pwd
++        end
+       end
+ 
+       def a2
+-        [@method, @path].join(":")
++        [@method, @path].join(':')
+       end
+     end
+   end
+diff --git a/lib/httparty/parser.rb b/lib/httparty/parser.rb
+index 8e611cb6c22a7b3a9cf0deb07e8cad5a407ee6bd..44451ce473fd4be2e3c24cb5114b08842d06bc28 100644
+--- a/lib/httparty/parser.rb
++++ b/lib/httparty/parser.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module HTTParty
+   # The default parser used by HTTParty, supports xml, json, html, csv and
+   # plain text.
+@@ -38,16 +40,18 @@ module HTTParty
+   # @abstract Read the Custom Parsers section for more information.
+   class Parser
+     SupportedFormats = {
+-      'text/xml'               => :xml,
+-      'application/xml'        => :xml,
+-      'application/json'       => :json,
+-      'text/json'              => :json,
+-      'application/javascript' => :plain,
+-      'text/javascript'        => :plain,
+-      'text/html'              => :html,
+-      'text/plain'             => :plain,
+-      'text/csv'               => :csv,
+-      'application/csv'        => :csv,
++      'text/xml'                    => :xml,
++      'application/xml'             => :xml,
++      'application/json'            => :json,
++      'application/vnd.api+json'    => :json,
++      'application/hal+json'        => :json,
++      'text/json'                   => :json,
++      'application/javascript'      => :plain,
++      'text/javascript'             => :plain,
++      'text/html'                   => :html,
++      'text/plain'                  => :plain,
++      'text/csv'                    => :csv,
++      'application/csv'             => :csv,
+       'text/comma-separated-values' => :csv
+     }
+ 
+@@ -98,7 +102,12 @@ module HTTParty
+     # @return [Object] the parsed body
+     # @return [nil] when the response body is nil, an empty string, spaces only or "null"
+     def parse
+-      return nil if body.nil? || body.strip.empty? || body == "null"
++      return nil if body.nil?
++      return nil if body == 'null'
++      return nil if body.valid_encoding? && body.strip.empty?
++      if body.valid_encoding? && body.encoding == Encoding::UTF_8
++        @body = body.gsub(/\A#{UTF8_BOM}/, '')
++      end
+       if supports_format?
+         parse_supported_format
+       else
+@@ -109,14 +118,19 @@ module HTTParty
+     protected
+ 
+     def xml
++      require 'multi_xml'
+       MultiXml.parse(body)
+     end
+ 
++    UTF8_BOM = "\xEF\xBB\xBF"
++
+     def json
+-      JSON.load(body, nil)
++      require 'json'
++      JSON.parse(body, :quirks_mode => true, :allow_nan => true)
+     end
+ 
+     def csv
++      require 'csv'
+       CSV.parse(body)
+     end
+ 
+@@ -133,9 +147,11 @@ module HTTParty
+     end
+ 
+     def parse_supported_format
+-      send(format)
+-    rescue NoMethodError => e
+-      raise NotImplementedError, "#{self.class.name} has not implemented a parsing method for the #{format.inspect} format.", e.backtrace
++      if respond_to?(format, true)
++        send(format)
++      else
++        raise NotImplementedError, "#{self.class.name} has not implemented a parsing method for the #{format.inspect} format."
++      end
+     end
+   end
+ end
+diff --git a/lib/httparty/request.rb b/lib/httparty/request.rb
+index ba7eadbdcf2e04281183baa0a6b7708aefe39141..81b82d3db6f2284f812e7ddd4f2c4b9af6634f8f 100644
+--- a/lib/httparty/request.rb
++++ b/lib/httparty/request.rb
+@@ -1,3 +1,7 @@
++# frozen_string_literal: true
++
++require 'erb'
++
+ module HTTParty
+   class Request #:nodoc:
+     SupportedHTTPMethods = [
+@@ -9,41 +13,86 @@ module HTTParty
+       Net::HTTP::Head,
+       Net::HTTP::Options,
+       Net::HTTP::Move,
+-      Net::HTTP::Copy
++      Net::HTTP::Copy,
++      Net::HTTP::Mkcol,
++      Net::HTTP::Lock,
++      Net::HTTP::Unlock,
+     ]
+ 
+-    SupportedURISchemes  = [URI::HTTP, URI::HTTPS, URI::Generic]
++    SupportedURISchemes  = ['http', 'https', 'webcal', nil]
++
++    NON_RAILS_QUERY_STRING_NORMALIZER = proc do |query|
++      Array(query).sort_by { |a| a[0].to_s }.map do |key, value|
++        if value.nil?
++          key.to_s
++        elsif value.respond_to?(:to_ary)
++          value.to_ary.map {|v| "#{key}=#{ERB::Util.url_encode(v.to_s)}"}
++        else
++          HashConversions.to_params(key => value)
++        end
++      end.flatten.join('&')
++    end
+ 
+-    NON_RAILS_QUERY_STRING_NORMALIZER = Proc.new do |query|
++    JSON_API_QUERY_STRING_NORMALIZER = proc do |query|
+       Array(query).sort_by { |a| a[0].to_s }.map do |key, value|
+         if value.nil?
+           key.to_s
+-        elsif value.is_a?(Array)
+-          value.map {|v| "#{key}=#{URI.encode(v.to_s, Regexp.new("[^#{URI::PATTERN::UNRESERVED}]"))}"}
++        elsif value.respond_to?(:to_ary)
++          values = value.to_ary.map{|v| ERB::Util.url_encode(v.to_s)}
++          "#{key}=#{values.join(',')}"
+         else
+           HashConversions.to_params(key => value)
+         end
+       end.flatten.join('&')
+     end
+ 
++    def self._load(data)
++      http_method, path, options, last_response, last_uri, raw_request,
++        redirect, changed_hosts, credentials_sent = Marshal.load(data)
++      instance = new(http_method, path, options)
++      instance.last_response = last_response
++      instance.last_uri = last_uri
++      instance.redirect = redirect
++      instance.instance_variable_set("@raw_request", raw_request)
++      instance.instance_variable_set("@changed_hosts", changed_hosts)
++      instance.instance_variable_set("@credentials_sent", credentials_sent)
++      instance
++    end
++
+     attr_accessor :http_method, :options, :last_response, :redirect, :last_uri
+     attr_reader :path
+ 
+-    def initialize(http_method, path, o={})
++    def initialize(http_method, path, o = {})
++      o = o.dup
++      o[:headers] = o[:headers].to_hash.dup if o[:headers].respond_to?(:to_hash)
++      @changed_hosts = false
++      @credentials_sent = false
++
+       self.http_method = http_method
+-      self.path = path
+       self.options = {
+         limit: o.delete(:no_follow) ? 1 : 5,
+         assume_utf16_is_big_endian: true,
+         default_params: {},
+         follow_redirects: true,
+         parser: Parser,
++        uri_adapter: URI,
+         connection_adapter: ConnectionAdapter
+       }.merge(o)
++      self.path = path
++      set_basic_auth_from_uri
+     end
+ 
+     def path=(uri)
+-      @path = URI(uri)
++      uri_adapter = options[:uri_adapter]
++
++      @path = if uri.is_a?(uri_adapter)
++        uri
++      elsif String.try_convert(uri)
++        uri_adapter.parse(uri).normalize
++      else
++        raise ArgumentError,
++          "bad argument (expected #{uri_adapter} object or URI string)"
++      end
+     end
+ 
+     def request_uri(uri)
+@@ -55,14 +104,29 @@ module HTTParty
+     end
+ 
+     def uri
+-      new_uri = path.relative? ? URI.parse("#{base_uri}#{path}") : path.clone
++      if redirect && path.relative? && path.path[0] != '/'
++        last_uri_host = @last_uri.path.gsub(/[^\/]+$/, '')
++
++        path.path = "/#{path.path}" if last_uri_host[-1] != '/'
++        path.path = "#{last_uri_host}#{path.path}"
++      end
++
++      if path.relative? && path.host
++        new_uri = options[:uri_adapter].parse("#{@last_uri.scheme}:#{path}").normalize
++      elsif path.relative?
++        new_uri = options[:uri_adapter].parse("#{base_uri}#{path}").normalize
++      else
++        new_uri = path.clone
++      end
++
++      validate_uri_safety!(new_uri) unless redirect
+ 
+       # avoid double query string on redirects [#12]
+       unless redirect
+         new_uri.query = query_string(new_uri)
+       end
+ 
+-      unless SupportedURISchemes.include? new_uri.class
++      unless SupportedURISchemes.include? new_uri.scheme
+         raise UnsupportedURIScheme, "'#{new_uri}' Must be HTTP, HTTPS or Generic"
+       end
+ 
+@@ -70,7 +134,13 @@ module HTTParty
+     end
+ 
+     def base_uri
+-      redirect ? "#{@last_uri.scheme}://#{@last_uri.host}" : options[:base_uri]
++      if redirect
++        base_uri = "#{@last_uri.scheme}://#{@last_uri.host}"
++        base_uri = "#{base_uri}:#{@last_uri.port}" if @last_uri.port != 80
++        base_uri
++      else
++        options[:base_uri] && HTTParty.normalize_base_uri(options[:base_uri])
++      end
+     end
+ 
+     def format
+@@ -89,40 +159,59 @@ module HTTParty
+       validate
+       setup_raw_request
+       chunked_body = nil
++      current_http = http
+ 
+-      self.last_response = http.request(@raw_request) do |http_response|
+-        if block
+-          chunks = []
++      begin
++        self.last_response = current_http.request(@raw_request) do |http_response|
++          if block
++            chunks = []
+ 
+-          http_response.read_body do |fragment|
+-            chunks << fragment
+-            block.call(fragment)
+-          end
++            http_response.read_body do |fragment|
++              encoded_fragment = encode_text(fragment, http_response['content-type'])
++              chunks << encoded_fragment if !options[:stream_body]
++              block.call ResponseFragment.new(encoded_fragment, http_response, current_http)
++            end
+ 
+-          chunked_body = chunks.join
++            chunked_body = chunks.join
++          end
+         end
++
++        handle_host_redirection if response_redirects?
++        result = handle_unauthorized
++        result ||= handle_response(chunked_body, &block)
++        result
++      rescue *COMMON_NETWORK_ERRORS => e
++        raise options[:foul] ? HTTParty::NetworkError.new("#{e.class}: #{e.message}") : e
+       end
++    end
+ 
+-      handle_deflation unless http_method == Net::HTTP::Head
+-      handle_response(chunked_body, &block)
++    def handle_unauthorized(&block)
++      return unless digest_auth? && response_unauthorized? && response_has_digest_auth_challenge?
++      return if @credentials_sent
++      @credentials_sent = true
++      perform(&block)
+     end
+ 
+     def raw_body
+       @raw_request.body
+     end
+ 
++    def _dump(_level)
++      opts = options.dup
++      opts.delete(:logger)
++      opts.delete(:parser) if opts[:parser] && opts[:parser].is_a?(Proc)
++      Marshal.dump([http_method, path, opts, last_response, @last_uri, @raw_request,
++        redirect, @changed_hosts, @credentials_sent])
++    end
++
+     private
+ 
+     def http
+       connection_adapter.call(uri, options)
+     end
+ 
+-    def body
+-      options[:body].is_a?(Hash) ? normalize_query(options[:body]) : options[:body]
+-    end
+-
+     def credentials
+-      options[:basic_auth] || options[:digest_auth]
++      (options[:basic_auth] || options[:digest_auth]).to_hash
+     end
+ 
+     def username
+@@ -146,148 +235,154 @@ module HTTParty
+     end
+ 
+     def setup_raw_request
+-      @raw_request = http_method.new(request_uri(uri))
+-      @raw_request.body = body if body
++      if options[:headers].respond_to?(:to_hash)
++        headers_hash = options[:headers].to_hash
++      else
++        headers_hash = nil
++      end
++
++      @raw_request = http_method.new(request_uri(uri), headers_hash)
+       @raw_request.body_stream = options[:body_stream] if options[:body_stream]
+-      @raw_request.initialize_http_header(options[:headers])
+-      @raw_request.basic_auth(username, password) if options[:basic_auth]
+-      setup_digest_auth if options[:digest_auth]
+-    end
+ 
+-    def setup_digest_auth
+-      auth_request = http_method.new(uri.request_uri)
+-      auth_request.initialize_http_header(options[:headers])
+-      res = http.request(auth_request)
++      if options[:body]
++        body = Body.new(
++          options[:body],
++          query_string_normalizer: query_string_normalizer,
++          force_multipart: options[:multipart]
++        )
++
++        if body.multipart?
++          content_type = "multipart/form-data; boundary=#{body.boundary}"
++          @raw_request['Content-Type'] = content_type
++        elsif options[:body].respond_to?(:to_hash) && !@raw_request['Content-Type']
++          @raw_request['Content-Type'] = 'application/x-www-form-urlencoded'
++        end
+ 
+-      if res['www-authenticate'] != nil && res['www-authenticate'].length > 0
+-        @raw_request.digest_auth(username, password, res)
++        if body.streaming? && options[:stream_body] != false
++          stream = body.to_stream
++          @raw_request.body_stream = stream
++          @raw_request['Content-Length'] = stream.size.to_s
++        else
++          @raw_request.body = body.call
++        end
+       end
+-    end
+ 
+-    def query_string(uri)
+-      query_string_parts = []
+-      query_string_parts << uri.query unless uri.query.nil?
++      @raw_request.instance_variable_set(:@decode_content, decompress_content?)
+ 
+-      if options[:query].is_a?(Hash)
+-        query_string_parts << normalize_query(options[:default_params].merge(options[:query]))
+-      else
+-        query_string_parts << normalize_query(options[:default_params]) unless options[:default_params].empty?
+-        query_string_parts << options[:query] unless options[:query].nil?
++      if options[:basic_auth] && send_authorization_header?
++        @raw_request.basic_auth(username, password)
++        @credentials_sent = true
+       end
++      setup_digest_auth if digest_auth? && response_unauthorized? && response_has_digest_auth_challenge?
++    end
+ 
+-      query_string_parts.reject!(&:empty?) unless query_string_parts == [""]
+-      query_string_parts.size > 0 ? query_string_parts.join('&') : nil
++    def digest_auth?
++      !!options[:digest_auth]
+     end
+ 
+-    def get_charset
+-      content_type = last_response["content-type"]
+-      if content_type.nil?
+-        return nil
+-      end
++    def decompress_content?
++      !options[:skip_decompression]
++    end
+ 
+-      if content_type =~ /;\s*charset\s*=\s*([^=,;"\s]+)/i
+-        return $1
+-      end
++    def response_unauthorized?
++      !!last_response && last_response.code == '401'
++    end
+ 
+-      if content_type =~ /;\s*charset\s*=\s*"((\\.|[^\\"])+)"/i
+-        return $1.gsub(/\\(.)/, '\1')
+-      end
++    def response_has_digest_auth_challenge?
++      !last_response['www-authenticate'].nil? && last_response['www-authenticate'].length > 0
++    end
+ 
+-      nil
++    def setup_digest_auth
++      @raw_request.digest_auth(username, password, last_response)
+     end
+ 
+-    def encode_with_ruby_encoding(body, charset)
+-      begin
+-        encoding = Encoding.find(charset)
+-        body.force_encoding(encoding)
+-      rescue
+-        body
++    def query_string(uri)
++      query_string_parts = []
++      query_string_parts << uri.query unless uri.query.nil?
++
++      if options[:query].respond_to?(:to_hash)
++        query_string_parts << normalize_query(options[:default_params].merge(options[:query].to_hash))
++      else
++        query_string_parts << normalize_query(options[:default_params]) unless options[:default_params].empty?
++        query_string_parts << options[:query] unless options[:query].nil?
+       end
++
++      query_string_parts.reject!(&:empty?) unless query_string_parts == ['']
++      query_string_parts.size > 0 ? query_string_parts.join('&') : nil
+     end
+ 
+     def assume_utf16_is_big_endian
+       options[:assume_utf16_is_big_endian]
+     end
+ 
+-    def encode_utf_16(body)
+-      if body.bytesize >= 2
+-        if body.getbyte(0) == 0xFF && body.getbyte(1) == 0xFE
+-          return body.force_encoding("UTF-16LE")
+-        elsif body.getbyte(0) == 0xFE && body.getbyte(1) == 0xFF
+-          return body.force_encoding("UTF-16BE")
+-        end
+-      end
+-
+-      if assume_utf16_is_big_endian
+-        body.force_encoding("UTF-16BE")
++    def handle_response(raw_body, &block)
++      if response_redirects?
++        handle_redirection(&block)
+       else
+-        body.force_encoding("UTF-16LE")
+-      end
++        raw_body ||= last_response.body
+ 
+-    end
++        body = decompress(raw_body, last_response['content-encoding']) unless raw_body.nil?
+ 
+-    def _encode_body(body)
+-      charset = get_charset
++        unless body.nil?
++          body = encode_text(body, last_response['content-type'])
+ 
+-      if charset.nil?
+-        return body
+-      end
++          if decompress_content?
++            last_response.delete('content-encoding')
++            raw_body = body
++          end
++        end
+ 
+-      if "utf-16".casecmp(charset) == 0
+-        encode_utf_16(body)
+-      else
+-        encode_with_ruby_encoding(body, charset)
++        Response.new(self, last_response, lambda { parse_response(body) }, body: raw_body)
+       end
+     end
+ 
+-    def encode_body(body)
+-      if "".respond_to?(:encoding)
+-        _encode_body(body)
+-      else
+-        body
++    def handle_redirection(&block)
++      options[:limit] -= 1
++      if options[:logger]
++        logger = HTTParty::Logger.build(options[:logger], options[:log_level], options[:log_format])
++        logger.format(self, last_response)
+       end
+-    end
+-
+-    def handle_response(body, &block)
+-      if response_redirects?
+-        options[:limit] -= 1
+-        if options[:logger]
+-          logger = HTTParty::Logger.build(options[:logger], options[:log_level], options[:log_format])
+-          logger.format(self, last_response)
++      self.path       = last_response['location']
++      self.redirect   = true
++      if last_response.class == Net::HTTPSeeOther
++        unless options[:maintain_method_across_redirects] && options[:resend_on_redirect]
++          self.http_method = Net::HTTP::Get
+         end
+-        self.path = last_response['location']
+-        self.redirect = true
+-        self.http_method = Net::HTTP::Get unless options[:maintain_method_across_redirects]
+-        capture_cookies(last_response)
+-        perform(&block)
+-      else
+-        body = body || last_response.body
+-        body = encode_body(body)
+-        Response.new(self, last_response, lambda { parse_response(body) }, body: body)
++      elsif last_response.code != '307' && last_response.code != '308'
++        unless options[:maintain_method_across_redirects]
++          self.http_method = Net::HTTP::Get
++        end
++      end
++      if http_method == Net::HTTP::Get
++        clear_body
+       end
++      capture_cookies(last_response)
++      perform(&block)
+     end
+ 
+-    # Inspired by Ruby 1.9
+-    def handle_deflation
+-      case last_response["content-encoding"]
+-      when "gzip", "x-gzip"
+-        body_io = StringIO.new(last_response.body)
+-        last_response.body.replace Zlib::GzipReader.new(body_io).read
+-        last_response.delete('content-encoding')
+-      when "deflate"
+-        last_response.body.replace Zlib::Inflate.inflate(last_response.body)
+-        last_response.delete('content-encoding')
++    def handle_host_redirection
++      check_duplicate_location_header
++      redirect_path = options[:uri_adapter].parse(last_response['location']).normalize
++      return if redirect_path.relative? || path.host == redirect_path.host || uri.host == redirect_path.host
++      @changed_hosts = true
++    end
++
++    def check_duplicate_location_header
++      location = last_response.get_fields('location')
++      if location.is_a?(Array) && location.count > 1
++        raise DuplicateLocationHeader.new(last_response)
+       end
+     end
+ 
++    def send_authorization_header?
++      !@changed_hosts
++    end
++
+     def response_redirects?
+       case last_response
+-      when Net::HTTPMultipleChoice, # 300
+-           Net::HTTPMovedPermanently, # 301
+-           Net::HTTPFound, # 302
+-           Net::HTTPSeeOther, # 303
+-           Net::HTTPUseProxy, # 305
+-           Net::HTTPTemporaryRedirect
++      when Net::HTTPNotModified # 304
++        false
++      when Net::HTTPRedirection
+         options[:follow_redirects] && last_response.key?('location')
+       end
+     end
+@@ -296,11 +391,20 @@ module HTTParty
+       parser.call(body, format)
+     end
+ 
++    # Some Web Application Firewalls reject incoming GET requests that have a body
++    # if we redirect, and the resulting verb is GET then we will clear the body that
++    # may be left behind from the initiating request
++    def clear_body
++      options[:body] = nil
++      @raw_request.body = nil
++    end
++
+     def capture_cookies(response)
+       return unless response['Set-Cookie']
+-      cookies_hash = HTTParty::CookieHash.new()
+-      cookies_hash.add_cookies(options[:headers]['Cookie']) if options[:headers] && options[:headers]['Cookie']
++      cookies_hash = HTTParty::CookieHash.new
++      cookies_hash.add_cookies(options[:headers].to_hash['Cookie']) if options[:headers] && options[:headers].to_hash['Cookie']
+       response.get_fields('Set-Cookie').each { |cookie| cookies_hash.add_cookies(cookie) }
++
+       options[:headers] ||= {}
+       options[:headers]['Cookie'] = cookies_hash.to_cookie_string
+     end
+@@ -317,15 +421,53 @@ module HTTParty
+     def validate
+       raise HTTParty::RedirectionTooDeep.new(last_response), 'HTTP redirects too deep' if options[:limit].to_i <= 0
+       raise ArgumentError, 'only get, post, patch, put, delete, head, and options methods are supported' unless SupportedHTTPMethods.include?(http_method)
+-      raise ArgumentError, ':headers must be a hash' if options[:headers] && !options[:headers].is_a?(Hash)
++      raise ArgumentError, ':headers must be a hash' if options[:headers] && !options[:headers].respond_to?(:to_hash)
+       raise ArgumentError, 'only one authentication method, :basic_auth or :digest_auth may be used at a time' if options[:basic_auth] && options[:digest_auth]
+-      raise ArgumentError, ':basic_auth must be a hash' if options[:basic_auth] && !options[:basic_auth].is_a?(Hash)
+-      raise ArgumentError, ':digest_auth must be a hash' if options[:digest_auth] && !options[:digest_auth].is_a?(Hash)
+-      raise ArgumentError, ':query must be hash if using HTTP Post' if post? && !options[:query].nil? && !options[:query].is_a?(Hash)
++      raise ArgumentError, ':basic_auth must be a hash' if options[:basic_auth] && !options[:basic_auth].respond_to?(:to_hash)
++      raise ArgumentError, ':digest_auth must be a hash' if options[:digest_auth] && !options[:digest_auth].respond_to?(:to_hash)
++      raise ArgumentError, ':query must be hash if using HTTP Post' if post? && !options[:query].nil? && !options[:query].respond_to?(:to_hash)
+     end
+ 
+     def post?
+       Net::HTTP::Post == http_method
+     end
++
++    def set_basic_auth_from_uri
++      if path.userinfo
++        username, password = path.userinfo.split(':')
++        options[:basic_auth] = {username: username, password: password}
++        @credentials_sent = true
++      end
++    end
++
++    def decompress(body, encoding)
++      Decompressor.call(body, encoding)
++    end
++
++    def encode_text(text, content_type)
++      TextEncoder.new(
++        text,
++        content_type: content_type,
++        assume_utf16_is_big_endian: assume_utf16_is_big_endian
++      ).call
++    end
++
++    def validate_uri_safety!(new_uri)
++      return if options[:skip_uri_validation]
++
++      configured_base_uri = options[:base_uri]
++      return unless configured_base_uri
++
++      normalized_base = options[:uri_adapter].parse(
++        HTTParty.normalize_base_uri(configured_base_uri)
++      )
++
++      return if new_uri.host == normalized_base.host
++
++      raise UnsafeURIError,
++        "Requested URI '#{new_uri}' has host '#{new_uri.host}' but the " \
++        "configured base_uri '#{normalized_base}' has host '#{normalized_base.host}'. " \
++        "This request could send credentials to an unintended server."
++    end
+   end
+ end
+diff --git a/lib/httparty/request/body.rb b/lib/httparty/request/body.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..da06e686327759e4fbb63f0e4f9eb2b2e45688a4
+--- /dev/null
++++ b/lib/httparty/request/body.rb
+@@ -0,0 +1,125 @@
++# frozen_string_literal: true
++
++require_relative 'multipart_boundary'
++require_relative 'streaming_multipart_body'
++
++module HTTParty
++  class Request
++    class Body
++      NEWLINE = "\r\n"
++      private_constant :NEWLINE
++
++      def initialize(params, query_string_normalizer: nil, force_multipart: false)
++        @params = params
++        @query_string_normalizer = query_string_normalizer
++        @force_multipart = force_multipart
++      end
++
++      def call
++        if params.respond_to?(:to_hash)
++          multipart? ? generate_multipart : normalize_query(params)
++        else
++          params
++        end
++      end
++
++      def boundary
++        @boundary ||= MultipartBoundary.generate
++      end
++
++      def multipart?
++        params.respond_to?(:to_hash) && (force_multipart || has_file?(params))
++      end
++
++      def streaming?
++        multipart? && has_file?(params)
++      end
++
++      def to_stream
++        return nil unless streaming?
++        StreamingMultipartBody.new(prepared_parts, boundary)
++      end
++
++      def prepared_parts
++        normalized_params = params.flat_map { |key, value| HashConversions.normalize_keys(key, value) }
++        normalized_params.map do |key, value|
++          [key, value, file?(value)]
++        end
++      end
++
++      private
++
++      # https://html.spec.whatwg.org/#multipart-form-data
++      MULTIPART_FORM_DATA_REPLACEMENT_TABLE = {
++        '"'  => '%22',
++        "\r" => '%0D',
++        "\n" => '%0A'
++      }.freeze
++
++      def generate_multipart
++        normalized_params = params.flat_map { |key, value| HashConversions.normalize_keys(key, value) }
++
++        multipart = normalized_params.inject(''.b) do |memo, (key, value)|
++          memo << "--#{boundary}#{NEWLINE}".b
++          memo << %(Content-Disposition: form-data; name="#{key}").b
++          # value.path is used to support ActionDispatch::Http::UploadedFile
++          # https://github.com/jnunemaker/httparty/pull/585
++          memo << %(; filename="#{file_name(value).gsub(/["\r\n]/, MULTIPART_FORM_DATA_REPLACEMENT_TABLE)}").b if file?(value)
++          memo << NEWLINE.b
++          memo << "Content-Type: #{content_type(value)}#{NEWLINE}".b if file?(value)
++          memo << NEWLINE.b
++          memo << content_body(value)
++          memo << NEWLINE.b
++        end
++
++        multipart << "--#{boundary}--#{NEWLINE}".b
++      end
++
++      def has_file?(value)
++        if value.respond_to?(:to_hash)
++          value.to_hash.any? { |_, v| has_file?(v) }
++        elsif value.respond_to?(:to_ary)
++          value.to_ary.any? { |v| has_file?(v) }
++        else
++          file?(value)
++        end
++      end
++
++      def file?(object)
++        object.respond_to?(:path) && object.respond_to?(:read)
++      end
++
++      def normalize_query(query)
++        if query_string_normalizer
++          query_string_normalizer.call(query)
++        else
++          HashConversions.to_params(query)
++        end
++      end
++
++      def content_body(object)
++        if file?(object)
++          object = (file = object).read
++          object.force_encoding(Encoding::BINARY) if object.respond_to?(:force_encoding)
++          file.rewind if file.respond_to?(:rewind)
++          object.to_s
++        else
++          object.to_s.b
++        end
++      end
++
++      def content_type(object)
++        return object.content_type if object.respond_to?(:content_type)
++        require 'mini_mime'
++        mime = MiniMime.lookup_by_filename(object.path)
++        mime ? mime.content_type : 'application/octet-stream'
++      end
++
++      def file_name(object)
++        object.respond_to?(:original_filename) ? object.original_filename : File.basename(object.path)
++      end
++
++      attr_reader :params, :query_string_normalizer, :force_multipart
++    end
++  end
++end
+diff --git a/lib/httparty/request/multipart_boundary.rb b/lib/httparty/request/multipart_boundary.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9e2ac14b0bd378eebbc14c0c2c105d8077de22e
+--- /dev/null
++++ b/lib/httparty/request/multipart_boundary.rb
+@@ -0,0 +1,13 @@
++# frozen_string_literal: true
++
++require 'securerandom'
++
++module HTTParty
++  class Request
++    class MultipartBoundary
++      def self.generate
++        "------------------------#{SecureRandom.urlsafe_base64(12)}"
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/request/streaming_multipart_body.rb b/lib/httparty/request/streaming_multipart_body.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..bccc87c39c0fbfe8d4907575cfdb678f912bf7cc
+--- /dev/null
++++ b/lib/httparty/request/streaming_multipart_body.rb
+@@ -0,0 +1,200 @@
++# frozen_string_literal: true
++
++module HTTParty
++  class Request
++    class StreamingMultipartBody
++      NEWLINE = "\r\n"
++      CHUNK_SIZE = 64 * 1024 # 64 KB chunks
++
++      def initialize(parts, boundary)
++        @parts = parts
++        @boundary = boundary
++        @part_index = 0
++        @state = :header
++        @current_file = nil
++        @header_buffer = nil
++        @header_offset = 0
++        @footer_sent = false
++      end
++
++      def size
++        @size ||= calculate_size
++      end
++
++      def read(length = nil, outbuf = nil)
++        raise ArgumentError, 'negative length' if length && length < 0
++        outbuf = outbuf ? outbuf.replace(''.b) : ''.b
++
++        return read_all(outbuf) if length.nil?
++        return outbuf if length.zero?
++
++        while outbuf.bytesize < length
++          remaining = length - outbuf.bytesize
++          chunk = @pending_chunk || read_chunk(remaining)
++          @pending_chunk = nil
++          break if chunk.nil?
++          outbuf << chunk.byteslice(0, remaining)
++          @pending_chunk = chunk.byteslice(remaining..) if chunk.bytesize > remaining
++        end
++
++        outbuf.empty? ? nil : outbuf
++      end
++
++      def rewind
++        @pending_chunk = nil
++        @part_index = 0
++        @state = :header
++        @current_file = nil
++        @header_buffer = nil
++        @header_offset = 0
++        @footer_sent = false
++        @parts.each do |_key, value, _is_file|
++          value.rewind if value.respond_to?(:rewind)
++        end
++      end
++
++      private
++
++      def read_all(outbuf)
++        if @pending_chunk
++          outbuf << @pending_chunk
++          @pending_chunk = nil
++        end
++        while (chunk = read_chunk(CHUNK_SIZE))
++          outbuf << chunk
++        end
++        outbuf
++      end
++
++      def read_chunk(max_length)
++        loop do
++          return nil if @part_index >= @parts.size && @footer_sent
++
++          if @part_index >= @parts.size
++            @footer_sent = true
++            return "--#{@boundary}--#{NEWLINE}".b
++          end
++
++          key, value, is_file = @parts[@part_index]
++
++          case @state
++          when :header
++            chunk = read_header_chunk(key, value, is_file, max_length)
++            return chunk if chunk
++
++          when :body
++            chunk = read_body_chunk(value, is_file, max_length)
++            return chunk if chunk
++
++          when :newline
++            @state = :header
++            @part_index += 1
++            return NEWLINE.b
++          end
++        end
++      end
++
++      def read_header_chunk(key, value, is_file, max_length)
++        if @header_buffer.nil?
++          @header_buffer = build_part_header(key, value, is_file)
++          @header_offset = 0
++        end
++
++        remaining = @header_buffer.bytesize - @header_offset
++        if remaining > 0
++          chunk_size = [remaining, max_length].min
++          chunk = @header_buffer.byteslice(@header_offset, chunk_size)
++          @header_offset += chunk_size
++          return chunk
++        end
++
++        @header_buffer = nil
++        @header_offset = 0
++        @state = :body
++        nil
++      end
++
++      def read_body_chunk(value, is_file, max_length)
++        if is_file
++          chunk = read_file_chunk(value, max_length)
++          if chunk
++            return chunk
++          else
++            @current_file = nil
++            @state = :newline
++            return nil
++          end
++        else
++          @state = :newline
++          return value.to_s.b
++        end
++      end
++
++      def read_file_chunk(file, max_length)
++        chunk_size = [max_length, CHUNK_SIZE].min
++        chunk = file.read(chunk_size)
++        return nil if chunk.nil?
++        chunk.force_encoding(Encoding::BINARY) if chunk.respond_to?(:force_encoding)
++        chunk
++      end
++
++      def build_part_header(key, value, is_file)
++        header = "--#{@boundary}#{NEWLINE}".b
++        header << %(Content-Disposition: form-data; name="#{key}").b
++        if is_file
++          header << %(; filename="#{file_name(value).gsub(/["\r\n]/, replacement_table)}").b
++          header << NEWLINE.b
++          header << "Content-Type: #{content_type(value)}#{NEWLINE}".b
++        else
++          header << NEWLINE.b
++        end
++        header << NEWLINE.b
++        header
++      end
++
++      def calculate_size
++        total = 0
++        @parts.each do |key, value, is_file|
++          total += build_part_header(key, value, is_file).bytesize
++          total += content_size(value, is_file)
++          total += NEWLINE.bytesize
++        end
++        total += "--#{@boundary}--#{NEWLINE}".bytesize
++        total
++      end
++
++      def content_size(value, is_file)
++        if is_file
++          if value.respond_to?(:size)
++            value.size
++          elsif value.respond_to?(:stat)
++            value.stat.size
++          else
++            value.read.bytesize.tap { value.rewind }
++          end
++        else
++          value.to_s.b.bytesize
++        end
++      end
++
++      def content_type(object)
++        return object.content_type if object.respond_to?(:content_type)
++        require 'mini_mime'
++        mime = MiniMime.lookup_by_filename(object.path)
++        mime ? mime.content_type : 'application/octet-stream'
++      end
++
++      def file_name(object)
++        object.respond_to?(:original_filename) ? object.original_filename : File.basename(object.path)
++      end
++
++      def replacement_table
++        @replacement_table ||= {
++          '"'  => '%22',
++          "\r" => '%0D',
++          "\n" => '%0A'
++        }.freeze
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/response.rb b/lib/httparty/response.rb
+index 52fcd88decbccbd959580d7f7856cc50685bda53..2a6fa42baa112fbfa57d13d9f1ef1deedcc1873c 100644
+--- a/lib/httparty/response.rb
++++ b/lib/httparty/response.rb
+@@ -1,12 +1,20 @@
++# frozen_string_literal: true
++
+ module HTTParty
+-  class Response < HTTParty::BasicObject #:nodoc:
++  class Response < Object
+     def self.underscore(string)
+-      string.gsub(/([A-Z]+)([A-Z][a-z])/,'\1_\2').gsub(/([a-z])([A-Z])/,'\1_\2').downcase
++      string.gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2').gsub(/([a-z])([A-Z])/, '\1_\2').downcase
++    end
++
++    def self._load(data)
++      req, resp, parsed_resp, resp_body = Marshal.load(data)
++
++      new(req, resp, -> { parsed_resp }, body: resp_body)
+     end
+ 
+     attr_reader :request, :response, :body, :headers
+ 
+-    def initialize(request, response, parsed_block, options={})
++    def initialize(request, response, parsed_block, options = {})
+       @request      = request
+       @response     = response
+       @body         = options[:body] || response.body
+@@ -14,45 +22,102 @@ module HTTParty
+       @headers      = Headers.new(response.to_hash)
+ 
+       if request.options[:logger]
+-        logger = ::HTTParty::Logger.build(request.options[:logger], request.options[:log_level], request.options[:log_format])
++        logger = ::HTTParty::Logger.build(
++          request.options[:logger],
++          request.options[:log_level],
++          request.options[:log_format]
++        )
+         logger.format(request, self)
+       end
++
++      throw_exception
+     end
+ 
+     def parsed_response
+       @parsed_response ||= @parsed_block.call
+     end
+ 
+-    def class
+-      Response
+-    end
+-
+     def code
+       response.code.to_i
+     end
+ 
++    def http_version
++      response.http_version
++    end
++
++    def tap
++      yield self
++      self
++    end
++
+     def inspect
+-      inspect_id = "%x" % (object_id * 2)
++      inspect_id = ::Kernel::format '%x', (object_id * 2)
+       %(#<#{self.class}:0x#{inspect_id} parsed_response=#{parsed_response.inspect}, @response=#{response.inspect}, @headers=#{headers.inspect}>)
+     end
+ 
+     CODES_TO_OBJ = ::Net::HTTPResponse::CODE_CLASS_TO_OBJ.merge ::Net::HTTPResponse::CODE_TO_OBJ
+ 
+     CODES_TO_OBJ.each do |response_code, klass|
+-      name = klass.name.sub("Net::HTTP", '')
+-      define_method("#{underscore(name)}?") do
++      name = klass.name.sub('Net::HTTP', '')
++      name = "#{underscore(name)}?".to_sym
++
++      define_method(name) do
+         klass === response
+       end
+     end
+ 
+     # Support old multiple_choice? method from pre 2.0.0 era.
+-    if ::RUBY_VERSION >= "2.0.0" && ::RUBY_PLATFORM != "java"
++    if ::RUBY_PLATFORM != 'java'
+       alias_method :multiple_choice?, :multiple_choices?
+     end
+ 
+-    def respond_to?(name, include_all = false)
+-      return true if [:request, :response, :parsed_response, :body, :headers].include?(name)
+-      parsed_response.respond_to?(name, include_all) || response.respond_to?(name, include_all)
++    # Support old status codes method from pre 2.6.0 era.
++    if ::RUBY_PLATFORM != 'java'
++      alias_method :gateway_time_out?,                :gateway_timeout?
++      alias_method :request_entity_too_large?,        :payload_too_large?
++      alias_method :request_time_out?,                :request_timeout?
++      alias_method :request_uri_too_long?,            :uri_too_long?
++      alias_method :requested_range_not_satisfiable?, :range_not_satisfiable?
++    end
++
++    def nil?
++      warn_about_nil_deprecation
++      response.nil? || response.body.nil? || response.body.empty?
++    end
++
++    def to_s
++      if !response.nil? && !response.body.nil? && response.body.respond_to?(:to_s)
++        response.body.to_s
++      else
++        inspect
++      end
++    end
++
++    def pretty_print(pp)
++      if !parsed_response.nil? && parsed_response.respond_to?(:pretty_print)
++        parsed_response.pretty_print(pp)
++      else
++        super
++      end
++    end
++
++    def display(port=$>)
++      if !parsed_response.nil? && parsed_response.respond_to?(:display)
++        parsed_response.display(port)
++      elsif !response.nil? && !response.body.nil? && response.body.respond_to?(:display)
++        response.body.display(port)
++      else
++        port.write(inspect)
++      end
++    end
++
++    def respond_to_missing?(name, *args)
++      return true if super
++      parsed_response.respond_to?(name) || response.respond_to?(name)
++    end
++
++    def _dump(_level)
++      Marshal.dump([request, response, parsed_response, body])
+     end
+ 
+     protected
+@@ -66,6 +131,25 @@ module HTTParty
+         super
+       end
+     end
++
++    def throw_exception
++      if @request.options[:raise_on].to_a.detect { |c| code.to_s.match(/#{c.to_s}/) }
++        ::Kernel.raise ::HTTParty::ResponseError.new(@response), "Code #{code} - #{body}"
++      end
++    end
++
++    private
++
++    def warn_about_nil_deprecation
++      trace_line = caller.reject { |line| line.include?('httparty') }.first
++      warning = "[DEPRECATION] HTTParty will no longer override `response#nil?`. " \
++        "This functionality will be removed in future versions. " \
++        "Please, add explicit check `response.body.nil? || response.body.empty?`. " \
++        "For more info refer to: https://github.com/jnunemaker/httparty/issues/568\n" \
++        "#{trace_line}"
++
++      warn(warning)
++    end
+   end
+ end
+ 
+diff --git a/lib/httparty/response/headers.rb b/lib/httparty/response/headers.rb
+index ac3da6624c8f2131103fc7b8aeb4bc4cc383150d..cc5fc7b53d53b12452039bd1173439c8f0d88344 100644
+--- a/lib/httparty/response/headers.rb
++++ b/lib/httparty/response/headers.rb
+@@ -1,31 +1,35 @@
++# frozen_string_literal: true
++
++require 'delegate'
++
+ module HTTParty
+   class Response #:nodoc:
+-    class Headers
++    class Headers < ::SimpleDelegator
+       include ::Net::HTTPHeader
+ 
+-      def initialize(header = {})
+-        @header = header
++      def initialize(header_values = nil)
++        @header = {}
++        if header_values
++          header_values.each_pair do |k,v|
++            if v.is_a?(Array)
++              v.each do |sub_v|
++                add_field(k, sub_v)
++              end
++            else
++              add_field(k, v)
++            end
++          end
++        end
++        super(@header)
+       end
+ 
+       def ==(other)
+-        @header == other
+-      end
+-
+-      def inspect
+-        @header.inspect
+-      end
+-
+-      def method_missing(name, *args, &block)
+-        if @header.respond_to?(name)
+-          @header.send(name, *args, &block)
+-        else
+-          super
++        if other.is_a?(::Net::HTTPHeader)
++          @header == other.instance_variable_get(:@header)
++        elsif other.is_a?(Hash)
++          @header == other || @header == Headers.new(other).instance_variable_get(:@header)
+         end
+       end
+-
+-      def respond_to?(method, include_all = false)
+-        super || @header.respond_to?(method, include_all)
+-      end
+     end
+   end
+ end
+diff --git a/lib/httparty/response_fragment.rb b/lib/httparty/response_fragment.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fb15a0f031ec68b8926ea9c0bf1a92c309f961b
+--- /dev/null
++++ b/lib/httparty/response_fragment.rb
+@@ -0,0 +1,21 @@
++# frozen_string_literal: true
++
++require 'delegate'
++
++module HTTParty
++  # Allow access to http_response and code by delegation on fragment
++  class ResponseFragment < SimpleDelegator
++    attr_reader :http_response, :connection
++
++    def code
++      @http_response.code.to_i
++    end
++
++    def initialize(fragment, http_response, connection)
++      @fragment = fragment
++      @http_response = http_response
++      @connection = connection
++      super fragment
++    end
++  end
++end
+diff --git a/lib/httparty/text_encoder.rb b/lib/httparty/text_encoder.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..006893ee5fe1e9bd184d4d0decee78d5e3e562f0
+--- /dev/null
++++ b/lib/httparty/text_encoder.rb
+@@ -0,0 +1,72 @@
++# frozen_string_literal: true
++
++module HTTParty
++  class TextEncoder
++    attr_reader :text, :content_type, :assume_utf16_is_big_endian
++
++    def initialize(text, assume_utf16_is_big_endian: true, content_type: nil)
++      @text = +text
++      @content_type = content_type
++      @assume_utf16_is_big_endian = assume_utf16_is_big_endian
++    end
++
++    def call
++      if can_encode?
++        encoded_text
++      else
++        text
++      end
++    end
++
++    private
++
++    def can_encode?
++      ''.respond_to?(:encoding) && charset
++    end
++
++    def encoded_text
++      if 'utf-16'.casecmp(charset) == 0
++        encode_utf_16
++      else
++        encode_with_ruby_encoding
++      end
++    end
++
++    def encode_utf_16
++      if text.bytesize >= 2
++        if text.getbyte(0) == 0xFF && text.getbyte(1) == 0xFE
++          return text.force_encoding('UTF-16LE')
++        elsif text.getbyte(0) == 0xFE && text.getbyte(1) == 0xFF
++          return text.force_encoding('UTF-16BE')
++        end
++      end
++
++      if assume_utf16_is_big_endian # option
++        text.force_encoding('UTF-16BE')
++      else
++        text.force_encoding('UTF-16LE')
++      end
++    end
++
++    def encode_with_ruby_encoding
++      # NOTE: This will raise an argument error if the
++      # charset does not exist
++      encoding = Encoding.find(charset)
++      text.force_encoding(encoding.to_s)
++    rescue ArgumentError
++      text
++    end
++
++    def charset
++      return nil if content_type.nil?
++
++      if (matchdata = content_type.match(/;\s*charset\s*=\s*([^=,;"\s]+)/i))
++        return matchdata.captures.first
++      end
++
++      if (matchdata = content_type.match(/;\s*charset\s*=\s*"((\\.|[^\\"])+)"/i))
++        return matchdata.captures.first.gsub(/\\(.)/, '\1')
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/utils.rb b/lib/httparty/utils.rb
+new file mode 100644
+index 0000000000000000000000000000000000000000..8393e920f454817de875c285de42b4be22453805
+--- /dev/null
++++ b/lib/httparty/utils.rb
+@@ -0,0 +1,13 @@
++# frozen_string_literal: true
++
++module HTTParty
++  module Utils
++    def self.stringify_keys(hash)
++      return hash.transform_keys(&:to_s) if hash.respond_to?(:transform_keys)
++
++      hash.each_with_object({}) do |(key, value), new_hash|
++        new_hash[key.to_s] = value
++      end
++    end
++  end
++end
+diff --git a/lib/httparty/version.rb b/lib/httparty/version.rb
+index 24b2a21830beed65bdf6d0bd9d4bab0a64979a52..4e0f71b8d5cce0c0e4c70d59415ef7f63e9202e9 100644
+--- a/lib/httparty/version.rb
++++ b/lib/httparty/version.rb
+@@ -1,3 +1,5 @@
++# frozen_string_literal: true
++
+ module HTTParty
+-  VERSION = "0.13.1"
++  VERSION = '0.23.2'
+ end

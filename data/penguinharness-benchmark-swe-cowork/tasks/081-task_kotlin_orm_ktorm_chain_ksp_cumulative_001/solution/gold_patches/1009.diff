@@ -1,0 +1,306 @@
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+index 2b4f665efd09f7e64111e9b587fc4e8cc838903a..097f68a71f84f961998fe70285c419c867dee5ea 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+@@ -30,6 +30,9 @@ import org.ktorm.ksp.compiler.util.isValid
+ import org.ktorm.ksp.spi.TableMetadata
+ import kotlin.reflect.jvm.jvmName
+ 
++/**
++ * Ktorm KSP symbol processor provider.
++ */
+ public class KtormProcessorProvider : SymbolProcessorProvider {
+ 
+     override fun create(environment: SymbolProcessorEnvironment): SymbolProcessor {
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/TableClassGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/TableClassGenerator.kt
+index 5f1b31dda54c7a1f7040963d115ea96f9526148f..a407ffafb1940f1283091a20372cbcdbb10d23b1 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/TableClassGenerator.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/TableClassGenerator.kt
+@@ -18,6 +18,7 @@ package org.ktorm.ksp.compiler.generator
+ 
+ import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
+ import com.google.devtools.ksp.symbol.ClassKind
++import com.google.devtools.ksp.symbol.KSValueParameter
+ import com.squareup.kotlinpoet.*
+ import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
+ import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
+@@ -127,51 +128,9 @@ internal object TableClassGenerator {
+             .any { it.hasDefault }
+ 
+         if (hasDefaultValues && options["ktorm.allowReflection"] == "true") {
+-            addStatement(
+-                "val constructor = %T::class.%M!!",
+-                table.entityClass.toClassName(),
+-                MemberName("kotlin.reflect.full", "primaryConstructor", true)
+-            )
+-
+-            add("«val args = mapOf(")
+-
+-            for (column in table.columns) {
+-                val propName = column.entityProperty.simpleName.asString()
+-                if (propName in constructorParams) {
+-                    add(
+-                        "constructor.%M(%S)!! to row[this.%N],",
+-                        MemberName("kotlin.reflect.full", "findParameterByName", true),
+-                        propName,
+-                        column.columnPropertyName
+-                    )
+-                }
+-            }
+-
+-            add(")\n»")
+-            addStatement("// Filter optional arguments out to make default values work.")
+-
+-            if (table.columns.all { it.entityProperty.simpleName.asString() in constructorParams }) {
+-                addStatement("return constructor.callBy(args.filterNot { (k, v) -> k.isOptional && v == null })")
+-            } else {
+-                addStatement("val entity = constructor.callBy(args.filterNot { (k, v) -> k.isOptional && v == null })")
+-            }
++            createEntityByReflection(table, constructorParams)
+         } else {
+-            if (table.columns.all { it.entityProperty.simpleName.asString() in constructorParams }) {
+-                add("«return·%T(", table.entityClass.toClassName())
+-            } else {
+-                add("«val·entity·=·%T(", table.entityClass.toClassName())
+-            }
+-
+-            for (column in table.columns) {
+-                val parameter = constructorParams[column.entityProperty.simpleName.asString()] ?: continue
+-                if (parameter._type.isMarkedNullable) {
+-                    add("%N·=·row[this.%N],", parameter.name!!.asString(), column.columnPropertyName)
+-                } else {
+-                    add("%N·=·row[this.%N]!!,", parameter.name!!.asString(), column.columnPropertyName)
+-                }
+-            }
+-
+-            add(")\n»")
++            createEntityByConstructor(table, constructorParams)
+         }
+ 
+         for (column in table.columns) {
+@@ -192,6 +151,60 @@ internal object TableClassGenerator {
+         }
+     }
+ 
++    private fun CodeBlock.Builder.createEntityByReflection(
++        table: TableMetadata, constructorParams: Map<String, KSValueParameter>
++    ) {
++        addStatement(
++            "val constructor = %T::class.%M!!",
++            table.entityClass.toClassName(),
++            MemberName("kotlin.reflect.full", "primaryConstructor", true)
++        )
++
++        add("«val args = mapOf(")
++
++        for (column in table.columns) {
++            val propName = column.entityProperty.simpleName.asString()
++            if (propName in constructorParams) {
++                add(
++                    "constructor.%M(%S)!! to row[this.%N],",
++                    MemberName("kotlin.reflect.full", "findParameterByName", true),
++                    propName,
++                    column.columnPropertyName
++                )
++            }
++        }
++
++        add(")\n»")
++        addStatement("// Filter optional arguments out to make default values work.")
++
++        if (table.columns.all { it.entityProperty.simpleName.asString() in constructorParams }) {
++            addStatement("return constructor.callBy(args.filterNot { (k, v) -> k.isOptional && v == null })")
++        } else {
++            addStatement("val entity = constructor.callBy(args.filterNot { (k, v) -> k.isOptional && v == null })")
++        }
++    }
++
++    private fun CodeBlock.Builder.createEntityByConstructor(
++        table: TableMetadata, constructorParams: Map<String, KSValueParameter>
++    ) {
++        if (table.columns.all { it.entityProperty.simpleName.asString() in constructorParams }) {
++            add("«return·%T(", table.entityClass.toClassName())
++        } else {
++            add("«val·entity·=·%T(", table.entityClass.toClassName())
++        }
++
++        for (column in table.columns) {
++            val parameter = constructorParams[column.entityProperty.simpleName.asString()] ?: continue
++            if (parameter._type.isMarkedNullable) {
++                add("%N·=·row[this.%N],", parameter.name!!.asString(), column.columnPropertyName)
++            } else {
++                add("%N·=·row[this.%N]!!,", parameter.name!!.asString(), column.columnPropertyName)
++            }
++        }
++
++        add(")\n»")
++    }
++
+     private fun TypeSpec.Builder.configureAliasedFunction(table: TableMetadata): TypeSpec.Builder {
+         val func = FunSpec.builder("aliased")
+             .addKdoc(
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
+index bd85405629fda5d1b13aa668c15ea3b51b7207a1..04ac15a1f2f4d12545b09354ad6a41a51f18e37b 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
+@@ -152,13 +152,13 @@ internal class MetadataParser(_resolver: Resolver, _environment: SymbolProcessor
+ 
+     private fun parseColumnSqlType(property: KSPropertyDeclaration): KSType {
+         var sqlType = property.annotations
+-            .filter { it._annotationType.getJvmName() == Column::class.jvmName }
++            .filter { it._annotationType.declaration.qualifiedName?.asString() == Column::class.jvmName }
+             .flatMap { it.arguments }
+             .filter { it.name?.asString() == Column::sqlType.name }
+             .map { it.value as KSType? }
+             .singleOrNull()
+ 
+-        if (sqlType?.getJvmName() == Nothing::class.jvmName) {
++        if (sqlType?.declaration?.qualifiedName?.asString() == Nothing::class.jvmName) {
+             sqlType = null
+         }
+ 
+@@ -184,7 +184,7 @@ internal class MetadataParser(_resolver: Resolver, _environment: SymbolProcessor
+ 
+             val hasConstructor = declaration.getConstructors()
+                 .filter { it.parameters.size == 1 }
+-                .filter { it.parameters[0]._type.getJvmName() == TypeReference::class.jvmName }
++                .filter { it.parameters[0]._type.declaration.qualifiedName?.asString() == TypeReference::class.jvmName }
+                 .any()
+ 
+             if (!hasConstructor) {
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/KspExtensions.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/KspExtensions.kt
+index e89a68043529725d95945e36bfbe573e50e19258..4a0858dbf49a2d45512d96e6afab74074d8cc281 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/KspExtensions.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/KspExtensions.kt
+@@ -28,6 +28,12 @@ import kotlin.reflect.jvm.jvmName
+ @Suppress("ObjectPropertyName")
+ internal val KSPropertyDeclaration._type: KSType get() = type.resolve()
+ 
++/**
++ * Return the resolved [KSType] of this parameter.
++ */
++@Suppress("ObjectPropertyName")
++internal val KSValueParameter._type: KSType get() = type.resolve()
++
+ /**
+  * Return the resolved [KSType] of this annotation.
+  */
+@@ -35,10 +41,40 @@ internal val KSPropertyDeclaration._type: KSType get() = type.resolve()
+ internal val KSAnnotation._annotationType: KSType get() = annotationType.resolve()
+ 
+ /**
+- * Return the resolved [KSType] of this parameter.
++ * Check if this type is an inline class.
+  */
+-@Suppress("ObjectPropertyName")
+-internal val KSValueParameter._type: KSType get() = type.resolve()
++@OptIn(KspExperimental::class)
++internal fun KSType.isInline(): Boolean {
++    val declaration = declaration as KSClassDeclaration
++    return declaration.isAnnotationPresent(JvmInline::class) && declaration.modifiers.contains(Modifier.VALUE)
++}
++
++/**
++ * Check if this class is a subclass of [T].
++ */
++internal inline fun <reified T : Any> KSClassDeclaration.isSubclassOf(): Boolean {
++    return findSuperTypeReference(T::class.jvmName) != null
++}
++
++/**
++ * Find the specific super type reference for this class.
++ */
++internal fun KSClassDeclaration.findSuperTypeReference(name: String): KSTypeReference? {
++    for (superType in this.superTypes) {
++        val ksType = superType.resolve()
++
++        if (ksType.declaration.qualifiedName?.asString() == name) {
++            return superType
++        }
++
++        val result = (ksType.declaration as KSClassDeclaration).findSuperTypeReference(name)
++        if (result != null) {
++            return result
++        }
++    }
++
++    return null
++}
+ 
+ /**
+  * Check if the given symbol is valid.
+@@ -79,46 +115,3 @@ internal fun KSNode.isValid(): Boolean {
+ 
+     return this.accept(visitor, null)
+ }
+-
+-/**
+- * Check if this class is a subclass of [T].
+- */
+-internal inline fun <reified T : Any> KSClassDeclaration.isSubclassOf(): Boolean {
+-    return findSuperTypeReference(T::class.jvmName) != null
+-}
+-
+-/**
+- * Find the specific super type reference for this class.
+- */
+-internal fun KSClassDeclaration.findSuperTypeReference(name: String): KSTypeReference? {
+-    for (superType in this.superTypes) {
+-        val ksType = superType.resolve()
+-
+-        if (ksType.getJvmName() == name) {
+-            return superType
+-        }
+-
+-        val result = (ksType.declaration as KSClassDeclaration).findSuperTypeReference(name)
+-        if (result != null) {
+-            return result
+-        }
+-    }
+-
+-    return null
+-}
+-
+-/**
+- * Check if this type is an inline class.
+- */
+-@OptIn(KspExperimental::class)
+-internal fun KSType.isInline(): Boolean {
+-    val declaration = declaration as KSClassDeclaration
+-    return declaration.isAnnotationPresent(JvmInline::class) && declaration.modifiers.contains(Modifier.VALUE)
+-}
+-
+-/**
+- * Return the JVM class name of this type.
+- */
+-internal fun KSType.getJvmName(): String? {
+-    return declaration.qualifiedName?.asString()
+-}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/SqlTypeMappings.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/SqlTypeMappings.kt
+index 5eda1ec550b56491f961c10baee377942c0a000a..2bd977b00f1dadb6cd7c01a825c269411717f02a 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/SqlTypeMappings.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/SqlTypeMappings.kt
+@@ -31,11 +31,12 @@ import org.ktorm.ksp.spi.ColumnMetadata
+ import org.ktorm.schema.*
+ 
+ internal fun KSPropertyDeclaration.getSqlType(resolver: Resolver): KSType? {
+-    if ((_type.declaration as KSClassDeclaration).classKind == ClassKind.ENUM_CLASS) {
++    val declaration = _type.declaration as KSClassDeclaration
++    if (declaration.classKind == ClassKind.ENUM_CLASS) {
+         return resolver.getClassDeclarationByName<EnumSqlType<*>>()?.asType(emptyList())
+     }
+ 
+-    val sqlType = when (_type.getJvmName()) {
++    val sqlType = when (declaration.qualifiedName?.asString()) {
+         "kotlin.Boolean" -> BooleanSqlType::class
+         "kotlin.Int" -> IntSqlType::class
+         "kotlin.Short" -> ShortSqlType::class
+@@ -64,7 +65,7 @@ internal fun KSPropertyDeclaration.getSqlType(resolver: Resolver): KSType? {
+ 
+ @OptIn(KotlinPoetKspPreview::class)
+ internal fun ColumnMetadata.getRegisteringCodeBlock(): CodeBlock {
+-    val sqlTypeName = sqlType.getJvmName()
++    val sqlTypeName = sqlType.declaration.qualifiedName?.asString()
+     val registerFun = when (sqlTypeName) {
+         "org.ktorm.schema.BooleanSqlType" -> MemberName("org.ktorm.schema", "boolean", true)
+         "org.ktorm.schema.IntSqlType" -> MemberName("org.ktorm.schema", "int", true)

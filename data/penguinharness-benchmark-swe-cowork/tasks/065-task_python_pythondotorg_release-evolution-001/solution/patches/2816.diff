@@ -1,0 +1,204 @@
+diff --git a/downloads/managers.py b/downloads/managers.py
+index 56040d2bbf9ac507e83d2e19cca553f797190469..22da0cdd03eca8021b79bc78465a92166fb0c8dd 100644
+--- a/downloads/managers.py
++++ b/downloads/managers.py
+@@ -29,8 +29,11 @@ class ReleaseQuerySet(QuerySet):
+     def latest_python2(self):
+         return self.python2().filter(is_latest=True)
+ 
+-    def latest_python3(self):
+-        return self.python3().filter(is_latest=True)
++    def latest_python3(self, minor_version: int | None = None):
++        if minor_version is None:
++            return self.python3().filter(is_latest=True)
++        pattern = rf"^Python 3\.{minor_version}\."
++        return self.python3().filter(name__regex=pattern).order_by("-release_date")
+ 
+     def latest_pymanager(self):
+         return self.pymanager().filter(is_latest=True)
+@@ -44,22 +47,10 @@ class ReleaseQuerySet(QuerySet):
+ 
+ class ReleaseManager(Manager.from_queryset(ReleaseQuerySet)):
+     def latest_python2(self):
+-        qs = self.get_queryset().latest_python2()
+-        if qs:
+-            return qs[0]
+-        else:
+-            return None
+-
+-    def latest_python3(self):
+-        qs = self.get_queryset().latest_python3()
+-        if qs:
+-            return qs[0]
+-        else:
+-            return None
++        return self.get_queryset().latest_python2().first()
++
++    def latest_python3(self, minor_version: int | None = None):
++        return self.get_queryset().latest_python3(minor_version).first()
+ 
+     def latest_pymanager(self):
+-        qs = self.get_queryset().latest_pymanager()
+-        if qs:
+-            return qs[0]
+-        else:
+-            return None
++        return self.get_queryset().latest_pymanager().first()
+diff --git a/downloads/models.py b/downloads/models.py
+index 3217dec50d6e1ca6f76767784338b3cb94e0ec76..f37a041d0514c62f4eae15c557709b9a432550a6 100644
+--- a/downloads/models.py
++++ b/downloads/models.py
+@@ -292,6 +292,12 @@ def purge_fastly_download_pages(sender, instance, **kwargs):
+         purge_url('/downloads/feed.rss')
+         purge_url('/downloads/latest/python2/')
+         purge_url('/downloads/latest/python3/')
++        # Purge minor version specific URLs (like /downloads/latest/python3.14/)
++        version = instance.get_version()
++        if instance.version == Release.PYTHON3 and version:
++            match = re.match(r'^3\.(\d+)', version)
++            if match:
++                purge_url(f'/downloads/latest/python3.{match.group(1)}/')
+         purge_url('/downloads/latest/pymanager/')
+         purge_url('/downloads/macos/')
+         purge_url('/downloads/source/')
+diff --git a/downloads/urls.py b/downloads/urls.py
+index 5b6b3fda05f7c6479e368f6fe08bfc048f1b1fea..4b2d573bfe0f6f5df18a6c30b9678f48b5f6a865 100644
+--- a/downloads/urls.py
++++ b/downloads/urls.py
+@@ -5,6 +5,7 @@ app_name = 'downloads'
+ urlpatterns = [
+     re_path(r'latest/python2/?$', views.DownloadLatestPython2.as_view(), name='download_latest_python2'),
+     re_path(r'latest/python3/?$', views.DownloadLatestPython3.as_view(), name='download_latest_python3'),
++    re_path(r'latest/python3\.(?P<minor>\d+)/?$', views.DownloadLatestPython3x.as_view(), name='download_latest_python3x'),
+     re_path(r'latest/pymanager/?$', views.DownloadLatestPyManager.as_view(), name='download_latest_pymanager'),
+     re_path(r'latest/?$', views.DownloadLatestPython3.as_view(), name='download_latest_python3'),
+     path('operating-systems/', views.DownloadFullOSList.as_view(), name='download_full_os_list'),
+diff --git a/downloads/views.py b/downloads/views.py
+index 57196d622e5394e18fc21b22d6f1e51e57914d81..d19f0e86840e47fd3da3c38e04b8425d85b3dcfd 100644
+--- a/downloads/views.py
++++ b/downloads/views.py
+@@ -45,6 +45,27 @@ class DownloadLatestPython3(RedirectView):
+             return reverse('download')
+ 
+ 
++class DownloadLatestPython3x(RedirectView):
++    """ Redirect to latest Python 3.x release for a specific minor version """
++    permanent = False
++
++    def get_redirect_url(self, **kwargs):
++        minor_version = kwargs.get('minor')
++        if not minor_version:
++            return reverse('downloads:download')
++
++        try:
++            minor_version_int = int(minor_version)
++            latest_release = Release.objects.latest_python3(minor_version_int)
++        except (ValueError, Release.DoesNotExist):
++            latest_release = None
++
++        if latest_release:
++            return latest_release.get_absolute_url()
++        else:
++            return reverse('downloads:download')
++
++
+ class DownloadLatestPyManager(RedirectView):
+     """ Redirect to latest Python install manager release """
+     permanent = False
+diff --git a/static/sass/_layout.scss b/static/sass/_layout.scss
+index 884a0e9bc53e8e3d5caa4740163a071706027128..3e256a6ac2fb8c14330779869695c1f544ada1f7 100644
+--- a/static/sass/_layout.scss
++++ b/static/sass/_layout.scss
+@@ -449,6 +449,7 @@
+ 
+     .release-version,
+     .release-status,
++    .release-dl,
+     .release-start,
+     .release-end,
+     .release-pep {
+@@ -458,10 +459,11 @@
+         vertical-align: middle;
+     }
+ 
+-    .release-version { width: 15%; }
++    .release-version { width: 10%; }
+     .release-status { width: 20%; }
+-    .release-start { width: 25%; }
+-    .release-end { width: 25%; }
++    .release-dl { width: 15%; }
++    .release-start { width: 20%; }
++    .release-end { width: 20%; }
+     .release-pep { width: 15%; }
+ 
+     /* Previous Next pattern */
+diff --git a/static/sass/mq.css b/static/sass/mq.css
+index 4d4dea4acfc3712e1e58e57d08ad4ca14fbb35be..7c49abf44652c90d4225a141ee19c6791adeb35f 100644
+--- a/static/sass/mq.css
++++ b/static/sass/mq.css
+@@ -1505,6 +1505,7 @@ html[xmlns] .slides { display: block; }
+ 
+   .release-version,
+   .release-status,
++  .release-dl,
+   .release-start,
+   .release-end,
+   .release-pep {
+@@ -1514,16 +1515,19 @@ html[xmlns] .slides { display: block; }
+     vertical-align: middle; }
+ 
+   .release-version {
+-    width: 15%; }
++    width: 10%; }
+ 
+   .release-status {
+     width: 20%; }
+ 
++  .release-dl {
++    width: 15%; }
++
+   .release-start {
+-    width: 25%; }
++    width: 20%; }
+ 
+   .release-end {
+-    width: 25%; }
++    width: 20%; }
+ 
+   .release-pep {
+     width: 15%; }
+diff --git a/static/sass/no-mq.css b/static/sass/no-mq.css
+index 0565a60dd79840a8bc951bb560bfd320deee4a62..f50d4140cdc15301028250c143c226dbb277b433 100644
+--- a/static/sass/no-mq.css
++++ b/static/sass/no-mq.css
+@@ -1219,6 +1219,7 @@ a.button {
+ 
+ .release-version,
+ .release-status,
++.release-dl,
+ .release-start,
+ .release-end,
+ .release-pep {
+@@ -1228,16 +1229,19 @@ a.button {
+   vertical-align: middle; }
+ 
+ .release-version {
+-  width: 15%; }
++  width: 10%; }
+ 
+ .release-status {
+   width: 20%; }
+ 
++.release-dl {
++  width: 15%; }
++
+ .release-start {
+-  width: 25%; }
++  width: 20%; }
+ 
+ .release-end {
+-  width: 25%; }
++  width: 20%; }
+ 
+ .release-pep {
+   width: 15%; }

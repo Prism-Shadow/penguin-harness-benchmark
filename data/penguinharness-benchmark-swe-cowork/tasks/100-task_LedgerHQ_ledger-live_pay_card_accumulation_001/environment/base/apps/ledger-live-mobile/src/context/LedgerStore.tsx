@@ -1,0 +1,323 @@
+import React, { useEffect, useState, ReactNode, useCallback } from "react";
+import { Provider } from "react-redux";
+import { Store } from "redux";
+import { importPostOnboardingState } from "@ledgerhq/live-common/postOnboarding/actions";
+import { restoreLargeScreenUpsellModalState } from "@ledgerhq/live-engagement/largeScreenUpsellModal";
+import { backfillOnboardingDate } from "~/logic/postOnboarding/backfillOnboardingDate";
+import { CounterValuesStateRaw } from "@ledgerhq/live-countervalues/types";
+import { findCryptoCurrencyById } from "@domain/entity-currency-crypto";
+import mmkvStorageWrapper from "LLM/storage/mmkvStorageWrapper";
+import { logStartupEvent } from "LLM/utils/logStartupTime";
+import type { StorageCurrencyData, StoreStorageData } from "LLM/utils/logLastStartupEvents";
+import { STARTUP_EVENTS } from "LLM/utils/resolveStartupEvents";
+import {
+  getAccounts,
+  getCountervalues,
+  getCryptoAssetsCacheState,
+  getFeatureFlagsState,
+  saveFeatureFlagsState,
+  getSettings,
+  getBle,
+  getHistory,
+  getKnownDevices,
+  getLargeScreenUpsellModalState,
+  getPostOnboardingState,
+  getProtect,
+  getMarketState,
+  getMarketListConfig,
+  getMarketBannerState,
+  getTrustchainState,
+  getWalletExportState,
+  getLargeMoverState,
+  getIdentities,
+  getUser,
+} from "../db";
+import { importSettings } from "~/actions/settings";
+import { importStore as importAccountsRaw } from "~/actions/accounts";
+import { importBle } from "~/actions/ble";
+import { importKnownDevices } from "~/reducers/knownDevices";
+import { updateProtectData, updateProtectStatus } from "~/actions/protect";
+import {
+  migrateLegacyCryptoCounterValue,
+  migrateLegacyStarredMarketCoins,
+} from "~/reducers/settings";
+import { listCachedCurrencyIds, hydrateCurrency } from "~/bridge/cache";
+import { importMarket } from "~/actions/market";
+import { importMarketListConfig } from "~/reducers/market";
+import { importMarketBannerState } from "~/reducers/marketBanner";
+import { importTrustchainStoreState } from "@ledgerhq/ledger-key-ring-protocol/store";
+import { importWalletState } from "~/reducers/wallet";
+import { importLargeMoverState } from "~/actions/largeMoverLandingPage";
+import { initHistory } from "~/reducers/history";
+import { restoreTokensToCache, parsePersistedCAL } from "@domain/api-currency-token";
+import { setAllOverrides, setBannerVisible, type PartialFeatures } from "@shared/feature-flags";
+import { initIdentities } from "../helpers/identities";
+
+interface Props {
+  onInitFinished: () => void;
+  children: (props: {
+    ready: boolean;
+    initialCountervalues?: CounterValuesStateRaw;
+    currencyInitialized: boolean;
+  }) => ReactNode;
+  store: Store;
+}
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 500;
+
+async function retry<T>(fn: () => Promise<T>, retries: number, delay: number): Promise<T> {
+  try {
+    return await fn();
+  } catch {
+    if (retries > 0) {
+      await new Promise(res => setTimeout(res, delay));
+      return retry(fn, retries - 1, delay);
+    } else {
+      throw new Error(`Max retries reached for ${fn.name}`);
+    }
+  }
+}
+
+const LedgerStoreProvider: React.FC<Props> = ({ onInitFinished, children, store }) => {
+  const [ready, setReady] = useState(false);
+  const [initialCountervalues, setInitialCountervalues] = useState<
+    CounterValuesStateRaw | undefined
+  >(undefined);
+  const [currencyInitialized, setCurrencyInitialized] = useState(false);
+
+  const init = useCallback(async () => {
+    try {
+      const readStorageStart = Date.now();
+      mmkvStorageWrapper.monitor(true);
+      const [
+        bleData,
+        persistedKnownDevices,
+        settingsData,
+        accountsData,
+        postOnboardingState,
+        largeScreenUpsellModalState,
+        marketState,
+        marketListConfigState,
+        marketBannerState,
+        trustchainStore,
+        walletStore,
+        protect,
+        initialCountervalues,
+        largeMoverState,
+        cryptoAssetsCache,
+        persistedIdentities,
+        persistedFeatureFlags,
+        legacyUser,
+        historyState,
+      ] = await Promise.all([
+        retry(getBle, MAX_RETRIES, RETRY_DELAY),
+        retry(getKnownDevices, MAX_RETRIES, RETRY_DELAY),
+        retry(getSettings, MAX_RETRIES, RETRY_DELAY),
+        retry(getAccounts, MAX_RETRIES, RETRY_DELAY),
+        retry(getPostOnboardingState, MAX_RETRIES, RETRY_DELAY),
+        retry(getLargeScreenUpsellModalState, MAX_RETRIES, RETRY_DELAY),
+        retry(getMarketState, MAX_RETRIES, RETRY_DELAY),
+        retry(getMarketListConfig, MAX_RETRIES, RETRY_DELAY),
+        retry(getMarketBannerState, MAX_RETRIES, RETRY_DELAY),
+        retry(getTrustchainState, MAX_RETRIES, RETRY_DELAY),
+        retry(getWalletExportState, MAX_RETRIES, RETRY_DELAY),
+        retry(getProtect, MAX_RETRIES, RETRY_DELAY),
+        retry(getCountervalues, MAX_RETRIES, RETRY_DELAY),
+        retry(getLargeMoverState, MAX_RETRIES, RETRY_DELAY),
+        retry(getCryptoAssetsCacheState, MAX_RETRIES, RETRY_DELAY),
+        retry(getIdentities, MAX_RETRIES, RETRY_DELAY),
+        retry(getFeatureFlagsState, MAX_RETRIES, RETRY_DELAY),
+        retry(getUser, MAX_RETRIES, RETRY_DELAY),
+        retry(getHistory, MAX_RETRIES, RETRY_DELAY),
+      ]).finally(() => {
+        logStartupEvent<StoreStorageData>(STARTUP_EVENTS.STORE_STORAGE_READ, {
+          readTime: Date.now() - readStorageStart,
+          mmkvRead: mmkvStorageWrapper.flushAccessedKeys(false),
+        });
+      });
+
+      store.dispatch(importBle(bleData));
+      if (persistedKnownDevices) {
+        store.dispatch(importKnownDevices(persistedKnownDevices));
+      }
+
+      // Legacy crypto counter-values were persisted as ticker (BTC/ETH); migrate them to Ledger ids.
+      if (settingsData && typeof settingsData.counterValue === "string") {
+        settingsData.counterValue = migrateLegacyCryptoCounterValue(settingsData.counterValue);
+      }
+      if (settingsData?.starredMarketCoins) {
+        settingsData.starredMarketCoins = migrateLegacyStarredMarketCoins(
+          settingsData.starredMarketCoins,
+        );
+      }
+
+      store.dispatch(importSettings(settingsData));
+
+      // Hydrate persisted crypto assets tokens BEFORE importing accounts
+      // This ensures tokens are available when decoding accounts (which now uses findTokenById)
+      // Cross-caching is automatic: tokens are cached under both ID and address lookups
+      // parsePersistedCAL validates version + schema; returns null for missing/corrupt/legacy blobs.
+      const persistedCryptoAssets = parsePersistedCAL(cryptoAssetsCache);
+      if (persistedCryptoAssets) {
+        const TOKEN_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+        await restoreTokensToCache(store.dispatch, persistedCryptoAssets, TOKEN_CACHE_TTL);
+      }
+
+      // Handle account import with error recovery for async issues
+      try {
+        (await importAccountsRaw(accountsData))(store.dispatch);
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error("Failed to import accounts during initialization:", error);
+        // Continue with app initialization even if account import fails
+        // This prevents blocking deeplink navigation
+      }
+
+      if (postOnboardingState) {
+        store.dispatch(importPostOnboardingState({ newState: postOnboardingState }));
+      }
+
+      backfillOnboardingDate(store);
+
+      if (largeScreenUpsellModalState) {
+        store.dispatch(restoreLargeScreenUpsellModalState(largeScreenUpsellModalState));
+      }
+
+      if (marketState) {
+        store.dispatch(importMarket(marketState));
+      }
+
+      if (marketListConfigState) {
+        store.dispatch(importMarketListConfig(marketListConfigState));
+      }
+
+      if (marketBannerState) {
+        store.dispatch(importMarketBannerState(marketBannerState));
+      }
+
+      store.dispatch(importTrustchainStoreState(trustchainStore));
+
+      if (walletStore) {
+        importWalletState(walletStore)(store.dispatch);
+      }
+
+      if (protect) {
+        store.dispatch(updateProtectData(protect.data));
+        store.dispatch(updateProtectStatus(protect.protectStatus));
+      }
+
+      if (largeMoverState) {
+        store.dispatch(importLargeMoverState(largeMoverState));
+      }
+
+      if (historyState) {
+        store.dispatch(initHistory(historyState));
+      }
+
+      // Initialize identities (single source of truth): migrate from legacy "user" if present, then persist under "identities" only
+      await initIdentities(store, persistedIdentities ?? null, legacyUser ?? null);
+
+      if (persistedFeatureFlags) {
+        store.dispatch(setAllOverrides(persistedFeatureFlags.overrides));
+        store.dispatch(setBannerVisible(persistedFeatureFlags.bannerVisible));
+      } else if (settingsData) {
+        // One-time migration from legacy settings fields. Write the new featureFlags key directly
+        // so DBSave does not need saveAtStart and avoids a spurious write on every subsequent boot.
+        // The legacy fields have been removed from SettingsState but may still exist in old persisted payloads.
+        const rawOverrides =
+          "overriddenFeatureFlags" in settingsData &&
+          typeof settingsData["overriddenFeatureFlags"] === "object" &&
+          settingsData["overriddenFeatureFlags"] !== null
+            ? (settingsData["overriddenFeatureFlags"] as Record<string, unknown>)
+            : undefined;
+        const filteredOverrides: PartialFeatures = rawOverrides
+          ? Object.fromEntries(Object.entries(rawOverrides).filter(([, v]) => v !== undefined))
+          : {};
+        const hasLegacyOverrides = Object.keys(filteredOverrides).length > 0;
+        if (hasLegacyOverrides) {
+          store.dispatch(setAllOverrides(filteredOverrides));
+        }
+
+        const legacyBannerVisible =
+          ("featureFlagsBannerVisible" in settingsData &&
+          typeof settingsData["featureFlagsBannerVisible"] === "boolean"
+            ? settingsData["featureFlagsBannerVisible"]
+            : undefined) ??
+          ("featureFlagsButtonVisible" in settingsData &&
+          typeof settingsData["featureFlagsButtonVisible"] === "boolean"
+            ? settingsData["featureFlagsButtonVisible"]
+            : undefined);
+
+        if (typeof legacyBannerVisible === "boolean") {
+          store.dispatch(setBannerVisible(legacyBannerVisible));
+        }
+
+        if (hasLegacyOverrides || typeof legacyBannerVisible === "boolean") {
+          await saveFeatureFlagsState({
+            overrides: filteredOverrides,
+            bannerVisible: legacyBannerVisible ?? false,
+          });
+        }
+      }
+
+      setInitialCountervalues(initialCountervalues);
+      setReady(true);
+      onInitFinished();
+
+      await hydrateCurrencies().finally(() => setCurrencyInitialized(true)); // Don't block the App rendering for this
+    } catch (error) {
+      console.error(
+        error instanceof Error
+          ? error.message
+          : "An unknown error occurred during the StoreProvider initialization",
+      );
+    }
+  }, [store, onInitFinished]);
+
+  useEffect(() => {
+    init();
+  }, [init]);
+
+  return (
+    <Provider store={store}>
+      {children({ ready, initialCountervalues, currencyInitialized })}
+    </Provider>
+  );
+};
+
+export default LedgerStoreProvider;
+
+async function hydrateCurrencies() {
+  const totalStartTime = Date.now();
+  const cachedCurrencyIds = await retry(listCachedCurrencyIds, MAX_RETRIES, RETRY_DELAY);
+
+  // hydrate the store with the bridge/cache
+  // Promise.allSettled doesn't exist in RN
+  const results: StorageCurrencyData["results"] = [];
+
+  mmkvStorageWrapper.monitor(true);
+  // The hydration is not actually asynchronous the function async signature is caused by the storage but MMKV is synchronous.
+  // Thus running the hydration sequentially is fine and it allows to actually measure per-currency durations.
+  for (const id of cachedCurrencyIds) {
+    const start = Date.now();
+    try {
+      const currency = findCryptoCurrencyById?.(id);
+      if (!currency) {
+        const duration = Date.now() - start;
+        results.push({ status: "rejected", id, reason: "unknown currency", duration });
+        continue;
+      }
+      await hydrateCurrency(currency);
+      results.push({ status: "fulfilled", id, duration: Date.now() - start });
+    } catch (error) {
+      results.push({ status: "rejected", id, reason: error, duration: Date.now() - start });
+    }
+  }
+
+  logStartupEvent<StorageCurrencyData>(STARTUP_EVENTS.CURRENCY_HYDRATED, {
+    results,
+    totalDuration: Date.now() - totalStartTime,
+    mmkvRead: mmkvStorageWrapper.flushAccessedKeys(false),
+  });
+}

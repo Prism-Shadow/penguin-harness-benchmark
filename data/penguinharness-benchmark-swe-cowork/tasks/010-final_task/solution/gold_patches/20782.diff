@@ -1,0 +1,384 @@
+diff --git a/packages/ember-template-compiler/lib/plugins/assert-against-attrs.ts b/packages/ember-template-compiler/lib/plugins/assert-against-attrs.ts
+index f2984a8c3aee98ea80e8f4c666c3874fd6e1faf9..481e1a6839fe07fd3565a1ae73809bad99528b02 100644
+--- a/packages/ember-template-compiler/lib/plugins/assert-against-attrs.ts
++++ b/packages/ember-template-compiler/lib/plugins/assert-against-attrs.ts
+@@ -2,6 +2,7 @@ import { assert, deprecate } from '@ember/debug';
+ import type { AST, ASTPlugin } from '@glimmer/syntax';
+ import calculateLocationDisplay from '../system/calculate-location-display';
+ import type { EmberASTPluginEnvironment } from '../types';
++import { trackLocals } from './utils';
+ 
+ /**
+  @module ember
+@@ -23,48 +24,16 @@ import type { EmberASTPluginEnvironment } from '../types';
+ export default function assertAgainstAttrs(env: EmberASTPluginEnvironment): ASTPlugin {
+   let { builders: b } = env.syntax;
+   let moduleName = env.meta?.moduleName;
+-
+-  let stack: string[][] = [[]];
+-
+-  function updateBlockParamsStack(blockParams: string[]) {
+-    let parent = stack[stack.length - 1];
+-    assert('has parent', parent);
+-    stack.push(parent.concat(blockParams));
+-  }
++  let { hasLocal, visitor } = trackLocals(env);
+ 
+   return {
+     name: 'assert-against-attrs',
+ 
+     visitor: {
+-      Template: {
+-        enter(node: AST.Template) {
+-          updateBlockParamsStack(node.blockParams);
+-        },
+-        exit() {
+-          stack.pop();
+-        },
+-      },
+-
+-      Block: {
+-        enter(node: AST.Block) {
+-          updateBlockParamsStack(node.blockParams);
+-        },
+-        exit() {
+-          stack.pop();
+-        },
+-      },
+-
+-      ElementNode: {
+-        enter(node: AST.ElementNode) {
+-          updateBlockParamsStack(node.blockParams);
+-        },
+-        exit() {
+-          stack.pop();
+-        },
+-      },
++      ...visitor,
+ 
+       PathExpression(node: AST.PathExpression): AST.Node | void {
+-        if (isAttrs(node, stack[stack.length - 1]!)) {
++        if (isAttrs(node, hasLocal)) {
+           assert(
+             `Using {{attrs}} to reference named arguments is not supported. {{${
+               node.original
+@@ -106,12 +75,8 @@ export default function assertAgainstAttrs(env: EmberASTPluginEnvironment): ASTP
+   };
+ }
+ 
+-function isAttrs(node: AST.PathExpression, symbols: string[]) {
+-  return (
+-    node.head.type === 'VarHead' &&
+-    node.head.name === 'attrs' &&
+-    symbols.indexOf(node.head.name) === -1
+-  );
++function isAttrs(node: AST.PathExpression, hasLocal: (k: string) => boolean) {
++  return node.head.type === 'VarHead' && node.head.name === 'attrs' && !hasLocal(node.head.name);
+ }
+ 
+ function isThisDotAttrs(node: AST.PathExpression) {
+diff --git a/packages/ember-template-compiler/lib/plugins/assert-against-named-outlets.ts b/packages/ember-template-compiler/lib/plugins/assert-against-named-outlets.ts
+index c680f3b7259861a4c3513f251cce3f962d8c39d2..da7931acfcad88603d5974341641c1ebc1baa02c 100644
+--- a/packages/ember-template-compiler/lib/plugins/assert-against-named-outlets.ts
++++ b/packages/ember-template-compiler/lib/plugins/assert-against-named-outlets.ts
+@@ -2,6 +2,7 @@ import { assert } from '@ember/debug';
+ import type { AST, ASTPlugin } from '@glimmer/syntax';
+ import calculateLocationDisplay from '../system/calculate-location-display';
+ import type { EmberASTPluginEnvironment } from '../types';
++import { trackLocals } from './utils';
+ 
+ /**
+  @module ember
+@@ -15,16 +16,19 @@ import type { EmberASTPluginEnvironment } from '../types';
+ */
+ export default function assertAgainstNamedOutlets(env: EmberASTPluginEnvironment): ASTPlugin {
+   let moduleName = env.meta?.moduleName;
++  let { hasLocal, visitor } = trackLocals(env);
+ 
+   return {
+     name: 'assert-against-named-outlets',
+ 
+     visitor: {
++      ...visitor,
+       MustacheStatement(node: AST.MustacheStatement) {
+         if (
+           node.path.type === 'PathExpression' &&
+           node.path.original === 'outlet' &&
+-          node.params[0]
++          node.params[0] &&
++          !hasLocal('outlet')
+         ) {
+           let sourceInformation = calculateLocationDisplay(moduleName, node.loc);
+           assert(
+diff --git a/packages/ember-template-compiler/lib/plugins/assert-input-helper-without-block.ts b/packages/ember-template-compiler/lib/plugins/assert-input-helper-without-block.ts
+index f16e76056c4e7f31bc5ef54fbfd41508544edf4b..9164bd92286fd5affbeee9032726554bc097b215 100644
+--- a/packages/ember-template-compiler/lib/plugins/assert-input-helper-without-block.ts
++++ b/packages/ember-template-compiler/lib/plugins/assert-input-helper-without-block.ts
+@@ -2,16 +2,20 @@ import { assert } from '@ember/debug';
+ import type { AST, ASTPlugin } from '@glimmer/syntax';
+ import calculateLocationDisplay from '../system/calculate-location-display';
+ import type { EmberASTPluginEnvironment } from '../types';
+-import { isPath } from './utils';
++import { isPath, trackLocals } from './utils';
+ 
+ export default function errorOnInputWithContent(env: EmberASTPluginEnvironment): ASTPlugin {
+   let moduleName = env.meta?.moduleName;
++  let { hasLocal, visitor } = trackLocals(env);
+ 
+   return {
+     name: 'assert-input-helper-without-block',
+ 
+     visitor: {
++      ...visitor,
+       BlockStatement(node: AST.BlockStatement) {
++        if (hasLocal('input')) return;
++
+         if (isPath(node.path) && node.path.original === 'input') {
+           assert(assertMessage(moduleName, node));
+         }
+diff --git a/packages/ember-template-compiler/lib/plugins/transform-action-syntax.ts b/packages/ember-template-compiler/lib/plugins/transform-action-syntax.ts
+index 2ee6fdd4bc492c868395153e4c72a860bcb9eef9..d606378f2ec38d401acdc9549d3f927a42378cc1 100644
+--- a/packages/ember-template-compiler/lib/plugins/transform-action-syntax.ts
++++ b/packages/ember-template-compiler/lib/plugins/transform-action-syntax.ts
+@@ -1,6 +1,6 @@
+ import type { AST, ASTPlugin } from '@glimmer/syntax';
+ import type { Builders, EmberASTPluginEnvironment } from '../types';
+-import { isPath } from './utils';
++import { isPath, trackLocals } from './utils';
+ 
+ /**
+  @module ember
+@@ -27,27 +27,29 @@ import { isPath } from './utils';
+   @class TransformActionSyntax
+ */
+ 
+-export default function transformActionSyntax({ syntax }: EmberASTPluginEnvironment): ASTPlugin {
+-  let { builders: b } = syntax;
++export default function transformActionSyntax(env: EmberASTPluginEnvironment): ASTPlugin {
++  let { builders: b } = env.syntax;
++  let { hasLocal, visitor } = trackLocals(env);
+ 
+   return {
+     name: 'transform-action-syntax',
+ 
+     visitor: {
++      ...visitor,
+       ElementModifierStatement(node: AST.ElementModifierStatement) {
+-        if (isAction(node)) {
++        if (isAction(node, hasLocal)) {
+           insertThisAsFirstParam(node, b);
+         }
+       },
+ 
+       MustacheStatement(node: AST.MustacheStatement) {
+-        if (isAction(node)) {
++        if (isAction(node, hasLocal)) {
+           insertThisAsFirstParam(node, b);
+         }
+       },
+ 
+       SubExpression(node: AST.SubExpression) {
+-        if (isAction(node)) {
++        if (isAction(node, hasLocal)) {
+           insertThisAsFirstParam(node, b);
+         }
+       },
+@@ -55,8 +57,11 @@ export default function transformActionSyntax({ syntax }: EmberASTPluginEnvironm
+   };
+ }
+ 
+-function isAction(node: AST.ElementModifierStatement | AST.MustacheStatement | AST.SubExpression) {
+-  return isPath(node.path) && node.path.original === 'action';
++function isAction(
++  node: AST.ElementModifierStatement | AST.MustacheStatement | AST.SubExpression,
++  hasLocal: (k: string) => boolean
++) {
++  return isPath(node.path) && node.path.original === 'action' && !hasLocal('action');
+ }
+ 
+ function insertThisAsFirstParam(
+diff --git a/packages/ember-template-compiler/lib/plugins/transform-each-track-array.ts b/packages/ember-template-compiler/lib/plugins/transform-each-track-array.ts
+index 269937a098c9bae3f6f54f816f1a3d84f463496e..6465a1c33c8f213673ead3c6b83ad72639b4dda7 100644
+--- a/packages/ember-template-compiler/lib/plugins/transform-each-track-array.ts
++++ b/packages/ember-template-compiler/lib/plugins/transform-each-track-array.ts
+@@ -1,7 +1,7 @@
+ import type { AST, ASTPlugin } from '@glimmer/syntax';
+ import { assert } from '@ember/debug';
+ import type { EmberASTPluginEnvironment } from '../types';
+-import { isPath } from './utils';
++import { isPath, trackLocals } from './utils';
+ 
+ /**
+  @module ember
+@@ -25,13 +25,15 @@ import { isPath } from './utils';
+ */
+ export default function transformEachTrackArray(env: EmberASTPluginEnvironment): ASTPlugin {
+   let { builders: b } = env.syntax;
++  let { hasLocal, visitor } = trackLocals(env);
+ 
+   return {
+     name: 'transform-each-track-array',
+ 
+     visitor: {
++      ...visitor,
+       BlockStatement(node: AST.BlockStatement): AST.Node | void {
+-        if (isPath(node.path) && node.path.original === 'each') {
++        if (isPath(node.path) && node.path.original === 'each' && !hasLocal('each')) {
+           let firstParam = node.params[0];
+           assert('has firstParam', firstParam);
+ 
+diff --git a/packages/ember-template-compiler/lib/plugins/transform-resolutions.ts b/packages/ember-template-compiler/lib/plugins/transform-resolutions.ts
+index ef4fce732bc1382e08bb1a28b469c185848e2b5d..311a485d0e0009045ad0fb50791e068ba1f68454 100644
+--- a/packages/ember-template-compiler/lib/plugins/transform-resolutions.ts
++++ b/packages/ember-template-compiler/lib/plugins/transform-resolutions.ts
+@@ -67,7 +67,7 @@ const TARGETS = Object.freeze(['helper', 'modifier']);
+ export default function transformResolutions(env: EmberASTPluginEnvironment): ASTPlugin {
+   let { builders: b } = env.syntax;
+   let moduleName = env.meta?.moduleName;
+-  let { hasLocal, node: tracker } = trackLocals();
++  let { hasLocal, node: tracker } = trackLocals(env);
+   let seen: Set<AST.Node> | undefined;
+ 
+   return {
+diff --git a/packages/ember-template-compiler/lib/plugins/transform-wrap-mount-and-outlet.ts b/packages/ember-template-compiler/lib/plugins/transform-wrap-mount-and-outlet.ts
+index 32482c8f404ed720e155b0c8c6a4624973e4ed1d..9a9f45b4a475dee3245c27d329958fd616eee4f3 100644
+--- a/packages/ember-template-compiler/lib/plugins/transform-wrap-mount-and-outlet.ts
++++ b/packages/ember-template-compiler/lib/plugins/transform-wrap-mount-and-outlet.ts
+@@ -37,15 +37,13 @@ import { isPath, trackLocals } from './utils';
+ export default function transformWrapMountAndOutlet(env: EmberASTPluginEnvironment): ASTPlugin {
+   let { builders: b } = env.syntax;
+ 
+-  let { hasLocal, node } = trackLocals();
++  let { hasLocal, visitor } = trackLocals(env);
+ 
+   return {
+     name: 'transform-wrap-mount-and-outlet',
+ 
+     visitor: {
+-      Template: node,
+-      ElementNode: node,
+-      Block: node,
++      ...visitor,
+ 
+       MustacheStatement(node: AST.MustacheStatement): AST.Node | void {
+         if (
+diff --git a/packages/ember-template-compiler/lib/plugins/utils.ts b/packages/ember-template-compiler/lib/plugins/utils.ts
+index 112ed51df4b90da6070663f2f711544bd2cd002f..99278ad7b8f578e54758d88ce9e0337a018bceb1 100644
+--- a/packages/ember-template-compiler/lib/plugins/utils.ts
++++ b/packages/ember-template-compiler/lib/plugins/utils.ts
+@@ -1,4 +1,5 @@
+ import type { AST } from '@glimmer/syntax';
++import type { EmberASTPluginEnvironment } from '../types';
+ 
+ export function isPath(node: AST.Node): node is AST.PathExpression {
+   return node.type === 'PathExpression';
+@@ -20,7 +21,11 @@ function getLocalName(node: string | AST.VarHead): string {
+   }
+ }
+ 
+-export function trackLocals() {
++export function inScope(env: EmberASTPluginEnvironment, name: string): boolean {
++  return Boolean(env.lexicalScope?.(name));
++}
++
++export function trackLocals(env: EmberASTPluginEnvironment) {
+   let locals = new Map();
+ 
+   let node = {
+@@ -49,7 +54,12 @@ export function trackLocals() {
+   };
+ 
+   return {
+-    hasLocal: (key: string) => locals.has(key),
++    hasLocal: (key: string) => locals.has(key) || inScope(env, key),
+     node,
++    visitor: {
++      Template: node,
++      ElementNode: node,
++      Block: node,
++    },
+   };
+ }
+diff --git a/packages/ember-template-compiler/lib/types.ts b/packages/ember-template-compiler/lib/types.ts
+index 6c068cb74c36ea60efe53a5bea162a279b223f5d..a54ec7f0d233a7092f1bb0c0f91898a4e891e319 100644
+--- a/packages/ember-template-compiler/lib/types.ts
++++ b/packages/ember-template-compiler/lib/types.ts
+@@ -23,6 +23,7 @@ export interface EmberPrecompileOptions extends PrecompileOptions {
+   isProduction?: boolean;
+   moduleName?: string;
+   plugins?: Plugins;
++  lexicalScope?: (name: string) => boolean;
+ }
+ 
+ export type EmberASTPluginEnvironment = ASTPluginEnvironment & EmberPrecompileOptions;
+diff --git a/packages/internal-test-helpers/lib/test-cases/rendering.ts b/packages/internal-test-helpers/lib/test-cases/rendering.ts
+index 27de1e8f693d1ca8e5936699385ade194201c20d..8c8322fa48af69075478d0ae2990faa619990877 100644
+--- a/packages/internal-test-helpers/lib/test-cases/rendering.ts
++++ b/packages/internal-test-helpers/lib/test-cases/rendering.ts
+@@ -1,19 +1,19 @@
+-import type { EmberPrecompileOptions } from 'ember-template-compiler';
+-import { compile } from 'ember-template-compiler';
+-import { EventDispatcher } from '@ember/-internals/views';
+ import type { Renderer } from '@ember/-internals/glimmer';
++import { _resetRenderers, helper, Helper } from '@ember/-internals/glimmer';
++import { EventDispatcher } from '@ember/-internals/views';
+ import Component, { setComponentTemplate } from '@ember/component';
+-import { helper, Helper, _resetRenderers } from '@ember/-internals/glimmer';
++import type { EmberPrecompileOptions } from 'ember-template-compiler';
++import { compile } from 'ember-template-compiler';
+ import type Resolver from '../test-resolver';
+ import { ModuleBasedResolver } from '../test-resolver';
+ 
+-import AbstractTestCase from './abstract';
+-import buildOwner from '../build-owner';
+-import { runAppend, runDestroy, runTask } from '../run';
+ import type { InternalFactory } from '@ember/-internals/owner';
+-import type { BootOptions, EngineInstanceOptions } from '@ember/engine/instance';
+-import type EngineInstance from '@ember/engine/instance';
+ import templateOnly from '@ember/component/template-only';
++import type EngineInstance from '@ember/engine/instance';
++import type { BootOptions, EngineInstanceOptions } from '@ember/engine/instance';
++import buildOwner from '../build-owner';
++import { runAppend, runDestroy, runTask } from '../run';
++import AbstractTestCase from './abstract';
+ 
+ const TextNode = window.Text;
+ 
+@@ -172,6 +172,13 @@ export default abstract class RenderingTestCase extends AbstractTestCase {
+     runAppend(this.component);
+   }
+ 
++  renderComponent(component: object, options: { expect: string }) {
++    this.registerComponent('root', { ComponentClass: component });
++    this.render('<Root />');
++    this.assertHTML(options.expect);
++    this.assertStableRerender();
++  }
++
+   rerender() {
+     this.component!.rerender();
+   }
+@@ -195,14 +202,21 @@ export default abstract class RenderingTestCase extends AbstractTestCase {
+ 
+   registerComponent(
+     name: string,
+-    { ComponentClass = Component, template = null, resolveableTemplate = null }
++    {
++      ComponentClass = Component,
++      template = null,
++      resolveableTemplate = null,
++    }: {
++      ComponentClass?: object | null;
++      template?: string | null;
++      resolveableTemplate?: string | null;
++    }
+   ) {
+     let { owner } = this;
+ 
+     if (ComponentClass) {
+       // We cannot set templates multiple times on a class
+       if (ComponentClass === Component) {
+-        // @ts-expect-error - class/instance types in TS are hard
+         ComponentClass = class extends Component {};
+       }
+ 

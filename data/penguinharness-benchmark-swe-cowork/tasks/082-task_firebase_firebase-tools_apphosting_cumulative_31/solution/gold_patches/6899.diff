@@ -1,0 +1,309 @@
+diff --git a/src/commands/apphosting-secrets-grantaccess.ts b/src/commands/apphosting-secrets-grantaccess.ts
+new file mode 100644
+index 00000000..46ab838d
+--- /dev/null
++++ b/src/commands/apphosting-secrets-grantaccess.ts
+@@ -0,0 +1,45 @@
++import { Command } from "../command";
++import { Options } from "../options";
++import { needProjectId, needProjectNumber } from "../projectUtils";
++import { FirebaseError } from "../error";
++import { requireAuth } from "../requireAuth";
++import * as secrets from "../functions/secrets";
++import { requirePermissions } from "../requirePermissions";
++import * as apphosting from "../gcp/apphosting";
++import { grantSecretAccess } from "../init/features/apphosting/secrets";
++
++export const command = new Command("apphosting:secrets:grantaccess <secretName>")
++  .description("grant service accounts permissions to the provided secret")
++  .option("-l, --location <location>", "app backend location")
++  .option("-b, --backend <backend>", "app backend name")
++  .before(requireAuth)
++  .before(secrets.ensureApi)
++  .before(apphosting.ensureApiEnabled)
++  .before(requirePermissions, [
++    "secretmanager.secrets.create",
++    "secretmanager.secrets.get",
++    "secretmanager.secrets.update",
++    "secretmanager.versions.add",
++    "secretmanager.secrets.getIamPolicy",
++    "secretmanager.secrets.setIamPolicy",
++  ])
++  .action(async (secretName: string, options: Options) => {
++    const projectId = needProjectId(options);
++    const projectNumber = await needProjectNumber(options);
++
++    if (!options.location) {
++      throw new FirebaseError(
++        "Missing required flag --location. See firebase apphosting:secrets:grantaccess --help for more info",
++      );
++    }
++    const location = options.location as string;
++
++    if (!options.backend) {
++      throw new FirebaseError(
++        "Missing required flag --backend. See firebase apphosting:secrets:grantaccess --help for more info",
++      );
++    }
++    const backend = options.backend as string;
++
++    await grantSecretAccess(secretName, location, backend, projectId, projectNumber);
++  });
+diff --git a/src/commands/index.ts b/src/commands/index.ts
+index 1559993d..1af7485b 100644
+--- a/src/commands/index.ts
++++ b/src/commands/index.ts
+@@ -170,6 +170,8 @@ export function load(client: any): any {
+     client.apphosting.builds = {};
+     client.apphosting.builds.get = loadCommand("apphosting-builds-get");
+     client.apphosting.builds.create = loadCommand("apphosting-builds-create");
++    client.apphosting.secrets = {};
++    client.apphosting.secrets.grantaccess = loadCommand("apphosting-secrets-grantaccess");
+     client.apphosting.rollouts = {};
+     client.apphosting.rollouts.create = loadCommand("apphosting-rollouts-create");
+     client.apphosting.rollouts.list = loadCommand("apphosting-rollouts-list");
+diff --git a/src/deploy/functions/checkIam.ts b/src/deploy/functions/checkIam.ts
+index f4db148b..dbf5a342 100644
+--- a/src/deploy/functions/checkIam.ts
++++ b/src/deploy/functions/checkIam.ts
+@@ -7,6 +7,7 @@ import { Options } from "../../options";
+ import { flattenArray } from "../../functional";
+ import * as iam from "../../gcp/iam";
+ import * as args from "./args";
++import * as gcb from "../../gcp/cloudbuild";
+ import * as backend from "./backend";
+ import { trackGA4 } from "../../track";
+ import * as utils from "../../utils";
+@@ -123,11 +124,6 @@ function getPubsubServiceAgent(projectNumber: string): string {
+   return `service-${projectNumber}@gcp-sa-pubsub.iam.gserviceaccount.com`;
+ }
+ 
+-/** obtain the default compute service agent */
+-export function getDefaultComputeServiceAgent(projectNumber: string): string {
+-  return `${projectNumber}-compute@developer.gserviceaccount.com`;
+-}
+-
+ /** Callback reducer function */
+ function reduceEventsToServices(services: Array<Service>, endpoint: backend.Endpoint) {
+   const service = serviceForEndpoint(endpoint);
+@@ -158,7 +154,7 @@ export function obtainPubSubServiceAgentBindings(projectNumber: string): iam.Bin
+  * @param existingPolicy the project level IAM policy
+  */
+ export function obtainDefaultComputeServiceAgentBindings(projectNumber: string): iam.Binding[] {
+-  const defaultComputeServiceAgent = `serviceAccount:${getDefaultComputeServiceAgent(
++  const defaultComputeServiceAgent = `serviceAccount:${gcb.getDefaultComputeEngineServiceAgent(
+     projectNumber,
+   )}`;
+   const runInvokerBinding: iam.Binding = {
+diff --git a/src/deploy/functions/release/fabricator.ts b/src/deploy/functions/release/fabricator.ts
+index 47466fdf..9a45ef10 100644
+--- a/src/deploy/functions/release/fabricator.ts
++++ b/src/deploy/functions/release/fabricator.ts
+@@ -25,7 +25,7 @@ import * as scheduler from "../../../gcp/cloudscheduler";
+ import * as utils from "../../../utils";
+ import * as services from "../services";
+ import { AUTH_BLOCKING_EVENTS } from "../../../functions/events/v1";
+-import { getDefaultComputeServiceAgent } from "../checkIam";
++import * as gcb from "../../../gcp/cloudbuild";
+ import { getHumanFriendlyPlatformName } from "../functionsDeployHelper";
+ 
+ // TODO: Tune this for better performance.
+@@ -436,7 +436,7 @@ export class Fabricator {
+     } else if (backend.isScheduleTriggered(endpoint)) {
+       const invoker = endpoint.serviceAccount
+         ? [endpoint.serviceAccount]
+-        : [getDefaultComputeServiceAgent(this.projectNumber)];
++        : [gcb.getDefaultComputeEngineServiceAgent(this.projectNumber)];
+       await this.executor
+         .run(() => run.setInvokerCreate(endpoint.project, serviceName, invoker))
+         .catch(rethrowAs(endpoint, "set invoker"));
+@@ -543,7 +543,7 @@ export class Fabricator {
+     } else if (backend.isScheduleTriggered(endpoint)) {
+       invoker = endpoint.serviceAccount
+         ? [endpoint.serviceAccount]
+-        : [getDefaultComputeServiceAgent(this.projectNumber)];
++        : [gcb.getDefaultComputeEngineServiceAgent(this.projectNumber)];
+     }
+ 
+     if (invoker) {
+diff --git a/src/gcp/cloudbuild.ts b/src/gcp/cloudbuild.ts
+index 1daf8465..0b3f0c99 100644
+--- a/src/gcp/cloudbuild.ts
++++ b/src/gcp/cloudbuild.ts
+@@ -223,3 +223,13 @@ export async function deleteRepository(
+ export function serviceAgentEmail(projectNumber: string): string {
+   return `service-${projectNumber}@gcp-sa-cloudbuild.iam.gserviceaccount.com`;
+ }
++
++/** Returns the default cloud build service agent */
++export function getDefaultCloudBuildServiceAgent(projectNumber: string): string {
++  return `${projectNumber}@cloudbuild.gserviceaccount.com`;
++}
++
++/** Returns the default compute engine service agent */
++export function getDefaultComputeEngineServiceAgent(projectNumber: string): string {
++  return `${projectNumber}-compute@developer.gserviceaccount.com`;
++}
+diff --git a/src/gcp/cloudscheduler.ts b/src/gcp/cloudscheduler.ts
+index 8c0dce34..63fea1e4 100644
+--- a/src/gcp/cloudscheduler.ts
++++ b/src/gcp/cloudscheduler.ts
+@@ -6,7 +6,7 @@ import { cloudschedulerOrigin } from "../api";
+ import { Client } from "../apiv2";
+ import * as backend from "../deploy/functions/backend";
+ import * as proto from "./proto";
+-import { getDefaultComputeServiceAgent } from "../deploy/functions/checkIam";
++import * as gcb from "../gcp/cloudbuild";
+ import { assertExhaustive, nullsafeVisitor } from "../functional";
+ 
+ const VERSION = "v1";
+@@ -246,7 +246,7 @@ export function jobFromEndpoint(
+       httpMethod: "POST",
+       oidcToken: {
+         serviceAccountEmail:
+-          endpoint.serviceAccount ?? getDefaultComputeServiceAgent(projectNumber),
++          endpoint.serviceAccount ?? gcb.getDefaultComputeEngineServiceAgent(projectNumber),
+       },
+     };
+   } else {
+diff --git a/src/gcp/iam.ts b/src/gcp/iam.ts
+index 925a0d32..5e2f98d2 100644
+--- a/src/gcp/iam.ts
++++ b/src/gcp/iam.ts
+@@ -56,7 +56,6 @@ export interface TestIamResult {
+ 
+ /**
+  * Creates a new the service account with the given parameters.
+- *
+  * @param projectId the id of the project where the service account will be created
+  * @param accountId the id to use for the account
+  * @param description a brief description of the account
+@@ -87,7 +86,6 @@ export async function createServiceAccount(
+ 
+ /**
+  * Retrieves a service account with the given parameters.
+- *
+  * @param projectId the id of the project where the service account will be created
+  * @param serviceAccountName the name of the service account
+  */
+@@ -160,7 +158,6 @@ export async function getRole(role: string): Promise<Role> {
+ 
+ /**
+  * List permissions not held by an arbitrary resource implementing the IAM APIs.
+- *
+  * @param origin Resource origin e.g. `https:// iam.googleapis.com`.
+  * @param apiVersion API version e.g. `v1`.
+  * @param resourceName Resource name e.g. `projects/my-projct/widgets/abc`
+diff --git a/src/init/features/apphosting/index.ts b/src/init/features/apphosting/index.ts
+index b2c73d99..1b0c11d0 100644
+--- a/src/init/features/apphosting/index.ts
++++ b/src/init/features/apphosting/index.ts
+@@ -19,7 +19,7 @@ import {
+   Rollout,
+ } from "../../../gcp/apphosting";
+ import { addServiceAccountToRoles } from "../../../gcp/resourceManager";
+-import { createServiceAccount } from "../../../gcp/iam";
++import * as iam from "../../../gcp/iam";
+ import { Repository } from "../../../gcp/cloudbuild";
+ import { FirebaseError } from "../../../error";
+ import { promptOnce } from "../../../prompt";
+@@ -216,7 +216,7 @@ export async function createBackend(
+ 
+ async function provisionDefaultComputeServiceAccount(projectId: string): Promise<void> {
+   try {
+-    await createServiceAccount(
++    await iam.createServiceAccount(
+       projectId,
+       DEFAULT_COMPUTE_SERVICE_ACCOUNT_NAME,
+       "Firebase App Hosting compute service account",
+diff --git a/src/init/features/apphosting/secrets.ts b/src/init/features/apphosting/secrets.ts
+new file mode 100644
+index 00000000..77d6040e
+--- /dev/null
++++ b/src/init/features/apphosting/secrets.ts
+@@ -0,0 +1,85 @@
++import { logSuccess } from "../../../utils";
++import * as iam from "../../../gcp/iam";
++import * as gcb from "../../../gcp/cloudbuild";
++import * as secretManager from "../../../gcp/secretManager";
++import { FirebaseError } from "../../../error";
++
++function fetchServiceAccounts(projectNumber: string): {
++  buildServiceAccount: string;
++  runServiceAccount: string;
++} {
++  // TODO: For now we will always return the default CBSA and CESA. When the getBackend call supports returning
++  // the attached service account in a given backend/location then return that value instead.
++  // Sample Call: await apphosting.getBackend(projectId, location, backendId); & make this function async
++  return {
++    buildServiceAccount: gcb.getDefaultCloudBuildServiceAgent(projectNumber),
++    runServiceAccount: gcb.getDefaultComputeEngineServiceAgent(projectNumber),
++  };
++}
++
++/**
++ * Grants the corresponding service accounts the necessary access permissions to the provided secret.
++ */
++export async function grantSecretAccess(
++  secretName: string,
++  location: string,
++  backendId: string,
++  projectId: string,
++  projectNumber: string,
++): Promise<void> {
++  const isExist = await secretManager.secretExists(projectId, secretName);
++  if (!isExist) {
++    throw new FirebaseError(`Secret ${secretName} does not exist in project ${projectId}`);
++  }
++
++  let serviceAccounts = { buildServiceAccount: "", runServiceAccount: "" };
++  try {
++    serviceAccounts = fetchServiceAccounts(projectNumber);
++  } catch (err: any) {
++    throw new FirebaseError(
++      `Failed to get backend ${backendId} at location ${location}. Please check the parameters you have provided.`,
++      { original: err },
++    );
++  }
++
++  const secret: secretManager.Secret = {
++    projectId: projectId,
++    name: secretName,
++  };
++
++  const newBindings: iam.Binding[] = [
++    {
++      role: "roles/secretmanager.secretAccessor",
++      members: [
++        `serviceAccount:${serviceAccounts.buildServiceAccount}`,
++        `serviceAccount:${serviceAccounts.runServiceAccount}`,
++      ],
++    },
++    {
++      role: "roles/secretmanager.viewer",
++      members: [`serviceAccount:${serviceAccounts.buildServiceAccount}`],
++    },
++  ];
++
++  let existingBindings;
++  try {
++    existingBindings = (await secretManager.getIamPolicy(secret)).bindings;
++  } catch (err: any) {
++    throw new FirebaseError(
++      `Failed to get IAM bindings on secret: ${secret.name}. Ensure you have the permissions to do so and try again.`,
++      { original: err },
++    );
++  }
++
++  try {
++    const updatedBindings = existingBindings.concat(newBindings);
++    await secretManager.setIamPolicy(secret, updatedBindings);
++  } catch (err: any) {
++    throw new FirebaseError(
++      `Failed to set IAM bindings ${JSON.stringify(newBindings)} on secret: ${secret.name}. Ensure you have the permissions to do so and try again.`,
++      { original: err },
++    );
++  }
++
++  logSuccess(`Successfully set IAM bindings on secret ${secret.name}.\n`);
++}

@@ -1,0 +1,359 @@
+diff --git a/apps/ledger-live-mobile/src/components/DBSave.ts b/apps/ledger-live-mobile/src/components/DBSave.ts
+index cff340f..8455842 100644
+--- a/apps/ledger-live-mobile/src/components/DBSave.ts
++++ b/apps/ledger-live-mobile/src/components/DBSave.ts
+@@ -26,6 +26,7 @@ import {
+   saveMarketState,
+   saveMarketListConfig,
+   saveMarketBannerState,
++  savePayCardState,
+   savePostOnboardingState,
+   saveSettings,
+   saveTrustchainState,
+@@ -38,6 +39,7 @@ import { exportSelector as knownDevicesExportSelector } from "~/reducers/knownDe
+ import { exportLargeMoverSelector } from "~/reducers/largeMover";
+ import { exportMarketSelector, exportMarketListConfigSelector } from "~/reducers/market";
+ import { marketBannerStoreSelector } from "~/reducers/marketBanner";
++import { payCardPersistedSelector } from "@domain/entity-pay-card";
+ import { settingsStoreSelector } from "~/reducers/settings";
+ import type { State } from "~/reducers/types";
+ import { Maybe } from "../types/helpers";
+@@ -184,6 +186,8 @@ const getLargeScreenUpsellModalStateChanged = (a: State, b: State) =>
+ const marketNotEquals = (a: State, b: State) => a.market !== b.market;
+ const marketListConfigNotEquals = (a: State, b: State) => a.marketListConfig !== b.marketListConfig;
+ const marketBannerNotEquals = (a: State, b: State) => a.marketBanner !== b.marketBanner;
++const payCardPersistedNotEquals = (a: State, b: State) =>
++  !isEqual(payCardPersistedSelector(a), payCardPersistedSelector(b));
+ const trustchainNotEquals = (a: State, b: State) => a.trustchain !== b.trustchain;
+ const compareWalletState = (a: State, b: State) =>
+   walletStateExportShouldDiffer(a.wallet, b.wallet);
+@@ -292,6 +296,14 @@ export const ConfigureDBSaveEffects = () => {
+     lense: marketBannerStoreSelector,
+   });
+ 
++  useDBSaveEffect({
++    stateSelector: (state: State) => state.payCard.hasSeenFeatureTour,
++    save: savePayCardState,
++    throttle: 500,
++    getChangesStats: payCardPersistedNotEquals,
++    lense: payCardPersistedSelector,
++  });
++
+   useDBSaveEffect({
+     stateSelector: (state: State) => state.trustchain,
+     save: saveTrustchainState,
+diff --git a/apps/ledger-live-mobile/src/context/LedgerStore.tsx b/apps/ledger-live-mobile/src/context/LedgerStore.tsx
+index eaacf22..91027cf 100644
+--- a/apps/ledger-live-mobile/src/context/LedgerStore.tsx
++++ b/apps/ledger-live-mobile/src/context/LedgerStore.tsx
+@@ -3,6 +3,7 @@ import { Provider } from "react-redux";
+ import { Store } from "redux";
+ import { importPostOnboardingState } from "@ledgerhq/live-common/postOnboarding/actions";
+ import { restoreLargeScreenUpsellModalState } from "@ledgerhq/live-engagement/largeScreenUpsellModal";
++import { restorePayCardPersistedState } from "@domain/entity-pay-card";
+ import { backfillOnboardingDate } from "~/logic/postOnboarding/backfillOnboardingDate";
+ import { CounterValuesStateRaw } from "@ledgerhq/live-countervalues/types";
+ import { findCryptoCurrencyById } from "@domain/entity-currency-crypto";
+@@ -26,6 +27,7 @@ import {
+   getMarketState,
+   getMarketListConfig,
+   getMarketBannerState,
++  getPayCardState,
+   getTrustchainState,
+   getWalletExportState,
+   getLargeMoverState,
+@@ -100,6 +102,7 @@ const LedgerStoreProvider: React.FC<Props> = ({ onInitFinished, children, store
+         marketState,
+         marketListConfigState,
+         marketBannerState,
++        payCardState,
+         trustchainStore,
+         walletStore,
+         protect,
+@@ -120,6 +123,7 @@ const LedgerStoreProvider: React.FC<Props> = ({ onInitFinished, children, store
+         retry(getMarketState, MAX_RETRIES, RETRY_DELAY),
+         retry(getMarketListConfig, MAX_RETRIES, RETRY_DELAY),
+         retry(getMarketBannerState, MAX_RETRIES, RETRY_DELAY),
++        retry(getPayCardState, MAX_RETRIES, RETRY_DELAY),
+         retry(getTrustchainState, MAX_RETRIES, RETRY_DELAY),
+         retry(getWalletExportState, MAX_RETRIES, RETRY_DELAY),
+         retry(getProtect, MAX_RETRIES, RETRY_DELAY),
+@@ -196,6 +200,10 @@ const LedgerStoreProvider: React.FC<Props> = ({ onInitFinished, children, store
+         store.dispatch(importMarketBannerState(marketBannerState));
+       }
+ 
++      if (payCardState) {
++        store.dispatch(restorePayCardPersistedState(payCardState));
++      }
++
+       store.dispatch(importTrustchainStoreState(trustchainStore));
+ 
+       if (walletStore) {
+diff --git a/apps/ledger-live-mobile/src/db.ts b/apps/ledger-live-mobile/src/db.ts
+index 948a862..e7fcfda 100644
+--- a/apps/ledger-live-mobile/src/db.ts
++++ b/apps/ledger-live-mobile/src/db.ts
+@@ -31,6 +31,7 @@ import { TrustchainStore } from "@ledgerhq/ledger-key-ring-protocol/store";
+ import { ExportedWalletState } from "~/reducers/wallet";
+ import { type PersistedCAL } from "@domain/api-currency-token";
+ import type { PersistedIdentities } from "@domain/entity-client-identity";
++import type { PayCardPersistedState } from "@domain/entity-pay-card";
+ 
+ const ACCOUNTS_KEY = "accounts";
+ const ACCOUNTS_KEY_SORT = "accounts.sort";
+@@ -309,6 +310,14 @@ export async function saveMarketBannerState(obj: MarketBannerState): Promise<voi
+   await storage.save("marketBanner", obj);
+ }
+ 
++export function getPayCardState(): Promise<PayCardPersistedState | null> {
++  return storage.get("payCard") as Promise<PayCardPersistedState | null>;
++}
++
++export async function savePayCardState(obj: PayCardPersistedState): Promise<void> {
++  await storage.save("payCard", obj);
++}
++
+ export function getTrustchainState(): Promise<TrustchainStore> {
+   return storage.get("trustchain") as Promise<TrustchainStore>;
+ }
+diff --git a/devtools/bindings/package.json b/devtools/bindings/package.json
+index e852992..3ec44c0 100644
+--- a/devtools/bindings/package.json
++++ b/devtools/bindings/package.json
+@@ -20,6 +20,7 @@
+   },
+   "dependencies": {
+     "@devtools/registry": "workspace:*",
++    "@domain/entity-pay-card": "workspace:*",
+     "@features/platform-feature-flags": "workspace:*",
+     "@shared/feature-flags": "workspace:*"
+   },
+diff --git a/devtools/bindings/src/usePayCardToolProps.ts b/devtools/bindings/src/usePayCardToolProps.ts
+index c4af62c..7e5e5d0 100644
+--- a/devtools/bindings/src/usePayCardToolProps.ts
++++ b/devtools/bindings/src/usePayCardToolProps.ts
+@@ -1,7 +1,11 @@
+ import { useCallback, useMemo, useState } from "react";
+-import { useDispatch } from "react-redux";
++import { useDispatch, useSelector } from "react-redux";
+ import { setOverride } from "@shared/feature-flags";
+ import { useFeature } from "@features/platform-feature-flags";
++import {
++  resetPayCardFeatureTourSeen,
++  selectPayCardHasSeenFeatureTour,
++} from "@domain/entity-pay-card";
+ import type { DevToolsConfig } from "@devtools/registry";
+ 
+ type PayCardToolProps = Extract<DevToolsConfig[number], { id: "pay-card" }>["config"];
+@@ -74,6 +78,12 @@ export function usePayCardToolProps(options: UsePayCardToolPropsOptions = {}): P
+     [dispatch],
+   );
+ 
++  const hasSeenFeatureTour = useSelector(selectPayCardHasSeenFeatureTour);
++
++  const resetFeatureTour = useCallback(() => {
++    dispatch(resetPayCardFeatureTourSeen());
++  }, [dispatch]);
++
+   const setStepDone = useCallback((id: string, done: boolean) => {
+     setSteps(current => {
+       if (id === "all") {
+@@ -97,5 +107,13 @@ export function usePayCardToolProps(options: UsePayCardToolPropsOptions = {}): P
+ 
+   const onboarding = useMemo(() => ({ steps, setStepDone }), [steps, setStepDone]);
+ 
+-  return useMemo(() => ({ flags, onboarding }), [flags, onboarding]);
++  return useMemo(
++    () => ({
++      flags,
++      onboarding,
++      hasSeenFeatureTour,
++      resetPayCardFeatureTourSeen: resetFeatureTour,
++    }),
++    [flags, onboarding, hasSeenFeatureTour, resetFeatureTour],
++  );
+ }
+diff --git a/devtools/pay-card/src/pay-card/PayCard.native.tsx b/devtools/pay-card/src/pay-card/PayCard.native.tsx
+index cbd9faa..65b875d 100644
+--- a/devtools/pay-card/src/pay-card/PayCard.native.tsx
++++ b/devtools/pay-card/src/pay-card/PayCard.native.tsx
+@@ -1,5 +1,5 @@
+ import { ScrollView } from "react-native";
+-import { Box, Button, Divider } from "@ledgerhq/lumen-ui-rnative";
++import { Box, Button, Divider, Tag } from "@ledgerhq/lumen-ui-rnative";
+ import type { PayCardToolProps } from "../types";
+ import { Section } from "../components/Section/Section";
+ import { ToggleRow } from "../components/ToggleRow/ToggleRow";
+@@ -7,7 +7,7 @@ import { ToggleRow } from "../components/ToggleRow/ToggleRow";
+ const BUTTON_ROW_STYLE = { flexDirection: "row", flexWrap: "wrap", gap: 8 } as const;
+ 
+ export function PayCard(props: Readonly<PayCardToolProps>) {
+-  const { flags, onboarding } = props;
++  const { flags, onboarding, hasSeenFeatureTour, resetPayCardFeatureTourSeen } = props;
+ 
+   return (
+     <ScrollView>
+@@ -56,6 +56,23 @@ export function PayCard(props: Readonly<PayCardToolProps>) {
+           </Button>
+         </Box>
+       </Section>
++
++      <Divider />
++
++      <Section title="Feature tour">
++        <Box style={BUTTON_ROW_STYLE}>
++          <Tag
++            size="sm"
++            appearance={hasSeenFeatureTour ? "success" : "gray"}
++            label={hasSeenFeatureTour ? "Seen" : "Not seen"}
++          />
++        </Box>
++        <Box style={BUTTON_ROW_STYLE}>
++          <Button appearance="gray" size="sm" onPress={resetPayCardFeatureTourSeen}>
++            Reset feature tour
++          </Button>
++        </Box>
++      </Section>
+     </ScrollView>
+   );
+ }
+diff --git a/devtools/pay-card/src/pay-card/PayCard.web.tsx b/devtools/pay-card/src/pay-card/PayCard.web.tsx
+index 459b009..af64841 100644
+--- a/devtools/pay-card/src/pay-card/PayCard.web.tsx
++++ b/devtools/pay-card/src/pay-card/PayCard.web.tsx
+@@ -1,10 +1,10 @@
+-import { Button, Divider } from "@ledgerhq/lumen-ui-react";
++import { Button, Divider, Tag } from "@ledgerhq/lumen-ui-react";
+ import type { PayCardToolProps } from "../types";
+ import { Section } from "../components/Section/Section";
+ import { ToggleRow } from "../components/ToggleRow/ToggleRow";
+ 
+ export function PayCard(props: Readonly<PayCardToolProps>) {
+-  const { flags, onboarding } = props;
++  const { flags, onboarding, hasSeenFeatureTour, resetPayCardFeatureTourSeen } = props;
+ 
+   return (
+     <div className="flex flex-col overflow-y-auto">
+@@ -53,6 +53,23 @@ export function PayCard(props: Readonly<PayCardToolProps>) {
+           </Button>
+         </div>
+       </Section>
++
++      <Divider />
++
++      <Section title="Feature tour">
++        <div>
++          <Tag
++            size="sm"
++            appearance={hasSeenFeatureTour ? "success" : "gray"}
++            label={hasSeenFeatureTour ? "Seen" : "Not seen"}
++          />
++        </div>
++        <div className="flex flex-wrap gap-8">
++          <Button appearance="gray" size="sm" onClick={resetPayCardFeatureTourSeen}>
++            Reset feature tour
++          </Button>
++        </div>
++      </Section>
+     </div>
+   );
+ }
+diff --git a/devtools/pay-card/src/types.ts b/devtools/pay-card/src/types.ts
+index 992c51f..42024e1 100644
+--- a/devtools/pay-card/src/types.ts
++++ b/devtools/pay-card/src/types.ts
+@@ -41,4 +41,8 @@ export interface PayCardOnboardingProps {
+ export interface PayCardToolProps {
+   readonly flags: PayCardFlagsProps;
+   readonly onboarding: PayCardOnboardingProps;
++  /** Whether the user has already seen the Pay feature tour. */
++  readonly hasSeenFeatureTour: boolean;
++  /** Resets the feature tour so it plays again on the next Pay visit. */
++  readonly resetPayCardFeatureTourSeen: () => void;
+ }
+diff --git a/domain/entity/pay-card/src/selectors.ts b/domain/entity/pay-card/src/selectors.ts
+index 33e2c1b..4c9b571 100644
+--- a/domain/entity/pay-card/src/selectors.ts
++++ b/domain/entity/pay-card/src/selectors.ts
+@@ -1,4 +1,4 @@
+-import type { PayCardParams, PayCardState } from "./types";
++import type { PayCardParams, PayCardPersistedState, PayCardState } from "./types";
+ 
+ type PayCardStateRoot = {
+   payCard: PayCardState;
+@@ -15,3 +15,14 @@ export function selectPayCardIsOpen(state: PayCardStateRoot): boolean {
+ export function selectPayCardParams(state: PayCardStateRoot): PayCardParams | null {
+   return state.payCard.params;
+ }
++
++export function selectPayCardHasSeenFeatureTour(state: PayCardStateRoot): boolean {
++  return state.payCard.hasSeenFeatureTour;
++}
++
++/** Returns only the persisted subset of the pay card state. */
++export function payCardPersistedSelector(state: PayCardStateRoot): PayCardPersistedState {
++  return {
++    hasSeenFeatureTour: state.payCard.hasSeenFeatureTour,
++  };
++}
+diff --git a/domain/entity/pay-card/src/slice.ts b/domain/entity/pay-card/src/slice.ts
+index 7b5a80f..d18e690 100644
+--- a/domain/entity/pay-card/src/slice.ts
++++ b/domain/entity/pay-card/src/slice.ts
+@@ -1,9 +1,10 @@
+ import { createSlice, type PayloadAction } from "@reduxjs/toolkit";
+-import type { PayCardParams, PayCardState } from "./types";
++import type { PayCardParams, PayCardPersistedState, PayCardState } from "./types";
+ 
+ export const payCardInitialState: PayCardState = {
+   isOpen: false,
+   params: null,
++  hasSeenFeatureTour: false,
+ };
+ 
+ export const payCardSlice = createSlice({
+@@ -18,7 +19,28 @@ export const payCardSlice = createSlice({
+       state.isOpen = false;
+       state.params = null;
+     },
++    markPayCardFeatureTourSeen: state => {
++      state.hasSeenFeatureTour = true;
++    },
++    resetPayCardFeatureTourSeen: state => {
++      state.hasSeenFeatureTour = false;
++    },
++    restorePayCardPersistedState: (
++      state,
++      action: PayloadAction<Partial<PayCardPersistedState>>,
++    ) => {
++      const { hasSeenFeatureTour } = action.payload ?? {};
++      if (typeof hasSeenFeatureTour === "boolean") {
++        state.hasSeenFeatureTour = hasSeenFeatureTour;
++      }
++    },
+   },
+ });
+ 
+-export const { openPayCard, closePayCard } = payCardSlice.actions;
++export const {
++  openPayCard,
++  closePayCard,
++  markPayCardFeatureTourSeen,
++  resetPayCardFeatureTourSeen,
++  restorePayCardPersistedState,
++} = payCardSlice.actions;
+diff --git a/domain/entity/pay-card/src/types.ts b/domain/entity/pay-card/src/types.ts
+index 2912698..b2489af 100644
+--- a/domain/entity/pay-card/src/types.ts
++++ b/domain/entity/pay-card/src/types.ts
+@@ -29,4 +29,10 @@ export type PayCardParams = z.infer<typeof PayCardParamsSchema>;
+ export type PayCardState = Readonly<{
+   isOpen: boolean;
+   params: PayCardParams | null;
++  hasSeenFeatureTour: boolean;
++}>;
++
++/** Subset of {@link PayCardState} that is persisted across app restarts. */
++export type PayCardPersistedState = Readonly<{
++  hasSeenFeatureTour: boolean;
+ }>;

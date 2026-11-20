@@ -1,0 +1,165 @@
+diff --git a/ktorm-ksp-compiler/ktorm-ksp-compiler.gradle.kts b/ktorm-ksp-compiler/ktorm-ksp-compiler.gradle.kts
+index 6fc55fa038d14dcffb782ab1be1396803984e9e9..2285feb5e7ef23d079d5225d16f9a3c7d0ef5d23 100644
+--- a/ktorm-ksp-compiler/ktorm-ksp-compiler.gradle.kts
++++ b/ktorm-ksp-compiler/ktorm-ksp-compiler.gradle.kts
+@@ -24,3 +24,9 @@ dependencies {
+     testImplementation("com.h2database:h2:1.4.198")
+     testImplementation("org.slf4j:slf4j-simple:2.0.3")
+ }
++
++if (JavaVersion.current() >= JavaVersion.VERSION_1_9) {
++    tasks.test {
++        jvmArgs("--add-opens", "java.base/java.lang=ALL-UNNAMED")
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+index 75f1ddb55dcb1e7b9ff4ceec187edf1cbb858aea..1658eeb102199f5cc16ab0da9fc3be70e0e34bd8 100644
+--- a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+@@ -20,36 +20,19 @@ import com.google.devtools.ksp.processing.*
+ import com.google.devtools.ksp.symbol.KSAnnotated
+ import com.google.devtools.ksp.symbol.KSClassDeclaration
+ import com.google.devtools.ksp.symbol.KSFile
+-import com.pinterest.ktlint.cli.ruleset.core.api.RuleSetProviderV3
+-import com.pinterest.ktlint.rule.engine.api.Code
+-import com.pinterest.ktlint.rule.engine.api.EditorConfigDefaults
+-import com.pinterest.ktlint.rule.engine.api.KtLintRuleEngine
+-import com.squareup.kotlinpoet.FileSpec
+-import org.ec4j.core.EditorConfigLoader
+-import org.ec4j.core.Resource.Resources
+ import org.ktorm.ksp.annotation.Table
++import org.ktorm.ksp.compiler.formatter.CodeFormatter
++import org.ktorm.ksp.compiler.formatter.KtLintCodeFormatter
+ import org.ktorm.ksp.compiler.generator.FileGenerator
+ import org.ktorm.ksp.compiler.parser.MetadataParser
+ import org.ktorm.ksp.compiler.util.isValid
+ import org.ktorm.ksp.spi.TableMetadata
+-import java.util.*
+ import kotlin.reflect.jvm.jvmName
+ 
+ /**
+  * Ktorm KSP symbol processor provider.
+  */
+ public class KtormProcessorProvider : SymbolProcessorProvider {
+-    private val ktLintRuleEngine = KtLintRuleEngine(
+-        ruleProviders = ServiceLoader
+-            .load(RuleSetProviderV3::class.java, javaClass.classLoader)
+-            .flatMap { it.getRuleProviders() }
+-            .toSet(),
+-        editorConfigDefaults = EditorConfigDefaults(
+-            EditorConfigLoader.default_().load(
+-                Resources.ofClassPath(javaClass.classLoader, "/ktorm-ksp-compiler/.editorconfig", Charsets.UTF_8)
+-            )
+-        )
+-    )
+ 
+     override fun create(environment: SymbolProcessorEnvironment): SymbolProcessor {
+         for (generator in FileGenerator.extCodeGenerators) {
+@@ -81,8 +64,8 @@ public class KtormProcessorProvider : SymbolProcessorProvider {
+         // Generate file spec by kotlinpoet.
+         val fileSpec = FileGenerator.generate(table, environment)
+ 
+-        // Beautify the generated code by ktlint.
+-        val formattedCode = formatCode(fileSpec, environment.logger)
++        // Beautify the generated code.
++        val formattedCode = getCodeFormatter(environment).format(fileSpec.toString())
+ 
+         // Output the formatted code.
+         val dependencies = Dependencies(false, *table.getDependencyFiles().toTypedArray())
+@@ -90,23 +73,14 @@ public class KtormProcessorProvider : SymbolProcessorProvider {
+         file.writer(Charsets.UTF_8).use { it.write(formattedCode) }
+     }
+ 
+-    private fun formatCode(fileSpec: FileSpec, logger: KSPLogger): String {
++    private fun getCodeFormatter(environment: SymbolProcessorEnvironment): CodeFormatter {
+         try {
+-            // Manually fix some code styles before formatting.
+-            val code = fileSpec.toString()
+-                .replace(Regex("""\(\s*"""), "(")
+-                .replace(Regex("""\s*\)"""), ")")
+-                .replace(Regex(""",\s*"""), ", ")
+-                .replace(Regex(""",\s*\)"""), ")")
+-                .replace(Regex("""\s+get\(\)\s="""), " get() =")
+-                .replace(Regex("""\s+=\s+"""), " = ")
+-                .replace("import org.ktorm.ksp.`annotation`", "import org.ktorm.ksp.annotation")
+-
+-            return ktLintRuleEngine.format(Code.fromSnippet(code))
+-        } catch (e: Exception) {
+-            logger.exception(e)
+-            return fileSpec.toString()
++            return KtLintCodeFormatter(environment)
++        } catch (_: ClassNotFoundException) {
++        } catch (_: NoClassDefFoundError) {
+         }
++
++        return CodeFormatter { code -> code }
+     }
+ 
+     private fun TableMetadata.getDependencyFiles(): List<KSFile> {
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/CodeFormatter.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/CodeFormatter.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c1473220a42f98e6fc84a0ca457d6031555f907
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/CodeFormatter.kt
+@@ -0,0 +1,12 @@
++package org.ktorm.ksp.compiler.formatter
++
++/**
++ * Code formatter interface.
++ */
++internal fun interface CodeFormatter {
++
++    /**
++     * Format the generated code to the community recommended coding style.
++     */
++    fun format(code: String): String
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/KtLintCodeFormatter.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/KtLintCodeFormatter.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..17d592c5d43e5cef8ba2329ac3998397efdf4c72
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/formatter/KtLintCodeFormatter.kt
+@@ -0,0 +1,43 @@
++package org.ktorm.ksp.compiler.formatter
++
++import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
++import com.pinterest.ktlint.cli.ruleset.core.api.RuleSetProviderV3
++import com.pinterest.ktlint.rule.engine.api.Code
++import com.pinterest.ktlint.rule.engine.api.EditorConfigDefaults
++import com.pinterest.ktlint.rule.engine.api.KtLintRuleEngine
++import org.ec4j.core.EditorConfigLoader
++import org.ec4j.core.Resource.Resources
++import java.util.*
++
++internal class KtLintCodeFormatter(val environment: SymbolProcessorEnvironment) : CodeFormatter {
++    private val ktLintRuleEngine = KtLintRuleEngine(
++        ruleProviders = ServiceLoader
++            .load(RuleSetProviderV3::class.java, javaClass.classLoader)
++            .flatMap { it.getRuleProviders() }
++            .toSet(),
++        editorConfigDefaults = EditorConfigDefaults(
++            EditorConfigLoader.default_().load(
++                Resources.ofClassPath(javaClass.classLoader, "/ktorm-ksp-compiler/.editorconfig", Charsets.UTF_8)
++            )
++        )
++    )
++
++    override fun format(code: String): String {
++        try {
++            // Manually fix some code styles before formatting.
++            val snippet = code
++                .replace(Regex("""\(\s*"""), "(")
++                .replace(Regex("""\s*\)"""), ")")
++                .replace(Regex(""",\s*"""), ", ")
++                .replace(Regex(""",\s*\)"""), ")")
++                .replace(Regex("""\s+get\(\)\s="""), " get() =")
++                .replace(Regex("""\s+=\s+"""), " = ")
++                .replace("import org.ktorm.ksp.`annotation`", "import org.ktorm.ksp.annotation")
++
++            return ktLintRuleEngine.format(Code.fromSnippet(snippet))
++        } catch (e: Throwable) {
++            environment.logger.exception(e)
++            return code
++        }
++    }
++}

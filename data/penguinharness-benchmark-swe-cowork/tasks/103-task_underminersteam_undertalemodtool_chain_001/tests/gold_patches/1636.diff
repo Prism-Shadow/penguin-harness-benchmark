@@ -1,0 +1,409 @@
+diff --git a/UndertaleModLib/Decompiler/Disassembler.cs b/UndertaleModLib/Decompiler/Disassembler.cs
+index 480f3caff14129f8e239f2a6b807181e3b8ea99c..45d927b2f7e7eef8071dd47e773783b8786a613e 100644
+--- a/UndertaleModLib/Decompiler/Disassembler.cs
++++ b/UndertaleModLib/Decompiler/Disassembler.cs
+@@ -1,8 +1,8 @@
+ ﻿using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Linq;
+ using System.Text;
+-using System.Threading.Tasks;
+ using UndertaleModLib.Models;
+ 
+ namespace UndertaleModLib.Decompiler
+@@ -34,18 +34,24 @@ namespace UndertaleModLib.Decompiler
+ 
+             return sb.ToString();
+         }
+-
++        
+         public static string Disassemble(this UndertaleCode code, IList<UndertaleVariable> vars, UndertaleCodeLocals locals)
+         {
+-            StringBuilder sb = new StringBuilder();
++            // This StringBuilder is shared with the ToString method of the code instructions.
++            // Experimentation has shown that 200 is a good enough starting value for it. 
++            // 300 seemed too high and 100 too low. This may change in the future.
++            StringBuilder sb = new StringBuilder(200);
+             if (locals == null && !code.WeirdLocalFlag)
+                 sb.Append("; WARNING: Missing code locals, possibly due to unsupported bytecode version or a brand new code entry.\n");
+             else
+                 sb.Append(code.GenerateLocalVarDefinitions(vars, locals));
+ 
+-            Dictionary<uint, string> fragments = new Dictionary<uint, string>();
++            Dictionary<uint, string> fragments = new(code.ChildEntries.Count);
+             foreach (var dup in code.ChildEntries)
++            {
+                 fragments.Add(dup.Offset / 4, (dup.Name?.Content ?? "<null>") + $" (locals={dup.LocalsCount}, argc={dup.ArgumentsCount})");
++            }
++
+             List<uint> blocks = FindBlockAddresses(code);
+ 
+             foreach (var inst in code.Instructions)
+@@ -66,7 +72,8 @@ namespace UndertaleModLib.Decompiler
+                     sb.AppendLine($":[{ind}]");
+                 }
+ 
+-                sb.AppendLine(inst.ToString(code, blocks));
++                inst.ToString(sb, code, blocks);
++                sb.Append(Environment.NewLine);
+             }
+ 
+             sb.AppendLine();
+diff --git a/UndertaleModLib/Models/UndertaleCode.cs b/UndertaleModLib/Models/UndertaleCode.cs
+index dbedb4abb2eac3b602420ae2650788e75321db0e..0be02a78b9a5567f16203a5a2245b24879bcc89b 100644
+--- a/UndertaleModLib/Models/UndertaleCode.cs
++++ b/UndertaleModLib/Models/UndertaleCode.cs
+@@ -6,6 +6,7 @@ using System.Linq;
+ using System.Text;
+ using UndertaleModLib.Compiler;
+ using UndertaleModLib.Decompiler;
++using UndertaleModLib.Util;
+ 
+ namespace UndertaleModLib.Models;
+ 
+@@ -848,11 +849,37 @@ public class UndertaleInstruction : UndertaleObject
+     {
+         return ToString(null);
+     }
+-
++    
++    /// <summary>
++    /// <inheritdoc cref="ToString()"/>
++    /// </summary>
++    /// <param name="code">The <see cref="UndertaleCode"/> code entry for which these instructions belong to.</param>
++    /// <param name="blocks">A list of block addresses for the code entry for which these instructions belong to.</param>
++    /// <returns></returns>
+     public string ToString(UndertaleCode code, List<uint> blocks = null)
+     {
+         StringBuilder sb = new StringBuilder();
++        ToString(sb, code, blocks);
++        return sb.ToString();
++    }
++    
++    /// <summary>
++    /// Inserts a string representation of this object at a specified index in a <see cref="StringBuilder"/>.
++    /// </summary>
++    /// <param name="stringBuilder">The <see cref="StringBuilder"/> instance on where to insert the string representation.</param>
++    /// <param name="code"><inheritdoc cref="ToString(UndertaleCode, List{uint})"/></param>
++    /// <param name="blocks"><inheritdoc cref="ToString(UndertaleCode, List{uint})"/></param>
++    /// <param name="index">The index on where to insert the string representation. If this is <see langword="null"/>
++    /// it will use <paramref name="stringBuilder.Length"/> as the index instead.</param>
++    /// <remarks>Note that performance of this function can be drastically different, depending on <paramref name="index"/>.
++    /// For best results, it's recommended to leave it at <see langword="null"/>.</remarks>
++    public void ToString(StringBuilder stringBuilder, UndertaleCode code, List<uint> blocks = null, int? index = null)
++    {
++        if (index is null)
++            index = stringBuilder.Length;
+ 
++        StringBuilderHelper sbh = new StringBuilderHelper(index.Value);
++        
+         string kind = Kind.ToString();
+         var type = GetInstructionType(Kind);
+         bool unknownBreak = false;
+@@ -865,114 +892,126 @@ public class UndertaleInstruction : UndertaleObject
+             }
+         }
+         else
++        {
+             kind = kind.ToLower(CultureInfo.InvariantCulture);
+-        sb.Append(kind);
++        }
++
++        sbh.Append(stringBuilder, kind);
+ 
+         switch (GetInstructionType(Kind))
+         {
+             case InstructionType.SingleTypeInstruction:
+-                sb.Append("." + Type1.ToOpcodeParam());
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type1.ToOpcodeParam());
+ 
+                 if (Kind == Opcode.Dup || Kind == Opcode.CallV)
+                 {
+-                    sb.Append(' ');
+-                    sb.Append(Extra);
++                    sbh.Append(stringBuilder, ' ');
++                    sbh.Append(stringBuilder, Extra);
+                     if (Kind == Opcode.Dup)
+                     {
+                         if ((byte)ComparisonKind != 0)
+                         {
+                             // Special dup instruction with extra parameters
+-                            sb.Append(' ');
+-                            sb.Append((byte)ComparisonKind & 0x7F);
+-                            sb.Append(" ;;; this is a weird GMS2.3+ swap instruction");
++                            sbh.Append(stringBuilder, ' ');
++                            sbh.Append(stringBuilder, (byte)ComparisonKind & 0x7F);
++                            sbh.Append(stringBuilder, " ;;; this is a weird GMS2.3+ swap instruction");
+                         }
+                     }
+                 }
+                 break;
+ 
+             case InstructionType.DoubleTypeInstruction:
+-                sb.Append("." + Type1.ToOpcodeParam());
+-                sb.Append("." + Type2.ToOpcodeParam());
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type1.ToOpcodeParam());
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type2.ToOpcodeParam());
+                 break;
+ 
+             case InstructionType.ComparisonInstruction:
+-                sb.Append("." + Type1.ToOpcodeParam());
+-                sb.Append("." + Type2.ToOpcodeParam());
+-                sb.Append(' ');
+-                sb.Append(ComparisonKind.ToString());
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type1.ToOpcodeParam());
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type2.ToOpcodeParam());
++                sbh.Append(stringBuilder, ' ');
++                sbh.Append(stringBuilder, ComparisonKind.ToString());
+                 break;
+ 
+             case InstructionType.GotoInstruction:
+-                sb.Append(' ');
+-                string tgt;
+-                if (code != null && Address + JumpOffset == code.Length / 4)
+-                    tgt = "[end]";
++                sbh.Append(stringBuilder, ' ');
++                string targetGoto;
++                if (code is not null && Address + JumpOffset == code.Length / 4)
++                    targetGoto = "[end]";
+                 else if (JumpOffsetPopenvExitMagic)
+-                    tgt = "<drop>";
+-                else if (blocks != null)
+-                    tgt = "[" + blocks.IndexOf((uint)(Address + JumpOffset)) + "]";
++                    targetGoto = "<drop>";
++                else if (blocks is not null)
++                    targetGoto = $"[{blocks.IndexOf((uint)(Address + JumpOffset))}]";
+                 else
+-                    tgt = (Address + JumpOffset).ToString("D5");
+-                sb.Append(tgt);
++                    targetGoto = (Address + JumpOffset).ToString("D5");
++                sbh.Append(stringBuilder, targetGoto);
+                 break;
+ 
+             case InstructionType.PopInstruction:
+-                sb.Append("." + Type1.ToOpcodeParam());
+-                sb.Append("." + Type2.ToOpcodeParam());
+-                sb.Append(' ');
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type1.ToOpcodeParam());
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type2.ToOpcodeParam());
++                sbh.Append(stringBuilder, ' ');
+                 if (Type1 == DataType.Int16)
+                 {
+                     // Special scenario - the swap instruction
+                     // TODO: Figure out the proper syntax, see #129
+-                    sb.Append(SwapExtra);
+-                    sb.Append(" ;;; this is a weird swap instruction, see #129");
++                    sbh.Append(stringBuilder, SwapExtra);
++                    sbh.Append(stringBuilder, " ;;; this is a weird swap instruction, see #129");
+                 }
+                 else
+                 {
+                     if (Type1 == DataType.Variable && TypeInst != InstanceType.Undefined)
+                     {
+-                        sb.Append(TypeInst.ToString().ToLower(CultureInfo.InvariantCulture));
+-                        sb.Append('.');
++                        sbh.Append(stringBuilder, TypeInst.ToString().ToLower(CultureInfo.InvariantCulture));
++                        sbh.Append(stringBuilder, '.');
+                     }
+-                    sb.Append(Destination);
++                    sbh.Append(stringBuilder, Destination);
+                 }
+                 break;
+ 
+             case InstructionType.PushInstruction:
+-                sb.Append("." + Type1.ToOpcodeParam());
+-                sb.Append(' ');
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type1.ToOpcodeParam());
++                sbh.Append(stringBuilder, ' ');
+                 if (Type1 == DataType.Variable && TypeInst != InstanceType.Undefined)
+                 {
+-                    sb.Append(TypeInst.ToString().ToLower(CultureInfo.InvariantCulture));
+-                    sb.Append('.');
++                    sbh.Append(stringBuilder, TypeInst.ToString().ToLower(CultureInfo.InvariantCulture));
++                    sbh.Append(stringBuilder, '.');
+                 }
+-                sb.Append((Value as IFormattable)?.ToString(null, CultureInfo.InvariantCulture) ?? Value.ToString());
++                sbh.Append(stringBuilder, (Value as IFormattable)?.ToString(null, CultureInfo.InvariantCulture) ?? Value.ToString());
+                 break;
+ 
+             case InstructionType.CallInstruction:
+-                sb.Append("." + Type1.ToOpcodeParam());
+-                sb.Append(' ');
+-                sb.Append(Function);
+-                sb.Append("(argc=");
+-                sb.Append(ArgumentsCount);
+-                sb.Append(')');
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type1.ToOpcodeParam());
++                sbh.Append(stringBuilder, ' ');
++                sbh.Append(stringBuilder, Function);
++                sbh.Append(stringBuilder, "(argc=");
++                sbh.Append(stringBuilder, ArgumentsCount);
++                sbh.Append(stringBuilder, ')');
+                 break;
+ 
+             case InstructionType.BreakInstruction:
+-                sb.Append("." + Type1.ToOpcodeParam());
++                sbh.Append(stringBuilder, '.');
++                sbh.Append(stringBuilder, Type1.ToOpcodeParam());
+                 if (unknownBreak)
+                 {
+-                    sb.Append(' ');
+-                    sb.Append(Value);
++                    sbh.Append(stringBuilder, ' ');
++                    sbh.Append(stringBuilder, Value);
+                 }
+                 if (Type1 == DataType.Int32)
+                 {
+-                    sb.Append(' ');
+-                    sb.Append(IntArgument);
++                    sbh.Append(stringBuilder, ' ');
++                    sbh.Append(stringBuilder, IntArgument);
+                 }
+                 break;
+         }
+-        return sb.ToString();
+     }
+ 
+     public uint CalculateInstructionSize()
+diff --git a/UndertaleModLib/Util/StringBuilderHelper.cs b/UndertaleModLib/Util/StringBuilderHelper.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2044fe645fe6f0e248a8da004ff5b003303121f7
+--- /dev/null
++++ b/UndertaleModLib/Util/StringBuilderHelper.cs
+@@ -0,0 +1,112 @@
++using System.Text;
++using UndertaleModLib.Compiler;
++
++namespace UndertaleModLib.Util;
++
++/// <summary>
++/// This is a helper class for <see cref="StringBuilder"/>. The main advantage that this one offers,
++/// is that it contains functions to keep appending starting from a position, so that one doesn't have to do that
++/// manually.
++/// </summary>
++/// <remarks>
++/// This is an example usage of how this struct is intended to be used:
++/// Instead of needing to do
++/// <code>
++/// var sb = new StringBuilder();
++/// var index = 0;
++/// sb.Append("Some String");
++/// index = 4;
++/// var stringToInsert = "insertion!";
++/// sb.Insert(index, stringToInsert);
++/// index += stringToInsert.Length;
++/// var otherString = "another!";
++/// sb.Insert(index, otherString);
++/// index += otherString;
++/// </code>
++/// One can instead do:
++/// <code>
++/// var sbh = new StringBuilderHelper();
++/// var sb = new StringBuilder();
++/// sb.Append("Some String");
++/// sbh.SetPosition(4);
++/// sbh.Append("insertion!");
++/// sbh.Append("another!");
++/// </code>
++/// </remarks>
++public struct StringBuilderHelper
++{
++    /// <summary>
++    /// The position from where functions will be executed from.
++    /// </summary>
++    public int Position;
++
++    /// <summary>
++    /// Initializes a new <see cref="StringBuilderHelper"/> instance.
++    /// </summary>
++    public StringBuilderHelper()
++    {
++        Position = 0;
++    }
++    
++    /// <summary>
++    /// Initializes a new <see cref="StringBuilderHelper"/> instance with a specific position.
++    /// </summary>
++    /// <param name="position">The position for this <see cref="StringBuilderHelper"/>.</param>
++    public StringBuilderHelper(int position)
++    {
++        this.Position = position;
++    }
++
++    /// <summary>
++    /// Appends a copy of the specified string to a <see cref="StringBuilder"/> at <see cref="Position"/> and increases it afterwards.
++    /// </summary>
++    /// <param name="sb">An instance on where a string should be appended to.</param>
++    /// <param name="value"><inheritdoc cref="StringBuilder.Append(string)"/></param>
++    public void Append(StringBuilder sb, string value)
++    {
++        if (Position == sb.Length)
++            sb.Append(value);
++        else
++            sb.Insert(Position, value);
++        Position += value.Length;
++    }
++    
++    /// <summary>
++    /// Appends the specified char to a <see cref="StringBuilder"/> at <see cref="Position"/> and increases it afterwards.
++    /// </summary>
++    /// <param name="sb">An instance on where a string should be appended to.</param>
++    /// <param name="value"><inheritdoc cref="StringBuilder.Append(char)"/></param>
++    public void Append(StringBuilder sb, char value)
++    {
++        if (Position == sb.Length)
++            sb.Append(value);
++        else
++            sb.Insert(Position, value);
++        Position += 1;
++    }
++    
++    /// <summary>
++    /// <inheritdoc cref="StringBuilderHelper.Append(StringBuilder, string)"/>
++    /// </summary>
++    /// <param name="sb">An instance on where a string should be appended to.</param>
++    /// <param name="value"><inheritdoc cref="StringBuilder.Append(object)"/></param>
++    public void Append(StringBuilder sb, object value) => this.Append(sb, value.ToString());
++    
++    /// <summary>
++    /// <inheritdoc cref="StringBuilderHelper.Append(StringBuilder, string)"/>
++    /// </summary>
++    /// <param name="sb">An instance on where a string should be appended to.</param>
++    /// <param name="value"><inheritdoc cref="StringBuilder.Append(int)"/></param>
++    public void Append(StringBuilder sb, int value) => this.Append(sb, value.ToString());
++    
++    /// <summary>
++    /// <inheritdoc cref="StringBuilderHelper.Append(StringBuilder, string)"/>
++    /// </summary>
++    /// <param name="sb">An instance on where a string should be appended to.</param>
++    /// <param name="value"><inheritdoc cref="StringBuilder.Append(byte)"/></param>
++    public void Append(StringBuilder sb, byte value) => this.Append(sb, value.ToString());
++    
++    
++    
++    // Add more overloads as needed.
++}
+\ No newline at end of file
+diff --git a/UndertaleModTool/MainWindow.xaml.cs b/UndertaleModTool/MainWindow.xaml.cs
+index df1d9ad3b1d0997f6692be140a3c7761aace1bc5..f9bed75e728e63f3438da08bef380a5171bc5820 100644
+--- a/UndertaleModTool/MainWindow.xaml.cs
++++ b/UndertaleModTool/MainWindow.xaml.cs
+@@ -1147,7 +1147,7 @@ namespace UndertaleModTool
+                                 {
+                                     if (debugMode == DebugDataDialog.DebugDataMode.FullAssembler || instr.Kind == UndertaleInstruction.Opcode.Pop || instr.Kind == UndertaleInstruction.Opcode.Popz || instr.Kind == UndertaleInstruction.Opcode.B || instr.Kind == UndertaleInstruction.Opcode.Bt || instr.Kind == UndertaleInstruction.Opcode.Bf || instr.Kind == UndertaleInstruction.Opcode.Ret || instr.Kind == UndertaleInstruction.Opcode.Exit)
+                                         debugInfo.Add(new UndertaleDebugInfo.DebugInfoPair() { SourceCodeOffset = (uint)sb.Length, BytecodeOffset = instr.Address * 4 });
+-                                    sb.Append(instr.ToString(code));
++                                    instr.ToString(sb, code);
+                                     sb.Append('\n');
+                                 }
+                                 outputs[i] = sb.ToString();

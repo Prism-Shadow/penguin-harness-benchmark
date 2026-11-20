@@ -1,0 +1,166 @@
+diff --git a/app/controllers/api/v3/notices_controller.rb b/app/controllers/api/v3/notices_controller.rb
+new file mode 100644
+index 0000000..750d0dd
+--- /dev/null
++++ b/app/controllers/api/v3/notices_controller.rb
+@@ -0,0 +1,34 @@
++class Api::V3::NoticesController < ApplicationController
++  skip_before_action :verify_authenticity_token
++  skip_before_action :authenticate_user!
++
++  respond_to :json
++
++  def create
++    response.headers['Access-Control-Allow-Origin'] = '*'
++    response.headers['Access-Control-Allow-Headers'] = 'origin, content-type, accept'
++
++    if !request.options?
++      report = AirbrakeApi::V3::NoticeParser.new(params).report
++
++      if report.valid?
++        if report.should_keep?
++          report.generate_notice!
++          render json: {
++            notice: {
++              id: report.notice.id
++            }
++          }
++        else
++          render text: 'Notice for old app version ignored'
++        end
++      else
++        render text: 'Your API key is unknown', status: 422
++      end
++    else
++      render nothing: true
++    end
++  rescue AirbrakeApi::ParamsError
++    render text: 'Invalid request', status: 400
++  end
++end
+diff --git a/config/routes.rb b/config/routes.rb
+index d45faac..fcf1e3d 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -1,4 +1,4 @@
+-Errbit::Application.routes.draw do
++Rails.application.routes.draw do
+ 
+   devise_for :users, :controllers => { :omniauth_callbacks => "users/omniauth_callbacks" }
+ 
+@@ -60,7 +60,8 @@ Errbit::Application.routes.draw do
+     end
+   end
+ 
+-  root :to => 'apps#index'
++  match '/api/v3/projects/:project_id/notices' => 'api/v3/notices#create', via: [:post, :options]
+ 
++  root :to => 'apps#index'
+ end
+ 
+diff --git a/lib/airbrake_api/params_error.rb b/lib/airbrake_api/params_error.rb
+new file mode 100644
+index 0000000..2e1bb7a
+--- /dev/null
++++ b/lib/airbrake_api/params_error.rb
+@@ -0,0 +1,3 @@
++module AirbrakeApi
++  class ParamsError < StandardError; end
++end
+\ No newline at end of file
+diff --git a/lib/airbrake_api/v3/notice_parser.rb b/lib/airbrake_api/v3/notice_parser.rb
+new file mode 100644
+index 0000000..a91e62f
+--- /dev/null
++++ b/lib/airbrake_api/v3/notice_parser.rb
+@@ -0,0 +1,89 @@
++module AirbrakeApi
++  module V3
++    class NoticeParser
++      class ParamsError < StandardError; end
++
++      attr_reader :params, :error
++
++      def initialize(params)
++        @params = params || {}
++      end
++
++      def report
++        attributes = {
++          error_class: error['type'],
++          message: error['message'],
++          backtrace: backtrace,
++          request: request,
++          server_environment: server_environment,
++          api_key: params['key'].present? ? params['key'] : params['project_id'],
++          notifier: params['notifier'],
++          user_attributes: user_attributes
++        }
++
++        ErrorReport.new(attributes)
++      end
++
++      private
++
++      def error
++        raise AirbrakeApi::ParamsError unless params.has_key?('errors') && params['errors'].any?
++        @error ||= params['errors'].first
++      end
++
++      def backtrace
++        error['backtrace'].map do |backtrace_line|
++          {
++            method: backtrace_line['function'],
++            file: backtrace_line['file'],
++            number: backtrace_line['line'],
++            column: backtrace_line['column']
++          }
++        end
++      end
++
++      def server_environment
++        {
++          'environment-name' => context['environment'],
++          'hostname' => hostname,
++          'project-root' => context['rootDirectory'],
++          'app-version' => context['version']
++        }
++      end
++
++      def request
++        environment = params['environment'].merge(
++          'HTTP_USER_AGENT' => context['userAgent']
++        )
++
++        {
++          'cgi-data' => environment,
++          'session' => params['session'],
++          'params' => params['params'],
++          'url' => url,
++          'component' => context['component'],
++          'action' => context['action']
++        }
++      end
++
++      def user_attributes
++        hash = context.slice('userId', 'userUsername', 'userName', 'userEmail')
++        Hash[hash.map { |key, value| [key.sub(/^user/, ''), value] }]
++      end
++
++      def url
++        context['url']
++      end
++
++      def hostname
++        URI.parse(url).hostname
++      rescue URI::InvalidURIError
++        ''
++      end
++
++      def context
++        @context = params['context'] || {}
++      end
++    end
++  end
++end
+\ No newline at end of file

@@ -1,0 +1,1162 @@
+diff --git a/app/controllers/notices_controller.rb b/app/controllers/notices_controller.rb
+index 3542556..6e1494c 100644
+--- a/app/controllers/notices_controller.rb
++++ b/app/controllers/notices_controller.rb
+@@ -2,7 +2,8 @@ class NoticesController < ApplicationController
+ 
+   class ParamsError < StandardError; end
+ 
+-  skip_before_filter :authenticate_user!, :only => :create
++  skip_before_action :authenticate_user!, only: :create
++  skip_before_filter :verify_authenticity_token, only: :create
+ 
+   rescue_from ParamsError, :with => :bad_params
+ 
+diff --git a/app/controllers/problems_controller.rb b/app/controllers/problems_controller.rb
+index 1b9a375..866bb34 100644
+--- a/app/controllers/problems_controller.rb
++++ b/app/controllers/problems_controller.rb
+@@ -22,7 +22,7 @@ class ProblemsController < ApplicationController
+   }
+ 
+   expose(:problem) {
+-    app.problems.find(params[:id])
++    ProblemDecorator.new app.problems.find(params[:id])
+   }
+ 
+   expose(:all_errs) {
+@@ -50,8 +50,9 @@ class ProblemsController < ApplicationController
+   def index; end
+ 
+   def show
+-    @notices  = problem.notices.reverse_ordered.page(params[:notice]).per(1)
+-    @notice   = @notices.first
++    @notices = problem.object.notices.reverse_ordered
++      .page(params[:notice]).per(1)
++    @notice  = NoticeDecorator.new @notices.first
+     @comment = Comment.new
+   end
+ 
+diff --git a/app/decorators/backtrace_decorator.rb b/app/decorators/backtrace_decorator.rb
+new file mode 100644
+index 0000000..9c2392d
+--- /dev/null
++++ b/app/decorators/backtrace_decorator.rb
+@@ -0,0 +1,5 @@
++class BacktraceDecorator < Draper::Decorator
++  def lines
++    @lines ||= object.lines.map { |line| BacktraceLineDecorator.new line }
++  end
++end
+diff --git a/app/decorators/backtrace_line_decorator.rb b/app/decorators/backtrace_line_decorator.rb
+new file mode 100644
+index 0000000..e13edf1
+--- /dev/null
++++ b/app/decorators/backtrace_line_decorator.rb
+@@ -0,0 +1,88 @@
++class BacktraceLineDecorator < Draper::Decorator
++  EMPTY_STRING = ''.freeze
++
++  def in_app?
++    object[:file].match Backtrace::IN_APP_PATH
++  end
++
++  def number
++    object[:number]
++  end
++
++  def column
++    object[:column]
++  end
++
++  def file
++    object[:file]
++  end
++
++  def method
++    object[:method]
++  end
++
++  def file_relative
++    file.to_s.sub(Backtrace::IN_APP_PATH, EMPTY_STRING)
++  end
++
++  def file_name
++    File.basename file
++  end
++
++  def to_s
++    column = object.try(:[], :column)
++    "#{file_relative}:#{number}#{column.present? ? ":#{column}" : ''}"
++  end
++
++  def link_to_source_file(app, &block)
++    text = h.capture_haml(&block)
++    link_to_in_app_source_file(app, text) || text
++  end
++
++  def path
++    File.dirname(object[:file]).gsub(/^\.$/, '') + "/"
++  end
++
++  def decorated_path
++    file_relative.sub(Backtrace::GEMS_PATH, "<strong>\\1</strong>")
++  end
++
++  private
++  def link_to_in_app_source_file(app, text)
++    return unless in_app?
++    if file_name =~ /\.js$/
++      link_to_hosted_javascript(app, text)
++    else
++      link_to_repo_source_file(app, text) ||
++      link_to_issue_tracker_file(app, text)
++    end
++  end
++
++  def link_to_repo_source_file(app, text)
++    link_to_github(app, text) || link_to_bitbucket(app, text)
++  end
++
++  def link_to_hosted_javascript(app, text)
++    if app.asset_host?
++      h.link_to(text, "#{app.asset_host}/#{file_relative}", :target => '_blank')
++    end
++  end
++
++  def link_to_github(app, text = nil)
++    return unless app.github_repo?
++    href = "%s#L%s" % [app.github_url_to_file(decorated_path + file_name), number]
++    h.link_to(text || file_name, href, :target => '_blank')
++  end
++
++  def link_to_bitbucket(app, text = nil)
++    return unless app.bitbucket_repo?
++    href = "%s#cl-%s" % [app.bitbucket_url_to_file(decorated_path + file_name), number]
++    h.link_to(text || file_name, href, :target => '_blank')
++  end
++
++  def link_to_issue_tracker_file(app, text = nil)
++    return unless app.issue_tracker && app.issue_tracker.respond_to?(:url_to_file)
++    href = app.issue_tracker.url_to_file(file_relative, number)
++    h.link_to(text || file_name, href, :target => '_blank')
++  end
++end
+diff --git a/app/decorators/notice_decorator.rb b/app/decorators/notice_decorator.rb
+new file mode 100644
+index 0000000..bffe374
+--- /dev/null
++++ b/app/decorators/notice_decorator.rb
+@@ -0,0 +1,4 @@
++class NoticeDecorator < Draper::Decorator
++  decorates_association :backtrace
++  delegate_all
++end
+diff --git a/app/decorators/problem_decorator.rb b/app/decorators/problem_decorator.rb
+new file mode 100644
+index 0000000..e2efb95
+--- /dev/null
++++ b/app/decorators/problem_decorator.rb
+@@ -0,0 +1,4 @@
++class ProblemDecorator < Draper::Decorator
++  decorates_association :notices
++  delegate_all
++end
+diff --git a/app/helpers/backtrace_line_helper.rb b/app/helpers/backtrace_line_helper.rb
+index 6c1d7fd..c65a7cd 100644
+--- a/app/helpers/backtrace_line_helper.rb
++++ b/app/helpers/backtrace_line_helper.rb
+@@ -1,49 +1,45 @@
+ module BacktraceLineHelper
+-  def link_to_source_file(line, &block)
++  def link_to_source_file(line, app, &block)
+     text = capture_haml(&block)
+-     link_to_in_app_source_file(line, text) || link_to_external_source_file(text)
++    link_to_in_app_source_file(line, app, text) || text
+   end
+ 
+   private
+-  def link_to_in_app_source_file(line, text)
++  def link_to_in_app_source_file(line, app, text)
+     return unless line.in_app?
+     if line.file_name =~ /\.js$/
+-      link_to_hosted_javascript(line, text)
++      link_to_hosted_javascript(line, app, text)
+     else
+-      link_to_repo_source_file(line, text) ||
+-      link_to_issue_tracker_file(line, text)
++      link_to_repo_source_file(line, app, text) ||
++      link_to_issue_tracker_file(line, app, text)
+     end
+   end
+ 
+-  def link_to_repo_source_file(line, text)
+-    link_to_github(line, text) || link_to_bitbucket(line, text)
++  def link_to_repo_source_file(line, app, text)
++    link_to_github(line, app, text) || link_to_bitbucket(line, app, text)
+   end
+ 
+-  def link_to_hosted_javascript(line, text)
+-    if line.app.asset_host?
+-      link_to(text, "#{line.app.asset_host}/#{line.file_relative}", :target => '_blank')
++  def link_to_hosted_javascript(line, app, text)
++    if app.asset_host?
++      link_to(text, "#{app.asset_host}/#{line.file_relative}", :target => '_blank')
+     end
+   end
+ 
+-  def link_to_external_source_file(text)
+-    text
+-  end
+-
+-  def link_to_github(line, text = nil)
+-    return unless line.app.github_repo?
+-    href = "%s#L%s" % [line.app.github_url_to_file(line.decorated_path + line.file_name), line.number]
++  def link_to_github(line, app, text = nil)
++    return unless app.github_repo?
++    href = "%s#L%s" % [app.github_url_to_file(line.decorated_path + line.file_name), line.number]
+     link_to(text || line.file_name, href, :target => '_blank')
+   end
+ 
+-  def link_to_bitbucket(line, text = nil)
+-    return unless line.app.bitbucket_repo?
+-    href = "%s#cl-%s" % [line.app.bitbucket_url_to_file(line.decorated_path + line.file_name), line.number]
++  def link_to_bitbucket(line, app, text = nil)
++    return unless app.bitbucket_repo?
++    href = "%s#cl-%s" % [app.bitbucket_url_to_file(line.decorated_path + line.file_name), line.number]
+     link_to(text || line.file_name, href, :target => '_blank')
+   end
+ 
+-  def link_to_issue_tracker_file(line, text = nil)
+-    return unless line.app.issue_tracker && line.app.issue_tracker.respond_to?(:url_to_file)
+-    href = line.app.issue_tracker.url_to_file(line.file_relative, line.number)
++  def link_to_issue_tracker_file(line, app, text = nil)
++    return unless app.issue_tracker && app.issue_tracker.respond_to?(:url_to_file)
++    href = app.issue_tracker.url_to_file(line.file_relative, line.number)
+     link_to(text || line.file_name, href, :target => '_blank')
+   end
+ 
+diff --git a/app/interactors/resolved_problem_clearer.rb b/app/interactors/resolved_problem_clearer.rb
+index f6945ce..a78ada5 100644
+--- a/app/interactors/resolved_problem_clearer.rb
++++ b/app/interactors/resolved_problem_clearer.rb
+@@ -27,6 +27,6 @@ class ResolvedProblemClearer
+   end
+ 
+   def repair_database
+-    Mongoid.default_session.command :repairDatabase => 1
++    Mongoid.default_client.command :repairDatabase => 1
+   end
+ end
+diff --git a/app/mailers/mailer.rb b/app/mailers/mailer.rb
+index eead55c..0f3ec4d 100644
+--- a/app/mailers/mailer.rb
++++ b/app/mailers/mailer.rb
+@@ -13,11 +13,11 @@ class Mailer < ActionMailer::Base
+           'Precedence' => 'bulk',
+           'Auto-Submitted' => 'auto-generated'
+ 
+-  def err_notification(notice)
+-    @notice   = notice
+-    @app      = notice.app
++  def err_notification(error_report)
++    @notice   = NoticeDecorator.new error_report.notice
++    @app      = AppDecorator.new error_report.app
+ 
+-    count = @notice.similar_count
++    count = error_report.problem.notices_count
+     count = count > 1 ? "(#{count}) " : ""
+ 
+     errbit_headers 'App' => @app.name,
+@@ -30,7 +30,7 @@ class Mailer < ActionMailer::Base
+ 
+   def deploy_notification(deploy)
+     @deploy   = deploy
+-    @app  = deploy.app
++    @app  = AppDecorator.new deploy.app
+ 
+     errbit_headers 'App' => @app.name,
+                    'Environment' => @deploy.environment,
+@@ -44,7 +44,7 @@ class Mailer < ActionMailer::Base
+   def comment_notification(comment)
+     @comment  = comment
+     @user     = comment.user
+-    @problem  = comment.err
++    @problem  = ProblemDecorator.new comment.err
+     @notice   = @problem.notices.first
+     @app      = @problem.app
+ 
+diff --git a/app/models/app.rb b/app/models/app.rb
+index fea8305..0ff1203 100644
+--- a/app/models/app.rb
++++ b/app/models/app.rb
+@@ -57,8 +57,14 @@ class App
+   def find_or_create_err!(attrs)
+     Err.where(
+       :fingerprint => attrs[:fingerprint]
+-    ).first ||
+-      problems.create!(attrs.slice(:error_class, :environment)).errs.create!(attrs.slice(:fingerprint, :problem_id))
++    ).first || (
++      problem = problems.create!(
++        error_class: attrs[:error_class],
++        environment: attrs[:environment],
++        app_name: name
++      )
++      problem.errs.create!(attrs.slice(:fingerprint, :problem_id))
++    )
+   end
+ 
+   # Mongoid Bug: find(id) on association proxies returns an Enumerator
+@@ -178,7 +184,9 @@ class App
+   protected
+ 
+     def store_cached_attributes_on_problems
+-      problems.each(&:cache_app_attributes)
++      Problem.where(:app_id => id).update_all(
++        app_name: name
++      )
+     end
+ 
+     def generate_api_key
+diff --git a/app/models/backtrace.rb b/app/models/backtrace.rb
+index bdebee7..560e0b4 100644
+--- a/app/models/backtrace.rb
++++ b/app/models/backtrace.rb
+@@ -2,35 +2,28 @@ class Backtrace
+   include Mongoid::Document
+   include Mongoid::Timestamps
+ 
+-  field :fingerprint
+-  index :fingerprint => 1
+-
+-  has_many :notices
+-  has_one :notice
+-
+-  embeds_many :lines, :class_name => "BacktraceLine"
++  IN_APP_PATH = %r{^\[PROJECT_ROOT\](?!(\/vendor))/?}
++  GEMS_PATH = %r{\[GEM_ROOT\]\/gems\/([^\/]+)}
+ 
+-  after_initialize :generate_fingerprint
++  field :fingerprint
++  field :lines
+ 
+-  delegate :app, :to => :notice
++  index :fingerprint => 1
+ 
+-  def self.find_or_create(attributes = {})
+-    new(attributes).similar || create(attributes)
+-  end
++  def self.find_or_create(lines)
++    fingerprint = generate_fingerprint(lines)
+ 
+-  def similar
+-    Backtrace.where(:fingerprint => fingerprint).first
++    where(fingerprint: fingerprint).find_one_and_update(
++      { '$setOnInsert' => { fingerprint: fingerprint, lines: lines } },
++      { return_document: :after, upsert: true })
+   end
+ 
+-  def raw=(raw)
+-    raw.compact.each do |raw_line|
+-      lines << BacktraceLine.new(BacktraceLineNormalizer.new(raw_line).call)
+-    end
++  def self.generate_fingerprint(lines)
++    Digest::SHA1.hexdigest(lines.map(&:to_s).join)
+   end
+ 
+   private
+   def generate_fingerprint
+-    self.fingerprint = Digest::SHA1.hexdigest(lines.map(&:to_s).join)
++    self.fingerprint = self.class.generate_fingerprint(lines)
+   end
+-
+ end
+diff --git a/app/models/backtrace_line.rb b/app/models/backtrace_line.rb
+deleted file mode 100644
+index 34df8a2..0000000
+--- a/app/models/backtrace_line.rb
++++ /dev/null
+@@ -1,42 +0,0 @@
+-class BacktraceLine
+-  include Mongoid::Document
+-  IN_APP_PATH = %r{^\[PROJECT_ROOT\](?!(\/vendor))/?}
+-  GEMS_PATH   = %r{\[GEM_ROOT\]\/gems\/([^\/]+)}
+-
+-  field :number, :type => Integer
+-  field :column, :type => Integer
+-  field :file
+-  field :method
+-
+-  embedded_in :backtrace
+-
+-  scope :in_app, ->{ where(:file => IN_APP_PATH) }
+-
+-  delegate :app, :to => :backtrace
+-
+-  def to_s
+-    "#{file_relative}:#{number}" << (column.present? ? ":#{column}" : "")
+-  end
+-
+-  def in_app?
+-    !!(file =~ IN_APP_PATH)
+-  end
+-
+-  def path
+-    File.dirname(file).gsub(/^\.$/, '') + "/"
+-  end
+-
+-  def file_relative
+-    file.to_s.sub(IN_APP_PATH, '')
+-  end
+-
+-  def file_name
+-    File.basename file
+-  end
+-
+-  def decorated_path
+-    path.sub(BacktraceLine::IN_APP_PATH, '').
+-      sub(BacktraceLine::GEMS_PATH, "<strong>\\1</strong>")
+-  end
+-
+-end
+diff --git a/app/models/backtrace_line_normalizer.rb b/app/models/backtrace_line_normalizer.rb
+deleted file mode 100644
+index cf99551..0000000
+--- a/app/models/backtrace_line_normalizer.rb
++++ /dev/null
+@@ -1,32 +0,0 @@
+-class BacktraceLineNormalizer
+-  def initialize(raw_line)
+-    @raw_line = raw_line || {}
+-  end
+-
+-  def call
+-    @raw_line.merge 'file' => normalized_file, 'method' => normalized_method
+-  end
+-
+-  private
+-  def normalized_file
+-    if @raw_line['file'].blank?
+-      "[unknown source]"
+-    else
+-      file = @raw_line['file'].to_s
+-      # Detect lines from gem
+-      file.gsub!(/\[PROJECT_ROOT\]\/.*\/ruby\/[0-9.]+\/gems/, '[GEM_ROOT]/gems')
+-      # Strip any query strings
+-      file.gsub!(/\?[^\?]*$/, '')
+-      @raw_line['file'] = file
+-    end
+-  end
+-
+-  def normalized_method
+-    if @raw_line['method'].blank?
+-      "[unknown method]"
+-    else
+-      @raw_line['method'].to_s.gsub(/[0-9_]{10,}+/, "__FRAGMENT__")
+-    end
+-  end
+-
+-end
+diff --git a/app/models/deploy.rb b/app/models/deploy.rb
+index 9b89160..71ff354 100644
+--- a/app/models/deploy.rb
++++ b/app/models/deploy.rb
+@@ -33,7 +33,9 @@ class Deploy
+     end
+ 
+     def store_cached_attributes_on_problems
+-      Problem.where(:app_id => app.id).each(&:cache_app_attributes)
++      Problem.where(:app_id => app.id).update_all(
++        last_deploy_at: created_at
++      )
+     end
+ 
+     def deliver_email
+diff --git a/app/models/error_report.rb b/app/models/error_report.rb
+index e3c4868..fd7a7ba 100644
+--- a/app/models/error_report.rb
++++ b/app/models/error_report.rb
+@@ -15,8 +15,16 @@ require 'hoptoad_notifier'
+ # * <tt>:notifier</tt> - information to identify the source of the error report
+ #
+ class ErrorReport
+-  attr_reader :error_class, :message, :request, :server_environment, :api_key,
+-              :notifier, :user_attributes, :framework, :notice
++  attr_reader :api_key
++  attr_reader :error_class
++  attr_reader :framework
++  attr_reader :message
++  attr_reader :notice
++  attr_reader :notifier
++  attr_reader :problem
++  attr_reader :request
++  attr_reader :server_environment
++  attr_reader :user_attributes
+ 
+   cattr_accessor :fingerprint_strategy do
+     Fingerprint::Sha1
+@@ -40,24 +48,59 @@ class ErrorReport
+   end
+ 
+   def backtrace
+-    @normalized_backtrace ||= Backtrace.find_or_create(raw: @backtrace)
++    @normalized_backtrace ||= Backtrace.find_or_create(@backtrace)
+   end
+ 
+   def generate_notice!
+     return unless valid?
+     return @notice if @notice
++
++    make_notice
++    error.notices << @notice
++    cache_attributes_on_problem
++    email_notification
++    services_notification
++    @notice
++  end
++
++  def make_notice
+     @notice = Notice.new(
+       message: message,
+       error_class: error_class,
+-      backtrace_id: backtrace.id,
++      backtrace: backtrace,
+       request: request,
+       server_environment: server_environment,
+       notifier: notifier,
+       user_attributes: user_attributes,
+       framework: framework
+     )
+-    error.notices << @notice
+-    @notice
++  end
++
++  # Update problem cache with information about this notice
++  def cache_attributes_on_problem
++    @problem = Problem.cache_notice(@error.problem_id, @notice)
++  end
++
++  # Send email notification if needed
++  def email_notification
++    return false unless app.emailable?
++    return false unless app.email_at_notices.include?(@problem.notices_count)
++    Mailer.err_notification(self).deliver
++  rescue => e
++    HoptoadNotifier.notify(e)
++  end
++
++  def should_notify?
++    app.notification_service.notify_at_notices.include?(0) ||
++      app.notification_service.notify_at_notices.include?(@problem.notices_count)
++  end
++
++  # Launch all notification define on the app associate to this notice
++  def services_notification
++    return true unless app.notification_service_configured? and should_notify?
++    app.notification_service.create_notification(problem)
++  rescue => e
++    HoptoadNotifier.notify(e)
+   end
+ 
+   ##
+diff --git a/app/models/notice.rb b/app/models/notice.rb
+index 4cca6d8..8104861 100644
+--- a/app/models/notice.rb
++++ b/app/models/notice.rb
+@@ -20,13 +20,10 @@ class Notice
+   index(:created_at => 1)
+   index(:err_id => 1, :created_at => 1, :_id => 1)
+ 
+-  after_create :cache_attributes_on_problem, :unresolve_problem
+-  after_create :email_notification
+-  after_create :services_notification
+   before_save :sanitize
+-  before_destroy :decrease_counter_cache, :remove_cached_attributes_from_problem
++  before_destroy :problem_recache
+ 
+-  validates_presence_of :backtrace, :server_environment, :notifier
++  validates_presence_of :backtrace_id, :server_environment, :notifier
+ 
+   scope :ordered, ->{ order_by(:created_at.asc) }
+   scope :reverse_ordered, ->{ order_by(:created_at.desc) }
+@@ -94,7 +91,8 @@ class Notice
+   end
+ 
+   def env_vars
+-    request['cgi-data'] || {}
++    vars = request['cgi-data']
++    vars.is_a?(Hash) ? vars : {}
+   end
+ 
+   def params
+@@ -105,26 +103,6 @@ class Notice
+     request['session'] || {}
+   end
+ 
+-  def in_app_backtrace_lines
+-    backtrace_lines.in_app
+-  end
+-
+-  def similar_count
+-    problem.notices_count
+-  end
+-
+-  def emailable?
+-    app.email_at_notices.include?(similar_count)
+-  end
+-
+-  def should_email?
+-    app.emailable? && emailable?
+-  end
+-
+-  def should_notify?
+-    app.notification_service.notify_at_notices.include?(0) || app.notification_service.notify_at_notices.include?(similar_count)
+-  end
+-
+   ##
+   # TODO: Move on decorator maybe
+   #
+@@ -142,20 +120,8 @@ class Notice
+ 
+   protected
+ 
+-  def decrease_counter_cache
+-    problem.inc(notices_count: -1) if err
+-  end
+-
+-  def remove_cached_attributes_from_problem
+-    problem.remove_cached_notice_attributes(self) if err
+-  end
+-
+-  def unresolve_problem
+-    problem.update_attributes!(:resolved => false, :resolved_at => nil, :notices_count => 1) if problem.resolved?
+-  end
+-
+-  def cache_attributes_on_problem
+-    ProblemUpdaterCache.new(problem, self).update
++  def problem_recache
++    problem.uncache_notice(self)
+   end
+ 
+   def sanitize
+@@ -164,7 +130,6 @@ class Notice
+     end
+   end
+ 
+-
+   def sanitize_hash(h)
+     h.recurse do |h|
+       h.inject({}) do |h,(k,v)|
+@@ -177,25 +142,4 @@ class Notice
+       end
+     end
+   end
+-
+-  private
+-
+-  ##
+-  # Send email notification if needed
+-  def email_notification
+-    return true unless should_email?
+-    Mailer.err_notification(self).deliver
+-  rescue => e
+-    HoptoadNotifier.notify(e)
+-  end
+-
+-  ##
+-  # Launch all notification define on the app associate to this notice
+-  def services_notification
+-    return true unless app.notification_service_configured? and should_notify?
+-    app.notification_service.create_notification(problem)
+-  rescue => e
+-    HoptoadNotifier.notify(e)
+-  end
+-
+ end
+diff --git a/app/models/notification_service.rb b/app/models/notification_service.rb
+index 5fba0f4..95cbbbf 100644
+--- a/app/models/notification_service.rb
++++ b/app/models/notification_service.rb
+@@ -26,7 +26,7 @@ class NotificationService
+   else
+     Fields = []
+   end
+-       
++
+   def notify_at_notices
+     Errbit::Config.per_app_notify_at_notices ? super : Errbit::Config.notify_at_notices
+   end
+diff --git a/app/models/problem.rb b/app/models/problem.rb
+index 0049926..99d8037 100644
+--- a/app/models/problem.rb
++++ b/app/models/problem.rb
+@@ -6,8 +6,15 @@ class Problem
+   include Mongoid::Document
+   include Mongoid::Timestamps
+ 
+-  field :last_notice_at, :type => DateTime, :default => Proc.new { Time.now }
+-  field :first_notice_at, :type => DateTime, :default => Proc.new { Time.now }
++  CACHED_NOTICE_ATTRIBUTES = {
++    messages: :message,
++    hosts: :host,
++    user_agents: :user_agent_string
++  }.freeze
++
++
++  field :last_notice_at, :type => ActiveSupport::TimeWithZone, :default => Proc.new { Time.now }
++  field :first_notice_at, :type => ActiveSupport::TimeWithZone, :default => Proc.new { Time.now }
+   field :last_deploy_at, :type => Time
+   field :resolved, :type => Boolean, :default => false
+   field :resolved_at, :type => Time
+@@ -35,6 +42,14 @@ class Problem
+   index :resolved_at => 1
+   index :notices_count => 1
+ 
++  index({
++    error_class: "text",
++    where: "text",
++    message: "text",
++    app_name: "text",
++    environment: "text"
++  }, default_language: "english")
++
+   belongs_to :app
+   has_many :errs, :inverse_of => :problem, :dependent => :destroy
+   has_many :comments, :inverse_of => :err, :dependent => :destroy
+@@ -42,6 +57,7 @@ class Problem
+   validates_presence_of :environment
+ 
+   before_create :cache_app_attributes
++  before_save :truncate_message
+ 
+   scope :resolved, ->{ where(:resolved => true) }
+   scope :unresolved, ->{ where(:resolved => false) }
+@@ -62,6 +78,83 @@ class Problem
+     env.present? ? where(:environment => env) : scoped
+   end
+ 
++  def self.cache_notice(id, notice)
++    # increment notice count
++    message_digest = Digest::MD5.hexdigest(notice.message)
++    host_digest = Digest::MD5.hexdigest(notice.host)
++    user_agent_digest = Digest::MD5.hexdigest(notice.user_agent_string)
++
++    Problem.where('_id' => id).find_one_and_update({
++      '$set' => {
++        'environment' => notice.environment_name,
++        'error_class' => notice.error_class,
++        'last_notice_at' => notice.created_at.utc,
++        'message' => notice.message,
++        'resolved' => false,
++        'resolved_at' => nil,
++        'where' => notice.where,
++        "messages.#{message_digest}.value" => notice.message,
++        "hosts.#{host_digest}.value" => notice.host,
++        "user_agents.#{user_agent_digest}.value" => notice.user_agent_string,
++      },
++      '$inc' => {
++        'notices_count' => 1,
++        "messages.#{message_digest}.count" => 1,
++        "hosts.#{host_digest}.count" => 1,
++        "user_agents.#{user_agent_digest}.count" => 1,
++      }
++    }, return_document: :after)
++  end
++
++  def uncache_notice(notice)
++    last_notice = notices.last
++
++    atomically do |doc|
++      doc.set(
++        'environment' => last_notice.environment_name,
++        'error_class' => last_notice.error_class,
++        'last_notice_at' => last_notice.created_at,
++        'message' => last_notice.message,
++        'where' => last_notice.where,
++        'notices_count' => notices_count.to_i > 1 ? notices_count - 1 : 0
++      )
++
++      CACHED_NOTICE_ATTRIBUTES.each do |k,v|
++        digest = Digest::MD5.hexdigest(notice.send(v))
++        field = "#{k}.#{digest}"
++
++        if (doc[k].try(:[], digest).try(:[], :count)).to_i > 1
++          doc.inc("#{field}.count" => -1)
++        else
++          doc.unset(field)
++        end
++      end
++    end
++  end
++
++  def recache
++    CACHED_NOTICE_ATTRIBUTES.each do |k,v|
++      # clear all cached attributes
++      send("#{k}=", {})
++
++      # find only notices related to this problem
++      Notice.collection.find.aggregate([
++        { "$match" => { err_id: { "$in" => err_ids } } },
++        { "$group" => { _id: "$#{v}", count: {"$sum" => 1} } }
++      ]).each do |agg|
++        next if agg[:_id] == nil
++
++        send(k)[Digest::MD5.hexdigest(agg[:_id])] = {
++          value: agg[:_id],
++          count: agg[:count]
++        }
++      end
++    end
++
++    self.notices_count = Notice.where({ err_id: { "$in" => err_ids }}).count
++    save
++  end
++
+   def url
+     Rails.application.routes.url_helpers.app_problem_url(app, self,
+       :host => Errbit::Config.host,
+@@ -97,16 +190,21 @@ class Problem
+   def unmerge!
+     attrs = {:error_class => error_class, :environment => environment}
+     problem_errs = errs.to_a
+-    problem_errs.shift
+-    [self] + problem_errs.map(&:id).map do |err_id|
+-      err = Err.find(err_id)
+-      app.problems.create(attrs).tap do |new_problem|
+-        err.update_attribute(:problem_id, new_problem.id)
+-        new_problem.reset_cached_attributes
+-      end
++
++    # associate and return all the problems
++    new_problems = [self]
++
++    # create new problems for each err that needs one
++    (problem_errs[1..-1] || []).each do |err|
++      new_problems << app.problems.create(attrs)
++      err.update_attribute(:problem, new_problems.last)
+     end
+-  end
+ 
++    # recache each new problem
++    new_problems.each(&:recache)
++
++    new_problems
++  end
+ 
+   def self.ordered_by(sort, order)
+     case sort
+@@ -123,29 +221,15 @@ class Problem
+     where(:first_notice_at.lte => date_range.end).where("$or" => [{:resolved_at => nil}, {:resolved_at.gte => date_range.begin}])
+   end
+ 
+-
+-  def reset_cached_attributes
+-    ProblemUpdaterCache.new(self).update
+-  end
+-
+   def cache_app_attributes
+     if app
+       self.app_name = app.name
+-      self.last_deploy_at = if (last_deploy = app.deploys.where(:environment => self.environment).last)
+-        last_deploy.created_at.utc
+-      end
+-      collection.find('_id' => self.id)
+-                .update({'$set' => {'app_name' => self.app_name,
+-                          'last_deploy_at' => self.last_deploy_at.try(:utc)}})
++      self.last_deploy_at = app.last_deploy_at
+     end
+   end
+ 
+-  def remove_cached_notice_attributes(notice)
+-    update_attributes!(
+-      :messages    => attribute_count_descrease(:messages, notice.message),
+-      :hosts       => attribute_count_descrease(:hosts, notice.host),
+-      :user_agents => attribute_count_descrease(:user_agents, notice.user_agent_string)
+-    )
++  def truncate_message
++    self.message = self.message[0, 1000] if self.message
+   end
+ 
+   def issue_type
+@@ -155,13 +239,7 @@ class Problem
+   end
+ 
+   def self.search(value)
+-    any_of(
+-      {:error_class => /#{value}/i},
+-      {:where => /#{value}/i},
+-      {:message => /#{value}/i},
+-      {:app_name => /#{value}/i},
+-      {:environment => /#{value}/i}
+-    )
++    Problem.where({'$text' => {'$search' => value}})
+   end
+ 
+   private
+diff --git a/app/views/issue_trackers/issue.md.erb b/app/views/issue_trackers/issue.md.erb
+index 56353a9..6b39c61 100644
+--- a/app/views/issue_trackers/issue.md.erb
++++ b/app/views/issue_trackers/issue.md.erb
+@@ -27,7 +27,7 @@
+ 
+ ## Backtrace ##
+ ~~~
+-<% notice.backtrace_lines.each do |line| %><%= line.number %>:  <%= line.file_relative %> -> **<%= line.method %>**
++<% notice.backtrace.lines.each do |line| %><%= line.number %>:  <%= line.file_relative %> -> **<%= line.method %>**
+ <% end %>
+ ~~~
+ 
+diff --git a/app/views/issue_trackers/issue.txt.erb b/app/views/issue_trackers/issue.txt.erb
+index ff285cb..ca28aa7 100644
+--- a/app/views/issue_trackers/issue.txt.erb
++++ b/app/views/issue_trackers/issue.txt.erb
+@@ -16,6 +16,6 @@ Env:     <%= pretty_hash notice.env_vars %>
+ 
+ Backtrace
+ ---------
+-<% notice.backtrace_lines.each do |line| %><%= sprintf('%5d: %s **%s', line.number, line.file_relative, line.method) %>
++<% notice.backtrace.lines.each do |line| %><%= sprintf('%5d: %s **%s', line.number, line.file_relative, line.method) %>
+ <% end %>
+ <% end %>
+diff --git a/app/views/mailer/comment_notification.text.erb b/app/views/mailer/comment_notification.text.erb
+index bf43174..9347fda 100644
+--- a/app/views/mailer/comment_notification.text.erb
++++ b/app/views/mailer/comment_notification.text.erb
+@@ -21,8 +21,8 @@ WHERE:
+ 
+ <%= @notice.where %>
+ 
+-<% @notice.in_app_backtrace_lines.each do |line| %>
+-  <%= line %>
++<% @notice.backtrace.lines.each do |line| %>
++  <% next unless line.in_app? %><%= line %>
+ <% end %>
+ 
+ 
+diff --git a/app/views/mailer/err_notification.html.haml b/app/views/mailer/err_notification.html.haml
+index 6ef7025..ee61597 100644
+--- a/app/views/mailer/err_notification.html.haml
++++ b/app/views/mailer/err_notification.html.haml
+@@ -27,9 +27,10 @@
+               %p.heading WHERE:
+               %p.monospace
+                 = @notice.where
+-              - @notice.in_app_backtrace_lines.each do |line|
++              - @notice.backtrace.lines.each do |line|
++                - next unless line.in_app?
+                 %p.backtrace
+-                  = link_to_source_file(line) do
++                  = line.link_to_source_file(@app) do
+                     = line.to_s
+               %br
+               - if @notice.app_version.present?
+@@ -37,6 +38,12 @@
+                 %p.monospace
+                   = @notice.app_version
+                 %br
++              %br
++              - if @notice.server_environment.present? && @notice.server_environment["hostname"].present?
++                %p.heading APP SERVER:
++                %p.monospace
++                  = @notice.server_environment["hostname"]
++                %br
+               %p.heading URL:
+               %p.monospace
+                 - if @notice.request['url'].present?
+@@ -53,11 +60,11 @@
+                       %td(style="text-align: right; padding-right: 10px; color: #6a6a6a;")= key.to_s.titleize + ":"
+                       %td= auto_link(value.to_s)
+                 %br
+-              - if @notice.backtrace_lines.any?
++              - if @notice.backtrace.lines.any?
+                 %br
+                 %p.heading FULL BACKTRACE:
+-                - @notice.backtrace_lines.each do |line|
++                - @notice.backtrace.lines.each do |line|
+                   %p.backtrace
+-                    = link_to_source_file(line) do
++                    = link_to_source_file(line, @app) do
+                       = line.to_s
+                 %br
+diff --git a/app/views/mailer/err_notification.text.erb b/app/views/mailer/err_notification.text.erb
+index 7d69ac3..5b12e56 100644
+--- a/app/views/mailer/err_notification.text.erb
++++ b/app/views/mailer/err_notification.text.erb
+@@ -14,7 +14,8 @@ WHERE:
+ 
+ <%= @notice.where %>
+ 
+-<% @notice.in_app_backtrace_lines.each do |line| %>
++<% @notice.backtrace.lines.each do |line| %>
++  <% next unless line.in_app? %>
+   <%= line %>
+ <% end %>
+ 
+@@ -24,6 +25,12 @@ APP VERSION:
+ <%= @notice.app_version %>
+ <%- end %>
+ 
++<%- if @notice.server_environment.present? && @notice.server_environment["hostname"].present? %>
++APP SERVER:
++
++<%= @notice.server_environment["hostname"] %>
++<%- end %>
++
+ URL:
+ 
+ <%= @notice.request['url'] %>
+@@ -45,7 +52,7 @@ USER:
+ 
+ BACKTRACE:
+ 
+-<% @notice.backtrace_lines.each do |line| %>
++<% @notice.backtrace.lines.each do |line| %>
+   <%= line %>
+ <% end %>
+ 
+diff --git a/app/views/notices/_backtrace_line.html.haml b/app/views/notices/_backtrace_line.html.haml
+index 62402aa..966bb1c 100644
+--- a/app/views/notices/_backtrace_line.html.haml
++++ b/app/views/notices/_backtrace_line.html.haml
+@@ -1,6 +1,6 @@
+ %tr{:class => defined?(row_class) && row_class}
+   %td.line{:class => line.in_app? && 'in-app' }
+-    = link_to_source_file(line) do
++    = line.link_to_source_file(app) do
+       %span.path>= raw line.decorated_path
+       %span.file>= line.file_name
+       - if line.number.present?
+diff --git a/app/views/problems/show.html.haml b/app/views/problems/show.html.haml
+index e9a47f2..cbca417 100644
+--- a/app/views/problems/show.html.haml
++++ b/app/views/problems/show.html.haml
+@@ -68,7 +68,7 @@
+ 
+   #backtrace
+     %h3 Backtrace
+-    = render 'notices/backtrace', :lines => @notice.backtrace_lines
++    = render 'notices/backtrace', :lines => @notice.backtrace.lines
+ 
+   - if @notice.user_attributes.present?
+     #user_attributes
+diff --git a/config/application.rb b/config/application.rb
+index c27e4eb..6eae88d 100644
+--- a/config/application.rb
++++ b/config/application.rb
+@@ -1,9 +1,9 @@
+ require File.expand_path('../boot', __FILE__)
+ 
+-require "action_controller/railtie"
+-require "action_mailer/railtie"
+-require 'mongoid/railtie'
+-require "sprockets/railtie"
++require 'action_controller/railtie'
++require 'action_mailer/railtie'
++# require 'mongoid/railtie'
++require 'sprockets/railtie'
+ 
+ # Require the gems listed in Gemfile, including any gems
+ # you've limited to :test, :development, or :production.
+@@ -19,14 +19,11 @@ module Errbit
+     config.autoload_paths += [Rails.root.join('lib')]
+ 
+     config.before_initialize do
+-      # Load up Errbit::Config with values from the environment
+-      require Rails.root.join('config/load')
+-
+       config.secret_key_base = Errbit::Config.secret_key_base
+       config.serve_static_assets = Errbit::Config.serve_static_assets
+     end
+ 
+-    initializer "errbit.mongoid", before: "mongoid.load-config" do
++    initializer 'errbit.mongoid', before: 'mongoid.load-config' do
+       require Rails.root.join('config/mongo')
+     end
+ 
+@@ -50,6 +47,6 @@ module Errbit
+     config.mongoid.preload_models = true
+ 
+     # Configure Devise mailer to use our mailer layout.
+-    config.to_prepare { Devise::Mailer.layout "mailer" }
++    config.to_prepare { Devise::Mailer.layout 'mailer' }
+   end
+ end
+diff --git a/config/environment.rb b/config/environment.rb
+index a04540e..2da595c 100644
+--- a/config/environment.rb
++++ b/config/environment.rb
+@@ -1,5 +1,16 @@
+-# Load the rails application
++# Load the Rails application.
+ require File.expand_path('../application', __FILE__)
+ 
+-# Initialize the rails application
+-Errbit::Application.initialize!
++# Load up Errbit::Config with values from the environment
++require Rails.root.join('config/load')
++
++if Errbit::Config.log_location == 'STDOUT'
++  Rails.logger = ActiveSupport::Logger.new STDOUT
++else
++  Rails.logger = ActiveSupport::Logger.new Errbit::Config.log_location
++end
++
++Rails.logger.level = Errbit::Config.log_level.to_sym
++
++# Initialize the Rails application.
++Rails.application.initialize!
+diff --git a/config/initializers/mongo.rb b/config/initializers/mongo.rb
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/config/load.rb b/config/load.rb
+index c924cb9..b8bc4fe 100644
+--- a/config/load.rb
++++ b/config/load.rb
+@@ -1,6 +1,8 @@
+ # load default ENV values (without overwriting any existing value)
+ Dotenv.load('.env.default')
+ 
++require_relative '../lib/configurator'
++
+ # map config keys to environment variables
+ #
+ # We use the first non-nil environment variable in the list. If the last array
+@@ -19,6 +21,8 @@ Errbit::Config = Configurator.run({
+   per_app_email_at_notices:  ['ERRBIT_PER_APP_EMAIL_AT_NOTICES'],
+   notify_at_notices:         ['ERRBIT_NOTIFY_AT_NOTICES'],
+   per_app_notify_at_notices: ['ERRBIT_PER_APP_NOTIFY_AT_NOTICES'],
++  log_location:              ['ERRBIT_LOG_LOCATION'],
++  log_level:                 ['ERRBIT_LOG_LEVEL'],
+ 
+   serve_static_assets:       ['SERVE_STATIC_ASSETS'],
+   secret_key_base:           ['SECRET_KEY_BASE'],
+diff --git a/config/mongo.rb b/config/mongo.rb
+--- a/config/mongo.rb
++++ b/config/mongo.rb
+@@ -1,13 +1,21 @@
+-require 'uri'
++log_level = Logger.const_get Errbit::Config.log_level.upcase
++
++Mongoid.logger.level = log_level
++modern_driver = Mongoid::VERSION.to_i >= 5
++driver_logger = modern_driver ? Mongo::Logger : Moped.logger
++driver_logger.level = log_level
+ 
+ Mongoid.configure do |config|
+-  uri = URI.parse(Errbit::Config.mongo_url)
+-  uri.path = "/errbit_#{Rails.env}" if uri.path.empty?
++  uri = if Errbit::Config.mongo_url == 'mongodb://localhost'
++          "mongodb://localhost/errbit_#{Rails.env}"
++        else
++          Errbit::Config.mongo_url
++        end
+ 
+   config.load_configuration({
+-    sessions: {
++    (modern_driver ? :clients : :sessions) => {
+       default: {
+-        uri: uri.to_s
++        uri: uri
+       }
+     },
+     options: {

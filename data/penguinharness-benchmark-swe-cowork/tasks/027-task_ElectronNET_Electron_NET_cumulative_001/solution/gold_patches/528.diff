@@ -1,0 +1,2296 @@
+diff --git a/.gitignore b/.gitignore
+index 9e949db2c99988ad905a35cf402f1de95a2f2e52..7169b145d691f831589648c9a4dc2459d35f6829 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -260,3 +260,6 @@ paket-files/
+ # Python Tools for Visual Studio (PTVS)
+ __pycache__/
+ *.pyc
++
++# Mac Only settings file
++.DS_Store
+diff --git a/Changelog.md b/Changelog.md
+index 85861c46f92aa0a69b302564267fddb7a6c50321..c346d55425149e5f032a8ee15fc36bce3e7a386d 100644
+--- a/Changelog.md
++++ b/Changelog.md
+@@ -19,6 +19,7 @@ ElectronNET.API:
+ * New Feature: Adding a configurable default electron port. (thanks [aarong-av](https://github.com/aarong-av)) [\#505](https://github.com/ElectronNET/Electron.NET/pull/505)
+ * New Feature: Added support for launching the application with a file on MacOS (thanks [dlitty](https://github.com/dlitty)) [\#478](https://github.com/ElectronNET/Electron.NET/pull/478)
+ * Improved: Avoid Blocking Calls in App and AutoUpdater (thanks [freosc](https://github.com/freosc)) [\#474](https://github.com/ElectronNET/Electron.NET/pull/474)
++* Fixed bug: Maintain references between socket.io connection events (thanks [danatcofo](https://github.com/danatcofo )) [\#468](https://github.com/ElectronNET/Electron.NET/pull/486)
+ * Fixed bug: Set default WebPreferences.DefaultFontSize (thanks [duncanawoods](https://github.com/duncanawoods)) [\#468](https://github.com/ElectronNET/Electron.NET/pull/468)
+ 
+ # Released
+diff --git a/ElectronNET.API/App.cs b/ElectronNET.API/App.cs
+index cd10028b1ab6266a65c20edea55adb8e5f3694c7..69d8722ccc1ab1cd2377bc9bad21a5a2a1f530f5 100644
+--- a/ElectronNET.API/App.cs
++++ b/ElectronNET.API/App.cs
+@@ -1608,5 +1608,35 @@ namespace ElectronNET.API
+         }
+ 
+         private bool _preventQuit = false;
++
++        private const string ModuleName = "app";
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="App"/> module.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void On(string eventName, Action fn)
++            => Events.Instance.On(ModuleName, eventName, fn);
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="App"/> module.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void On(string eventName, Action<object> fn)
++            => Events.Instance.On(ModuleName, eventName, fn);
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="App"/> module once.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void Once(string eventName, Action fn)
++            => Events.Instance.Once(ModuleName, eventName, fn);
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="App"/> module once.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void Once(string eventName, Action<object> fn)
++            => Events.Instance.Once(ModuleName, eventName, fn);
+     }
+ }
+\ No newline at end of file
+diff --git a/ElectronNET.API/Dock.cs b/ElectronNET.API/Dock.cs
+index 8a1a5ea6f4e4e0b475e14e3ca7303abc3ea47ca7..0327684263ae4e95d45927d79f10babc0a45b1fb 100644
+--- a/ElectronNET.API/Dock.cs
++++ b/ElectronNET.API/Dock.cs
+@@ -1,8 +1,11 @@
+-﻿using System.Threading;
++using System.Collections.Generic;
++using System.Threading;
+ using System.Threading.Tasks;
+ using ElectronNET.API.Entities;
+ using ElectronNET.API.Extensions;
++using Newtonsoft.Json;
+ using Newtonsoft.Json.Linq;
++using Newtonsoft.Json.Serialization;
+ 
+ namespace ElectronNET.API
+ {
+@@ -162,12 +165,29 @@ namespace ElectronNET.API
+         }
+ 
+         /// <summary>
+-        /// TODO: Menu (macOS) still to be implemented
++        /// Gets the dock menu items.
++        /// </summary>
++        /// <value>
++        /// The menu items.
++        /// </value>
++        public IReadOnlyCollection<MenuItem> MenuItems { get { return _items.AsReadOnly(); } }
++        private List<MenuItem> _items = new List<MenuItem>();
++
++        /// <summary>
+         /// Sets the application's dock menu.
+         /// </summary>
+-        public void SetMenu()
++        public void SetMenu(MenuItem[] menuItems)
+         {
+-            BridgeConnector.Socket.Emit("dock-setMenu");
++            menuItems.AddMenuItemsId();
++            BridgeConnector.Socket.Emit("dock-setMenu", JArray.FromObject(menuItems, _jsonSerializer));
++            _items.AddRange(menuItems);
++
++            BridgeConnector.Socket.Off("dockMenuItemClicked");
++            BridgeConnector.Socket.On("dockMenuItemClicked", (id) => {
++                MenuItem menuItem = _items.GetMenuItem(id.ToString());
++                menuItem?.Click();
++            });
++           
+         }
+ 
+         /// <summary>
+@@ -202,5 +222,11 @@ namespace ElectronNET.API
+         {
+             BridgeConnector.Socket.Emit("dock-setIcon", image);
+         }
++
++        private JsonSerializer _jsonSerializer = new JsonSerializer()
++        {
++            ContractResolver = new CamelCasePropertyNamesContractResolver(),
++            NullValueHandling = NullValueHandling.Ignore
++        };
+     }
+ }
+\ No newline at end of file
+diff --git a/ElectronNET.API/Entities/WebPreferences.cs b/ElectronNET.API/Entities/WebPreferences.cs
+index 7d3ceff57a086b3a49581801ff4ee18ad1ed5493..a93c0321290641b91b932366f801f2485ce78607 100644
+--- a/ElectronNET.API/Entities/WebPreferences.cs
++++ b/ElectronNET.API/Entities/WebPreferences.cs
+@@ -1,4 +1,4 @@
+-﻿using System.ComponentModel;
++using System.ComponentModel;
+ 
+ namespace ElectronNET.API.Entities
+ {
+@@ -206,5 +206,11 @@ namespace ElectronNET.API.Entities
+         /// </value>
+         [DefaultValue(false)]
+         public bool WebviewTag { get; set; } = false;
++
++        /// <summary>
++        /// Whether to enable the remote module. Defaults to false.
++        /// </summary>
++        [DefaultValue(false)]
++        public bool EnableRemoteModule { get; set; } = false;
+     }
+ }
+\ No newline at end of file
+diff --git a/ElectronNET.API/Events.cs b/ElectronNET.API/Events.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbbee340798cdd8b118cb4a1eded678310b37e5e
+--- /dev/null
++++ b/ElectronNET.API/Events.cs
+@@ -0,0 +1,105 @@
++﻿using System;
++using System.Globalization;
++using Quobject.EngineIoClientDotNet.ComponentEmitter;
++
++namespace ElectronNET.API
++{
++    /// <summary>
++    /// Generic Event Consumers for Electron Modules
++    /// </summary>
++    internal class Events
++    {
++        private static Events _events;
++        private static object _syncRoot = new object();
++        private TextInfo _ti = new CultureInfo("en-US", false).TextInfo;
++        private Events()
++        {
++
++        }
++
++        public static Events Instance
++        {
++            get
++            {
++                if (_events == null)
++                {
++                    lock (_syncRoot)
++                    {
++                        if (_events == null)
++                        {
++                            _events = new Events();
++                        }
++                    }
++                }
++
++                return _events;
++            }
++        }
++
++        /// <summary>
++        /// Subscribe to an unmapped electron event.
++        /// </summary>
++        /// <param name="moduleName">The name of the module, e.g. app, dock, etc...</param>
++        /// <param name="eventName">The name of the event</param>
++        /// <param name="fn">The event handler</param>
++        public void On(string moduleName, string eventName, Action fn)
++            => On(moduleName, eventName, new ListenerImpl(fn));
++
++        /// <summary>
++        /// Subscribe to an unmapped electron event.
++        /// </summary>
++        /// <param name="moduleName">The name of the module, e.g. app, dock, etc...</param>
++        /// <param name="eventName">The name of the event</param>
++        /// <param name="fn">The event handler</param>
++        public void On(string moduleName, string eventName, Action<object> fn)
++            => On(moduleName, eventName, new ListenerImpl(fn));
++
++        /// <summary>
++        /// Subscribe to an unmapped electron event.
++        /// </summary>
++        /// <param name="moduleName">The name of the module, e.g. app, dock, etc...</param>
++        /// <param name="eventName">The name of the event</param>
++        /// <param name="fn">The event handler</param>
++        private void On(string moduleName, string eventName, IListener fn)
++        {
++            var listener = $"{moduleName}{_ti.ToTitleCase(eventName)}Completed";
++            var subscriber = $"register-{moduleName}-on-event";
++            
++            BridgeConnector.Socket.On(listener, fn);
++            BridgeConnector.Socket.Emit(subscriber, eventName, listener);
++        }
++
++        /// <summary>
++        /// Subscribe to an unmapped electron event.
++        /// </summary>
++        /// <param name="moduleName">The name of the module, e.g. app, dock, etc...</param>
++        /// <param name="eventName">The name of the event</param>
++        /// <param name="fn">The event handler</param>
++        public void Once(string moduleName, string eventName, Action fn)
++            => Once(moduleName, eventName, new ListenerImpl(fn));
++
++        /// <summary>
++        /// Subscribe to an unmapped electron event.
++        /// </summary>
++        /// <param name="moduleName">The name of the module, e.g. app, dock, etc...</param>
++        /// <param name="eventName">The name of the event</param>
++        /// <param name="fn">The event handler</param>
++        public void Once(string moduleName, string eventName, Action<object> fn)
++            => Once(moduleName, eventName, new ListenerImpl(fn));
++
++        /// <summary>
++        /// Subscribe to an unmapped electron event.
++        /// </summary>
++        /// <param name="moduleName">The name of the module, e.g. app, dock, etc...</param>
++        /// <param name="eventName">The name of the event</param>
++        /// <param name="fn">The event handler</param>
++        private void Once(string moduleName, string eventName, IListener fn)
++        {
++            var listener = $"{moduleName}{_ti.ToTitleCase(eventName)}Completed";
++            var subscriber = $"register-{moduleName}-once-event";
++            BridgeConnector.Socket.Once(listener, fn);
++            BridgeConnector.Socket.Emit(subscriber, eventName, listener);
++        }
++
++    }
++}
+diff --git a/ElectronNET.API/ServiceCollectionExtensions.cs b/ElectronNET.API/ServiceCollectionExtensions.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f933731bdffe855c6f3cc0127ba61210e06ed18e
+--- /dev/null
++++ b/ElectronNET.API/ServiceCollectionExtensions.cs
+@@ -0,0 +1,33 @@
++﻿using Microsoft.Extensions.DependencyInjection;
++
++namespace ElectronNET.API
++{
++    /// <summary>
++    /// 
++    /// </summary>
++    public static class ServiceCollectionExtensions
++    {
++        /// <summary>
++        /// Adds the <see cref="Electron"/> Members to the Service Collection
++        /// </summary>
++        public static IServiceCollection AddElectron(this IServiceCollection services)
++            => services
++                // adding in this manner to ensure late binding.
++                .AddSingleton(provider => IpcMain.Instance)
++                .AddSingleton(provider => App.Instance)
++                .AddSingleton(provider => AutoUpdater.Instance)
++                .AddSingleton(provider => WindowManager.Instance)
++                .AddSingleton(provider => Menu.Instance)
++                .AddSingleton(provider => Dialog.Instance)
++                .AddSingleton(provider => Notification.Instance)
++                .AddSingleton(provider => Tray.Instance)
++                .AddSingleton(provider => GlobalShortcut.Instance)
++                .AddSingleton(provider => Shell.Instance)
++                .AddSingleton(provider => Screen.Instance)
++                .AddSingleton(provider => Clipboard.Instance)
++                .AddSingleton(provider => HostHook.Instance)
++                .AddSingleton(provider => PowerMonitor.Instance)
++                .AddSingleton(provider => NativeTheme.Instance)
++                .AddSingleton(provider => Dock.Instance);
++    }
++}
+diff --git a/ElectronNET.API/Tray.cs b/ElectronNET.API/Tray.cs
+index 76705a48790ca584c5804c3812992c8e9acc9636..a5aac8a162f4b955089c1992feb9490f6c649e5d 100644
+--- a/ElectronNET.API/Tray.cs
++++ b/ElectronNET.API/Tray.cs
+@@ -351,5 +351,35 @@ namespace ElectronNET.API
+             ContractResolver = new CamelCasePropertyNamesContractResolver(),
+             NullValueHandling = NullValueHandling.Ignore
+         };
++
++        private const string ModuleName = "tray";
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="Tray"/> module.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void On(string eventName, Action fn)
++            => Events.Instance.On(ModuleName, eventName, fn);
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="Tray"/> module.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void On(string eventName, Action<object> fn)
++            => Events.Instance.On(ModuleName, eventName, fn);
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="Tray"/> module once.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void Once(string eventName, Action fn)
++            => Events.Instance.Once(ModuleName, eventName, fn);
++        /// <summary>
++        /// Subscribe to an unmapped event on the <see cref="Tray"/> module once.
++        /// </summary>
++        /// <param name="eventName">The event name</param>
++        /// <param name="fn">The handler</param>
++        public void Once(string eventName, Action<object> fn)
++            => Events.Instance.Once(ModuleName, eventName, fn);
+     }
+ }
+diff --git a/ElectronNET.Host/api/app.js b/ElectronNET.Host/api/app.js
+index a148a168734ffc4dc1efeb2b8398e9193f8341e8..3577d7f9087f95b9f67f2285034a4861b8274f22 100644
+--- a/ElectronNET.Host/api/app.js
++++ b/ElectronNET.Host/api/app.js
+@@ -228,5 +228,25 @@ module.exports = (socket, app) => {
+     socket.on('appSetUserAgentFallback', (userAgent) => {
+         app.userAgentFallback = userAgent;
+     });
++    socket.on('register-app-on-event', (eventName, listenerName) => {
++        app.on(eventName, (...args) => {
++            if (args.length > 1) {
++                electronSocket.emit(listenerName, args[1]);
++            }
++            else {
++                electronSocket.emit(listenerName);
++            }
++        });
++    });
++    socket.on('register-app-once-event', (eventName, listenerName) => {
++        app.once(eventName, (...args) => {
++            if (args.length > 1) {
++                electronSocket.emit(listenerName, args[1]);
++            }
++            else {
++                electronSocket.emit(listenerName);
++            }
++        });
++    });
+ };
+ //# sourceMappingURL=app.js.map
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/app.js.map b/ElectronNET.Host/api/app.js.map
+index 5d0ffd85892e0b8845d2524d4ec118ab9485c69c..d03e9ecebccc4bff2bdbcd3c46e19af08ea65227 100644
+--- a/ElectronNET.Host/api/app.js.map
++++ b/ElectronNET.Host/api/app.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"app.js","sourceRoot":"","sources":["app.ts"],"names":[],"mappings":";AAAA,IAAI,qBAAqB,GAAG,IAAI,EAAE,cAAc,CAAC;AACjD,IAAI,yBAAyB,CAAC;AAC9B,iBAAS,CAAC,MAAuB,EAAE,GAAiB,EAAE,EAAE;IACpD,cAAc,GAAG,MAAM,CAAC;IAExB,+CAA+C;IAC/C,GAAG,CAAC,EAAE,CAAC,mBAAmB,EAAE,GAAG,EAAE;QAC7B,4DAA4D;QAC5D,8DAA8D;QAC9D,IAAI,OAAO,CAAC,QAAQ,KAAK,QAAQ,IAAI,qBAAqB,EAAE;YACxD,GAAG,CAAC,IAAI,EAAE,CAAC;SACd;aAAM,IAAI,yBAAyB,EAAE;YAClC,0BAA0B;YAC1B,SAAS;YACT,qEAAqE;YACrE,kBAAkB;YAClB,cAAc,CAAC,IAAI,CAAC,uBAAuB,GAAG,yBAAyB,CAAC,CAAC;SAC5E;IACL,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kCAAkC,EAAE,CAAC,IAAI,EAAE,EAAE;QACnD,qBAAqB,GAAG,IAAI,CAAC;IACjC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,sCAAsC,EAAE,CAAC,EAAE,EAAE,EAAE;QACrD,yBAAyB,GAAG,EAAE,CAAC;IACnC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gCAAgC,EAAE,CAAC,EAAE,EAAE,EAAE;QAC/C,GAAG,CAAC,EAAE,CAAC,aAAa,EAAE,CAAC,KAAK,EAAE,EAAE;YAC5B,KAAK,CAAC,cAAc,EAAE,CAAC;YAEvB,cAAc,CAAC,IAAI,CAAC,iBAAiB,GAAG,EAAE,CAAC,CAAC;QAChD,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,8BAA8B,EAAE,CAAC,EAAE,EAAE,EAAE;QAC7C,GAAG,CAAC,EAAE,CAAC,WAAW,EAAE,CAAC,KAAK,EAAE,EAAE;YAC1B,KAAK,CAAC,cAAc,EAAE,CAAC;YAEvB,cAAc,CAAC,IAAI,CAAC,eAAe,GAAG,EAAE,CAAC,CAAC;QAC9C,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,wCAAwC,EAAE,CAAC,EAAE,EAAE,EAAE;QACvD,GAAG,CAAC,EAAE,CAAC,qBAAqB,EAAE,GAAG,EAAE;YAC/B,cAAc,CAAC,IAAI,CAAC,yBAAyB,GAAG,EAAE,CAAC,CAAC;QACxD,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yCAAyC,EAAE,CAAC,EAAE,EAAE,EAAE;QACxD,GAAG,CAAC,EAAE,CAAC,sBAAsB,EAAE,GAAG,EAAE;YAChC,cAAc,CAAC,IAAI,CAAC,0BAA0B,GAAG,EAAE,CAAC,CAAC;QACzD,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,2CAA2C,EAAE,CAAC,EAAE,EAAE,EAAE;QAC1D,GAAG,CAAC,EAAE,CAAC,wBAAwB,EAAE,GAAG,EAAE;YAClC,cAAc,CAAC,IAAI,CAAC,4BAA4B,GAAG,EAAE,CAAC,CAAC;QAC3D,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yCAAyC,EAAE,CAAC,EAAE,EAAE,EAAE;QACxD,GAAG,CAAC,EAAE,CAAC,sBAAsB,EAAE,GAAG,EAAE;YAChC,cAAc,CAAC,IAAI,CAAC,0BAA0B,GAAG,EAAE,CAAC,CAAC;QACzD,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kDAAkD,EAAE,CAAC,EAAE,EAAE,EAAE;QACjE,GAAG,CAAC,EAAE,CAAC,+BAA+B,EAAE,CAAC,KAAK,EAAE,2BAA2B,EAAE,EAAE;YAC3E,cAAc,CAAC,IAAI,CAAC,mCAAmC,GAAG,EAAE,EAAE,2BAA2B,CAAC,CAAC;QAC/F,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,SAAS,EAAE,GAAG,EAAE;QACtB,GAAG,CAAC,IAAI,EAAE,CAAC;IACf,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,SAAS,EAAE,CAAC,QAAQ,GAAG,CAAC,EAAE,EAAE;QAClC,GAAG,CAAC,IAAI,CAAC,QAAQ,CAAC,CAAC;IACvB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,aAAa,EAAE,CAAC,OAAO,EAAE,EAAE;QACjC,GAAG,CAAC,QAAQ,CAAC,OAAO,CAAC,CAAC;IAC1B,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,UAAU,EAAE,CAAC,OAAO,EAAE,EAAE;QAC9B,GAAG,CAAC,KAAK,CAAC,OAAO,CAAC,CAAC;IACvB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,SAAS,EAAE,GAAG,EAAE;QACtB,GAAG,CAAC,IAAI,EAAE,CAAC;IACf,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,SAAS,EAAE,GAAG,EAAE;QACtB,GAAG,CAAC,IAAI,EAAE,CAAC;IACf,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,eAAe,EAAE,GAAG,EAAE;QAC5B,MAAM,IAAI,GAAG,GAAG,CAAC,UAAU,EAAE,CAAC;QAC9B,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,IAAI,CAAC,CAAC;IACxD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,mBAAmB,EAAE,CAAC,IAAI,EAAE,EAAE;QACpC,GAAG,CAAC,cAAc,CAAC,IAAI,CAAC,CAAC;IAC7B,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,YAAY,EAAE,CAAC,IAAI,EAAE,EAAE;QAC7B,MAAM,IAAI,GAAG,GAAG,CAAC,OAAO,CAAC,IAAI,CAAC,CAAC;QAC/B,cAAc,CAAC,IAAI,CAAC,qBAAqB,EAAE,IAAI,CAAC,CAAC;IACrD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gBAAgB,EAAE,KAAK,EAAE,IAAI,EAAE,OAAO,EAAE,EAAE;QAChD,IAAI,KAAK,GAAG,EAAE,CAAC;QAEf,IAAI,OAAO,EAAE;YACT,MAAM,WAAW,GAAG,MAAM,GAAG,CAAC,WAAW,CAAC,IAAI,EAAE,OAAO,CAAC,CAAC,KAAK,CAAC,CAAC,aAAa,EAAE,EAAE,CAAE,KAAK,GAAG,aAAa,CAAC,CAAC;YAE1G,cAAc,CAAC,IAAI,CAAC,yBAAyB,EAAE,CAAC,KAAK,EAAE,WAAW,CAAC,CAAC,CAAC;SACxE;aAAM;YACH,MAAM,WAAW,GAAG,MAAM,GAAG,CAAC,WAAW,CAAC,IAAI,CAAC,CAAC,KAAK,CAAC,CAAC,aAAa,EAAE,EAAE,CAAE,KAAK,GAAG,aAAa,CAAC,CAAC;YAEjG,cAAc,CAAC,IAAI,CAAC,yBAAyB,EAAE,CAAC,KAAK,EAAE,WAAW,CAAC,CAAC,CAAC;SACxE;IACL,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,YAAY,EAAE,CAAC,IAAI,EAAE,IAAI,EAAE,EAAE;QACnC,GAAG,CAAC,OAAO,CAAC,IAAI,EAAE,IAAI,CAAC,CAAC;IAC5B,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,eAAe,EAAE,GAAG,EAAE;QAC5B,MAAM,OAAO,GAAG,GAAG,CAAC,UAAU,EAAE,CAAC;QACjC,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,OAAO,CAAC,CAAC;IAC3D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,YAAY,EAAE,GAAG,EAAE;QACzB,cAAc,CAAC,IAAI,CAAC,qBAAqB,EAAE,GAAG,CAAC,IAAI,CAAC,CAAC;IACzD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,YAAY,EAAE,CAAC,IAAI,EAAE,EAAE;QAC7B,GAAG,CAAC,IAAI,GAAG,IAAI,CAAC;IACpB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,cAAc,EAAE,GAAG,EAAE;QAC3B,MAAM,MAAM,GAAG,GAAG,CAAC,SAAS,EAAE,CAAC;QAC/B,cAAc,CAAC,IAAI,CAAC,uBAAuB,EAAE,MAAM,CAAC,CAAC;IACzD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,sBAAsB,EAAE,CAAC,IAAI,EAAE,EAAE;QACvC,GAAG,CAAC,iBAAiB,CAAC,IAAI,CAAC,CAAC;IAChC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,GAAG,EAAE;QACtC,GAAG,CAAC,oBAAoB,EAAE,CAAC;IAC/B,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,+BAA+B,EAAE,CAAC,QAAQ,EAAE,IAAI,EAAE,IAAI,EAAE,EAAE;QAChE,MAAM,OAAO,GAAG,GAAG,CAAC,0BAA0B,CAAC,QAAQ,EAAE,IAAI,EAAE,IAAI,CAAC,CAAC;QACrE,cAAc,CAAC,IAAI,CAAC,wCAAwC,EAAE,OAAO,CAAC,CAAC;IAC3E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kCAAkC,EAAE,CAAC,QAAQ,EAAE,IAAI,EAAE,IAAI,EAAE,EAAE;QACnE,MAAM,OAAO,GAAG,GAAG,CAAC,6BAA6B,CAAC,QAAQ,EAAE,IAAI,EAAE,IAAI,CAAC,CAAC;QACxE,cAAc,CAAC,IAAI,CAAC,2CAA2C,EAAE,OAAO,CAAC,CAAC;IAC9E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,4BAA4B,EAAE,CAAC,QAAQ,EAAE,IAAI,EAAE,IAAI,EAAE,EAAE;QAC7D,MAAM,OAAO,GAAG,GAAG,CAAC,uBAAuB,CAAC,QAAQ,EAAE,IAAI,EAAE,IAAI,CAAC,CAAC;QAClE,cAAc,CAAC,IAAI,CAAC,qCAAqC,EAAE,OAAO,CAAC,CAAC;IACxE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,iBAAiB,EAAE,CAAC,KAAK,EAAE,EAAE;QACnC,MAAM,OAAO,GAAG,GAAG,CAAC,YAAY,CAAC,KAAK,CAAC,CAAC;QACxC,cAAc,CAAC,IAAI,CAAC,0BAA0B,EAAE,OAAO,CAAC,CAAC;IAC7D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,wBAAwB,EAAE,GAAG,EAAE;QACrC,MAAM,gBAAgB,GAAG,GAAG,CAAC,mBAAmB,EAAE,CAAC;QACnD,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,gBAAgB,CAAC,CAAC;IAC7E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gBAAgB,EAAE,CAAC,UAAU,EAAE,EAAE;QACvC,GAAG,CAAC,WAAW,CAAC,UAAU,CAAC,CAAC;IAChC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,8BAA8B,EAAE,GAAG,EAAE;QAC3C,GAAG,CAAC,EAAE,CAAC,iBAAiB,EAAE,CAAC,IAAI,EAAE,gBAAgB,EAAE,EAAE;YACjD,cAAc,CAAC,IAAI,CAAC,gBAAgB,EAAE,CAAC,IAAI,EAAE,gBAAgB,CAAC,CAAC,CAAC;QACpE,CAAC,CAAC,CAAC;QAEH,MAAM,OAAO,GAAG,GAAG,CAAC,yBAAyB,EAAE,CAAC;QAChD,cAAc,CAAC,IAAI,CAAC,uCAAuC,EAAE,OAAO,CAAC,CAAC;IAC1E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,0BAA0B,EAAE,GAAG,EAAE;QACvC,MAAM,OAAO,GAAG,GAAG,CAAC,qBAAqB,EAAE,CAAC;QAE5C,cAAc,CAAC,IAAI,CAAC,mCAAmC,EAAE,OAAO,CAAC,CAAC;IACtE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,8BAA8B,EAAE,GAAG,EAAE;QAC3C,GAAG,CAAC,yBAAyB,EAAE,CAAC;IACpC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,oBAAoB,EAAE,CAAC,IAAI,EAAE,QAAQ,EAAE,UAAU,EAAE,EAAE;QAC3D,GAAG,CAAC,eAAe,CAAC,IAAI,EAAE,QAAQ,EAAE,UAAU,CAAC,CAAC;IACpD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,2BAA2B,EAAE,GAAG,EAAE;QACxC,MAAM,YAAY,GAAG,GAAG,CAAC,sBAAsB,EAAE,CAAC;QAClD,cAAc,CAAC,IAAI,CAAC,oCAAoC,EAAE,YAAY,CAAC,CAAC;IAC5E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,8BAA8B,EAAE,GAAG,EAAE;QAC3C,GAAG,CAAC,yBAAyB,EAAE,CAAC;IACpC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,0BAA0B,EAAE,GAAG,EAAE;QACvC,GAAG,CAAC,qBAAqB,EAAE,CAAC;IAChC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,sBAAsB,EAAE,CAAC,EAAE,EAAE,EAAE;QACrC,GAAG,CAAC,iBAAiB,CAAC,EAAE,CAAC,CAAC;IAC9B,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,sBAAsB,EAAE,CAAC,OAAO,EAAE,EAAE;QAC1C,GAAG,CAAC,iBAAiB,CAAC,OAAO,EAAE,CAAC,MAAM,EAAE,EAAE;YACtC,cAAc,CAAC,IAAI,CAAC,+BAA+B,EAAE,MAAM,CAAC,CAAC;QACjE,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kBAAkB,EAAE,GAAG,EAAE;QAC/B,MAAM,cAAc,GAAG,GAAG,CAAC,aAAa,EAAE,CAAC;QAC3C,cAAc,CAAC,IAAI,CAAC,2BAA2B,EAAE,cAAc,CAAC,CAAC;IACrE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,wBAAwB,EAAE,GAAG,EAAE;QACrC,MAAM,gBAAgB,GAAG,GAAG,CAAC,mBAAmB,EAAE,CAAC;QACnD,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,gBAAgB,CAAC,CAAC;IAC7E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kBAAkB,EAAE,CAAC,KAAK,EAAE,EAAE;QACpC,MAAM,OAAO,GAAG,GAAG,CAAC,aAAa,CAAC,KAAK,CAAC,CAAC;QACzC,cAAc,CAAC,IAAI,CAAC,2BAA2B,EAAE,OAAO,CAAC,CAAC;IAC9D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kBAAkB,EAAE,GAAG,EAAE;QAC/B,MAAM,KAAK,GAAG,GAAG,CAAC,aAAa,EAAE,CAAC;QAClC,cAAc,CAAC,IAAI,CAAC,2BAA2B,EAAE,KAAK,CAAC,CAAC;IAC5D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,mBAAmB,EAAE,GAAG,EAAE;QAChC,MAAM,cAAc,GAAG,GAAG,CAAC,cAAc,EAAE,CAAC;QAC5C,cAAc,CAAC,IAAI,CAAC,4BAA4B,EAAE,cAAc,CAAC,CAAC;IACtE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,OAAO,EAAE,EAAE;QAC7C,MAAM,iBAAiB,GAAG,GAAG,CAAC,oBAAoB,CAAC,OAAO,CAAC,CAAC;QAC5D,cAAc,CAAC,IAAI,CAAC,kCAAkC,EAAE,iBAAiB,CAAC,CAAC;IAC/E,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,QAAQ,EAAE,EAAE;QAC9C,GAAG,CAAC,oBAAoB,CAAC,QAAQ,CAAC,CAAC;IACvC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,kCAAkC,EAAE,GAAG,EAAE;QAC/C,MAAM,6BAA6B,GAAG,GAAG,CAAC,6BAA6B,EAAE,CAAC;QAC1E,cAAc,CAAC,IAAI,CAAC,2CAA2C,EAAE,6BAA6B,CAAC,CAAC;IACpG,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,mCAAmC,EAAE,CAAC,OAAO,EAAE,EAAE;QACvD,GAAG,CAAC,8BAA8B,CAAC,OAAO,CAAC,CAAC;IAChD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,mBAAmB,EAAE,GAAG,EAAE;QAChC,GAAG,CAAC,cAAc,EAAE,CAAC;IACzB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,OAAO,EAAE,EAAE;QAC7C,GAAG,CAAC,oBAAoB,CAAC,OAAO,CAAC,CAAC;IACtC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,GAAG,EAAE;QACtC,cAAc,CAAC,IAAI,CAAC,kCAAkC,EAAE,GAAG,CAAC,iBAAiB,CAAC,CAAC;IACnF,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,SAAS,EAAE,EAAE;QAC/C,GAAG,CAAC,iBAAiB,GAAG,SAAS,CAAC;IACtC,CAAC,CAAC,CAAC;AACP,CAAC,CAAC"}
+\ No newline at end of file
++{"version":3,"file":"app.js","sourceRoot":"","sources":["app.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/app.ts b/ElectronNET.Host/api/app.ts
+index 15584ea14eac7d9e1c653b874eb6125a516b9eff..c66d075a1c43e2ab17023179e3216309c13c2475 100644
+--- a/ElectronNET.Host/api/app.ts
++++ b/ElectronNET.Host/api/app.ts
+@@ -287,4 +287,24 @@ export = (socket: SocketIO.Socket, app: Electron.App) => {
+     socket.on('appSetUserAgentFallback', (userAgent) => {
+         app.userAgentFallback = userAgent;
+     });
++
++    socket.on('register-app-on-event', (eventName, listenerName) => {
++        app.on(eventName, (...args) => {
++            if (args.length > 1) {
++                electronSocket.emit(listenerName, args[1]);
++            } else {
++                electronSocket.emit(listenerName);
++            }
++        });
++    });
++
++    socket.on('register-app-once-event', (eventName, listenerName) => {
++        app.once(eventName, (...args) => {
++            if (args.length > 1) {
++                electronSocket.emit(listenerName, args[1]);
++            } else {
++                electronSocket.emit(listenerName);
++            }
++        });
++    });
+ };
+diff --git a/ElectronNET.Host/api/browserView.js b/ElectronNET.Host/api/browserView.js
+index 2256dfb44efe9dcf908129ac169f49266c9d6e75..a4283f46072e1314d8ae3a8b45bc7a2d1bb575e4 100644
+--- a/ElectronNET.Host/api/browserView.js
++++ b/ElectronNET.Host/api/browserView.js
+@@ -2,7 +2,7 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.browserViewMediateService = exports.browserViewApi = void 0;
+ const electron_1 = require("electron");
+-const browserViews = [];
++const browserViews = (global['browserViews'] = global['browserViews'] || []);
+ let browserView, electronSocket;
+ const browserViewApi = (socket) => {
+     electronSocket = socket;
+diff --git a/ElectronNET.Host/api/browserView.js.map b/ElectronNET.Host/api/browserView.js.map
+index 6e7972fc9f1e7ce8098beebcfe1cd17556f66733..d279cea0c2d8582654d5169738f9f7d3b8d50b60 100644
+--- a/ElectronNET.Host/api/browserView.js.map
++++ b/ElectronNET.Host/api/browserView.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"browserView.js","sourceRoot":"","sources":["browserView.ts"],"names":[],"mappings":";;;AAAA,uCAAuC;AACvC,MAAM,YAAY,GAA2B,EAAE,CAAC;AAChD,IAAI,WAAwB,EAAE,cAAc,CAAC;AAE7C,MAAM,cAAc,GAAG,CAAC,MAAuB,EAAE,EAAE;IAC/C,cAAc,GAAG,MAAM,CAAC;IAExB,MAAM,CAAC,EAAE,CAAC,mBAAmB,EAAE,CAAC,OAAO,EAAE,EAAE;QACvC,IAAI,CAAC,eAAe,CAAC,OAAO,EAAE,gBAAgB,EAAE,iBAAiB,CAAC,EAAE;YAChE,OAAO,GAAG,EAAE,GAAG,OAAO,EAAE,cAAc,EAAE,EAAE,eAAe,EAAE,IAAI,EAAE,EAAE,CAAC;SACvE;QAED,WAAW,GAAG,IAAI,sBAAW,CAAC,OAAO,CAAC,CAAC;QACvC,WAAW,CAAC,IAAI,CAAC,GAAG,YAAY,CAAC,MAAM,GAAG,CAAC,CAAC;QAC5C,YAAY,CAAC,IAAI,CAAC,WAAW,CAAC,CAAC;QAE/B,cAAc,CAAC,IAAI,CAAC,oBAAoB,EAAE,WAAW,CAAC,IAAI,CAAC,CAAC,CAAC;IACjE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,EAAE,EAAE,EAAE;QACtC,MAAM,MAAM,GAAG,kBAAkB,CAAC,EAAE,CAAC,CAAC,SAAS,EAAE,CAAC;QAElD,cAAc,CAAC,IAAI,CAAC,6BAA6B,EAAE,MAAM,CAAC,CAAC;IAC/D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,EAAE,EAAE,MAAM,EAAE,EAAE;QAC9C,kBAAkB,CAAC,EAAE,CAAC,CAAC,SAAS,CAAC,MAAM,CAAC,CAAC;IAC7C,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,2BAA2B,EAAE,CAAC,EAAE,EAAE,OAAO,EAAE,EAAE;QACnD,kBAAkB,CAAC,EAAE,CAAC,CAAC,aAAa,CAAC,OAAO,CAAC,CAAC;IAClD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gCAAgC,EAAE,CAAC,EAAE,EAAE,KAAK,EAAE,EAAE;QACtD,kBAAkB,CAAC,EAAE,CAAC,CAAC,kBAAkB,CAAC,KAAK,CAAC,CAAC;IACrD,CAAC,CAAC,CAAC;IAEH,SAAS,eAAe,CAAC,GAAG,EAAE,GAAG,UAAU;QACvC,KAAK,IAAI,CAAC,GAAG,CAAC,EAAE,CAAC,GAAG,UAAU,CAAC,MAAM,EAAE,CAAC,EAAE,EAAE;YACxC,IAAI,CAAC,GAAG,IAAI,CAAC,GAAG,CAAC,cAAc,CAAC,UAAU,CAAC,CAAC,CAAC,CAAC,EAAE;gBAC5C,OAAO,KAAK,CAAC;aAChB;YACD,GAAG,GAAG,GAAG,CAAC,UAAU,CAAC,CAAC,CAAC,CAAC,CAAC;SAC5B;QAED,OAAO,IAAI,CAAC;IAChB,CAAC;AACL,CAAC,CAAC;AAeO,wCAAc;AAbvB,MAAM,yBAAyB,GAAG,CAAC,aAAqB,EAAe,EAAE;IACrE,OAAO,kBAAkB,CAAC,aAAa,CAAC,CAAC;AAC7C,CAAC,CAAC;AAWuB,8DAAyB;AATlD,SAAS,kBAAkB,CAAC,EAAU;IAClC,KAAK,IAAI,KAAK,GAAG,CAAC,EAAE,KAAK,GAAG,YAAY,CAAC,MAAM,EAAE,KAAK,EAAE,EAAE;QACtD,MAAM,eAAe,GAAG,YAAY,CAAC,KAAK,CAAC,CAAC;QAC5C,IAAI,eAAe,CAAC,IAAI,CAAC,KAAK,EAAE,EAAE;YAC9B,OAAO,eAAe,CAAC;SAC1B;KACJ;AACL,CAAC"}
+\ No newline at end of file
++{"version":3,"file":"browserView.js","sourceRoot":"","sources":["browserView.ts"],"names":[],"mappings":";;;AAAA,uCAAuC;AACvC,MAAM,YAAY,GAAkB,CAAC,MAAM,CAAC,cAAc,CAAC,GAAG,MAAM,CAAC,cAAc,CAAC,IAAI,EAAE,CAAkB,CAAC;AAC7G,IAAI,WAAwB,EAAE,cAAc,CAAC;AAE7C,MAAM,cAAc,GAAG,CAAC,MAAuB,EAAE,EAAE;IAC/C,cAAc,GAAG,MAAM,CAAC;IAExB,MAAM,CAAC,EAAE,CAAC,mBAAmB,EAAE,CAAC,OAAO,EAAE,EAAE;QACvC,IAAI,CAAC,eAAe,CAAC,OAAO,EAAE,gBAAgB,EAAE,iBAAiB,CAAC,EAAE;YAChE,OAAO,GAAG,EAAE,GAAG,OAAO,EAAE,cAAc,EAAE,EAAE,eAAe,EAAE,IAAI,EAAE,EAAE,CAAC;SACvE;QAED,WAAW,GAAG,IAAI,sBAAW,CAAC,OAAO,CAAC,CAAC;QACvC,WAAW,CAAC,IAAI,CAAC,GAAG,YAAY,CAAC,MAAM,GAAG,CAAC,CAAC;QAC5C,YAAY,CAAC,IAAI,CAAC,WAAW,CAAC,CAAC;QAE/B,cAAc,CAAC,IAAI,CAAC,oBAAoB,EAAE,WAAW,CAAC,IAAI,CAAC,CAAC,CAAC;IACjE,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,EAAE,EAAE,EAAE;QACtC,MAAM,MAAM,GAAG,kBAAkB,CAAC,EAAE,CAAC,CAAC,SAAS,EAAE,CAAC;QAElD,cAAc,CAAC,IAAI,CAAC,6BAA6B,EAAE,MAAM,CAAC,CAAC;IAC/D,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,EAAE,EAAE,MAAM,EAAE,EAAE;QAC9C,kBAAkB,CAAC,EAAE,CAAC,CAAC,SAAS,CAAC,MAAM,CAAC,CAAC;IAC7C,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,2BAA2B,EAAE,CAAC,EAAE,EAAE,OAAO,EAAE,EAAE;QACnD,kBAAkB,CAAC,EAAE,CAAC,CAAC,aAAa,CAAC,OAAO,CAAC,CAAC;IAClD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gCAAgC,EAAE,CAAC,EAAE,EAAE,KAAK,EAAE,EAAE;QACtD,kBAAkB,CAAC,EAAE,CAAC,CAAC,kBAAkB,CAAC,KAAK,CAAC,CAAC;IACrD,CAAC,CAAC,CAAC;IAEH,SAAS,eAAe,CAAC,GAAG,EAAE,GAAG,UAAU;QACvC,KAAK,IAAI,CAAC,GAAG,CAAC,EAAE,CAAC,GAAG,UAAU,CAAC,MAAM,EAAE,CAAC,EAAE,EAAE;YACxC,IAAI,CAAC,GAAG,IAAI,CAAC,GAAG,CAAC,cAAc,CAAC,UAAU,CAAC,CAAC,CAAC,CAAC,EAAE;gBAC5C,OAAO,KAAK,CAAC;aAChB;YACD,GAAG,GAAG,GAAG,CAAC,UAAU,CAAC,CAAC,CAAC,CAAC,CAAC;SAC5B;QAED,OAAO,IAAI,CAAC;IAChB,CAAC;AACL,CAAC,CAAC;AAeO,wCAAc;AAbvB,MAAM,yBAAyB,GAAG,CAAC,aAAqB,EAAe,EAAE;IACrE,OAAO,kBAAkB,CAAC,aAAa,CAAC,CAAC;AAC7C,CAAC,CAAC;AAWuB,8DAAyB;AATlD,SAAS,kBAAkB,CAAC,EAAU;IAClC,KAAK,IAAI,KAAK,GAAG,CAAC,EAAE,KAAK,GAAG,YAAY,CAAC,MAAM,EAAE,KAAK,EAAE,EAAE;QACtD,MAAM,eAAe,GAAG,YAAY,CAAC,KAAK,CAAC,CAAC;QAC5C,IAAI,eAAe,CAAC,IAAI,CAAC,KAAK,EAAE,EAAE;YAC9B,OAAO,eAAe,CAAC;SAC1B;KACJ;AACL,CAAC"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/browserWindows.js b/ElectronNET.Host/api/browserWindows.js
+index 5cc2d748909dc5d90be52dc6366271186bc2ee6d..0861a2edc9abb20a77eb2cb40b804b49a595b365 100644
+--- a/ElectronNET.Host/api/browserWindows.js
++++ b/ElectronNET.Host/api/browserWindows.js
+@@ -2,7 +2,7 @@
+ const electron_1 = require("electron");
+ const browserView_1 = require("./browserView");
+ const path = require('path');
+-const windows = [];
++const windows = (global['browserWindows'] = global['browserWindows'] || []);
+ let readyToShowWindowsIds = [];
+ let window, lastOptions, electronSocket;
+ let mainWindowURL;
+diff --git a/ElectronNET.Host/api/browserWindows.js.map b/ElectronNET.Host/api/browserWindows.js.map
+index 6392e3bb485ac08abca9bbd81bc526c2b060de90..199d7aec329642422cf7de01380327ea888b18d1 100644
+--- a/ElectronNET.Host/api/browserWindows.js.map
++++ b/ElectronNET.Host/api/browserWindows.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"browserWindows.js","sourceRoot":"","sources":["browserWindows.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
++{"version":3,"file":"browserWindows.js","sourceRoot":"","sources":["browserWindows.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/dock.js b/ElectronNET.Host/api/dock.js
+index 3181c9b2c93af31570185f397d5259171b1bcfd1..7d5010d6c596da9ea07f487acb564341b7218d8d 100644
+--- a/ElectronNET.Host/api/dock.js
++++ b/ElectronNET.Host/api/dock.js
+@@ -30,8 +30,14 @@ module.exports = (socket) => {
+         const isVisible = electron_1.app.dock.isVisible();
+         electronSocket.emit('dock-isVisible-completed', isVisible);
+     });
+-    // TODO: Menu (macOS) still to be implemented
+-    socket.on('dock-setMenu', (menu) => {
++    socket.on('dock-setMenu', (menuItems) => {
++        let menu = null;
++        if (menuItems) {
++            menu = electron_1.Menu.buildFromTemplate(menuItems);
++            addMenuItemClickConnector(menu.items, (id) => {
++                electronSocket.emit('dockMenuItemClicked', id);
++            });
++        }
+         electron_1.app.dock.setMenu(menu);
+     });
+     // TODO: Menu (macOS) still to be implemented
+@@ -42,5 +48,15 @@ module.exports = (socket) => {
+     socket.on('dock-setIcon', (image) => {
+         electron_1.app.dock.setIcon(image);
+     });
++    function addMenuItemClickConnector(menuItems, callback) {
++        menuItems.forEach((item) => {
++            if (item.submenu && item.submenu.items.length > 0) {
++                addMenuItemClickConnector(item.submenu.items, callback);
++            }
++            if ('id' in item && item.id) {
++                item.click = () => { callback(item.id); };
++            }
++        });
++    }
+ };
+ //# sourceMappingURL=dock.js.map
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/dock.js.map b/ElectronNET.Host/api/dock.js.map
+index f1ca709e772522738409fe2456ba8aa7da474181..740972e0155f90e13a1a8f1536307e88b6c07e54 100644
+--- a/ElectronNET.Host/api/dock.js.map
++++ b/ElectronNET.Host/api/dock.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"dock.js","sourceRoot":"","sources":["dock.ts"],"names":[],"mappings":";AAAA,uCAA+B;AAC/B,IAAI,cAAc,CAAC;AAEnB,iBAAS,CAAC,MAAuB,EAAE,EAAE;IACjC,cAAc,GAAG,MAAM,CAAC;IAExB,MAAM,CAAC,EAAE,CAAC,aAAa,EAAE,CAAC,IAAI,EAAE,EAAE;QAC9B,MAAM,EAAE,GAAG,cAAG,CAAC,IAAI,CAAC,MAAM,CAAC,IAAI,CAAC,CAAC;QACjC,cAAc,CAAC,IAAI,CAAC,uBAAuB,EAAE,EAAE,CAAC,CAAC;IACrD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,mBAAmB,EAAE,CAAC,EAAE,EAAE,EAAE;QAClC,cAAG,CAAC,IAAI,CAAC,YAAY,CAAC,EAAE,CAAC,CAAC;IAC9B,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,QAAQ,EAAE,EAAE;QAC5C,cAAG,CAAC,IAAI,CAAC,gBAAgB,CAAC,QAAQ,CAAC,CAAC;IACxC,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,eAAe,EAAE,CAAC,IAAI,EAAE,EAAE;QAChC,cAAG,CAAC,IAAI,CAAC,QAAQ,CAAC,IAAI,CAAC,CAAC;IAC5B,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,eAAe,EAAE,GAAG,EAAE;QAC5B,MAAM,IAAI,GAAG,cAAG,CAAC,IAAI,CAAC,QAAQ,EAAE,CAAC;QACjC,cAAc,CAAC,IAAI,CAAC,yBAAyB,EAAE,IAAI,CAAC,CAAC;IACzD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,WAAW,EAAE,GAAG,EAAE;QACxB,cAAG,CAAC,IAAI,CAAC,IAAI,EAAE,CAAC;IACpB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,WAAW,EAAE,GAAG,EAAE;QACxB,cAAG,CAAC,IAAI,CAAC,IAAI,EAAE,CAAC;IACpB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,gBAAgB,EAAE,GAAG,EAAE;QAC7B,MAAM,SAAS,GAAG,cAAG,CAAC,IAAI,CAAC,SAAS,EAAE,CAAC;QACvC,cAAc,CAAC,IAAI,CAAC,0BAA0B,EAAE,SAAS,CAAC,CAAC;IAC/D,CAAC,CAAC,CAAC;IAEH,6CAA6C;IAC7C,MAAM,CAAC,EAAE,CAAC,cAAc,EAAE,CAAC,IAAI,EAAE,EAAE;QAC/B,cAAG,CAAC,IAAI,CAAC,OAAO,CAAC,IAAI,CAAC,CAAC;IAC3B,CAAC,CAAC,CAAC;IAEH,6CAA6C;IAC7C,MAAM,CAAC,EAAE,CAAC,cAAc,EAAE,GAAG,EAAE;QAC3B,MAAM,IAAI,GAAG,cAAG,CAAC,IAAI,CAAC,OAAO,EAAE,CAAC;QAChC,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,IAAI,CAAC,CAAC;IACxD,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,cAAc,EAAE,CAAC,KAAK,EAAE,EAAE;QAChC,cAAG,CAAC,IAAI,CAAC,OAAO,CAAC,KAAK,CAAC,CAAC;IAC5B,CAAC,CAAC,CAAC;AACP,CAAC,CAAC"}
+\ No newline at end of file
++{"version":3,"file":"dock.js","sourceRoot":"","sources":["dock.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/dock.ts b/ElectronNET.Host/api/dock.ts
+index 90e7a8354a7e8f75e5ecde341012d12b103f43e6..094799f04c0601a059b49ac5618ef8d97c14f484 100644
+--- a/ElectronNET.Host/api/dock.ts
++++ b/ElectronNET.Host/api/dock.ts
+@@ -1,4 +1,4 @@
+-import { app } from 'electron';
++import { app, Menu } from 'electron';
+ let electronSocket;
+ 
+ export = (socket: SocketIO.Socket) => {
+@@ -39,8 +39,17 @@ export = (socket: SocketIO.Socket) => {
+         electronSocket.emit('dock-isVisible-completed', isVisible);
+     });
+ 
+-    // TODO: Menu (macOS) still to be implemented
+-    socket.on('dock-setMenu', (menu) => {
++    socket.on('dock-setMenu', (menuItems) => {
++        let menu = null;
++
++        if (menuItems) {
++            menu = Menu.buildFromTemplate(menuItems);
++
++            addMenuItemClickConnector(menu.items, (id) => {
++                electronSocket.emit('dockMenuItemClicked', id);
++            });
++        }
++
+         app.dock.setMenu(menu);
+     });
+ 
+@@ -53,4 +62,16 @@ export = (socket: SocketIO.Socket) => {
+     socket.on('dock-setIcon', (image) => {
+         app.dock.setIcon(image);
+     });
++
++    function addMenuItemClickConnector(menuItems, callback) {
++        menuItems.forEach((item) => {
++            if (item.submenu && item.submenu.items.length > 0) {
++                addMenuItemClickConnector(item.submenu.items, callback);
++            }
++
++            if ('id' in item && item.id) {
++                item.click = () => { callback(item.id); };
++            }
++        });
++    }
+ };
+diff --git a/ElectronNET.Host/api/menu.js b/ElectronNET.Host/api/menu.js
+index 09e9ad91280d5c7f1f550f8574e4fe489b815b4f..2500036f0c9592fc09d63ab98e41836f7d7dbad2 100644
+--- a/ElectronNET.Host/api/menu.js
++++ b/ElectronNET.Host/api/menu.js
+@@ -1,6 +1,6 @@
+ "use strict";
+ const electron_1 = require("electron");
+-const contextMenuItems = [];
++const contextMenuItems = (global['contextMenuItems'] = global['contextMenuItems'] || []);
+ let electronSocket;
+ module.exports = (socket) => {
+     electronSocket = socket;
+diff --git a/ElectronNET.Host/api/menu.js.map b/ElectronNET.Host/api/menu.js.map
+index 7d7a4c99f23f169297d9a7ce329bc0bb10f45aa4..d255a3801aa2034affe20019248c419822533887 100644
+--- a/ElectronNET.Host/api/menu.js.map
++++ b/ElectronNET.Host/api/menu.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"menu.js","sourceRoot":"","sources":["menu.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
++{"version":3,"file":"menu.js","sourceRoot":"","sources":["menu.ts"],"names":[],"mappings":";AAAA,uCAA+C;AAC/C,MAAM,gBAAgB,GAAG,CAAC,MAAM,CAAC,kBAAkB,CAAC,GAAG,MAAM,CAAC,kBAAkB,CAAC,IAAI,EAAE,CAAC,CAAC;AACzF,IAAI,cAAc,CAAC;AAEnB,iBAAS,CAAC,MAAuB,EAAE,EAAE;IACjC,cAAc,GAAG,MAAM,CAAC;IACxB,MAAM,CAAC,EAAE,CAAC,qBAAqB,EAAE,CAAC,eAAe,EAAE,SAAS,EAAE,EAAE;QAC5D,MAAM,IAAI,GAAG,eAAI,CAAC,iBAAiB,CAAC,SAAS,CAAC,CAAC;QAE/C,gCAAgC,CAAC,IAAI,CAAC,KAAK,EAAE,eAAe,EAAE,CAAC,EAAE,EAAE,QAAQ,EAAE,EAAE;YAC3E,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,CAAC,EAAE,EAAE,QAAQ,CAAC,CAAC,CAAC;QAClE,CAAC,CAAC,CAAC;QAEH,MAAM,KAAK,GAAG,gBAAgB,CAAC,SAAS,CAAC,WAAW,CAAC,EAAE,CAAC,WAAW,CAAC,eAAe,KAAK,eAAe,CAAC,CAAC;QAEzG,MAAM,eAAe,GAAG;YACpB,IAAI,EAAE,IAAI;YACV,eAAe,EAAE,eAAe;SACnC,CAAC;QAEF,IAAI,KAAK,KAAK,CAAC,CAAC,EAAE;YACd,gBAAgB,CAAC,IAAI,CAAC,eAAe,CAAC,CAAC;SAC1C;aAAM;YACH,gBAAgB,CAAC,KAAK,CAAC,GAAG,eAAe,CAAC;SAC7C;IACL,CAAC,CAAC,CAAC;IAEH,SAAS,gCAAgC,CAAC,SAAS,EAAE,eAAe,EAAE,QAAQ;QAC1E,SAAS,CAAC,OAAO,CAAC,CAAC,IAAI,EAAE,EAAE;YACvB,IAAI,IAAI,CAAC,OAAO,IAAI,IAAI,CAAC,OAAO,CAAC,KAAK,CAAC,MAAM,GAAG,CAAC,EAAE;gBAC/C,gCAAgC,CAAC,IAAI,CAAC,OAAO,CAAC,KAAK,EAAE,eAAe,EAAE,QAAQ,CAAC,CAAC;aACnF;YAED,IAAI,IAAI,IAAI,IAAI,IAAI,IAAI,CAAC,EAAE,EAAE;gBACzB,IAAI,CAAC,KAAK,GAAG,GAAG,EAAE,GAAG,QAAQ,CAAC,IAAI,CAAC,EAAE,EAAE,eAAe,CAAC,CAAC,CAAC,CAAC,CAAC;aAC9D;QACL,CAAC,CAAC,CAAC;IACP,CAAC;IAED,MAAM,CAAC,EAAE,CAAC,uBAAuB,EAAE,CAAC,eAAe,EAAE,EAAE;QACnD,gBAAgB,CAAC,OAAO,CAAC,CAAC,CAAC,EAAE;YACzB,IAAI,CAAC,CAAC,eAAe,KAAK,eAAe,EAAE;gBACvC,MAAM,aAAa,GAAG,wBAAa,CAAC,MAAM,CAAC,eAAe,CAAC,CAAC;gBAC5D,CAAC,CAAC,IAAI,CAAC,KAAK,CAAC,aAAa,CAAC,CAAC;aAC/B;QACL,CAAC,CAAC,CAAC;IACP,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,CAAC,SAAS,EAAE,EAAE;QAC/C,MAAM,IAAI,GAAG,eAAI,CAAC,iBAAiB,CAAC,SAAS,CAAC,CAAC;QAE/C,yBAAyB,CAAC,IAAI,CAAC,KAAK,EAAE,CAAC,EAAE,EAAE,EAAE;YACzC,cAAc,CAAC,IAAI,CAAC,iBAAiB,EAAE,EAAE,CAAC,CAAC;QAC/C,CAAC,CAAC,CAAC;QAEH,eAAI,CAAC,kBAAkB,CAAC,IAAI,CAAC,CAAC;IAClC,CAAC,CAAC,CAAC;IAEH,SAAS,yBAAyB,CAAC,SAAS,EAAE,QAAQ;QAClD,SAAS,CAAC,OAAO,CAAC,CAAC,IAAI,EAAE,EAAE;YACvB,IAAI,IAAI,CAAC,OAAO,IAAI,IAAI,CAAC,OAAO,CAAC,KAAK,CAAC,MAAM,GAAG,CAAC,EAAE;gBAC/C,yBAAyB,CAAC,IAAI,CAAC,OAAO,CAAC,KAAK,EAAE,QAAQ,CAAC,CAAC;aAC3D;YAED,IAAI,IAAI,IAAI,IAAI,IAAI,IAAI,CAAC,EAAE,EAAE;gBACzB,IAAI,CAAC,KAAK,GAAG,GAAG,EAAE,GAAG,QAAQ,CAAC,IAAI,CAAC,EAAE,CAAC,CAAC,CAAC,CAAC,CAAC;aAC7C;QACL,CAAC,CAAC,CAAC;IACP,CAAC;AACL,CAAC,CAAC"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/notification.js b/ElectronNET.Host/api/notification.js
+index c919af3cb819c597c7117ae5833449e1c0b03a48..3a575cf2f0d4f7cbd36852ef8a954dfda4b297e7 100644
+--- a/ElectronNET.Host/api/notification.js
++++ b/ElectronNET.Host/api/notification.js
+@@ -1,39 +1,39 @@
+ "use strict";
+-var electron_1 = require("electron");
+-var notifications = (global['notifications'] = global['notifications'] || []);
+-var electronSocket;
+-module.exports = function (socket) {
++const electron_1 = require("electron");
++const notifications = (global['notifications'] = global['notifications'] || []);
++let electronSocket;
++module.exports = (socket) => {
+     electronSocket = socket;
+-    socket.on('createNotification', function (options) {
+-        var notification = new electron_1.Notification(options);
+-        var haveEvent = false;
++    socket.on('createNotification', (options) => {
++        const notification = new electron_1.Notification(options);
++        let haveEvent = false;
+         if (options.showID) {
+             haveEvent = true;
+-            notification.on('show', function () {
++            notification.on('show', () => {
+                 electronSocket.emit('NotificationEventShow', options.showID);
+             });
+         }
+         if (options.clickID) {
+             haveEvent = true;
+-            notification.on('click', function () {
++            notification.on('click', () => {
+                 electronSocket.emit('NotificationEventClick', options.clickID);
+             });
+         }
+         if (options.closeID) {
+             haveEvent = true;
+-            notification.on('close', function () {
++            notification.on('close', () => {
+                 electronSocket.emit('NotificationEventClose', options.closeID);
+             });
+         }
+         if (options.replyID) {
+             haveEvent = true;
+-            notification.on('reply', function (event, value) {
++            notification.on('reply', (event, value) => {
+                 electronSocket.emit('NotificationEventReply', [options.replyID, value]);
+             });
+         }
+         if (options.actionID) {
+             haveEvent = true;
+-            notification.on('action', function (event, value) {
++            notification.on('action', (event, value) => {
+                 electronSocket.emit('NotificationEventAction', [options.actionID, value]);
+             });
+         }
+@@ -42,8 +42,9 @@ module.exports = function (socket) {
+         }
+         notification.show();
+     });
+-    socket.on('notificationIsSupported', function () {
+-        var isSupported = electron_1.Notification.isSupported;
++    socket.on('notificationIsSupported', () => {
++        const isSupported = electron_1.Notification.isSupported;
+         electronSocket.emit('notificationIsSupportedComplete', isSupported);
+     });
+ };
++//# sourceMappingURL=notification.js.map
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/notification.js.map b/ElectronNET.Host/api/notification.js.map
+index 3c89cbfe00f3f652cb2050618c25a983ba675eb9..69e7c9ff4f4a66548408ebec3dbd82d5a3102bbd 100644
+--- a/ElectronNET.Host/api/notification.js.map
++++ b/ElectronNET.Host/api/notification.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"notification.js","sourceRoot":"","sources":["notification.ts"],"names":[],"mappings":";AAAA,uCAAwC;AACxC,MAAM,aAAa,GAA4B,EAAE,CAAC;AAClD,IAAI,cAAc,CAAC;AAEnB,iBAAS,CAAC,MAAuB,EAAE,EAAE;IACjC,cAAc,GAAG,MAAM,CAAC;IACxB,MAAM,CAAC,EAAE,CAAC,oBAAoB,EAAE,CAAC,OAAO,EAAE,EAAE;QACxC,MAAM,YAAY,GAAG,IAAI,uBAAY,CAAC,OAAO,CAAC,CAAC;QAC/C,IAAI,SAAS,GAAG,KAAK,CAAC;QAEtB,IAAI,OAAO,CAAC,MAAM,EAAE;YAChB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,MAAM,EAAE,GAAG,EAAE;gBACzB,cAAc,CAAC,IAAI,CAAC,uBAAuB,EAAE,OAAO,CAAC,MAAM,CAAC,CAAC;YACjE,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,OAAO,EAAE;YACjB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,OAAO,EAAE,GAAG,EAAE;gBAC1B,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,OAAO,CAAC,OAAO,CAAC,CAAC;YACnE,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,OAAO,EAAE;YACjB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,OAAO,EAAE,GAAG,EAAE;gBAC1B,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,OAAO,CAAC,OAAO,CAAC,CAAC;YACnE,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,OAAO,EAAE;YACjB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,OAAO,EAAE,CAAC,KAAK,EAAE,KAAK,EAAE,EAAE;gBACtC,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,CAAC,OAAO,CAAC,OAAO,EAAE,KAAK,CAAC,CAAC,CAAC;YAC5E,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,QAAQ,EAAE;YAClB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,QAAQ,EAAE,CAAC,KAAK,EAAE,KAAK,EAAE,EAAE;gBACvC,cAAc,CAAC,IAAI,CAAC,yBAAyB,EAAE,CAAC,OAAO,CAAC,QAAQ,EAAE,KAAK,CAAC,CAAC,CAAC;YAC9E,CAAC,CAAC,CAAC;SACN;QAED,IAAI,SAAS,EAAE;YACX,aAAa,CAAC,IAAI,CAAC,YAAY,CAAC,CAAC;SACpC;QAED,YAAY,CAAC,IAAI,EAAE,CAAC;IACxB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,GAAG,EAAE;QACtC,MAAM,WAAW,GAAG,uBAAY,CAAC,WAAW,CAAC;QAC7C,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,WAAW,CAAC,CAAC;IACxE,CAAC,CAAC,CAAC;AACP,CAAC,CAAC"}
+\ No newline at end of file
++{"version":3,"file":"notification.js","sourceRoot":"","sources":["notification.ts"],"names":[],"mappings":";AAAA,uCAAwC;AACxC,MAAM,aAAa,GAA4B,CAAC,MAAM,CAAC,eAAe,CAAC,GAAG,MAAM,CAAC,eAAe,CAAC,IAAI,EAAE,CAA4B,CAAC;AACpI,IAAI,cAAc,CAAC;AAEnB,iBAAS,CAAC,MAAuB,EAAE,EAAE;IACjC,cAAc,GAAG,MAAM,CAAC;IACxB,MAAM,CAAC,EAAE,CAAC,oBAAoB,EAAE,CAAC,OAAO,EAAE,EAAE;QACxC,MAAM,YAAY,GAAG,IAAI,uBAAY,CAAC,OAAO,CAAC,CAAC;QAC/C,IAAI,SAAS,GAAG,KAAK,CAAC;QAEtB,IAAI,OAAO,CAAC,MAAM,EAAE;YAChB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,MAAM,EAAE,GAAG,EAAE;gBACzB,cAAc,CAAC,IAAI,CAAC,uBAAuB,EAAE,OAAO,CAAC,MAAM,CAAC,CAAC;YACjE,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,OAAO,EAAE;YACjB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,OAAO,EAAE,GAAG,EAAE;gBAC1B,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,OAAO,CAAC,OAAO,CAAC,CAAC;YACnE,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,OAAO,EAAE;YACjB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,OAAO,EAAE,GAAG,EAAE;gBAC1B,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,OAAO,CAAC,OAAO,CAAC,CAAC;YACnE,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,OAAO,EAAE;YACjB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,OAAO,EAAE,CAAC,KAAK,EAAE,KAAK,EAAE,EAAE;gBACtC,cAAc,CAAC,IAAI,CAAC,wBAAwB,EAAE,CAAC,OAAO,CAAC,OAAO,EAAE,KAAK,CAAC,CAAC,CAAC;YAC5E,CAAC,CAAC,CAAC;SACN;QAED,IAAI,OAAO,CAAC,QAAQ,EAAE;YAClB,SAAS,GAAG,IAAI,CAAC;YACjB,YAAY,CAAC,EAAE,CAAC,QAAQ,EAAE,CAAC,KAAK,EAAE,KAAK,EAAE,EAAE;gBACvC,cAAc,CAAC,IAAI,CAAC,yBAAyB,EAAE,CAAC,OAAO,CAAC,QAAQ,EAAE,KAAK,CAAC,CAAC,CAAC;YAC9E,CAAC,CAAC,CAAC;SACN;QAED,IAAI,SAAS,EAAE;YACX,aAAa,CAAC,IAAI,CAAC,YAAY,CAAC,CAAC;SACpC;QAED,YAAY,CAAC,IAAI,EAAE,CAAC;IACxB,CAAC,CAAC,CAAC;IAEH,MAAM,CAAC,EAAE,CAAC,yBAAyB,EAAE,GAAG,EAAE;QACtC,MAAM,WAAW,GAAG,uBAAY,CAAC,WAAW,CAAC;QAC7C,cAAc,CAAC,IAAI,CAAC,iCAAiC,EAAE,WAAW,CAAC,CAAC;IACxE,CAAC,CAAC,CAAC;AACP,CAAC,CAAC"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/tray.js b/ElectronNET.Host/api/tray.js
+index 7280a7af52da09202f900effd06768f8e7e8462d..98fb740c334899161db7925f75ef021dae6ffa17 100644
+--- a/ElectronNET.Host/api/tray.js
++++ b/ElectronNET.Host/api/tray.js
+@@ -1,107 +1,132 @@
+ "use strict";
+-var electron_1 = require("electron");
+-var tray = (global['$tray'] = global['tray'] = global['$tray'] || global['tray'] || { value: null });
+-var electronSocket;
+-module.exports = function (socket) {
++const electron_1 = require("electron");
++let tray = (global['$tray'] = global['tray'] = global['$tray'] || global['tray'] || { value: null });
++let electronSocket;
++module.exports = (socket) => {
+     electronSocket = socket;
+-    socket.on('register-tray-click', function (id) {
++    socket.on('register-tray-click', (id) => {
+         if (tray.value) {
+-            tray.value.on('click', function (event, bounds) {
++            tray.value.on('click', (event, bounds) => {
+                 electronSocket.emit('tray-click-event' + id, [event.__proto__, bounds]);
+             });
+         }
+     });
+-    socket.on('register-tray-right-click', function (id) {
++    socket.on('register-tray-right-click', (id) => {
+         if (tray.value) {
+-            tray.value.on('right-click', function (event, bounds) {
++            tray.value.on('right-click', (event, bounds) => {
+                 electronSocket.emit('tray-right-click-event' + id, [event.__proto__, bounds]);
+             });
+         }
+     });
+-    socket.on('register-tray-double-click', function (id) {
++    socket.on('register-tray-double-click', (id) => {
+         if (tray.value) {
+-            tray.value.on('double-click', function (event, bounds) {
++            tray.value.on('double-click', (event, bounds) => {
+                 electronSocket.emit('tray-double-click-event' + id, [event.__proto__, bounds]);
+             });
+         }
+     });
+-    socket.on('register-tray-balloon-show', function (id) {
++    socket.on('register-tray-balloon-show', (id) => {
+         if (tray.value) {
+-            tray.value.on('balloon-show', function () {
++            tray.value.on('balloon-show', () => {
+                 electronSocket.emit('tray-balloon-show-event' + id);
+             });
+         }
+     });
+-    socket.on('register-tray-balloon-click', function (id) {
++    socket.on('register-tray-balloon-click', (id) => {
+         if (tray.value) {
+-            tray.value.on('balloon-click', function () {
++            tray.value.on('balloon-click', () => {
+                 electronSocket.emit('tray-balloon-click-event' + id);
+             });
+         }
+     });
+-    socket.on('register-tray-balloon-closed', function (id) {
++    socket.on('register-tray-balloon-closed', (id) => {
+         if (tray.value) {
+-            tray.value.on('balloon-closed', function () {
++            tray.value.on('balloon-closed', () => {
+                 electronSocket.emit('tray-balloon-closed-event' + id);
+             });
+         }
+     });
+-    socket.on('create-tray', function (image, menuItems) {
+-        var trayIcon = electron_1.nativeImage.createFromPath(image);
++    socket.on('create-tray', (image, menuItems) => {
++        const trayIcon = electron_1.nativeImage.createFromPath(image);
+         tray.value = new electron_1.Tray(trayIcon);
+         if (menuItems) {
+-            var menu = electron_1.Menu.buildFromTemplate(menuItems);
+-            addMenuItemClickConnector(menu.items, function (id) {
++            const menu = electron_1.Menu.buildFromTemplate(menuItems);
++            addMenuItemClickConnector(menu.items, (id) => {
+                 electronSocket.emit('trayMenuItemClicked', id);
+             });
+             tray.value.setContextMenu(menu);
+         }
+     });
+-    socket.on('tray-destroy', function () {
++    socket.on('tray-destroy', () => {
+         if (tray.value) {
+             tray.value.destroy();
+         }
+     });
+-    socket.on('tray-setImage', function (image) {
++    socket.on('tray-setImage', (image) => {
+         if (tray.value) {
+             tray.value.setImage(image);
+         }
+     });
+-    socket.on('tray-setPressedImage', function (image) {
++    socket.on('tray-setPressedImage', (image) => {
+         if (tray.value) {
+-            var img = electron_1.nativeImage.createFromPath(image);
++            const img = electron_1.nativeImage.createFromPath(image);
+             tray.value.setPressedImage(img);
+         }
+     });
+-    socket.on('tray-setToolTip', function (toolTip) {
++    socket.on('tray-setToolTip', (toolTip) => {
+         if (tray.value) {
+             tray.value.setToolTip(toolTip);
+         }
+     });
+-    socket.on('tray-setTitle', function (title) {
++    socket.on('tray-setTitle', (title) => {
+         if (tray.value) {
+             tray.value.setTitle(title);
+         }
+     });
+-    socket.on('tray-displayBalloon', function (options) {
++    socket.on('tray-displayBalloon', (options) => {
+         if (tray.value) {
+             tray.value.displayBalloon(options);
+         }
+     });
+-    socket.on('tray-isDestroyed', function () {
++    socket.on('tray-isDestroyed', () => {
+         if (tray.value) {
+-            var isDestroyed = tray.value.isDestroyed();
++            const isDestroyed = tray.value.isDestroyed();
+             electronSocket.emit('tray-isDestroyedCompleted', isDestroyed);
+         }
+     });
++    socket.on('register-tray-on-event', (eventName, listenerName) => {
++        if (tray.value) {
++            tray.value.on(eventName, (...args) => {
++                if (args.length > 1) {
++                    electronSocket.emit(listenerName, args[1]);
++                }
++                else {
++                    electronSocket.emit(listenerName);
++                }
++            });
++        }
++    });
++    socket.on('register-tray-once-event', (eventName, listenerName) => {
++        if (tray.value) {
++            tray.value.once(eventName, (...args) => {
++                if (args.length > 1) {
++                    electronSocket.emit(listenerName, args[1]);
++                }
++                else {
++                    electronSocket.emit(listenerName);
++                }
++            });
++        }
++    });
+     function addMenuItemClickConnector(menuItems, callback) {
+-        menuItems.forEach(function (item) {
++        menuItems.forEach((item) => {
+             if (item.submenu && item.submenu.items.length > 0) {
+                 addMenuItemClickConnector(item.submenu.items, callback);
+             }
+             if ('id' in item && item.id) {
+-                item.click = function () { callback(item.id); };
++                item.click = () => { callback(item.id); };
+             }
+         });
+     }
+ };
++//# sourceMappingURL=tray.js.map
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/tray.js.map b/ElectronNET.Host/api/tray.js.map
+index 7522ddcb3e2c454f30fe83801d17212b11fd185d..167fd761390d2597ca09c833db18194df5330d7e 100644
+--- a/ElectronNET.Host/api/tray.js.map
++++ b/ElectronNET.Host/api/tray.js.map
+@@ -1 +1 @@
+-{"version":3,"file":"tray.js","sourceRoot":"","sources":["tray.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
++{"version":3,"file":"tray.js","sourceRoot":"","sources":["tray.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
+diff --git a/ElectronNET.Host/api/tray.ts b/ElectronNET.Host/api/tray.ts
+index d1a3bfa0fa6fdfabea7a773a71139e0f417657cf..5bca977582fede8dca3720678630709e910e03d4 100644
+--- a/ElectronNET.Host/api/tray.ts
++++ b/ElectronNET.Host/api/tray.ts
+@@ -111,6 +111,30 @@ export = (socket: SocketIO.Socket) => {
+         }
+     });
+ 
++    socket.on('register-tray-on-event', (eventName, listenerName) => {
++        if (tray.value){
++            tray.value.on(eventName, (...args) => {
++                if (args.length > 1) {
++                    electronSocket.emit(listenerName, args[1]);
++                } else {
++                    electronSocket.emit(listenerName);
++                }
++            });
++        }
++    });
++
++    socket.on('register-tray-once-event', (eventName, listenerName) => {
++        if (tray.value){
++            tray.value.once(eventName, (...args) => {
++                if (args.length > 1) {
++                    electronSocket.emit(listenerName, args[1]);
++                } else {
++                    electronSocket.emit(listenerName);
++                }
++            });
++        }
++    });
++
+     function addMenuItemClickConnector(menuItems, callback) {
+         menuItems.forEach((item) => {
+             if (item.submenu && item.submenu.items.length > 0) {
+diff --git a/ElectronNET.Host/main.js b/ElectronNET.Host/main.js
+index 0280b3f6a4ffc9f3ba62453adbd9ed6bec27bf6c..163cd1e3b155539261dd23f3dbfd111d2337f8b4 100644
+--- a/ElectronNET.Host/main.js
++++ b/ElectronNET.Host/main.js
+@@ -201,7 +201,7 @@ function startSocketApiBridge(port) {
+         if (shellApi === undefined) shellApi = require('./api/shell')(socket);
+         if (screen === undefined) screen = require('./api/screen')(socket);
+         if (clipboard === undefined) clipboard = require('./api/clipboard')(socket);
+-        if (browserView === undefined) browserView = require('./api/browserView')(socket);
++        if (browserView === undefined) browserView = require('./api/browserView').browserViewApi(socket);
+         if (powerMonitor === undefined) powerMonitor = require('./api/powerMonitor')(socket);
+         if (nativeTheme === undefined) nativeTheme = require('./api/nativeTheme')(socket);
+         if (dock === undefined) dock = require('./api/dock')(socket);
+diff --git a/ElectronNET.Host/package-lock.json b/ElectronNET.Host/package-lock.json
+index bea4ba19ae357668993cbed55e61ec19ba7ef07f..4a150765dc2eae28491c19fc5c3e63fb57037126 100644
+--- a/ElectronNET.Host/package-lock.json
++++ b/ElectronNET.Host/package-lock.json
+@@ -13,7 +13,7 @@
+                 "electron-updater": "^4.3.5",
+                 "image-size": "^0.9.3",
+                 "portscanner": "^2.2.0",
+-                "socket.io": "^3.0.5"
++                "socket.io": "^2.2.0"
+             },
+             "devDependencies": {
+                 "@types/node": "^10.17.20",
+@@ -94,21 +94,6 @@
+                 "node": ">=6"
+             }
+         },
+-        "node_modules/@types/component-emitter": {
+-            "version": "1.2.10",
+-            "resolved": "https://registry.npmjs.org/@types/component-emitter/-/component-emitter-1.2.10.tgz",
+-            "integrity": "sha512-bsjleuRKWmGqajMerkzox19aGbscQX5rmmvvXl3wlIp5gMG1HgkiwPxsN5p070fBDKTNSPgojVbuY1+HWMbFhg=="
+-        },
+-        "node_modules/@types/cookie": {
+-            "version": "0.4.0",
+-            "resolved": "https://registry.npmjs.org/@types/cookie/-/cookie-0.4.0.tgz",
+-            "integrity": "sha512-y7mImlc/rNkvCRmg8gC3/lj87S7pTUIJ6QGjwHR9WQJcFs+ZMTOaoPrkdFA/YdbuqVEmEbb5RdhVxMkAcgOnpg=="
+-        },
+-        "node_modules/@types/cors": {
+-            "version": "2.8.9",
+-            "resolved": "https://registry.npmjs.org/@types/cors/-/cors-2.8.9.tgz",
+-            "integrity": "sha512-zurD1ibz21BRlAOIKP8yhrxlqKx6L9VCwkB5kMiP6nZAhoF5MvC7qS1qPA7nRcr1GJolfkQC7/EAL4hdYejLtg=="
+-        },
+         "node_modules/@types/engine.io": {
+             "version": "3.1.5",
+             "resolved": "https://registry.npmjs.org/@types/engine.io/-/engine.io-3.1.5.tgz",
+@@ -161,6 +146,11 @@
+                 "node": ">= 0.6"
+             }
+         },
++        "node_modules/after": {
++            "version": "0.8.2",
++            "resolved": "https://registry.npmjs.org/after/-/after-0.8.2.tgz",
++            "integrity": "sha1-/ts5T58OAqqXaOcCvaI7UF+ufh8="
++        },
+         "node_modules/ansi-styles": {
+             "version": "3.2.1",
+             "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-3.2.1.tgz",
+@@ -181,6 +171,11 @@
+                 "sprintf-js": "~1.0.2"
+             }
+         },
++        "node_modules/arraybuffer.slice": {
++            "version": "0.0.7",
++            "resolved": "https://registry.npmjs.org/arraybuffer.slice/-/arraybuffer.slice-0.0.7.tgz",
++            "integrity": "sha512-wGUIVQXuehL5TCqQun8OW81jGzAWycqzFF8lFp+GOM5BXLYj3bKNsYC4daB7n6XjCqxQA/qgTJ+8ANR3acjrog=="
++        },
+         "node_modules/async": {
+             "version": "2.6.3",
+             "resolved": "https://registry.npmjs.org/async/-/async-2.6.3.tgz",
+@@ -189,6 +184,11 @@
+                 "lodash": "^4.17.14"
+             }
+         },
++        "node_modules/async-limiter": {
++            "version": "1.0.1",
++            "resolved": "https://registry.npmjs.org/async-limiter/-/async-limiter-1.0.1.tgz",
++            "integrity": "sha512-csOlWGAcRFJaI6m+F2WKdnMKr4HhdhFVBk0H/QbJFMCr+uO2kwohwXQPxw/9OCxp05r5ghVBFSyioixx3gfkNQ=="
++        },
+         "node_modules/at-least-node": {
+             "version": "1.0.0",
+             "resolved": "https://registry.npmjs.org/at-least-node/-/at-least-node-1.0.0.tgz",
+@@ -197,6 +197,11 @@
+                 "node": ">= 4.0.0"
+             }
+         },
++        "node_modules/backo2": {
++            "version": "1.0.2",
++            "resolved": "https://registry.npmjs.org/backo2/-/backo2-1.0.2.tgz",
++            "integrity": "sha1-MasayLEpNjRj41s+u2n038+6eUc="
++        },
+         "node_modules/balanced-match": {
+             "version": "1.0.0",
+             "resolved": "https://registry.npmjs.org/balanced-match/-/balanced-match-1.0.0.tgz",
+@@ -204,21 +209,37 @@
+             "dev": true
+         },
+         "node_modules/base64-arraybuffer": {
+-            "version": "0.1.4",
+-            "resolved": "https://registry.npmjs.org/base64-arraybuffer/-/base64-arraybuffer-0.1.4.tgz",
+-            "integrity": "sha1-mBjHngWbE1X5fgQooBfIOOkLqBI=",
++            "version": "0.1.5",
++            "resolved": "https://registry.npmjs.org/base64-arraybuffer/-/base64-arraybuffer-0.1.5.tgz",
++            "integrity": "sha1-c5JncZI7Whl0etZmqlzUv5xunOg=",
+             "engines": {
+                 "node": ">= 0.6.0"
+             }
+         },
+         "node_modules/base64id": {
+-            "version": "2.0.0",
+-            "resolved": "https://registry.npmjs.org/base64id/-/base64id-2.0.0.tgz",
+-            "integrity": "sha512-lGe34o6EHj9y3Kts9R4ZYs/Gr+6N7MCaMlIFA3F1R2O5/m7K06AxfSeO5530PEERE6/WyEg3lsuyw4GHlPZHog==",
++            "version": "1.0.0",
++            "resolved": "https://registry.npmjs.org/base64id/-/base64id-1.0.0.tgz",
++            "integrity": "sha1-R2iMuZu2gE8OBtPnY7HDLlfY5rY=",
++            "engines": {
++                "node": ">= 0.4.0"
++            }
++        },
++        "node_modules/better-assert": {
++            "version": "1.0.2",
++            "resolved": "https://registry.npmjs.org/better-assert/-/better-assert-1.0.2.tgz",
++            "integrity": "sha1-QIZrnhueC1W0gYlDEeaPr/rrxSI=",
++            "dependencies": {
++                "callsite": "1.0.0"
++            },
+             "engines": {
+-                "node": "^4.5.0 || >= 5.9"
++                "node": "*"
+             }
+         },
++        "node_modules/blob": {
++            "version": "0.0.5",
++            "resolved": "https://registry.npmjs.org/blob/-/blob-0.0.5.tgz",
++            "integrity": "sha512-gaqbzQPqOoamawKg0LGVd7SzLgXS+JH61oWprSLH+P+abTczqJbhTR8CmJ2u9/bUYNmHTGJx/UEmn6doAvvuig=="
++        },
+         "node_modules/boolean": {
+             "version": "3.0.2",
+             "resolved": "https://registry.npmjs.org/boolean/-/boolean-3.0.2.tgz",
+@@ -314,6 +335,14 @@
+                 "node": ">=8"
+             }
+         },
++        "node_modules/callsite": {
++            "version": "1.0.0",
++            "resolved": "https://registry.npmjs.org/callsite/-/callsite-1.0.0.tgz",
++            "integrity": "sha1-KAOY5dZkvXQDi28JBRU+borxvCA=",
++            "engines": {
++                "node": "*"
++            }
++        },
+         "node_modules/chalk": {
+             "version": "2.4.2",
+             "resolved": "https://registry.npmjs.org/chalk/-/chalk-2.4.2.tgz",
+@@ -367,10 +396,20 @@
+             "integrity": "sha512-GpVkmM8vF2vQUkj2LvZmD35JxeJOLCwJ9cUkugyk2nuhbv3+mJvpLYYt+0+USMxE+oj+ey/lJEnhZw75x/OMcQ==",
+             "dev": true
+         },
++        "node_modules/component-bind": {
++            "version": "1.0.0",
++            "resolved": "https://registry.npmjs.org/component-bind/-/component-bind-1.0.0.tgz",
++            "integrity": "sha1-AMYIq33Nk4l8AAllGx06jh5zu9E="
++        },
+         "node_modules/component-emitter": {
+-            "version": "1.3.0",
+-            "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.3.0.tgz",
+-            "integrity": "sha512-Rd3se6QB+sO1TwqZjscQrurpEPIfO0/yYnSin6Q/rD3mOutHvUrCAhJub3r90uNb+SESBuE0QYoB90YdfatsRg=="
++            "version": "1.2.1",
++            "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.2.1.tgz",
++            "integrity": "sha1-E3kY1teCg/ffemt8WmPhQOaUJeY="
++        },
++        "node_modules/component-inherit": {
++            "version": "0.0.3",
++            "resolved": "https://registry.npmjs.org/component-inherit/-/component-inherit-0.0.3.tgz",
++            "integrity": "sha1-ZF/ErfWLcrZJ1crmUTVhnbJv8UM="
+         },
+         "node_modules/concat-map": {
+             "version": "0.0.1",
+@@ -405,9 +444,9 @@
+             }
+         },
+         "node_modules/cookie": {
+-            "version": "0.4.1",
+-            "resolved": "https://registry.npmjs.org/cookie/-/cookie-0.4.1.tgz",
+-            "integrity": "sha512-ZwrFkGJxUR3EIoXtO+yVE69Eb7KlixbaeAWfBQB9vVsNn/o+Yw69gBWSSDK825hQNdN+wF8zELf3dFNl/kxkUA==",
++            "version": "0.3.1",
++            "resolved": "https://registry.npmjs.org/cookie/-/cookie-0.3.1.tgz",
++            "integrity": "sha1-5+Ch+e9DtMi6klxcWpboBtFoc7s=",
+             "engines": {
+                 "node": ">= 0.6"
+             }
+@@ -430,18 +469,6 @@
+             "integrity": "sha1-tf1UIgqivFq1eqtxQMlAdUUDwac=",
+             "dev": true
+         },
+-        "node_modules/cors": {
+-            "version": "2.8.5",
+-            "resolved": "https://registry.npmjs.org/cors/-/cors-2.8.5.tgz",
+-            "integrity": "sha512-KIHbLJqu73RGr/hnbrO9uBeixNGuvSQjul/jdFvS/KFSIH1hWVd1ng7zOHx+YrEfInLG7q4n6GHQ9cDtxv/P6g==",
+-            "dependencies": {
+-                "object-assign": "^4",
+-                "vary": "^1"
+-            },
+-            "engines": {
+-                "node": ">= 0.10"
+-            }
+-        },
+         "node_modules/dasherize": {
+             "version": "2.0.0",
+             "resolved": "https://registry.npmjs.org/dasherize/-/dasherize-2.0.0.tgz",
+@@ -616,33 +643,74 @@
+             }
+         },
+         "node_modules/engine.io": {
+-            "version": "4.0.6",
+-            "resolved": "https://registry.npmjs.org/engine.io/-/engine.io-4.0.6.tgz",
+-            "integrity": "sha512-rf7HAVZpcRrcKEKddgIzYUnwg0g5HE1RvJaTLwkcfJmce4g+po8aMuE6vxzp6JwlK8FEq/vi0KWN6tA585DjaA==",
++            "version": "3.3.2",
++            "resolved": "https://registry.npmjs.org/engine.io/-/engine.io-3.3.2.tgz",
++            "integrity": "sha512-AsaA9KG7cWPXWHp5FvHdDWY3AMWeZ8x+2pUVLcn71qE5AtAzgGbxuclOytygskw8XGmiQafTmnI9Bix3uihu2w==",
+             "dependencies": {
+                 "accepts": "~1.3.4",
+-                "base64id": "2.0.0",
+-                "cookie": "~0.4.1",
+-                "cors": "~2.8.5",
+-                "debug": "~4.3.1",
+-                "engine.io-parser": "~4.0.0",
+-                "ws": "~7.4.2"
+-            },
+-            "engines": {
+-                "node": ">=10.0.0"
++                "base64id": "1.0.0",
++                "cookie": "0.3.1",
++                "debug": "~3.1.0",
++                "engine.io-parser": "~2.1.0",
++                "ws": "~6.1.0"
+             }
+         },
++        "node_modules/engine.io-client": {
++            "version": "3.3.2",
++            "resolved": "https://registry.npmjs.org/engine.io-client/-/engine.io-client-3.3.2.tgz",
++            "integrity": "sha512-y0CPINnhMvPuwtqXfsGuWE8BB66+B6wTtCofQDRecMQPYX3MYUZXFNKDhdrSe3EVjgOu4V3rxdeqN/Tr91IgbQ==",
++            "dependencies": {
++                "component-emitter": "1.2.1",
++                "component-inherit": "0.0.3",
++                "debug": "~3.1.0",
++                "engine.io-parser": "~2.1.1",
++                "has-cors": "1.1.0",
++                "indexof": "0.0.1",
++                "parseqs": "0.0.5",
++                "parseuri": "0.0.5",
++                "ws": "~6.1.0",
++                "xmlhttprequest-ssl": "~1.5.4",
++                "yeast": "0.1.2"
++            }
++        },
++        "node_modules/engine.io-client/node_modules/debug": {
++            "version": "3.1.0",
++            "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++            "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++            "dependencies": {
++                "ms": "2.0.0"
++            }
++        },
++        "node_modules/engine.io-client/node_modules/ms": {
++            "version": "2.0.0",
++            "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++            "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
++        },
+         "node_modules/engine.io-parser": {
+-            "version": "4.0.2",
+-            "resolved": "https://registry.npmjs.org/engine.io-parser/-/engine.io-parser-4.0.2.tgz",
+-            "integrity": "sha512-sHfEQv6nmtJrq6TKuIz5kyEKH/qSdK56H/A+7DnAuUPWosnIZAS2NHNcPLmyjtY3cGS/MqJdZbUjW97JU72iYg==",
++            "version": "2.1.3",
++            "resolved": "https://registry.npmjs.org/engine.io-parser/-/engine.io-parser-2.1.3.tgz",
++            "integrity": "sha512-6HXPre2O4Houl7c4g7Ic/XzPnHBvaEmN90vtRO9uLmwtRqQmTOw0QMevL1TOfL2Cpu1VzsaTmMotQgMdkzGkVA==",
+             "dependencies": {
+-                "base64-arraybuffer": "0.1.4"
+-            },
+-            "engines": {
+-                "node": ">=8.0.0"
++                "after": "0.8.2",
++                "arraybuffer.slice": "~0.0.7",
++                "base64-arraybuffer": "0.1.5",
++                "blob": "0.0.5",
++                "has-binary2": "~1.0.2"
+             }
+         },
++        "node_modules/engine.io/node_modules/debug": {
++            "version": "3.1.0",
++            "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++            "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++            "dependencies": {
++                "ms": "2.0.0"
++            }
++        },
++        "node_modules/engine.io/node_modules/ms": {
++            "version": "2.0.0",
++            "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++            "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
++        },
+         "node_modules/env-paths": {
+             "version": "2.2.0",
+             "resolved": "https://registry.npmjs.org/env-paths/-/env-paths-2.2.0.tgz",
+@@ -864,6 +932,19 @@
+                 "node": ">= 0.4.0"
+             }
+         },
++        "node_modules/has-binary2": {
++            "version": "1.0.3",
++            "resolved": "https://registry.npmjs.org/has-binary2/-/has-binary2-1.0.3.tgz",
++            "integrity": "sha512-G1LWKhDSvhGeAQ8mPVQlqNcOB2sJdwATtZKl2pDKKHfpf/rYj24lkinxf69blJbnsvtqqNU+L3SL50vzZhXOnw==",
++            "dependencies": {
++                "isarray": "2.0.1"
++            }
++        },
++        "node_modules/has-cors": {
++            "version": "1.1.0",
++            "resolved": "https://registry.npmjs.org/has-cors/-/has-cors-1.1.0.tgz",
++            "integrity": "sha1-XkdHk/fqmEPRu5nCPu9J/xJv/zk="
++        },
+         "node_modules/has-flag": {
+             "version": "3.0.0",
+             "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-3.0.0.tgz",
+@@ -893,6 +974,11 @@
+                 "node": ">=10.18.0"
+             }
+         },
++        "node_modules/indexof": {
++            "version": "0.0.1",
++            "resolved": "https://registry.npmjs.org/indexof/-/indexof-0.0.1.tgz",
++            "integrity": "sha1-gtwzbSMrkGIXnQWrMpOmYFn9Q10="
++        },
+         "node_modules/inflight": {
+             "version": "1.0.6",
+             "resolved": "https://registry.npmjs.org/inflight/-/inflight-1.0.6.tgz",
+@@ -935,6 +1021,11 @@
+                 "lodash.isfinite": "^3.3.2"
+             }
+         },
++        "node_modules/isarray": {
++            "version": "2.0.1",
++            "resolved": "https://registry.npmjs.org/isarray/-/isarray-2.0.1.tgz",
++            "integrity": "sha1-o32U7ZzaLVmGXJ92/llu4fM4dB4="
++        },
+         "node_modules/js-tokens": {
+             "version": "4.0.0",
+             "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
+@@ -1120,13 +1211,10 @@
+                 "node": ">=4"
+             }
+         },
+-        "node_modules/object-assign": {
+-            "version": "4.1.1",
+-            "resolved": "https://registry.npmjs.org/object-assign/-/object-assign-4.1.1.tgz",
+-            "integrity": "sha1-IQmtx5ZYh8/AXLvUQsrIv7s2CGM=",
+-            "engines": {
+-                "node": ">=0.10.0"
+-            }
++        "node_modules/object-component": {
++            "version": "0.0.3",
++            "resolved": "https://registry.npmjs.org/object-component/-/object-component-0.0.3.tgz",
++            "integrity": "sha1-8MaapQ78lbhmwYb0AKM3acsvEpE="
+         },
+         "node_modules/object-keys": {
+             "version": "1.1.1",
+@@ -1156,6 +1244,22 @@
+                 "node": ">=6"
+             }
+         },
++        "node_modules/parseqs": {
++            "version": "0.0.5",
++            "resolved": "https://registry.npmjs.org/parseqs/-/parseqs-0.0.5.tgz",
++            "integrity": "sha1-1SCKNzjkZ2bikbouoXNoSSGouJ0=",
++            "dependencies": {
++                "better-assert": "~1.0.0"
++            }
++        },
++        "node_modules/parseuri": {
++            "version": "0.0.5",
++            "resolved": "https://registry.npmjs.org/parseuri/-/parseuri-0.0.5.tgz",
++            "integrity": "sha1-gCBKUNTbt3m/3G6+J3jZDkvOMgo=",
++            "dependencies": {
++                "better-assert": "~1.0.0"
++            }
++        },
+         "node_modules/path-is-absolute": {
+             "version": "1.0.1",
+             "resolved": "https://registry.npmjs.org/path-is-absolute/-/path-is-absolute-1.0.1.tgz",
+@@ -1366,46 +1470,93 @@
+             }
+         },
+         "node_modules/socket.io": {
+-            "version": "3.0.5",
+-            "resolved": "https://registry.npmjs.org/socket.io/-/socket.io-3.0.5.tgz",
+-            "integrity": "sha512-5yWQ43P/4IttmPCGKDQ3CVocBiJWGpibyhYJxgUhf69EHMzmK8XW0DkmHIoYdLmZaVZJyiEkUqpeC7rSCIqekw==",
++            "version": "2.2.0",
++            "resolved": "https://registry.npmjs.org/socket.io/-/socket.io-2.2.0.tgz",
++            "integrity": "sha512-wxXrIuZ8AILcn+f1B4ez4hJTPG24iNgxBBDaJfT6MsyOhVYiTXWexGoPkd87ktJG8kQEcL/NBvRi64+9k4Kc0w==",
+             "dependencies": {
+-                "@types/cookie": "^0.4.0",
+-                "@types/cors": "^2.8.8",
+-                "@types/node": "^14.14.10",
+-                "accepts": "~1.3.4",
+-                "base64id": "~2.0.0",
+-                "debug": "~4.3.1",
+-                "engine.io": "~4.0.6",
+-                "socket.io-adapter": "~2.0.3",
+-                "socket.io-parser": "~4.0.3"
+-            },
+-            "engines": {
+-                "node": ">=10.0.0"
++                "debug": "~4.1.0",
++                "engine.io": "~3.3.1",
++                "has-binary2": "~1.0.2",
++                "socket.io-adapter": "~1.1.0",
++                "socket.io-client": "2.2.0",
++                "socket.io-parser": "~3.3.0"
+             }
+         },
+         "node_modules/socket.io-adapter": {
+-            "version": "2.0.3",
+-            "resolved": "https://registry.npmjs.org/socket.io-adapter/-/socket.io-adapter-2.0.3.tgz",
+-            "integrity": "sha512-2wo4EXgxOGSFueqvHAdnmi5JLZzWqMArjuP4nqC26AtLh5PoCPsaRbRdah2xhcwTAMooZfjYiNVNkkmmSMaxOQ=="
++            "version": "1.1.2",
++            "resolved": "https://registry.npmjs.org/socket.io-adapter/-/socket.io-adapter-1.1.2.tgz",
++            "integrity": "sha512-WzZRUj1kUjrTIrUKpZLEzFZ1OLj5FwLlAFQs9kuZJzJi5DKdU7FsWc36SNmA8iDOtwBQyT8FkrriRM8vXLYz8g=="
++        },
++        "node_modules/socket.io-client": {
++            "version": "2.2.0",
++            "resolved": "https://registry.npmjs.org/socket.io-client/-/socket.io-client-2.2.0.tgz",
++            "integrity": "sha512-56ZrkTDbdTLmBIyfFYesgOxsjcLnwAKoN4CiPyTVkMQj3zTUh0QAx3GbvIvLpFEOvQWu92yyWICxB0u7wkVbYA==",
++            "dependencies": {
++                "backo2": "1.0.2",
++                "base64-arraybuffer": "0.1.5",
++                "component-bind": "1.0.0",
++                "component-emitter": "1.2.1",
++                "debug": "~3.1.0",
++                "engine.io-client": "~3.3.1",
++                "has-binary2": "~1.0.2",
++                "has-cors": "1.1.0",
++                "indexof": "0.0.1",
++                "object-component": "0.0.3",
++                "parseqs": "0.0.5",
++                "parseuri": "0.0.5",
++                "socket.io-parser": "~3.3.0",
++                "to-array": "0.1.4"
++            }
++        },
++        "node_modules/socket.io-client/node_modules/debug": {
++            "version": "3.1.0",
++            "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++            "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++            "dependencies": {
++                "ms": "2.0.0"
++            }
++        },
++        "node_modules/socket.io-client/node_modules/ms": {
++            "version": "2.0.0",
++            "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++            "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
+         },
+         "node_modules/socket.io-parser": {
+-            "version": "4.0.3",
+-            "resolved": "https://registry.npmjs.org/socket.io-parser/-/socket.io-parser-4.0.3.tgz",
+-            "integrity": "sha512-m4ybFiP4UYVORRt7jcdqf8UWx+ywVdAqqsJyruXxAdD3Sv6MDemijWij34mOWdMJ55bEdIb9jACBhxUgNK6sxw==",
++            "version": "3.3.2",
++            "resolved": "https://registry.npmjs.org/socket.io-parser/-/socket.io-parser-3.3.2.tgz",
++            "integrity": "sha512-FJvDBuOALxdCI9qwRrO/Rfp9yfndRtc1jSgVgV8FDraihmSP/MLGD5PEuJrNfjALvcQ+vMDM/33AWOYP/JSjDg==",
+             "dependencies": {
+-                "@types/component-emitter": "^1.2.10",
+                 "component-emitter": "~1.3.0",
+-                "debug": "~4.3.1"
+-            },
+-            "engines": {
+-                "node": ">=10.0.0"
++                "debug": "~3.1.0",
++                "isarray": "2.0.1"
++            }
++        },
++        "node_modules/socket.io-parser/node_modules/component-emitter": {
++            "version": "1.3.0",
++            "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.3.0.tgz",
++            "integrity": "sha512-Rd3se6QB+sO1TwqZjscQrurpEPIfO0/yYnSin6Q/rD3mOutHvUrCAhJub3r90uNb+SESBuE0QYoB90YdfatsRg=="
++        },
++        "node_modules/socket.io-parser/node_modules/debug": {
++            "version": "3.1.0",
++            "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++            "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++            "dependencies": {
++                "ms": "2.0.0"
+             }
+         },
+-        "node_modules/socket.io/node_modules/@types/node": {
+-            "version": "14.14.20",
+-            "resolved": "https://registry.npmjs.org/@types/node/-/node-14.14.20.tgz",
+-            "integrity": "sha512-Y93R97Ouif9JEOWPIUyU+eyIdyRqQR0I8Ez1dzku4hDx34NWh4HbtIc3WNzwB1Y9ULvNGeu5B8h8bVL5cAk4/A=="
++        "node_modules/socket.io-parser/node_modules/ms": {
++            "version": "2.0.0",
++            "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++            "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
++        },
++        "node_modules/socket.io/node_modules/debug": {
++            "version": "4.1.1",
++            "resolved": "https://registry.npmjs.org/debug/-/debug-4.1.1.tgz",
++            "integrity": "sha512-pYAIzeRo8J6KPEaJ0VWOh5Pzkbw/RetuzehGM7QRRX5he4fPHx2rdKMB256ehJCkX+XRQm16eZLqLNS8RSZXZw==",
++            "deprecated": "Debug versions >=3.2.0 <3.2.7 || >=4 <4.3.1 have a low-severity ReDos regression when used in a Node.js environment. It is recommended you upgrade to 3.2.7 or 4.3.1. (https://github.com/visionmedia/debug/issues/797)",
++            "dependencies": {
++                "ms": "^2.1.1"
++            }
+         },
+         "node_modules/sprintf-js": {
+             "version": "1.0.3",
+@@ -1445,6 +1596,11 @@
+                 "node": ">=4"
+             }
+         },
++        "node_modules/to-array": {
++            "version": "0.1.4",
++            "resolved": "https://registry.npmjs.org/to-array/-/to-array-0.1.4.tgz",
++            "integrity": "sha1-F+bBH3PdTz10zaek/zI46a2b+JA="
++        },
+         "node_modules/to-readable-stream": {
+             "version": "1.0.0",
+             "resolved": "https://registry.npmjs.org/to-readable-stream/-/to-readable-stream-1.0.0.tgz",
+@@ -1596,14 +1752,6 @@
+             "integrity": "sha1-RQ1Nyfpw3nMnYvvS1KKJgUGaDM8=",
+             "dev": true
+         },
+-        "node_modules/vary": {
+-            "version": "1.1.2",
+-            "resolved": "https://registry.npmjs.org/vary/-/vary-1.1.2.tgz",
+-            "integrity": "sha1-IpnwLG3tMNSllhsLn3RSShj2NPw=",
+-            "engines": {
+-                "node": ">= 0.8"
+-            }
+-        },
+         "node_modules/wrappy": {
+             "version": "1.0.2",
+             "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
+@@ -1611,23 +1759,19 @@
+             "dev": true
+         },
+         "node_modules/ws": {
+-            "version": "7.4.2",
+-            "resolved": "https://registry.npmjs.org/ws/-/ws-7.4.2.tgz",
+-            "integrity": "sha512-T4tewALS3+qsrpGI/8dqNMLIVdq/g/85U98HPMa6F0m6xTbvhXU6RCQLqPH3+SlomNV/LdY6RXEbBpMH6EOJnA==",
++            "version": "6.1.4",
++            "resolved": "https://registry.npmjs.org/ws/-/ws-6.1.4.tgz",
++            "integrity": "sha512-eqZfL+NE/YQc1/ZynhojeV8q+H050oR8AZ2uIev7RU10svA9ZnJUddHcOUZTJLinZ9yEfdA2kSATS2qZK5fhJA==",
++            "dependencies": {
++                "async-limiter": "~1.0.0"
++            }
++        },
++        "node_modules/xmlhttprequest-ssl": {
++            "version": "1.5.5",
++            "resolved": "https://registry.npmjs.org/xmlhttprequest-ssl/-/xmlhttprequest-ssl-1.5.5.tgz",
++            "integrity": "sha1-wodrBhaKrcQOV9l+gRkayPQ5iz4=",
+             "engines": {
+-                "node": ">=8.3.0"
+-            },
+-            "peerDependencies": {
+-                "bufferutil": "^4.0.1",
+-                "utf-8-validate": "^5.0.2"
+-            },
+-            "peerDependenciesMeta": {
+-                "bufferutil": {
+-                    "optional": true
+-                },
+-                "utf-8-validate": {
+-                    "optional": true
+-                }
++                "node": ">=0.4.0"
+             }
+         },
+         "node_modules/yauzl": {
+@@ -1639,6 +1783,11 @@
+                 "buffer-crc32": "~0.2.3",
+                 "fd-slicer": "~1.1.0"
+             }
++        },
++        "node_modules/yeast": {
++            "version": "0.1.2",
++            "resolved": "https://registry.npmjs.org/yeast/-/yeast-0.1.2.tgz",
++            "integrity": "sha1-AI4G2AlDIMNy28L47XagymyKxBk="
+         }
+     },
+     "dependencies": {
+@@ -1700,21 +1849,6 @@
+                 "defer-to-connect": "^1.0.1"
+             }
+         },
+-        "@types/component-emitter": {
+-            "version": "1.2.10",
+-            "resolved": "https://registry.npmjs.org/@types/component-emitter/-/component-emitter-1.2.10.tgz",
+-            "integrity": "sha512-bsjleuRKWmGqajMerkzox19aGbscQX5rmmvvXl3wlIp5gMG1HgkiwPxsN5p070fBDKTNSPgojVbuY1+HWMbFhg=="
+-        },
+-        "@types/cookie": {
+-            "version": "0.4.0",
+-            "resolved": "https://registry.npmjs.org/@types/cookie/-/cookie-0.4.0.tgz",
+-            "integrity": "sha512-y7mImlc/rNkvCRmg8gC3/lj87S7pTUIJ6QGjwHR9WQJcFs+ZMTOaoPrkdFA/YdbuqVEmEbb5RdhVxMkAcgOnpg=="
+-        },
+-        "@types/cors": {
+-            "version": "2.8.9",
+-            "resolved": "https://registry.npmjs.org/@types/cors/-/cors-2.8.9.tgz",
+-            "integrity": "sha512-zurD1ibz21BRlAOIKP8yhrxlqKx6L9VCwkB5kMiP6nZAhoF5MvC7qS1qPA7nRcr1GJolfkQC7/EAL4hdYejLtg=="
+-        },
+         "@types/engine.io": {
+             "version": "3.1.5",
+             "resolved": "https://registry.npmjs.org/@types/engine.io/-/engine.io-3.1.5.tgz",
+@@ -1764,6 +1898,11 @@
+                 "negotiator": "0.6.2"
+             }
+         },
++        "after": {
++            "version": "0.8.2",
++            "resolved": "https://registry.npmjs.org/after/-/after-0.8.2.tgz",
++            "integrity": "sha1-/ts5T58OAqqXaOcCvaI7UF+ufh8="
++        },
+         "ansi-styles": {
+             "version": "3.2.1",
+             "resolved": "https://registry.npmjs.org/ansi-styles/-/ansi-styles-3.2.1.tgz",
+@@ -1781,6 +1920,11 @@
+                 "sprintf-js": "~1.0.2"
+             }
+         },
++        "arraybuffer.slice": {
++            "version": "0.0.7",
++            "resolved": "https://registry.npmjs.org/arraybuffer.slice/-/arraybuffer.slice-0.0.7.tgz",
++            "integrity": "sha512-wGUIVQXuehL5TCqQun8OW81jGzAWycqzFF8lFp+GOM5BXLYj3bKNsYC4daB7n6XjCqxQA/qgTJ+8ANR3acjrog=="
++        },
+         "async": {
+             "version": "2.6.3",
+             "resolved": "https://registry.npmjs.org/async/-/async-2.6.3.tgz",
+@@ -1789,11 +1933,21 @@
+                 "lodash": "^4.17.14"
+             }
+         },
++        "async-limiter": {
++            "version": "1.0.1",
++            "resolved": "https://registry.npmjs.org/async-limiter/-/async-limiter-1.0.1.tgz",
++            "integrity": "sha512-csOlWGAcRFJaI6m+F2WKdnMKr4HhdhFVBk0H/QbJFMCr+uO2kwohwXQPxw/9OCxp05r5ghVBFSyioixx3gfkNQ=="
++        },
+         "at-least-node": {
+             "version": "1.0.0",
+             "resolved": "https://registry.npmjs.org/at-least-node/-/at-least-node-1.0.0.tgz",
+             "integrity": "sha512-+q/t7Ekv1EDY2l6Gda6LLiX14rU9TV20Wa3ofeQmwPFZbOMo9DXrLbOjFaaclkXKWidIaopwAObQDqwWtGUjqg=="
+         },
++        "backo2": {
++            "version": "1.0.2",
++            "resolved": "https://registry.npmjs.org/backo2/-/backo2-1.0.2.tgz",
++            "integrity": "sha1-MasayLEpNjRj41s+u2n038+6eUc="
++        },
+         "balanced-match": {
+             "version": "1.0.0",
+             "resolved": "https://registry.npmjs.org/balanced-match/-/balanced-match-1.0.0.tgz",
+@@ -1801,14 +1955,27 @@
+             "dev": true
+         },
+         "base64-arraybuffer": {
+-            "version": "0.1.4",
+-            "resolved": "https://registry.npmjs.org/base64-arraybuffer/-/base64-arraybuffer-0.1.4.tgz",
+-            "integrity": "sha1-mBjHngWbE1X5fgQooBfIOOkLqBI="
++            "version": "0.1.5",
++            "resolved": "https://registry.npmjs.org/base64-arraybuffer/-/base64-arraybuffer-0.1.5.tgz",
++            "integrity": "sha1-c5JncZI7Whl0etZmqlzUv5xunOg="
+         },
+         "base64id": {
+-            "version": "2.0.0",
+-            "resolved": "https://registry.npmjs.org/base64id/-/base64id-2.0.0.tgz",
+-            "integrity": "sha512-lGe34o6EHj9y3Kts9R4ZYs/Gr+6N7MCaMlIFA3F1R2O5/m7K06AxfSeO5530PEERE6/WyEg3lsuyw4GHlPZHog=="
++            "version": "1.0.0",
++            "resolved": "https://registry.npmjs.org/base64id/-/base64id-1.0.0.tgz",
++            "integrity": "sha1-R2iMuZu2gE8OBtPnY7HDLlfY5rY="
++        },
++        "better-assert": {
++            "version": "1.0.2",
++            "resolved": "https://registry.npmjs.org/better-assert/-/better-assert-1.0.2.tgz",
++            "integrity": "sha1-QIZrnhueC1W0gYlDEeaPr/rrxSI=",
++            "requires": {
++                "callsite": "1.0.0"
++            }
++        },
++        "blob": {
++            "version": "0.0.5",
++            "resolved": "https://registry.npmjs.org/blob/-/blob-0.0.5.tgz",
++            "integrity": "sha512-gaqbzQPqOoamawKg0LGVd7SzLgXS+JH61oWprSLH+P+abTczqJbhTR8CmJ2u9/bUYNmHTGJx/UEmn6doAvvuig=="
+         },
+         "boolean": {
+             "version": "3.0.2",
+@@ -1886,6 +2053,11 @@
+                 }
+             }
+         },
++        "callsite": {
++            "version": "1.0.0",
++            "resolved": "https://registry.npmjs.org/callsite/-/callsite-1.0.0.tgz",
++            "integrity": "sha1-KAOY5dZkvXQDi28JBRU+borxvCA="
++        },
+         "chalk": {
+             "version": "2.4.2",
+             "resolved": "https://registry.npmjs.org/chalk/-/chalk-2.4.2.tgz",
+@@ -1935,10 +2107,20 @@
+             "integrity": "sha512-GpVkmM8vF2vQUkj2LvZmD35JxeJOLCwJ9cUkugyk2nuhbv3+mJvpLYYt+0+USMxE+oj+ey/lJEnhZw75x/OMcQ==",
+             "dev": true
+         },
++        "component-bind": {
++            "version": "1.0.0",
++            "resolved": "https://registry.npmjs.org/component-bind/-/component-bind-1.0.0.tgz",
++            "integrity": "sha1-AMYIq33Nk4l8AAllGx06jh5zu9E="
++        },
+         "component-emitter": {
+-            "version": "1.3.0",
+-            "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.3.0.tgz",
+-            "integrity": "sha512-Rd3se6QB+sO1TwqZjscQrurpEPIfO0/yYnSin6Q/rD3mOutHvUrCAhJub3r90uNb+SESBuE0QYoB90YdfatsRg=="
++            "version": "1.2.1",
++            "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.2.1.tgz",
++            "integrity": "sha1-E3kY1teCg/ffemt8WmPhQOaUJeY="
++        },
++        "component-inherit": {
++            "version": "0.0.3",
++            "resolved": "https://registry.npmjs.org/component-inherit/-/component-inherit-0.0.3.tgz",
++            "integrity": "sha1-ZF/ErfWLcrZJ1crmUTVhnbJv8UM="
+         },
+         "concat-map": {
+             "version": "0.0.1",
+@@ -1970,9 +2152,9 @@
+             }
+         },
+         "cookie": {
+-            "version": "0.4.1",
+-            "resolved": "https://registry.npmjs.org/cookie/-/cookie-0.4.1.tgz",
+-            "integrity": "sha512-ZwrFkGJxUR3EIoXtO+yVE69Eb7KlixbaeAWfBQB9vVsNn/o+Yw69gBWSSDK825hQNdN+wF8zELf3dFNl/kxkUA=="
++            "version": "0.3.1",
++            "resolved": "https://registry.npmjs.org/cookie/-/cookie-0.3.1.tgz",
++            "integrity": "sha1-5+Ch+e9DtMi6klxcWpboBtFoc7s="
+         },
+         "core-js": {
+             "version": "3.8.2",
+@@ -1987,15 +2169,6 @@
+             "integrity": "sha1-tf1UIgqivFq1eqtxQMlAdUUDwac=",
+             "dev": true
+         },
+-        "cors": {
+-            "version": "2.8.5",
+-            "resolved": "https://registry.npmjs.org/cors/-/cors-2.8.5.tgz",
+-            "integrity": "sha512-KIHbLJqu73RGr/hnbrO9uBeixNGuvSQjul/jdFvS/KFSIH1hWVd1ng7zOHx+YrEfInLG7q4n6GHQ9cDtxv/P6g==",
+-            "requires": {
+-                "object-assign": "^4",
+-                "vary": "^1"
+-            }
+-        },
+         "dasherize": {
+             "version": "2.0.0",
+             "resolved": "https://registry.npmjs.org/dasherize/-/dasherize-2.0.0.tgz",
+@@ -2137,25 +2310,76 @@
+             }
+         },
+         "engine.io": {
+-            "version": "4.0.6",
+-            "resolved": "https://registry.npmjs.org/engine.io/-/engine.io-4.0.6.tgz",
+-            "integrity": "sha512-rf7HAVZpcRrcKEKddgIzYUnwg0g5HE1RvJaTLwkcfJmce4g+po8aMuE6vxzp6JwlK8FEq/vi0KWN6tA585DjaA==",
++            "version": "3.3.2",
++            "resolved": "https://registry.npmjs.org/engine.io/-/engine.io-3.3.2.tgz",
++            "integrity": "sha512-AsaA9KG7cWPXWHp5FvHdDWY3AMWeZ8x+2pUVLcn71qE5AtAzgGbxuclOytygskw8XGmiQafTmnI9Bix3uihu2w==",
+             "requires": {
+                 "accepts": "~1.3.4",
+-                "base64id": "2.0.0",
+-                "cookie": "~0.4.1",
+-                "cors": "~2.8.5",
+-                "debug": "~4.3.1",
+-                "engine.io-parser": "~4.0.0",
+-                "ws": "~7.4.2"
++                "base64id": "1.0.0",
++                "cookie": "0.3.1",
++                "debug": "~3.1.0",
++                "engine.io-parser": "~2.1.0",
++                "ws": "~6.1.0"
++            },
++            "dependencies": {
++                "debug": {
++                    "version": "3.1.0",
++                    "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++                    "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++                    "requires": {
++                        "ms": "2.0.0"
++                    }
++                },
++                "ms": {
++                    "version": "2.0.0",
++                    "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++                    "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
++                }
++            }
++        },
++        "engine.io-client": {
++            "version": "3.3.2",
++            "resolved": "https://registry.npmjs.org/engine.io-client/-/engine.io-client-3.3.2.tgz",
++            "integrity": "sha512-y0CPINnhMvPuwtqXfsGuWE8BB66+B6wTtCofQDRecMQPYX3MYUZXFNKDhdrSe3EVjgOu4V3rxdeqN/Tr91IgbQ==",
++            "requires": {
++                "component-emitter": "1.2.1",
++                "component-inherit": "0.0.3",
++                "debug": "~3.1.0",
++                "engine.io-parser": "~2.1.1",
++                "has-cors": "1.1.0",
++                "indexof": "0.0.1",
++                "parseqs": "0.0.5",
++                "parseuri": "0.0.5",
++                "ws": "~6.1.0",
++                "xmlhttprequest-ssl": "~1.5.4",
++                "yeast": "0.1.2"
++            },
++            "dependencies": {
++                "debug": {
++                    "version": "3.1.0",
++                    "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++                    "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++                    "requires": {
++                        "ms": "2.0.0"
++                    }
++                },
++                "ms": {
++                    "version": "2.0.0",
++                    "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++                    "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
++                }
+             }
+         },
+         "engine.io-parser": {
+-            "version": "4.0.2",
+-            "resolved": "https://registry.npmjs.org/engine.io-parser/-/engine.io-parser-4.0.2.tgz",
+-            "integrity": "sha512-sHfEQv6nmtJrq6TKuIz5kyEKH/qSdK56H/A+7DnAuUPWosnIZAS2NHNcPLmyjtY3cGS/MqJdZbUjW97JU72iYg==",
++            "version": "2.1.3",
++            "resolved": "https://registry.npmjs.org/engine.io-parser/-/engine.io-parser-2.1.3.tgz",
++            "integrity": "sha512-6HXPre2O4Houl7c4g7Ic/XzPnHBvaEmN90vtRO9uLmwtRqQmTOw0QMevL1TOfL2Cpu1VzsaTmMotQgMdkzGkVA==",
+             "requires": {
+-                "base64-arraybuffer": "0.1.4"
++                "after": "0.8.2",
++                "arraybuffer.slice": "~0.0.7",
++                "base64-arraybuffer": "0.1.5",
++                "blob": "0.0.5",
++                "has-binary2": "~1.0.2"
+             }
+         },
+         "env-paths": {
+@@ -2339,6 +2563,19 @@
+                 "function-bind": "^1.1.1"
+             }
+         },
++        "has-binary2": {
++            "version": "1.0.3",
++            "resolved": "https://registry.npmjs.org/has-binary2/-/has-binary2-1.0.3.tgz",
++            "integrity": "sha512-G1LWKhDSvhGeAQ8mPVQlqNcOB2sJdwATtZKl2pDKKHfpf/rYj24lkinxf69blJbnsvtqqNU+L3SL50vzZhXOnw==",
++            "requires": {
++                "isarray": "2.0.1"
++            }
++        },
++        "has-cors": {
++            "version": "1.1.0",
++            "resolved": "https://registry.npmjs.org/has-cors/-/has-cors-1.1.0.tgz",
++            "integrity": "sha1-XkdHk/fqmEPRu5nCPu9J/xJv/zk="
++        },
+         "has-flag": {
+             "version": "3.0.0",
+             "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-3.0.0.tgz",
+@@ -2359,6 +2596,11 @@
+                 "queue": "6.0.1"
+             }
+         },
++        "indexof": {
++            "version": "0.0.1",
++            "resolved": "https://registry.npmjs.org/indexof/-/indexof-0.0.1.tgz",
++            "integrity": "sha1-gtwzbSMrkGIXnQWrMpOmYFn9Q10="
++        },
+         "inflight": {
+             "version": "1.0.6",
+             "resolved": "https://registry.npmjs.org/inflight/-/inflight-1.0.6.tgz",
+@@ -2398,6 +2640,11 @@
+                 "lodash.isfinite": "^3.3.2"
+             }
+         },
++        "isarray": {
++            "version": "2.0.1",
++            "resolved": "https://registry.npmjs.org/isarray/-/isarray-2.0.1.tgz",
++            "integrity": "sha1-o32U7ZzaLVmGXJ92/llu4fM4dB4="
++        },
+         "js-tokens": {
+             "version": "4.0.0",
+             "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
+@@ -2550,10 +2797,10 @@
+                 "pify": "^3.0.0"
+             }
+         },
+-        "object-assign": {
+-            "version": "4.1.1",
+-            "resolved": "https://registry.npmjs.org/object-assign/-/object-assign-4.1.1.tgz",
+-            "integrity": "sha1-IQmtx5ZYh8/AXLvUQsrIv7s2CGM="
++        "object-component": {
++            "version": "0.0.3",
++            "resolved": "https://registry.npmjs.org/object-component/-/object-component-0.0.3.tgz",
++            "integrity": "sha1-8MaapQ78lbhmwYb0AKM3acsvEpE="
+         },
+         "object-keys": {
+             "version": "1.1.1",
+@@ -2577,6 +2824,22 @@
+             "integrity": "sha512-s73XxOZ4zpt1edZYZzvhqFa6uvQc1vwUa0K0BdtIZgQMAJj9IbebH+JkgKZc9h+B05PKHLOTl4ajG1BmNrVZlw==",
+             "dev": true
+         },
++        "parseqs": {
++            "version": "0.0.5",
++            "resolved": "https://registry.npmjs.org/parseqs/-/parseqs-0.0.5.tgz",
++            "integrity": "sha1-1SCKNzjkZ2bikbouoXNoSSGouJ0=",
++            "requires": {
++                "better-assert": "~1.0.0"
++            }
++        },
++        "parseuri": {
++            "version": "0.0.5",
++            "resolved": "https://registry.npmjs.org/parseuri/-/parseuri-0.0.5.tgz",
++            "integrity": "sha1-gCBKUNTbt3m/3G6+J3jZDkvOMgo=",
++            "requires": {
++                "better-assert": "~1.0.0"
++            }
++        },
+         "path-is-absolute": {
+             "version": "1.0.1",
+             "resolved": "https://registry.npmjs.org/path-is-absolute/-/path-is-absolute-1.0.1.tgz",
+@@ -2763,41 +3026,97 @@
+             }
+         },
+         "socket.io": {
+-            "version": "3.0.5",
+-            "resolved": "https://registry.npmjs.org/socket.io/-/socket.io-3.0.5.tgz",
+-            "integrity": "sha512-5yWQ43P/4IttmPCGKDQ3CVocBiJWGpibyhYJxgUhf69EHMzmK8XW0DkmHIoYdLmZaVZJyiEkUqpeC7rSCIqekw==",
++            "version": "2.2.0",
++            "resolved": "https://registry.npmjs.org/socket.io/-/socket.io-2.2.0.tgz",
++            "integrity": "sha512-wxXrIuZ8AILcn+f1B4ez4hJTPG24iNgxBBDaJfT6MsyOhVYiTXWexGoPkd87ktJG8kQEcL/NBvRi64+9k4Kc0w==",
+             "requires": {
+-                "@types/cookie": "^0.4.0",
+-                "@types/cors": "^2.8.8",
+-                "@types/node": "^14.14.10",
+-                "accepts": "~1.3.4",
+-                "base64id": "~2.0.0",
+-                "debug": "~4.3.1",
+-                "engine.io": "~4.0.6",
+-                "socket.io-adapter": "~2.0.3",
+-                "socket.io-parser": "~4.0.3"
++                "debug": "~4.1.0",
++                "engine.io": "~3.3.1",
++                "has-binary2": "~1.0.2",
++                "socket.io-adapter": "~1.1.0",
++                "socket.io-client": "2.2.0",
++                "socket.io-parser": "~3.3.0"
+             },
+             "dependencies": {
+-                "@types/node": {
+-                    "version": "14.14.20",
+-                    "resolved": "https://registry.npmjs.org/@types/node/-/node-14.14.20.tgz",
+-                    "integrity": "sha512-Y93R97Ouif9JEOWPIUyU+eyIdyRqQR0I8Ez1dzku4hDx34NWh4HbtIc3WNzwB1Y9ULvNGeu5B8h8bVL5cAk4/A=="
++                "debug": {
++                    "version": "4.1.1",
++                    "resolved": "https://registry.npmjs.org/debug/-/debug-4.1.1.tgz",
++                    "integrity": "sha512-pYAIzeRo8J6KPEaJ0VWOh5Pzkbw/RetuzehGM7QRRX5he4fPHx2rdKMB256ehJCkX+XRQm16eZLqLNS8RSZXZw==",
++                    "requires": {
++                        "ms": "^2.1.1"
++                    }
+                 }
+             }
+         },
+         "socket.io-adapter": {
+-            "version": "2.0.3",
+-            "resolved": "https://registry.npmjs.org/socket.io-adapter/-/socket.io-adapter-2.0.3.tgz",
+-            "integrity": "sha512-2wo4EXgxOGSFueqvHAdnmi5JLZzWqMArjuP4nqC26AtLh5PoCPsaRbRdah2xhcwTAMooZfjYiNVNkkmmSMaxOQ=="
++            "version": "1.1.2",
++            "resolved": "https://registry.npmjs.org/socket.io-adapter/-/socket.io-adapter-1.1.2.tgz",
++            "integrity": "sha512-WzZRUj1kUjrTIrUKpZLEzFZ1OLj5FwLlAFQs9kuZJzJi5DKdU7FsWc36SNmA8iDOtwBQyT8FkrriRM8vXLYz8g=="
++        },
++        "socket.io-client": {
++            "version": "2.2.0",
++            "resolved": "https://registry.npmjs.org/socket.io-client/-/socket.io-client-2.2.0.tgz",
++            "integrity": "sha512-56ZrkTDbdTLmBIyfFYesgOxsjcLnwAKoN4CiPyTVkMQj3zTUh0QAx3GbvIvLpFEOvQWu92yyWICxB0u7wkVbYA==",
++            "requires": {
++                "backo2": "1.0.2",
++                "base64-arraybuffer": "0.1.5",
++                "component-bind": "1.0.0",
++                "component-emitter": "1.2.1",
++                "debug": "~3.1.0",
++                "engine.io-client": "~3.3.1",
++                "has-binary2": "~1.0.2",
++                "has-cors": "1.1.0",
++                "indexof": "0.0.1",
++                "object-component": "0.0.3",
++                "parseqs": "0.0.5",
++                "parseuri": "0.0.5",
++                "socket.io-parser": "~3.3.0",
++                "to-array": "0.1.4"
++            },
++            "dependencies": {
++                "debug": {
++                    "version": "3.1.0",
++                    "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++                    "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++                    "requires": {
++                        "ms": "2.0.0"
++                    }
++                },
++                "ms": {
++                    "version": "2.0.0",
++                    "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++                    "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
++                }
++            }
+         },
+         "socket.io-parser": {
+-            "version": "4.0.3",
+-            "resolved": "https://registry.npmjs.org/socket.io-parser/-/socket.io-parser-4.0.3.tgz",
+-            "integrity": "sha512-m4ybFiP4UYVORRt7jcdqf8UWx+ywVdAqqsJyruXxAdD3Sv6MDemijWij34mOWdMJ55bEdIb9jACBhxUgNK6sxw==",
++            "version": "3.3.2",
++            "resolved": "https://registry.npmjs.org/socket.io-parser/-/socket.io-parser-3.3.2.tgz",
++            "integrity": "sha512-FJvDBuOALxdCI9qwRrO/Rfp9yfndRtc1jSgVgV8FDraihmSP/MLGD5PEuJrNfjALvcQ+vMDM/33AWOYP/JSjDg==",
+             "requires": {
+-                "@types/component-emitter": "^1.2.10",
+                 "component-emitter": "~1.3.0",
+-                "debug": "~4.3.1"
++                "debug": "~3.1.0",
++                "isarray": "2.0.1"
++            },
++            "dependencies": {
++                "component-emitter": {
++                    "version": "1.3.0",
++                    "resolved": "https://registry.npmjs.org/component-emitter/-/component-emitter-1.3.0.tgz",
++                    "integrity": "sha512-Rd3se6QB+sO1TwqZjscQrurpEPIfO0/yYnSin6Q/rD3mOutHvUrCAhJub3r90uNb+SESBuE0QYoB90YdfatsRg=="
++                },
++                "debug": {
++                    "version": "3.1.0",
++                    "resolved": "https://registry.npmjs.org/debug/-/debug-3.1.0.tgz",
++                    "integrity": "sha512-OX8XqP7/1a9cqkxYw2yXss15f26NKWBpDXQd0/uK/KPqdQhxbPa994hnzjcE2VqQpDslf55723cKPUOGSmMY3g==",
++                    "requires": {
++                        "ms": "2.0.0"
++                    }
++                },
++                "ms": {
++                    "version": "2.0.0",
++                    "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++                    "integrity": "sha1-VgiurfwAvmwpAd9fmGF4jeDVl8g="
++                }
+             }
+         },
+         "sprintf-js": {
+@@ -2832,6 +3151,11 @@
+                 "has-flag": "^3.0.0"
+             }
+         },
++        "to-array": {
++            "version": "0.1.4",
++            "resolved": "https://registry.npmjs.org/to-array/-/to-array-0.1.4.tgz",
++            "integrity": "sha1-F+bBH3PdTz10zaek/zI46a2b+JA="
++        },
+         "to-readable-stream": {
+             "version": "1.0.0",
+             "resolved": "https://registry.npmjs.org/to-readable-stream/-/to-readable-stream-1.0.0.tgz",
+@@ -2944,11 +3268,6 @@
+             "integrity": "sha1-RQ1Nyfpw3nMnYvvS1KKJgUGaDM8=",
+             "dev": true
+         },
+-        "vary": {
+-            "version": "1.1.2",
+-            "resolved": "https://registry.npmjs.org/vary/-/vary-1.1.2.tgz",
+-            "integrity": "sha1-IpnwLG3tMNSllhsLn3RSShj2NPw="
+-        },
+         "wrappy": {
+             "version": "1.0.2",
+             "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
+@@ -2956,10 +3275,17 @@
+             "dev": true
+         },
+         "ws": {
+-            "version": "7.4.2",
+-            "resolved": "https://registry.npmjs.org/ws/-/ws-7.4.2.tgz",
+-            "integrity": "sha512-T4tewALS3+qsrpGI/8dqNMLIVdq/g/85U98HPMa6F0m6xTbvhXU6RCQLqPH3+SlomNV/LdY6RXEbBpMH6EOJnA==",
+-            "requires": {}
++            "version": "6.1.4",
++            "resolved": "https://registry.npmjs.org/ws/-/ws-6.1.4.tgz",
++            "integrity": "sha512-eqZfL+NE/YQc1/ZynhojeV8q+H050oR8AZ2uIev7RU10svA9ZnJUddHcOUZTJLinZ9yEfdA2kSATS2qZK5fhJA==",
++            "requires": {
++                "async-limiter": "~1.0.0"
++            }
++        },
++        "xmlhttprequest-ssl": {
++            "version": "1.5.5",
++            "resolved": "https://registry.npmjs.org/xmlhttprequest-ssl/-/xmlhttprequest-ssl-1.5.5.tgz",
++            "integrity": "sha1-wodrBhaKrcQOV9l+gRkayPQ5iz4="
+         },
+         "yauzl": {
+             "version": "2.10.0",
+@@ -2970,6 +3296,11 @@
+                 "buffer-crc32": "~0.2.3",
+                 "fd-slicer": "~1.1.0"
+             }
++        },
++        "yeast": {
++            "version": "0.1.2",
++            "resolved": "https://registry.npmjs.org/yeast/-/yeast-0.1.2.tgz",
++            "integrity": "sha1-AI4G2AlDIMNy28L47XagymyKxBk="
+         }
+     }
+ }
+diff --git a/ElectronNET.Host/package.json b/ElectronNET.Host/package.json
+index ec78a9e52097273db235a4d079328790163263e4..ff7cb352d7764f8f4ef7619f2ff312ae9e3d150b 100644
+--- a/ElectronNET.Host/package.json
++++ b/ElectronNET.Host/package.json
+@@ -16,7 +16,7 @@
+         "electron-updater": "^4.3.5",
+         "image-size": "^0.9.3",
+         "portscanner": "^2.2.0",
+-        "socket.io": "^3.0.5"
++        "socket.io": "^2.2.0"
+     },
+     "devDependencies": {
+         "@types/node": "^10.17.20",
+diff --git a/ElectronNET.WebApp/Startup.cs b/ElectronNET.WebApp/Startup.cs
+index f6131b3f6edcb44e2b8b53bd6cda39171817fdba..f6c0c3389b224a0019cdd9eae96d34dd38431b76 100644
+--- a/ElectronNET.WebApp/Startup.cs
++++ b/ElectronNET.WebApp/Startup.cs
+@@ -49,6 +49,8 @@ namespace ElectronNET.WebApp
+ 
+         public async void ElectronBootstrap()
+         {
++            //AddDevelopmentTests();
++
+             var browserWindow = await Electron.WindowManager.CreateWindowAsync(new BrowserWindowOptions
+             {
+                 Width = 1152,
+@@ -61,5 +63,56 @@ namespace ElectronNET.WebApp
+             browserWindow.OnReadyToShow += () => browserWindow.Show();
+             browserWindow.SetTitle(Configuration["DemoTitleInSettings"]);
+         }
++
++        private static void AddDevelopmentTests()
++        {
++            // NOTE: on mac you will need to allow the app to post notifications when asked.
++
++            Electron.App.On("activate", (obj) =>
++            {
++                // obj should be a boolean that represents where there are active windows or not.
++                var hasWindows = (bool) obj;
++
++                Electron.Notification.Show(
++                    new NotificationOptions("Activate", $"activate event has been captured. Active windows = {hasWindows}")
++                    {
++                        Silent = false,
++                    });
++            });
++
++            Electron.Dock.SetMenu(new[]
++            {
++                new MenuItem
++                {
++                    Type = MenuType.normal,
++                    Label = "MenuItem",
++                    Click = () =>
++                    {
++                        Electron.Notification.Show(new NotificationOptions(
++                            "Dock MenuItem Click",
++                            "A menu item added to the Dock was selected;"));
++                    },
++                },
++                new MenuItem
++                {
++                    Type = MenuType.submenu,
++                    Label = "SubMenu",
++                    Submenu = new[]
++                    {
++                        new MenuItem
++                        {
++                            Type = MenuType.normal,
++                            Label = "Sub MenuItem",
++                            Click = () =>
++                            {
++                                Electron.Notification.Show(new NotificationOptions(
++                                    "Dock Sub MenuItem Click",
++                                    "A menu item added to the Dock was selected;"));
++                            },
++                        },
++                    }
++                }
++            });
++        }
+     }
+ }
+diff --git a/ElectronNET.WebApp/Views/Home/Index.cshtml b/ElectronNET.WebApp/Views/Home/Index.cshtml
+index 976ff7e702dd6fd3ee1d85b5995f3a337f6ca185..2756dbb5a9f5b1ea27736eda207543b561d3c20e 100644
+--- a/ElectronNET.WebApp/Views/Home/Index.cshtml
++++ b/ElectronNET.WebApp/Views/Home/Index.cshtml
+@@ -11,23 +11,6 @@
+     <link rel="stylesheet" href="assets/css/demo.css">
+     <link rel="stylesheet" href="assets/css/github.css">
+     <link rel="stylesheet" href="assets/css/highlight.min.css">
+-
+-    <link rel="import" href="about">
+-    <link rel="import" href="windows">
+-    <link rel="import" href="crashhang">
+-    <link rel="import" href="menus">
+-    <link rel="import" href="shortcuts">
+-    <link rel="import" href="shell">
+-    <link rel="import" href="notifications">
+-    <link rel="import" href="dialogs">
+-    <link rel="import" href="tray">
+-    <link rel="import" href="ipc">
+-    <link rel="import" href="hosthook">
+-    <link rel="import" href="appsysinformation">
+-    <link rel="import" href="clipboard">
+-    <link rel="import" href="pdf">
+-    <link rel="import" href="desktopcapturer">
+-    <link rel="import" href="update">
+ </head>
+ <body>
+ 
+diff --git a/ElectronNET.WebApp/wwwroot/assets/code-blocks.js b/ElectronNET.WebApp/wwwroot/assets/code-blocks.js
+index ebfeb3b4234ec1ceae3b767ddee8844de2f4bb1a..4f1b91409098a6cde4ffeb664ebc4a97f1ed49d3 100644
+--- a/ElectronNET.WebApp/wwwroot/assets/code-blocks.js
++++ b/ElectronNET.WebApp/wwwroot/assets/code-blocks.js
+@@ -1,6 +1,8 @@
+ document.addEventListener('DOMContentLoaded', function () {
++  setTimeout(() => {
+     const codeBlocks = document.querySelectorAll('pre code');
+-  Array.prototype.forEach.call(codeBlocks, function (code) {
++    Array.prototype.forEach.call(codeBlocks, function (code) {
+       hljs.highlightBlock(code)
+-  });
++    });
++  }, 1000);
+ })
+diff --git a/ElectronNET.WebApp/wwwroot/assets/demo-btns.js b/ElectronNET.WebApp/wwwroot/assets/demo-btns.js
+index d3a22013ea1ed20c795ce508af1393339d0acd24..01df8021077b39ecd6761b6f028416ccb2600a1d 100644
+--- a/ElectronNET.WebApp/wwwroot/assets/demo-btns.js
++++ b/ElectronNET.WebApp/wwwroot/assets/demo-btns.js
+@@ -1,11 +1,13 @@
+-const demoBtns = document.querySelectorAll('.js-container-target');
+-
+-// Listen for demo button clicks
+-Array.prototype.forEach.call(demoBtns, function (btn) {
+-  btn.addEventListener('click', function (event) {
+-      const parent = event.target.parentElement;
+-
+-    // Toggles the "is-open" class on the demo's parent element.
+-    parent.classList.toggle('is-open');
++setTimeout(() => {
++  const demoBtns = document.querySelectorAll('.js-container-target');
++  
++  // Listen for demo button clicks
++  Array.prototype.forEach.call(demoBtns, function (btn) {
++    btn.addEventListener('click', function (event) {
++        const parent = event.target.parentElement;
++  
++      // Toggles the "is-open" class on the demo's parent element.
++      parent.classList.toggle('is-open');
++    })
+   })
+-})
++}, 1000);
+diff --git a/ElectronNET.WebApp/wwwroot/assets/imports.js b/ElectronNET.WebApp/wwwroot/assets/imports.js
+index 1c5a7032a2651f7758ab016c1dc72287fd27b3db..27f38fd5f11ce0db58b1105c8eed25d89cd7b447 100644
+--- a/ElectronNET.WebApp/wwwroot/assets/imports.js
++++ b/ElectronNET.WebApp/wwwroot/assets/imports.js
+@@ -1,12 +1,15 @@
+-const links = document.querySelectorAll('link[rel="import"]')
++const links = ["windows", "crashhang", "menus", "shortcuts", "shell", "notifications", "dialogs", "tray", "ipc", "hosthook", "appsysinformation", "clipboard", "pdf", "desktopcapturer", "update"];
+ 
+-// Import and add each page to the DOM
+-Array.prototype.forEach.call(links, function (link) {
+-  let template = link.import.querySelector('.task-template')
+-  let clone = document.importNode(template.content, true)
+-  if (link.href.match('about.html')) {
+-    document.querySelector('body').appendChild(clone)
+-  } else {
+-    document.querySelector('.content').appendChild(clone)
+-  }
+-})
++fetch('about').then((aboutPage) => {
++  aboutPage.text().then(pageContent => {
++    const template = document.createRange().createContextualFragment(pageContent);
++    document.querySelector('body').appendChild(template.firstElementChild.content);
++  });
++});
++
++links.forEach(async pageName => {
++  const page = await fetch(pageName);
++  const pageContent = await page.text();
++  const template = document.createRange().createContextualFragment(pageContent);
++  document.querySelector('.content').appendChild(template.firstElementChild.content);
++});
+\ No newline at end of file
+diff --git a/ElectronNET.WebApp/wwwroot/assets/nav.js b/ElectronNET.WebApp/wwwroot/assets/nav.js
+index 64bb05db6cd9a9e51ae1cc09653c778a060baa58..421050f0d9be132031624d8f4f00e761f7c53686 100644
+--- a/ElectronNET.WebApp/wwwroot/assets/nav.js
++++ b/ElectronNET.WebApp/wwwroot/assets/nav.js
+@@ -74,5 +74,7 @@ function showNav() {
+     document.querySelector('.js-nav').classList.add('is-shown');
+ }
+ 
+-activateDefaultSection();
+-displayAbout();
++setTimeout(() => {
++  activateDefaultSection();
++  displayAbout();
++}, 1000);
+diff --git a/ElectronNET.sln b/ElectronNET.sln
+index eed5a6dff1d403705caa96a867ab03cd5b1a778c..eb37b6766a5b1c5390e2ffd0e7c91dbd49da7e2d 100644
+--- a/ElectronNET.sln
++++ b/ElectronNET.sln
+@@ -1,4 +1,4 @@
+-﻿
++
+ Microsoft Visual Studio Solution File, Format Version 12.00
+ # Visual Studio 15
+ VisualStudioVersion = 15.0.27130.2027
+@@ -36,6 +36,9 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution
+ 		buildAll.sh = buildAll.sh
+ 		buildReleaseNuGetPackages.cmd = buildReleaseNuGetPackages.cmd
+ 		Changelog.md = Changelog.md
++		README.md = README.md
++		start.cmd = start.cmd
++		start.sh = start.sh
+ 	EndProjectSection
+ EndProject
+ Global
+diff --git a/README.md b/README.md
+index 78cdee7de4e92403ca3d42a5a007ca2a5179c82a..c20804a03270400d9e69c74420066c6a65e3e9c3 100644
+--- a/README.md
++++ b/README.md
+@@ -145,7 +145,7 @@ Those three "default" targets will produce x64 packages for those platforms.
+ For certain NuGet packages or certain scenarios you may want to build a pure x86 application. To support those things you can define the desired [.NET Core runtime](https://docs.microsoft.com/en-us/dotnet/core/rid-catalog), the [electron platform](https://github.com/electron-userland/electron-packager/blob/master/docs/api.md#platform) and [electron architecture](https://github.com/electron-userland/electron-packager/blob/master/docs/api.md#arch) like this:
+ 
+ ```
+-electronize build /target custom win7-x86;win32 /electron-arch ia32 
++electronize build /target custom "win7-x86;win32" /electron-arch ia32 
+ ```
+ 
+ The end result should be an electron app under your __/bin/desktop__ folder.
+@@ -270,3 +270,16 @@ BrowserWindowOptions browserWindowOptions = new BrowserWindowOptions
+ }
+ 
+ ```
++
++### Dependency Injection
++
++ElectronNET.Api can be added to your DI container within the Startup class. All of the modules available in Electron will be added as Singletons.
++
++```csharp
++using ElectronNET.API;
++
++public void ConfigureServices(IServiceCollection services)
++{
++    services.AddElectron()
++}
++```
+diff --git a/buildAll.sh b/buildAll.sh
+old mode 100755
+new mode 100644
+index f85e4f028cb2878af836a17efe0eb674514babab..b88f32ece7da675a9bd7aff3f919563d0ef00329
+--- a/buildAll.sh
++++ b/buildAll.sh
+@@ -1,3 +1,17 @@
++# flag arguments to target specific builds are available.
++
++# sh ./buildAll.sh
++# sh ./buildAll.sh -t osx
++# sh ./buildAll.sh -t win
++# sh ./buildAll.sh -t linux
++
++target=default
++while getopts t: flag; do
++    case "${flag}" in
++    t) target=${OPTARG} ;;
++    esac
++done
++
+ dir=$(cd -P -- "$(dirname -- "$0")" && pwd -P)
+ echo "Start building Electron.NET dev stack..."
+ 
+@@ -23,29 +37,35 @@ echo "Restore & Build WebApp Demo"
+ pushd $dir/ElectronNET.WebApp
+     dotnet restore
+     dotnet build
+-    
++
+     echo "Install CLI as dotnet tool"
+-    
++
+     dotnet tool uninstall ElectronNET.CLI -g
+     dotnet tool install ElectronNET.CLI -g
+-    
++
+     echo "Invoke electronize build in WebApp Demo"
+-    echo "/target win (dev-build)"
+-    electronize build /target win
+-    
+-    echo "/target linux (dev-build)"
+-    electronize build /target linux
+-    
+-    # Cannot public osx/win on windows due to:
+-    # NETSDK1095: Optimizing assemblies for performance is not supported for the selected target platform or architecture.
+-    if [[ "$OSTYPE" != "linux-gnu"* ]]; then
+-        echo "/target osx (dev-build)"
+-        electronize build /target osx
+-        
+-        echo "/target custom win7-x86;win (dev-build)"
+-        electronize build /target custom "win7-x86;win"
++
++    if [[ "$target" != "default" ]]; then
++        echo "/target $target (dev-build)"
++        electronize build /target $target
++    else
++        echo "/target win (dev-build)"
++        electronize build /target win
++
++        echo "/target linux (dev-build)"
++        electronize build /target linux
++
++        # Cannot publish osx/win on windows due to:
++        # NETSDK1095: Optimizing assemblies for performance is not supported for the selected target platform or architecture.
++        if [[ "$OSTYPE" != "linux-gnu"* ]]; then
++            echo "/target osx (dev-build)"
++            electronize build /target osx
++
++            echo "/target custom win7-x86;win (dev-build)"
++            electronize build /target custom "win7-x86;win"
++        fi
+     fi
+ popd
+ 
+-# Be aware, that for non-electronnet-dev environments the correct 
++# Be aware, that for non-electronnet-dev environments the correct
+ # invoke command would be dotnet electronize ...

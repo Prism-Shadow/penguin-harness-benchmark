@@ -1,0 +1,5 @@
+set(SDL3_image_FOUND TRUE)
+set(SDL3_image_VERSION "3.2.4")
+if(NOT TARGET SDL3_image::SDL3_image)
+  add_library(SDL3_image::SDL3_image INTERFACE IMPORTED)
+endif()

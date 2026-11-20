@@ -1,0 +1,5680 @@
+diff --git a/.travis.yml b/.travis.yml
+index 2ac22ac..b9810c0 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -1,7 +1,7 @@
+ # http://docs.travis-ci.com/user/languages/go/
+ language: go
+ 
+-go: 1.8.1
++go: 1.8.3
+ 
+ os:
+   - linux
+diff --git a/appveyor.yml b/appveyor.yml
+index 39f2180..dd30a52 100644
+--- a/appveyor.yml
++++ b/appveyor.yml
+@@ -8,7 +8,7 @@ clone_folder: $(GOPATH)\src\github.com\git-lfs\git-lfs
+ 
+ install:
+   - rd C:\Go /s /q
+-  - cinst golang --version 1.8.1 -y
++  - cinst golang --version 1.8.3 -y
+   - cinst InnoSetup -y
+   - refreshenv
+   - ps: |
+diff --git a/commands/command_fetch.go b/commands/command_fetch.go
+index d938da3..e1fc12d 100644
+--- a/commands/command_fetch.go
++++ b/commands/command_fetch.go
+@@ -105,7 +105,7 @@ func fetchCommand(cmd *cobra.Command, args []string) {
+ 	if !success {
+ 		c := getAPIClient()
+ 		e := c.Endpoints.Endpoint("download", cfg.CurrentRemote)
+-		Exit("error: failed to push some objects to '%s'", e.Url)
++		Exit("error: failed to fetch some objects from '%s'", e.Url)
+ 	}
+ }
+ 
+diff --git a/commands/command_migrate.go b/commands/command_migrate.go
+new file mode 100644
+index 0000000..27459bf
+--- /dev/null
++++ b/commands/command_migrate.go
+@@ -0,0 +1,230 @@
++package commands
++
++import (
++	"path/filepath"
++	"strings"
++
++	"github.com/git-lfs/git-lfs/errors"
++	"github.com/git-lfs/git-lfs/git"
++	"github.com/git-lfs/git-lfs/git/githistory"
++	"github.com/git-lfs/git-lfs/git/odb"
++	"github.com/spf13/cobra"
++)
++
++var (
++	// migrateIncludeRefs is a set of Git references to explicitly include
++	// in the migration.
++	migrateIncludeRefs []string
++	// migrateExcludeRefs is a set of Git references to explicitly exclude
++	// in the migration.
++	migrateExcludeRefs []string
++)
++
++// migrate takes the given command and arguments, *odb.ObjectDatabase, as well
++// as a BlobRewriteFn to apply, and performs a migration.
++func migrate(cmd *cobra.Command, args []string, db *odb.ObjectDatabase, fn githistory.BlobRewriteFn) {
++	requireInRepo()
++
++	opts, err := rewriteOptions(args, fn)
++	if err != nil {
++		ExitWithError(err)
++	}
++
++	_, err = getHistoryRewriter(cmd, db).Rewrite(opts)
++	if err != nil {
++		ExitWithError(err)
++	}
++}
++
++// getObjectDatabase creates a *git.ObjectDatabase from the filesystem pointed
++// at the .git directory of the currently checked-out repository.
++func getObjectDatabase() (*odb.ObjectDatabase, error) {
++	dir, err := git.GitDir()
++	if err != nil {
++		return nil, errors.Wrap(err, "cannot open root")
++	}
++	return odb.FromFilesystem(filepath.Join(dir, "objects"))
++}
++
++// rewriteOptions returns *githistory.RewriteOptions able to be passed to a
++// *githistory.Rewriter that reflect the current arguments and flags passed to
++// an invocation of git-lfs-migrate(1).?
++//
++// Repository references are included and excluded based on the following rules:
++//
++// The included and excluded references are determined based on the output of
++// includeExcludeRefs (see below for documentation and detail).
++//
++// The given "fn" githistory.BlobRewriteFn is passed as the BlobFn.
++//
++// If any of the above could not be determined without error, that error will be
++// returned immediately.
++func rewriteOptions(args []string, fn githistory.BlobRewriteFn) (*githistory.RewriteOptions, error) {
++	include, exclude, err := includeExcludeRefs(args)
++	if err != nil {
++		return nil, err
++	}
++
++	return &githistory.RewriteOptions{
++		Include: include,
++		Exclude: exclude,
++
++		BlobFn: fn,
++	}, nil
++}
++
++// includeExcludeRefs returns fully-qualified sets of references to include, and
++// exclude, or an error if those could not be determined.
++//
++// They are determined based on the following rules:
++//
++//   - Include all local refs/heads/<branch> references for each branch
++//     specified as an argument.
++//   - Include the currently checked out branch if no branches are given as
++//     arguments and the --include-ref= or --exclude-ref= flag(s) aren't given.
++//   - Include all references given in --include-ref=<ref>.
++//   - Exclude all references given in --exclude-ref=<ref>.
++func includeExcludeRefs(args []string) (include, exclude []string, err error) {
++	hardcore := len(migrateIncludeRefs) > 0 || len(migrateExcludeRefs) > 0
++
++	if len(args) == 0 && !hardcore {
++		// If no branches were given explicitly AND neither
++		// --include-ref or --exclude-ref flags were given, then add the
++		// currently checked out reference.
++		current, err := currentRefToMigrate()
++		if err != nil {
++			return nil, nil, err
++		}
++		args = append(args, current.Name)
++	}
++
++	for _, name := range args {
++		// Then, loop through each branch given, resolve that reference,
++		// and include it.
++		ref, err := git.ResolveRef(name)
++		if err != nil {
++			return nil, nil, err
++		}
++
++		include = append(include, ref.Name)
++	}
++
++	if hardcore {
++		// If either --include-ref=<ref> or --exclude-ref=<ref> were
++		// given, append those to the include and excluded reference
++		// set, respectively.
++		include = append(include, migrateIncludeRefs...)
++		exclude = append(exclude, migrateExcludeRefs...)
++	} else {
++		// Otherwise, if neither --include-ref=<ref> or
++		// --exclude-ref=<ref> were given, include no additional
++		// references, and exclude all remote references that are remote
++		// branches or remote tags.
++		remoteRefs, err := getRemoteRefs()
++		if err != nil {
++			return nil, nil, err
++		}
++
++		exclude = append(exclude, remoteRefs...)
++	}
++
++	return include, exclude, nil
++}
++
++// getRemoteRefs returns a fully qualified set of references belonging to all
++// remotes known by the currently checked-out repository, or an error if those
++// references could not be determined.
++func getRemoteRefs() ([]string, error) {
++	var refs []string
++
++	remotes, err := git.RemoteList()
++	if err != nil {
++		return nil, err
++	}
++
++	for _, remote := range remotes {
++		refsForRemote, err := git.RemoteRefs(remote)
++		if err != nil {
++			return nil, err
++		}
++
++		for _, ref := range refsForRemote {
++			refs = append(refs, formatRefName(ref, remote))
++		}
++	}
++
++	return refs, nil
++}
++
++// formatRefName returns the fully-qualified name for the given Git reference
++// "ref".
++func formatRefName(ref *git.Ref, remote string) string {
++	var name []string
++
++	switch ref.Type {
++	case git.RefTypeRemoteBranch:
++		name = []string{"refs", "remotes", remote, ref.Name}
++	case git.RefTypeRemoteTag:
++		name = []string{"refs", "tags", ref.Name}
++	default:
++		return ref.Name
++	}
++	return strings.Join(name, "/")
++
++}
++
++// currentRefToMigrate returns the fully-qualified name of the currently
++// checked-out reference, or an error if the reference's type was not a local
++// branch.
++func currentRefToMigrate() (*git.Ref, error) {
++	current, err := git.CurrentRef()
++	if err != nil {
++		return nil, err
++	}
++
++	if current.Type == git.RefTypeOther ||
++		current.Type == git.RefTypeRemoteBranch ||
++		current.Type == git.RefTypeRemoteTag {
++
++		return nil, errors.Errorf("fatal: cannot migrate non-local ref: %s", current.Name)
++	}
++	return current, nil
++}
++
++// getHistoryRewriter returns a history rewriter that includes the filepath
++// filter given by the --include and --exclude arguments.
++func getHistoryRewriter(cmd *cobra.Command, db *odb.ObjectDatabase) *githistory.Rewriter {
++	include, exclude := getIncludeExcludeArgs(cmd)
++	filter := buildFilepathFilter(cfg, include, exclude)
++
++	return githistory.NewRewriter(db, githistory.WithFilter(filter))
++}
++
++func init() {
++	info := NewCommand("info", migrateInfoCommand)
++	info.Flags().IntVar(&migrateInfoTopN, "top", 5, "--top=<n>")
++	info.Flags().StringVar(&migrateInfoAboveFmt, "above", "1mb", "--above=<n>")
++	info.Flags().StringVar(&migrateInfoUnitFmt, "unit", "", "--unit=<unit>")
++
++	RegisterCommand("migrate", nil, func(cmd *cobra.Command) {
++		// Adding flags directly to cmd.Flags() doesn't apply those
++		// flags to any subcommands of the root. Therefore, loop through
++		// each subcommand specifically, and include common arguments to
++		// each.
++		//
++		// Once done, link each orphaned command to the
++		// `git-lfs-migrate(1)` command as a subcommand (child).
++
++		for _, subcommand := range []*cobra.Command{
++			info,
++		} {
++			subcommand.Flags().StringVarP(&includeArg, "include", "I", "", "Include a list of paths")
++			subcommand.Flags().StringVarP(&excludeArg, "exclude", "X", "", "Exclude a list of paths")
++
++			subcommand.Flags().StringSliceVar(&migrateIncludeRefs, "include-ref", nil, "An explicit list of refs to include")
++			subcommand.Flags().StringSliceVar(&migrateExcludeRefs, "exclude-ref", nil, "An explicit list of refs to exclude")
++
++			cmd.AddCommand(subcommand)
++		}
++	})
++}
+diff --git a/commands/command_migrate_info.go b/commands/command_migrate_info.go
+new file mode 100644
+index 0000000..013b2d0
+--- /dev/null
++++ b/commands/command_migrate_info.go
+@@ -0,0 +1,197 @@
++package commands
++
++import (
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	"github.com/git-lfs/git-lfs/errors"
++	"github.com/git-lfs/git-lfs/git/odb"
++	"github.com/git-lfs/git-lfs/tools"
++	"github.com/git-lfs/git-lfs/tools/humanize"
++	"github.com/spf13/cobra"
++)
++
++var (
++	// migrateInfoTopN is a flag given to the git-lfs-migrate(1) subcommand
++	// 'info' which specifies how many info entries to show by default.
++	migrateInfoTopN int
++
++	// migrateInfoAboveFmt is a flag given to the git-lfs-migrate(1)
++	// subcommand 'info' specifying a human-readable string threshold of
++	// filesize before entries are counted.
++	migrateInfoAboveFmt string
++	// migrateInfoAbove is the number of bytes parsed from the above
++	// migrateInfoAboveFmt flag.
++	migrateInfoAbove uint64
++
++	// migrateInfoUnitFmt is a flag given to the git-lfs-migrate(1)
++	// subcommand 'info' specifying a human-readable string of units with
++	// which to display the number of bytes.
++	migrateInfoUnitFmt string
++	// migrateInfoUnit is the number of bytes in the unit given as
++	// migrateInfoUnitFmt.
++	migrateInfoUnit uint64
++)
++
++func migrateInfoCommand(cmd *cobra.Command, args []string) {
++	db, err := getObjectDatabase()
++	if err != nil {
++		ExitWithError(err)
++	}
++
++	defer db.Close()
++	exts := make(map[string]*MigrateInfoEntry)
++
++	above, err := humanize.ParseBytes(migrateInfoAboveFmt)
++	if err != nil {
++		ExitWithError(errors.Wrap(err, "cannot parse --above=<n>"))
++	}
++
++	if u := cmd.Flag("unit"); u.Changed {
++		unit, err := humanize.ParseByteUnit(u.Value.String())
++		if err != nil {
++			ExitWithError(errors.Wrap(err, "cannot parse --unit=<unit>"))
++		}
++
++		migrateInfoUnit = unit
++	}
++
++	migrateInfoAbove = above
++
++	migrate(cmd, args, db, func(path string, b *odb.Blob) (*odb.Blob, error) {
++		ext := fmt.Sprintf("*%s", filepath.Ext(path))
++
++		if len(ext) > 1 {
++			entry := exts[ext]
++			if entry == nil {
++				entry = &MigrateInfoEntry{Qualifier: ext}
++			}
++
++			entry.Total++
++			entry.BytesTotal += b.Size
++
++			if b.Size > int64(migrateInfoAbove) {
++				entry.TotalAbove++
++				entry.BytesAbove += b.Size
++			}
++
++			exts[ext] = entry
++		}
++
++		return b, nil
++	})
++
++	entries := EntriesBySize(MapToEntries(exts))
++	sort.Sort(sort.Reverse(entries))
++
++	migrateInfoTopN = tools.ClampInt(migrateInfoTopN, len(entries), 0)
++
++	entries = entries[:tools.MaxInt(0, migrateInfoTopN)]
++
++	if _, err := entries.Print(os.Stdout); err != nil {
++		ExitWithError(err)
++	}
++}
++
++// MigrateInfoEntry represents a tuple of filetype to bytes and entry count
++// above and below a threshold.
++type MigrateInfoEntry struct {
++	// Qualifier is the filepath's extension.
++	Qualifier string
++
++	// BytesAbove is total size of all files above a given threshold.
++	BytesAbove int64
++	// TotalAbove is the count of all files above a given size threshold.
++	TotalAbove int64
++	// BytesTotal is the number of bytes of all files
++	BytesTotal int64
++	// Total is the count of all files.
++	Total int64
++}
++
++// MapToEntries creates a set of `*MigrateInfoEntry`'s for a given map of
++// filepath extensions to file size in bytes.
++func MapToEntries(exts map[string]*MigrateInfoEntry) []*MigrateInfoEntry {
++	entries := make([]*MigrateInfoEntry, 0, len(exts))
++	for _, entry := range exts {
++		entries = append(entries, entry)
++	}
++
++	return entries
++}
++
++// EntriesBySize is an implementation of sort.Interface that sorts a set of
++// `*MigrateInfoEntry`'s
++type EntriesBySize []*MigrateInfoEntry
++
++// Len returns the total length of the set of `*MigrateInfoEntry`'s.
++func (e EntriesBySize) Len() int { return len(e) }
++
++// Less returns the whether or not the MigrateInfoEntry given at `i` takes up
++// less total size than the MigrateInfoEntry given at `j`.
++func (e EntriesBySize) Less(i, j int) bool {
++	if e[i].BytesAbove == e[j].BytesAbove {
++		return e[i].Qualifier < e[j].Qualifier
++	}
++	return e[i].BytesAbove < e[j].BytesAbove
++}
++
++// Swap swaps the entries given at i, j.
++func (e EntriesBySize) Swap(i, j int) { e[i], e[j] = e[j], e[i] }
++
++// Print formats the `*MigrateInfoEntry`'s in the set and prints them to the
++// given io.Writer, "to", returning "n" the number of bytes written, and any
++// error, if one occurred.
++func (e EntriesBySize) Print(to io.Writer) (int, error) {
++	extensions := make([]string, 0, len(e))
++	sizes := make([]string, 0, len(e))
++	stats := make([]string, 0, len(e))
++	percentages := make([]string, 0, len(e))
++
++	for _, entry := range e {
++		bytesAbove := uint64(entry.BytesAbove)
++		above := entry.TotalAbove
++		total := entry.Total
++		percentAbove := 100 * (float64(above) / float64(total))
++
++		var size string
++		if migrateInfoUnit > 0 {
++			size = humanize.FormatBytesUnit(bytesAbove, migrateInfoUnit)
++		} else {
++			size = humanize.FormatBytes(bytesAbove)
++		}
++
++		stat := fmt.Sprintf("%d/%d files(s)",
++			above, total)
++
++		percentage := fmt.Sprintf("%.0f%%", percentAbove)
++
++		extensions = append(extensions, entry.Qualifier)
++		sizes = append(sizes, size)
++		stats = append(stats, stat)
++		percentages = append(percentages, percentage)
++	}
++
++	extensions = tools.Ljust(extensions)
++	sizes = tools.Ljust(sizes)
++	stats = tools.Rjust(stats)
++	percentages = tools.Rjust(percentages)
++
++	output := make([]string, 0, len(e))
++	for i := 0; i < len(e); i++ {
++		extension := extensions[i]
++		size := sizes[i]
++		stat := stats[i]
++		percentage := percentages[i]
++
++		line := strings.Join([]string{extension, size, stat, percentage}, "\t")
++
++		output = append(output, line)
++	}
++
++	return fmt.Fprintln(to, strings.Join(output, "\n"))
++}
+diff --git a/commands/command_prune.go b/commands/command_prune.go
+index e289b64..291219f 100644
+--- a/commands/command_prune.go
++++ b/commands/command_prune.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/git-lfs/git-lfs/localstorage"
+ 	"github.com/git-lfs/git-lfs/progress"
+ 	"github.com/git-lfs/git-lfs/tools"
++	"github.com/git-lfs/git-lfs/tools/humanize"
+ 	"github.com/git-lfs/git-lfs/tq"
+ 	"github.com/rubyist/tracerx"
+ 	"github.com/spf13/cobra"
+@@ -142,7 +143,7 @@ func prune(fetchPruneConfig config.FetchPruneConfig, verifyRemote, dryRun, verbo
+ 			totalSize += file.Size
+ 			if verbose {
+ 				// Save up verbose output for the end, spinner still going
+-				verboseOutput.WriteString(fmt.Sprintf(" * %v (%v)\n", file.Oid, humanizeBytes(file.Size)))
++				verboseOutput.WriteString(fmt.Sprintf(" * %v (%v)\n", file.Oid, humanize.FormatBytes(uint64(file.Size))))
+ 			}
+ 
+ 			if verifyRemote {
+@@ -171,12 +172,12 @@ func prune(fetchPruneConfig config.FetchPruneConfig, verifyRemote, dryRun, verbo
+ 		return
+ 	}
+ 	if dryRun {
+-		Print("%d files would be pruned (%v)", len(prunableObjects), humanizeBytes(totalSize))
++		Print("%d files would be pruned (%v)", len(prunableObjects), humanize.FormatBytes(uint64(totalSize)))
+ 		if verbose {
+ 			Print(verboseOutput.String())
+ 		}
+ 	} else {
+-		Print("Pruning %d files, (%v)", len(prunableObjects), humanizeBytes(totalSize))
++		Print("Pruning %d files, (%v)", len(prunableObjects), humanize.FormatBytes(uint64(totalSize)))
+ 		if verbose {
+ 			Print(verboseOutput.String())
+ 		}
+@@ -461,26 +462,6 @@ func pruneTaskGetReachableObjects(gitscanner *lfs.GitScanner, outObjectSet *tool
+ 	}
+ }
+ 
+-var byteUnits = []string{"B", "KB", "MB", "GB", "TB"}
+-
+-func humanizeBytes(bytes int64) string {
+-	var output string
+-	size := float64(bytes)
+-
+-	if bytes < 1024 {
+-		return fmt.Sprintf("%d B", bytes)
+-	}
+-
+-	for _, unit := range byteUnits {
+-		if size < 1024.0 {
+-			output = fmt.Sprintf("%3.1f %s", size, unit)
+-			break
+-		}
+-		size /= 1024.0
+-	}
+-	return output
+-}
+-
+ func init() {
+ 	RegisterCommand("prune", pruneCommand, func(cmd *cobra.Command) {
+ 		cmd.Flags().BoolVarP(&pruneDryRunArg, "dry-run", "d", false, "Don't delete anything, just report")
+diff --git a/commands/command_pull.go b/commands/command_pull.go
+index c2f7f22..de4f56d 100644
+--- a/commands/command_pull.go
++++ b/commands/command_pull.go
+@@ -113,7 +113,7 @@ func pull(remote string, filter *filepathfilter.Filter) {
+ 	if !success {
+ 		c := getAPIClient()
+ 		e := c.Endpoints.Endpoint("download", remote)
+-		Exit("error: failed to push some objects to '%s'", e.Url)
++		Exit("error: failed to fetch some objects from '%s'", e.Url)
+ 	}
+ }
+ 
+diff --git a/commands/command_status.go b/commands/command_status.go
+index 6bc38ac..e74e26b 100644
+--- a/commands/command_status.go
++++ b/commands/command_status.go
+@@ -2,6 +2,7 @@ package commands
+ 
+ import (
+ 	"crypto/sha256"
++	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"os"
+@@ -14,7 +15,8 @@ import (
+ )
+ 
+ var (
+-	porcelain = false
++	porcelain  = false
++	statusJson = false
+ )
+ 
+ func statusCommand(cmd *cobra.Command, args []string) {
+@@ -31,6 +33,9 @@ func statusCommand(cmd *cobra.Command, args []string) {
+ 	if porcelain {
+ 		porcelainStagedPointers(scanIndexAt)
+ 		return
++	} else if statusJson {
++		jsonStagedPointers(scanIndexAt)
++		return
+ 	}
+ 
+ 	statusScanRefRange(ref)
+@@ -224,6 +229,43 @@ func statusScanRefRange(ref *git.Ref) {
+ 
+ }
+ 
++type JSONStatusEntry struct {
++	Status string `json:"status"`
++	From   string `json:"from,omitempty"`
++}
++
++type JSONStatus struct {
++	Files map[string]JSONStatusEntry `json:"files"`
++}
++
++func jsonStagedPointers(ref string) {
++	staged, unstaged, err := scanIndex(ref)
++	if err != nil {
++		ExitWithError(err)
++	}
++
++	status := JSONStatus{Files: make(map[string]JSONStatusEntry)}
++
++	for _, entry := range append(unstaged, staged...) {
++		switch entry.Status {
++		case lfs.StatusRename, lfs.StatusCopy:
++			status.Files[entry.DstName] = JSONStatusEntry{
++				Status: string(entry.Status), From: entry.SrcName,
++			}
++		default:
++			status.Files[entry.SrcName] = JSONStatusEntry{
++				Status: string(entry.Status),
++			}
++		}
++	}
++
++	ret, err := json.Marshal(status)
++	if err != nil {
++		ExitWithError(err)
++	}
++	Print(string(ret))
++}
++
+ func porcelainStagedPointers(ref string) {
+ 	staged, unstaged, err := scanIndex(ref)
+ 	if err != nil {
+@@ -260,5 +302,6 @@ func porcelainStatusLine(entry *lfs.DiffIndexEntry) string {
+ func init() {
+ 	RegisterCommand("status", statusCommand, func(cmd *cobra.Command) {
+ 		cmd.Flags().BoolVarP(&porcelain, "porcelain", "p", false, "Give the output in an easy-to-parse format for scripts.")
++		cmd.Flags().BoolVarP(&statusJson, "json", "j", false, "Give the output in a stable json format for scripts.")
+ 	})
+ }
+diff --git a/commands/uploader.go b/commands/uploader.go
+index b6ffd45..0a40c54 100644
+--- a/commands/uploader.go
++++ b/commands/uploader.go
+@@ -122,6 +122,9 @@ func newUploadContext(remote string, dryRun bool) *uploadContext {
+ func verifyLocks(remote string) (ours, theirs []locking.Lock, st verifyState) {
+ 	endpoint := getAPIClient().Endpoints.Endpoint("upload", remote)
+ 	state := getVerifyStateFor(endpoint)
++	if state == verifyStateDisabled {
++		return
++	}
+ 
+ 	lockClient := newLockClient(remote)
+ 
+diff --git a/docs/man/git-lfs-migrate.1.ronn b/docs/man/git-lfs-migrate.1.ronn
+new file mode 100644
+index 0000000..934f41a
+--- /dev/null
++++ b/docs/man/git-lfs-migrate.1.ronn
+@@ -0,0 +1,94 @@
++git-lfs-migrate(1) - Migrate history to or from git-lfs
++=======================================================
++
++## SYNOPSIS
++
++`git lfs migrate` <mode> [options] [--] [branch ...]
++
++## MODES
++
++* `info`
++    Show information about repository size.
++
++## OPTIONS
++
++* `-I` <paths> `--include=`<paths>:
++    See [INCLUDE AND EXCLUDE].
++
++* `-X` <paths> `--exclude=`<paths>:
++    See [INCLUDE AND EXCLUDE].
++
++* `--include-ref`=<refname>:
++    See [INCLUDE AND EXCLUDE (REFS)].
++
++* `--exclude-ref`=<refname>:
++    See [INCLUDE AND EXCLUDE (REFS)].
++
++* [branch ...]:
++    Migrate only the set of branches listed. If not given, `git-lfs-migrate(1)`
++    will migrate the currently checked out branch.
++
++    If any of `--include-ref` or `--exclude-ref` are given, the checked out
++    branch will not be appended, but branches given explicitly will be appended.
++
++### INFO
++
++The 'info' mode has these additional options:
++
++* `--above=<size>`
++    Only count files whose individual filesize is above the given size. 'size'
++    may be specified as a number of bytes, or a number followed by a storage
++    unit, e.g., "1b", "20 MB", "3 TiB", etc.
++
++* `--top=<n>`
++    Only include the top 'n' entries, ordered by the total bytes in files above
++    the threshold. Equal-sized groups have a deterministic order.
++
++* `--unit=<unit>`
++    Format the number of bytes in each entry as a quantity of the storage unit
++    provided. Valid units include:
++      * b, kib, mib, gib, tib, pib - for IEC storage units
++      * b, kb, mb, gb, tb, pb - for SI storage units
++
++    If a --unit is not specified, the largest unit that can fit the number of
++    counted bytes as a whole number quantity is chosen.
++
++## INCLUDE AND EXCLUDE
++
++You can configure Git LFS to only migrate tree entries whose pathspec matches
++the include glob and does not match the exclude glob, to reduce total migration
++time or to only migrate part of your repo.
++
++Pattern matching is done as given to be functionally equivalent to pattern
++matching as in .gitattributes.
++
++## INCLUDE AND EXCLUDE (REFS)
++
++You can configure Git LFS to only migrate commits reachable by references
++include by `--include-ref` and not reachable by `--exclude-ref`.
++
++        D---E---F
++       /         \
++  A---B------C    refs/heads/my-feature
++   \          \
++    \          refs/heads/master
++     \
++      refs/remotes/origin/master
++
++In the above configuration, the following commits are reachable by each ref:
++
++refs/heads/master:         C, B, A
++refs/heads/my-feature:     F, E, D, B, A
++refs/remote/origin/master: A
++
++The following configuration:
++
++  --include-ref=refs/heads/my-feature
++  --include-ref=refs/heads/master
++  --exclude-ref=refs/remotes/origin/master
++
++Would, therefore, include commits: F, E, D, C, B, but exclude commit A.
++
++## SEE ALSO
++
++Part of the git-lfs(1) suite.
+diff --git a/docs/man/git-lfs-status.1.ronn b/docs/man/git-lfs-status.1.ronn
+index 45b004a..4fe533d 100644
+--- a/docs/man/git-lfs-status.1.ronn
++++ b/docs/man/git-lfs-status.1.ronn
+@@ -22,6 +22,8 @@ Display paths of Git LFS objects that
+ 
+ * `--porcelain`:
+     Give the output in an easy-to-parse format for scripts.
++* `--json`:
++    Give the output in a stable json format for scripts.
+ 
+ ## SEE ALSO
+ 
+diff --git a/docs/man/git-lfs-track.1.ronn b/docs/man/git-lfs-track.1.ronn
+index fa88161..234880e 100644
+--- a/docs/man/git-lfs-track.1.ronn
++++ b/docs/man/git-lfs-track.1.ronn
+@@ -51,11 +51,11 @@ to match paths.
+ 
+ * Configure Git LFS to track GIF files:
+ 
+-    `git lfs track '*.gif'`
++    `git lfs track "*.gif"`
+ 
+ * Configure Git LFS to track PSD files and make them read-only unless locked:
+ 
+-    `git lfs track --lockable '*.psd'`
++    `git lfs track --lockable "*.psd"`
+ 
+ ## SEE ALSO
+ 
+diff --git a/docs/man/git-lfs-untrack.1.ronn b/docs/man/git-lfs-untrack.1.ronn
+index 72c6a3f..138e65b 100644
+--- a/docs/man/git-lfs-untrack.1.ronn
++++ b/docs/man/git-lfs-untrack.1.ronn
+@@ -14,7 +14,7 @@ can be a glob pattern or a file path.
+ 
+ * Configure Git LFS to stop tracking GIF files:
+ 
+-    `git lfs untrack '*.gif'`
++    `git lfs untrack "*.gif"`
+ 
+ ## SEE ALSO
+ 
+diff --git a/errors/types.go b/errors/types.go
+index e4fafd8..efeca36 100644
+--- a/errors/types.go
++++ b/errors/types.go
+@@ -2,6 +2,7 @@ package errors
+ 
+ import (
+ 	"fmt"
++	"net/url"
+ 
+ 	"github.com/pkg/errors"
+ )
+@@ -134,6 +135,9 @@ func IsRetriableError(err error) bool {
+ 	}); ok {
+ 		return e.RetriableError()
+ 	}
++	if cause, ok := Cause(err).(*url.Error); ok {
++		return cause.Temporary() || cause.Timeout()
++	}
+ 	if parent := parentOf(err); parent != nil {
+ 		return IsRetriableError(parent)
+ 	}
+diff --git a/errors/types_test.go b/errors/types_test.go
+new file mode 100644
+index 0000000..a71ab9f
+--- /dev/null
++++ b/errors/types_test.go
+@@ -0,0 +1,46 @@
++package errors_test
++
++import (
++	"net/url"
++	"testing"
++
++	"github.com/git-lfs/git-lfs/errors"
++	"github.com/stretchr/testify/assert"
++)
++
++type TemporaryError struct {
++}
++
++func (e TemporaryError) Error() string {
++	return ""
++}
++
++func (e TemporaryError) Temporary() bool {
++	return true
++}
++
++type TimeoutError struct {
++}
++
++func (e TimeoutError) Error() string {
++	return ""
++}
++
++func (e TimeoutError) Timeout() bool {
++	return true
++}
++
++func TestCanRetryOnTemporaryError(t *testing.T) {
++	err := &url.Error{Err: TemporaryError{}}
++	assert.True(t, errors.IsRetriableError(err))
++}
++
++func TestCanRetryOnTimeoutError(t *testing.T) {
++	err := &url.Error{Err: TimeoutError{}}
++	assert.True(t, errors.IsRetriableError(err))
++}
++
++func TestCannotRetryOnGenericUrlError(t *testing.T) {
++	err := &url.Error{Err: errors.New("")}
++	assert.False(t, errors.IsRetriableError(err))
++}
+diff --git a/filepathfilter/filepathfilter.go b/filepathfilter/filepathfilter.go
+index b9ec532..dbbf6ba 100644
+--- a/filepathfilter/filepathfilter.go
++++ b/filepathfilter/filepathfilter.go
+@@ -93,7 +93,13 @@ func NewPattern(rawpattern string) Pattern {
+ 	// Also support ** with path separators
+ 	if hasPathSep && strings.Contains(cleanpattern, "**") {
+ 		pattern := regexp.QuoteMeta(cleanpattern)
+-		regpattern := fmt.Sprintf("^%s$", strings.Replace(pattern, "\\*\\*", ".*", -1))
++		// A double star followed by a separator matches zero or more
++		// directories; ordinary stars still stop at a separator.
++		pattern = strings.Replace(pattern, `\*\*`+regexp.QuoteMeta(sep), "\x00", -1)
++		pattern = strings.Replace(pattern, `\*\*`, ".*", -1)
++		pattern = strings.Replace(pattern, `\*`, "[^"+regexp.QuoteMeta(sep)+"]*", -1)
++		pattern = strings.Replace(pattern, "\x00", "(.*"+regexp.QuoteMeta(sep)+")?", -1)
++		regpattern := fmt.Sprintf("^%s$", pattern)
+ 		return &doubleWildcardPattern{
+ 			rawPattern: cleanpattern,
+ 			wildcardRE: regexp.MustCompile(regpattern),
+diff --git a/git/git.go b/git/git.go
+index 8a6b5ee..9dd0e99 100644
+--- a/git/git.go
++++ b/git/git.go
+@@ -5,6 +5,7 @@ package git
+ import (
+ 	"bufio"
+ 	"bytes"
++	"encoding/hex"
+ 	"errors"
+ 	"fmt"
+ 	"io/ioutil"
+@@ -38,6 +39,30 @@ const (
+ 	RefBeforeFirstCommit = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+ )
+ 
++// Prefix returns the given RefType's prefix, "refs/heads", "ref/remotes",
++// etc. It returns an additional value of either true/false, whether or not this
++// given ref type has a prefix.
++//
++// If the RefType is unrecognized, Prefix() will panic.
++func (t RefType) Prefix() (string, bool) {
++	switch t {
++	case RefTypeLocalBranch:
++		return "refs/heads", true
++	case RefTypeRemoteBranch:
++		return "refs/remotes", true
++	case RefTypeLocalTag:
++		return "refs/tags", true
++	case RefTypeRemoteTag:
++		return "refs/remotes/tags", true
++	case RefTypeHEAD:
++		return "", false
++	case RefTypeOther:
++		return "", false
++	default:
++		panic(fmt.Sprintf("git: unknown RefType %d", t))
++	}
++}
++
+ // A git reference (branch, tag etc)
+ type Ref struct {
+ 	Name string
+@@ -229,6 +254,35 @@ func LocalRefs() ([]*Ref, error) {
+ 	return refs, cmd.Wait()
+ }
+ 
++// UpdateRef moves the given ref to a new sha with a given reason (and creates a
++// reflog entry, if a "reason" was provided). It returns an error if any were
++// encountered.
++func UpdateRef(ref *Ref, to []byte, reason string) error {
++	return UpdateRefIn("", ref, to, reason)
++}
++
++// UpdateRef moves the given ref to a new sha with a given reason (and creates a
++// reflog entry, if a "reason" was provided). It operates within the given
++// working directory "wd". It returns an error if any were encountered.
++func UpdateRefIn(wd string, ref *Ref, to []byte, reason string) error {
++	var refspec string
++	if prefix, ok := ref.Type.Prefix(); ok {
++		refspec = fmt.Sprintf("%s/%s", prefix, ref.Name)
++	} else {
++		refspec = ref.Name
++	}
++
++	args := []string{"update-ref", refspec, hex.EncodeToString(to)}
++	if len(reason) > 0 {
++		args = append(args, "-m", reason)
++	}
++
++	cmd := subprocess.ExecCommand("git", args...)
++	cmd.Dir = wd
++
++	return cmd.Run()
++}
++
+ // ValidateRemote checks that a named remote is valid for use
+ // Mainly to check user-supplied remotes & fail more nicely
+ func ValidateRemote(remote string) error {
+@@ -509,12 +563,12 @@ func ParseRefToTypeAndName(fullref string) (t RefType, name string) {
+ 	} else if strings.HasPrefix(fullref, localPrefix) {
+ 		name = fullref[len(localPrefix):]
+ 		t = RefTypeLocalBranch
+-	} else if strings.HasPrefix(fullref, remotePrefix) {
+-		name = fullref[len(remotePrefix):]
+-		t = RefTypeRemoteBranch
+ 	} else if strings.HasPrefix(fullref, remoteTagPrefix) {
+ 		name = fullref[len(remoteTagPrefix):]
+ 		t = RefTypeRemoteTag
++	} else if strings.HasPrefix(fullref, remotePrefix) {
++		name = fullref[len(remotePrefix):]
++		t = RefTypeRemoteBranch
+ 	} else if strings.HasPrefix(fullref, localTagPrefix) {
+ 		name = fullref[len(localTagPrefix):]
+ 		t = RefTypeLocalTag
+@@ -950,6 +1004,29 @@ func CloneWithoutFilters(flags CloneFlags, args []string) error {
+ 	return nil
+ }
+ 
++// Checkout performs an invocation of `git-checkout(1)` applying the given
++// treeish, paths, and force option, if given.
++//
++// If any error was encountered, it will be returned immediately. Otherwise, the
++// checkout has occurred successfully.
++func Checkout(treeish string, paths []string, force bool) error {
++	args := []string{"checkout"}
++	if force {
++		args = append(args, "--force")
++	}
++
++	if len(treeish) > 0 {
++		args = append(args, treeish)
++	}
++
++	if len(paths) > 0 {
++		args = append(args, append([]string{"--"}, paths...)...)
++	}
++
++	_, err := subprocess.SimpleExec("git", args...)
++	return err
++}
++
+ // CachedRemoteRefs returns the list of branches & tags for a remote which are
+ // currently cached locally. No remote request is made to verify them.
+ func CachedRemoteRefs(remoteName string) ([]*Ref, error) {
+@@ -1012,6 +1089,53 @@ func RemoteRefs(remoteName string) ([]*Ref, error) {
+ 	return ret, cmd.Wait()
+ }
+ 
++// AllRefs returns a slice of all references in a Git repository in the current
++// working directory, or an error if those references could not be loaded.
++func AllRefs() ([]*Ref, error) {
++	return AllRefsIn("")
++}
++
++// AllRefs returns a slice of all references in a Git repository located in a
++// the given working directory "wd", or an error if those references could not
++// be loaded.
++func AllRefsIn(wd string) ([]*Ref, error) {
++	cmd := subprocess.ExecCommand("git",
++		"for-each-ref", "--format=%(objectname)%00%(refname)")
++	cmd.Dir = wd
++
++	outp, err := cmd.StdoutPipe()
++	if err != nil {
++		return nil, lfserrors.Wrap(err, "cannot open pipe")
++	}
++	cmd.Start()
++
++	refs := make([]*Ref, 0)
++
++	scanner := bufio.NewScanner(outp)
++	for scanner.Scan() {
++		parts := strings.SplitN(scanner.Text(), "\x00", 2)
++		if len(parts) != 2 {
++			return nil, lfserrors.Errorf(
++				"git: invalid for-each-ref line: %q", scanner.Text())
++		}
++
++		sha := parts[0]
++		typ, name := ParseRefToTypeAndName(parts[1])
++
++		refs = append(refs, &Ref{
++			Name: name,
++			Type: typ,
++			Sha:  sha,
++		})
++	}
++
++	if err := scanner.Err(); err != nil {
++		return nil, err
++	}
++
++	return refs, nil
++}
++
+ // GetTrackedFiles returns a list of files which are tracked in Git which match
+ // the pattern specified (standard wildcard form)
+ // Both pattern and the results are relative to the current working directory, not
+diff --git a/git/git_test.go b/git/git_test.go
+index 0f3f95d..4df2d4d 100644
+--- a/git/git_test.go
++++ b/git/git_test.go
+@@ -542,3 +542,35 @@ func TestValidateRemoteURL(t *testing.T) {
+ 	assert.Nil(t, ValidateRemoteURL("git@server:/absolute/path.git"))
+ 	assert.NotNil(t, ValidateRemoteURL("ftp://git@github.com/git-lfs/git-lfs"))
+ }
++
++func TestRefTypeKnownPrefixes(t *testing.T) {
++	for typ, expected := range map[RefType]struct {
++		Prefix string
++		Ok     bool
++	}{
++		RefTypeLocalBranch:  {"refs/heads", true},
++		RefTypeRemoteBranch: {"refs/remotes", true},
++		RefTypeLocalTag:     {"refs/tags", true},
++		RefTypeRemoteTag:    {"refs/remotes/tags", true},
++		RefTypeHEAD:         {"", false},
++		RefTypeOther:        {"", false},
++	} {
++		prefix, ok := typ.Prefix()
++
++		assert.Equal(t, expected.Prefix, prefix)
++		assert.Equal(t, expected.Ok, ok)
++	}
++}
++
++func TestRefTypeUnknownPrefix(t *testing.T) {
++	defer func() {
++		if err := recover(); err != nil {
++			assert.Equal(t, "git: unknown RefType -1", err)
++		} else {
++			t.Fatal("git: expected panic() from RefType.Prefix()")
++		}
++	}()
++
++	unknown := RefType(-1)
++	unknown.Prefix()
++}
+diff --git a/git/githistory/fixtures/identical-blobs.git/HEAD b/git/githistory/fixtures/identical-blobs.git/HEAD
+new file mode 100644
+index 0000000..cb089cd
+--- /dev/null
++++ b/git/githistory/fixtures/identical-blobs.git/HEAD
+@@ -0,0 +1 @@
++ref: refs/heads/master
+diff --git a/git/githistory/fixtures/identical-blobs.git/config b/git/githistory/fixtures/identical-blobs.git/config
+new file mode 100644
+index 0000000..6c9406b
+--- /dev/null
++++ b/git/githistory/fixtures/identical-blobs.git/config
+@@ -0,0 +1,7 @@
++[core]
++	repositoryformatversion = 0
++	filemode = true
++	bare = false
++	logallrefupdates = true
++	ignorecase = true
++	precomposeunicode = true
+diff --git a/git/githistory/fixtures/identical-blobs.git/index b/git/githistory/fixtures/identical-blobs.git/index
+new file mode 100644
+index 0000000000000000000000000000000000000000..312ec31421b5d50b8e3d77e669eb8ca24dfbd258
+GIT binary patch
+literal 209
+zcmZ?q402{*U|<5_NW(k7fiwe*W@KPsVKC0Q%fQgMgn@zaD^N-Vh&iTwPUPW;XmJqK
+zyIF3YueRd%!psc}tciLh6(u0;ApL)lX{b3*h%+Y%Zca#$t1HkPNd_YY1Fmh_u5Yy?
+p&l}xM&skD3{dtz`>N$1ie$QH|wTUHT`9r;(%7@J_ik61*0RXv$Jxl-q
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/identical-blobs.git/logs/HEAD b/git/githistory/fixtures/identical-blobs.git/logs/HEAD
+new file mode 100644
+index 0000000..5577a8a
+--- /dev/null
++++ b/git/githistory/fixtures/identical-blobs.git/logs/HEAD
+@@ -0,0 +1 @@
++0000000000000000000000000000000000000000 42723ad796caa500ddf4e3f6ad37600ed5a65491 Taylor Blau <me@ttaylorr.com> 1496440063 -0600	commit (initial): initial commit
+diff --git a/git/githistory/fixtures/identical-blobs.git/logs/refs/heads/master b/git/githistory/fixtures/identical-blobs.git/logs/refs/heads/master
+new file mode 100644
+index 0000000..5577a8a
+--- /dev/null
++++ b/git/githistory/fixtures/identical-blobs.git/logs/refs/heads/master
+@@ -0,0 +1 @@
++0000000000000000000000000000000000000000 42723ad796caa500ddf4e3f6ad37600ed5a65491 Taylor Blau <me@ttaylorr.com> 1496440063 -0600	commit (initial): initial commit
+diff --git a/git/githistory/fixtures/identical-blobs.git/objects/42/723ad796caa500ddf4e3f6ad37600ed5a65491 b/git/githistory/fixtures/identical-blobs.git/objects/42/723ad796caa500ddf4e3f6ad37600ed5a65491
+new file mode 100644
+index 0000000..6b104fe
+--- /dev/null
++++ b/git/githistory/fixtures/identical-blobs.git/objects/42/723ad796caa500ddf4e3f6ad37600ed5a65491
+@@ -0,0 +1,2 @@
++xïç]
++B!F{v≥Å¬ø;"DDkh£N$hÇÃ}h˜I≠†ßŒ˜Â—{0¡d2CBõ¸∆≈¶-Êá≥•`¿L>¯8 ôB)Ê¿ävyé	wz∑Ö[£ŒùØ"_1OyÙ—{≠—¡Q£÷jŸu'¸w®Í´J•øı©h8Ú
+\ No newline at end of file
+diff --git a/git/githistory/fixtures/identical-blobs.git/objects/94/f3610c08588440112ed977376f26a8fba169b0 b/git/githistory/fixtures/identical-blobs.git/objects/94/f3610c08588440112ed977376f26a8fba169b0
+new file mode 100644
+index 0000000000000000000000000000000000000000..00ac760b13db7d690a51bf6c9ba190d9209359ca
+GIT binary patch
+literal 23
+fcmb<m^geacKWIb33H?((=g)YbVPw!)&FTvPf2s-Y
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/identical-blobs.git/objects/b6/2b45ed2b59cf32dd676ca47497e76a1dab9c7e b/git/githistory/fixtures/identical-blobs.git/objects/b6/2b45ed2b59cf32dd676ca47497e76a1dab9c7e
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ae7f00141a6ac57041fdad25f15c0ec5896f60d
+GIT binary patch
+literal 55
+zcmb<m)YkO!4K*-MHZU<TFg6VIxT3vMBXPzj%ZcsEi;g-5yieO%x$jojeQslO2T_%W
+LAq))7E>ckd8<G@G
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/identical-blobs.git/refs/heads/master b/git/githistory/fixtures/identical-blobs.git/refs/heads/master
+new file mode 100644
+index 0000000..2a69103
+--- /dev/null
++++ b/git/githistory/fixtures/identical-blobs.git/refs/heads/master
+@@ -0,0 +1 @@
++42723ad796caa500ddf4e3f6ad37600ed5a65491
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/HEAD b/git/githistory/fixtures/linear-history-with-tags.git/HEAD
+new file mode 100644
+index 0000000..cb089cd
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history-with-tags.git/HEAD
+@@ -0,0 +1 @@
++ref: refs/heads/master
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/config b/git/githistory/fixtures/linear-history-with-tags.git/config
+new file mode 100644
+index 0000000..6c9406b
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history-with-tags.git/config
+@@ -0,0 +1,7 @@
++[core]
++	repositoryformatversion = 0
++	filemode = true
++	bare = false
++	logallrefupdates = true
++	ignorecase = true
++	precomposeunicode = true
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/index b/git/githistory/fixtures/linear-history-with-tags.git/index
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4668719a8f97c123d81e50b84509846e8bd9934
+GIT binary patch
+literal 137
+zcmZ?q402{*U|<4b#z@PpsX&?mMl&)nurQ?W*I;01TmqE-3X~E7sWTB^(_U5+cXf8F
+zbNh-td<TTwCucBl6zAur>XlTKFffD!xw-<?NirBJ7;q`PdAruGWT9|o{L>Fy8<;cw
+d^yKE0yqd7WO*#JOvf19}XD^%c#G>(B833IEDb4@@
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/logs/HEAD b/git/githistory/fixtures/linear-history-with-tags.git/logs/HEAD
+new file mode 100644
+index 0000000..7de3b66
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history-with-tags.git/logs/HEAD
+@@ -0,0 +1,3 @@
++0000000000000000000000000000000000000000 91b85be6928569390e937479509b80a1d0dccb0c Taylor Blau <me@ttaylorr.com> 1496954196 -0600	commit (initial): some.txt: a
++91b85be6928569390e937479509b80a1d0dccb0c 228afe30855933151f7a88e70d9d88314fd2f191 Taylor Blau <me@ttaylorr.com> 1496954207 -0600	commit: some.txt: b
++228afe30855933151f7a88e70d9d88314fd2f191 d941e4756add6b06f5bee766fcf669f55419f13f Taylor Blau <me@ttaylorr.com> 1496954214 -0600	commit: some.txt: c
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/logs/refs/heads/master b/git/githistory/fixtures/linear-history-with-tags.git/logs/refs/heads/master
+new file mode 100644
+index 0000000..7de3b66
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history-with-tags.git/logs/refs/heads/master
+@@ -0,0 +1,3 @@
++0000000000000000000000000000000000000000 91b85be6928569390e937479509b80a1d0dccb0c Taylor Blau <me@ttaylorr.com> 1496954196 -0600	commit (initial): some.txt: a
++91b85be6928569390e937479509b80a1d0dccb0c 228afe30855933151f7a88e70d9d88314fd2f191 Taylor Blau <me@ttaylorr.com> 1496954207 -0600	commit: some.txt: b
++228afe30855933151f7a88e70d9d88314fd2f191 d941e4756add6b06f5bee766fcf669f55419f13f Taylor Blau <me@ttaylorr.com> 1496954214 -0600	commit: some.txt: c
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/20/ecedad3e74a113695fe5f00ab003694e2e1e9c b/git/githistory/fixtures/linear-history-with-tags.git/objects/20/ecedad3e74a113695fe5f00ab003694e2e1e9c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2033da03fd91964e5aba030302808d3882550519
+GIT binary patch
+literal 53
+zcmb<m)YkO!4K*-JHZU<TFg6U-ICtLns`g5aL<7Nu%W+}C<)vk-i+^|7*08tSQBP-J
+J(7M9U3INlR5<ma|
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/22/8afe30855933151f7a88e70d9d88314fd2f191 b/git/githistory/fixtures/linear-history-with-tags.git/objects/22/8afe30855933151f7a88e70d9d88314fd2f191
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe0fd76b15c28f584228414a90229a6e329c2749
+GIT binary patch
+literal 156
+zcmV;N0Av4n0hNy12|_Ut1^rGHX~4_oofQ$W1{=s@MZp+}dqKN5*nwXI1H(C`w{~Nx
+zRow6(l1`_H-dt>~&X!P((;i*YA(mt_Xh+IG$yPkmpa)A-Il4?9b#xvL0-*^upaaYi
+zlB!Tk$xuXE`Pzp(r_X)jbWf|?H##!^#8^si2dOO1HLD@WEqDMi?YzhIcPL)H(ZX-u
+K$t=F?q(f>cN=PyQ
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/2e/65efe2a145dda7ee51d1741299f848e5bf752e b/git/githistory/fixtures/linear-history-with-tags.git/objects/2e/65efe2a145dda7ee51d1741299f848e5bf752e
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e46ba4a32b0d9c687dbc65f4a2241a91250a71d
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(gN1>Ig((OCEph}s
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/34/10062ba67c5ed59b854387a8bc0ec012479368 b/git/githistory/fixtures/linear-history-with-tags.git/objects/34/10062ba67c5ed59b854387a8bc0ec012479368
+new file mode 100644
+index 0000000000000000000000000000000000000000..7582510252d990d1eda2a6e99c307d5c70e8b99e
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(gN=cQjVS~GErtX`
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/3c/b3201d7942353fff5f45e03d114e8e7a061f87 b/git/githistory/fixtures/linear-history-with-tags.git/objects/3c/b3201d7942353fff5f45e03d114e8e7a061f87
+new file mode 100644
+index 0000000000000000000000000000000000000000..01f148d9ddd6ba2a41350bbb3fb0f728e59c9185
+GIT binary patch
+literal 53
+zcmV-50LuS(0V^p=O;s>9V=y!@Ff%bxD9+DK)hnqeVbDu`|7fA>-R18BFO~?+{NeF*
+Lf2ke-R*e!*BWV`o
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/52/a8963f48d54c7d352695a278ca4b025e130cb4 b/git/githistory/fixtures/linear-history-with-tags.git/objects/52/a8963f48d54c7d352695a278ca4b025e130cb4
+new file mode 100644
+index 0000000000000000000000000000000000000000..08e48bcbfd7ba2d5f3a388db8dc23f751b10ef2f
+GIT binary patch
+literal 52
+zcmb<m)YkO!4K*-JHZU<TFg6U-ICtLns`g5aM2~%izq$I0I^sB^pA>D>n|J(B?P*&E
+I({FtL0pQRTAOHXW
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/63/d8dbd40c23542e740659a7168a0ce3138ea748 b/git/githistory/fixtures/linear-history-with-tags.git/objects/63/d8dbd40c23542e740659a7168a0ce3138ea748
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9051fff80f9972c98cda05b66725cedc1ecb517
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(gNcEMl_?kiEouZk
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/91/b85be6928569390e937479509b80a1d0dccb0c b/git/githistory/fixtures/linear-history-with-tags.git/objects/91/b85be6928569390e937479509b80a1d0dccb0c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a6199bb0367bf38b4a7cb6c286b7e54040d4be4
+GIT binary patch
+literal 127
+zcmV-_0D%8^0hNtg3c@fD0R7G>_5zmO=G7D_;u*X^OgAVr1mYIz?G4_*uYrMKQZ3~r
+zKps!hm_et99+6fb%&4u-IooV3qh5&&PwXQ)%9B@dmuGEokDsmMw#6MTg|8w%(S}sZ
+h0%U><)=+S8Mu(`n?K|PWL-nqO2RUShsJ?V2Hhqe_JA(iK
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/objects/d9/41e4756add6b06f5bee766fcf669f55419f13f b/git/githistory/fixtures/linear-history-with-tags.git/objects/d9/41e4756add6b06f5bee766fcf669f55419f13f
+new file mode 100644
+index 0000000000000000000000000000000000000000..e134799bafd6154d3fd8e46981ef87c478addace
+GIT binary patch
+literal 156
+zcmV;N0Av4n0hNy32?8+?gndpGX~1JQKX-|Uh&9;2nru)oM&cf5_Xa!gX_yZ_W>Ty5
+zCfZ=wNN3gtIB}+Id2xhj=jaRj0zeml(Ht8_j!8YK^J9o6P+<$f`)DnCEDMFe3*?wX
+zu;@xQ1tTh2<=VPF)8{_obf;DCD<4IEpiimQgGLv}pfl+77G?l7=(s2Rx2RsN@+5EB
+K>7>4jYD5?ZZ%9M{
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/refs/heads/master b/git/githistory/fixtures/linear-history-with-tags.git/refs/heads/master
+new file mode 100644
+index 0000000..35f2d5d
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history-with-tags.git/refs/heads/master
+@@ -0,0 +1 @@
++d941e4756add6b06f5bee766fcf669f55419f13f
+diff --git a/git/githistory/fixtures/linear-history-with-tags.git/refs/tags/middle b/git/githistory/fixtures/linear-history-with-tags.git/refs/tags/middle
+new file mode 100644
+index 0000000..5e7d4b2
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history-with-tags.git/refs/tags/middle
+@@ -0,0 +1 @@
++228afe30855933151f7a88e70d9d88314fd2f191
+diff --git a/git/githistory/fixtures/linear-history.git/HEAD b/git/githistory/fixtures/linear-history.git/HEAD
+new file mode 100644
+index 0000000..cb089cd
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history.git/HEAD
+@@ -0,0 +1 @@
++ref: refs/heads/master
+diff --git a/git/githistory/fixtures/linear-history.git/config b/git/githistory/fixtures/linear-history.git/config
+new file mode 100644
+index 0000000..6c9406b
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history.git/config
+@@ -0,0 +1,7 @@
++[core]
++	repositoryformatversion = 0
++	filemode = true
++	bare = false
++	logallrefupdates = true
++	ignorecase = true
++	precomposeunicode = true
+diff --git a/git/githistory/fixtures/linear-history.git/index b/git/githistory/fixtures/linear-history.git/index
+new file mode 100644
+index 0000000000000000000000000000000000000000..53c91b2aaca21a0e5e1e5d8807d32833a531ab17
+GIT binary patch
+literal 137
+zcmZ?q402{*U|<4b#z=$WA3&M`Ml&)nurL@YxG*p@E&)n^1xks4)ID){dcr9pGj;jz
+z@_V=RPGux&%Lg-XW~Aoi<m;7GlrV$@xw-<?NirBJ7;xpW?=?JKaAfVJlf@oVSAJP+
+dGCh@<BQ*bra9!pdzZD@8=Fxv&?Mz;|7XWN#EOP(=
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/logs/HEAD b/git/githistory/fixtures/linear-history.git/logs/HEAD
+new file mode 100644
+index 0000000..9e7c036
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history.git/logs/HEAD
+@@ -0,0 +1,3 @@
++0000000000000000000000000000000000000000 62811b8f930323895033b3b338c35f51c0b7268b Taylor Blau <me@ttaylorr.com> 1496347620 -0600	commit (initial): hello.txt: 1
++62811b8f930323895033b3b338c35f51c0b7268b efeab7a9b61312fa56fc74eee1e0f5a714abfb70 Taylor Blau <me@ttaylorr.com> 1496347630 -0600	commit: hello.txt: 2
++efeab7a9b61312fa56fc74eee1e0f5a714abfb70 e669b63f829bfb0b91fc52a5bcea53dd7977a0ee Taylor Blau <me@ttaylorr.com> 1496347641 -0600	commit: hello.txt: 3
+diff --git a/git/githistory/fixtures/linear-history.git/logs/refs/heads/master b/git/githistory/fixtures/linear-history.git/logs/refs/heads/master
+new file mode 100644
+index 0000000..9e7c036
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history.git/logs/refs/heads/master
+@@ -0,0 +1,3 @@
++0000000000000000000000000000000000000000 62811b8f930323895033b3b338c35f51c0b7268b Taylor Blau <me@ttaylorr.com> 1496347620 -0600	commit (initial): hello.txt: 1
++62811b8f930323895033b3b338c35f51c0b7268b efeab7a9b61312fa56fc74eee1e0f5a714abfb70 Taylor Blau <me@ttaylorr.com> 1496347630 -0600	commit: hello.txt: 2
++efeab7a9b61312fa56fc74eee1e0f5a714abfb70 e669b63f829bfb0b91fc52a5bcea53dd7977a0ee Taylor Blau <me@ttaylorr.com> 1496347641 -0600	commit: hello.txt: 3
+diff --git a/git/githistory/fixtures/linear-history.git/objects/56/a6051ca2b02b04ef92d5150c9ef600403cb1de b/git/githistory/fixtures/linear-history.git/objects/56/a6051ca2b02b04ef92d5150c9ef600403cb1de
+new file mode 100644
+index 0000000000000000000000000000000000000000..b17dfe30e64f245f6aa2284091ae1af5cba214ff
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(fQ5nk3X>85F9rm}
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/objects/62/811b8f930323895033b3b338c35f51c0b7268b b/git/githistory/fixtures/linear-history.git/objects/62/811b8f930323895033b3b338c35f51c0b7268b
+new file mode 100644
+index 0000000..9e62508
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history.git/objects/62/811b8f930323895033b3b338c35f51c0b7268b
+@@ -0,0 +1 @@
++xïç›	1}N€Ä«ÆÊÚ#"b6]X8!!pÏÅvo∞üÜ)ΩµóëD9ÿ¶JQ‡S“"âΩjéä0À¬ŸYí§Xª≠}£'>u‡Q±”µÈ›Ï'∂©Ùv#Ò9ú}'¶#f7Ïÿô˛∫UkÌìΩÌB‚æÓ^7
+\ No newline at end of file
+diff --git a/git/githistory/fixtures/linear-history.git/objects/6e/07bd31cb70c4add2c973481ad4fa38b235ca69 b/git/githistory/fixtures/linear-history.git/objects/6e/07bd31cb70c4add2c973481ad4fa38b235ca69
+new file mode 100644
+index 0000000000000000000000000000000000000000..26d8eda20cbd5e6c6be6466cf8d90cb2de6462ac
+GIT binary patch
+literal 54
+zcmV-60LlM&0V^p=O;s>9XD~D{Ff%bx$Vkn}$=55XC}DWw@brXJL}u#p-{tpi>7B|*
+M)Rqqh0Aj8Ylxa>GGXMYp
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/objects/71/a488ec1804ee97ea651b094aa9181ca85aab0a b/git/githistory/fixtures/linear-history.git/objects/71/a488ec1804ee97ea651b094aa9181ca85aab0a
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa415b1dee31a899719293baec5f26ce6fde6a53
+GIT binary patch
+literal 54
+zcmb<m)YkO!4K*-JH!v|UFg6T4;c@ol$?MuHH4-_Zk7;erXf`|j+cVs?@>y+i!G@a^
+K{0#P<{0{&h%@wNv
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/objects/c5/decfe1fcf39b8c489f4a0bf3b3823676339f80 b/git/githistory/fixtures/linear-history.git/objects/c5/decfe1fcf39b8c489f4a0bf3b3823676339f80
+new file mode 100644
+index 0000000000000000000000000000000000000000..5306da1fe273a33cef2967f41b6633fb45b0c020
+GIT binary patch
+literal 54
+zcmV-60LlM&0V^p=O;s>9XD~D{Ff%bx$Vkn}$=55XC}FsvX7{p<b;_lNY~H`pf5n5k
+Mxfd+~08c0olvZgMcK`qY
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/objects/d8/263ee9860594d2806b0dfd1bfd17528b0ba2a4 b/git/githistory/fixtures/linear-history.git/objects/d8/263ee9860594d2806b0dfd1bfd17528b0ba2a4
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b1baefffb3b60b8e9181765583c22017a52f5b2
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(fQf<oDw8q*F8&0>
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/objects/e4/40e5c842586965a7fb77deda2eca68612b1f53 b/git/githistory/fixtures/linear-history.git/objects/e4/40e5c842586965a7fb77deda2eca68612b1f53
+new file mode 100644
+index 0000000000000000000000000000000000000000..c412ae465fe670ef8631017fde0a1c57b655e04d
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(fQ^Cs8j}hDFB$~O
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/objects/e6/69b63f829bfb0b91fc52a5bcea53dd7977a0ee b/git/githistory/fixtures/linear-history.git/objects/e6/69b63f829bfb0b91fc52a5bcea53dd7977a0ee
+new file mode 100644
+index 0000000..5acde6b
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history.git/objects/e6/69b63f829bfb0b91fc52a5bcea53dd7977a0ee
+@@ -0,0 +1,3 @@
++xïéQ
++!E˚vn†¡ßéé≠°<ı…NÜºÅ⁄}“˙:p‡\nj€ˆ`©!∏IG «l EØí≈úu
++ﬁÿ0€Çfâ⁄Ã	]/ÏÙdIÖ0z—Å]pv%yKD@™ÃË¡b,cK‡ŒkÎÚéü:p´∏ÀÛFWÊüËSj€EÇŒXÔ,»£rJâa«=¶øC±R≠m‚7ü§_‹F
+\ No newline at end of file
+diff --git a/git/githistory/fixtures/linear-history.git/objects/ef/eab7a9b61312fa56fc74eee1e0f5a714abfb70 b/git/githistory/fixtures/linear-history.git/objects/ef/eab7a9b61312fa56fc74eee1e0f5a714abfb70
+new file mode 100644
+index 0000000000000000000000000000000000000000..74ea02b565028eeaf36e651cfe398102ad8446dc
+GIT binary patch
+literal 158
+zcmV;P0Ac@l0hNwX3PK?eMf-LYZlK5LsBesjXbo*ZO)1a}nFqD|q#g8i;cyT4rrz3v
+zrB;5&BWIcHEvJ%INd<kRWXKm2AQp^B8r|v;eIXF9F!Gb7)1*|S;t^0Ic?&q35s?zw
+zVpW2;YDZCojqiQPYxvX|ml`&CZ28Rm17k_Oouo3}p_v;X_uv4;r1Ku<zeRD+wf2SI
+Me2`jv0k6VC@TBZa*8l(j
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/linear-history.git/refs/heads/master b/git/githistory/fixtures/linear-history.git/refs/heads/master
+new file mode 100644
+index 0000000..b2cf4df
+--- /dev/null
++++ b/git/githistory/fixtures/linear-history.git/refs/heads/master
+@@ -0,0 +1 @@
++e669b63f829bfb0b91fc52a5bcea53dd7977a0ee
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/HEAD b/git/githistory/fixtures/non-repeated-subtrees.git/HEAD
+new file mode 100644
+index 0000000..cb089cd
+--- /dev/null
++++ b/git/githistory/fixtures/non-repeated-subtrees.git/HEAD
+@@ -0,0 +1 @@
++ref: refs/heads/master
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/config b/git/githistory/fixtures/non-repeated-subtrees.git/config
+new file mode 100644
+index 0000000..6c9406b
+--- /dev/null
++++ b/git/githistory/fixtures/non-repeated-subtrees.git/config
+@@ -0,0 +1,7 @@
++[core]
++	repositoryformatversion = 0
++	filemode = true
++	bare = false
++	logallrefupdates = true
++	ignorecase = true
++	precomposeunicode = true
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/index b/git/githistory/fixtures/non-repeated-subtrees.git/index
+new file mode 100644
+index 0000000000000000000000000000000000000000..c975ac0460505ea0acd303eb6af1384ac7c009b7
+GIT binary patch
+literal 248
+zcmZ?q402{*U|<5_NYnXSfHVV)W@KPsVKAw`%fQgMgn@zaD^N-Vh*^6@PXBD){Oek?
+zxXcuZnZ5HfOgNMoSQGV1DoQ}wLHbW4(-3nS<j~ELTywW^HP;@|<AwhiqCXyLit|fo
+zVBje(O-jiu(ocdL#}E?a>IyW^g270^kjqwj)tYw)T94}4g)gZp-BDd8df`1p3xlD8
+w0hdtSxl>n4&px}w;K3@JBqX!?lHru~^LX|O*7{WmSl&?W<`8u9_~>B-05&{HumAu6
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/logs/HEAD b/git/githistory/fixtures/non-repeated-subtrees.git/logs/HEAD
+new file mode 100644
+index 0000000..18c82d3
+--- /dev/null
++++ b/git/githistory/fixtures/non-repeated-subtrees.git/logs/HEAD
+@@ -0,0 +1,2 @@
++0000000000000000000000000000000000000000 37f99c7f2706d317b3bf7ff13d574eef33d8788a Taylor Blau <me@ttaylorr.com> 1496686519 -0600	commit (initial): a.txt: initial commit
++37f99c7f2706d317b3bf7ff13d574eef33d8788a bc63077ac5e575ccc9dbbd93dc882f1e10600ea7 Taylor Blau <me@ttaylorr.com> 1496686541 -0600	commit: subdir/b.txt: initial commit
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/logs/refs/heads/master b/git/githistory/fixtures/non-repeated-subtrees.git/logs/refs/heads/master
+new file mode 100644
+index 0000000..18c82d3
+--- /dev/null
++++ b/git/githistory/fixtures/non-repeated-subtrees.git/logs/refs/heads/master
+@@ -0,0 +1,2 @@
++0000000000000000000000000000000000000000 37f99c7f2706d317b3bf7ff13d574eef33d8788a Taylor Blau <me@ttaylorr.com> 1496686519 -0600	commit (initial): a.txt: initial commit
++37f99c7f2706d317b3bf7ff13d574eef33d8788a bc63077ac5e575ccc9dbbd93dc882f1e10600ea7 Taylor Blau <me@ttaylorr.com> 1496686541 -0600	commit: subdir/b.txt: initial commit
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/objects/07/bd7fbfc41b7d36135bcffe7c465490f4aca32d b/git/githistory/fixtures/non-repeated-subtrees.git/objects/07/bd7fbfc41b7d36135bcffe7c465490f4aca32d
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c3d45498744c37721f206890262d9fd5d0b484a
+GIT binary patch
+literal 50
+zcmV-20L}k+0V^p=O;s>9W-v4`Ff%bxNYpE-C}HRoIsLPF^RH{o;xbbtX7<j{FyT-J
+I036*8&d4SdaR2}S
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/objects/12/7ececad475cde6da0048051d62121cabd23194 b/git/githistory/fixtures/non-repeated-subtrees.git/objects/12/7ececad475cde6da0048051d62121cabd23194
+new file mode 100644
+index 0000000000000000000000000000000000000000..393a2e2ff049449b33963c921c8721835fa8bad6
+GIT binary patch
+literal 50
+zcmb<m)YkO!4K*-JGcYkQFg6VIxTL*OBXL4Z@%BQ~>v9(#xBiz{WG|Q1_1QavfkEUW
+Ge<1*_4-%CC
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/objects/19/acdd81ab0abc15c771fe005bf1c2825e4e6080 b/git/githistory/fixtures/non-repeated-subtrees.git/objects/19/acdd81ab0abc15c771fe005bf1c2825e4e6080
+new file mode 100644
+index 0000000000000000000000000000000000000000..4aaa4e8e9de0e2f809f0b03aa32618d0dc8f3143
+GIT binary patch
+literal 20
+bcmb<m^geacKgb}}<C6AD4Mqlur_4_QP(KHX
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/objects/37/f99c7f2706d317b3bf7ff13d574eef33d8788a b/git/githistory/fixtures/non-repeated-subtrees.git/objects/37/f99c7f2706d317b3bf7ff13d574eef33d8788a
+new file mode 100644
+index 0000000000000000000000000000000000000000..39bc7a69285a61701f5cba49d375c66d03d66927
+GIT binary patch
+literal 133
+zcmV;00DAv;0hNv02?8+`1^rGHw*i;Lyfz{t)?foSFAO9b2zNodH)sWZ4GhdVp|@5D
+z#L5peQUY#$wAtsNgtt)|A+--VCmWQ}%JHl)pgcu}J3ae=2fpjXz2Xj+mTp8}F_zHV
+n6@+retVRn5M{YQ0)6P3ee}@bgdeIrmR;XZw-w^u%TUk4Mqc1l;
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/objects/3d/1baaaceec085c52e3e57a47a75b87b7615d0ef b/git/githistory/fixtures/non-repeated-subtrees.git/objects/3d/1baaaceec085c52e3e57a47a75b87b7615d0ef
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c2e712bd9aba33d06d95a763e9f53078fa72cfd
+GIT binary patch
+literal 82
+zcmV-Y0ImOc0V^p=O;s>6V=y!@Ff%bxNYpE-C}HRoIsLPF^RH{o;xbbtX7<j{FyT-(
+oF#rOE;?ks)%pwM%x^t(ll%9Qdi@}3cHc3ck^(Dh80MF_ht7(8Fd;kCd
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/objects/8d/14cbf983b3fad683171c9418998d9f68340823 b/git/githistory/fixtures/non-repeated-subtrees.git/objects/8d/14cbf983b3fad683171c9418998d9f68340823
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e41c137033e2ab1785aedb6647f1b29bbbf8fe2
+GIT binary patch
+literal 20
+bcmb<m^geacKgb}}<BIl54Mqlu2h2|ZP(ufX
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/objects/bc/63077ac5e575ccc9dbbd93dc882f1e10600ea7 b/git/githistory/fixtures/non-repeated-subtrees.git/objects/bc/63077ac5e575ccc9dbbd93dc882f1e10600ea7
+new file mode 100644
+index 0000000..eca6423
+--- /dev/null
++++ b/git/githistory/fixtures/non-repeated-subtrees.git/objects/bc/63077ac5e575ccc9dbbd93dc882f1e10600ea7
+@@ -0,0 +1,2 @@
++xïéQj√0Û≠SÏíJ^K+óBœ–¨§ÿqQ÷ê‹>¶=AøÊÒÚ∫,Ma@–.X\bÊ,ímÙŸÇ‚âGbÚ)R¢‡|±RÕwπ+ ’i T≤°†£Ñ©R≠ãßQ§"ñH1≤·Mokáo~Õ;æfﬁ‡º»UıWÙS^ó∏q
++!?:8⁄`≠ŸÌ~OÂﬂ°yl©¥˛ëN˙‘Oh˜¶çg¯€3o.«KÔ
+\ No newline at end of file
+diff --git a/git/githistory/fixtures/non-repeated-subtrees.git/refs/heads/master b/git/githistory/fixtures/non-repeated-subtrees.git/refs/heads/master
+new file mode 100644
+index 0000000..6b3e2c9
+--- /dev/null
++++ b/git/githistory/fixtures/non-repeated-subtrees.git/refs/heads/master
+@@ -0,0 +1 @@
++bc63077ac5e575ccc9dbbd93dc882f1e10600ea7
+diff --git a/git/githistory/fixtures/octopus-merge.git/HEAD b/git/githistory/fixtures/octopus-merge.git/HEAD
+new file mode 100644
+index 0000000..cb089cd
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/HEAD
+@@ -0,0 +1 @@
++ref: refs/heads/master
+diff --git a/git/githistory/fixtures/octopus-merge.git/ORIG_HEAD b/git/githistory/fixtures/octopus-merge.git/ORIG_HEAD
+new file mode 100644
+index 0000000..a91274e
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/ORIG_HEAD
+@@ -0,0 +1 @@
++8be6d64cddab01f53381e9feafe50d95ca5e6629
+diff --git a/git/githistory/fixtures/octopus-merge.git/config b/git/githistory/fixtures/octopus-merge.git/config
+new file mode 100644
+index 0000000..6c9406b
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/config
+@@ -0,0 +1,7 @@
++[core]
++	repositoryformatversion = 0
++	filemode = true
++	bare = false
++	logallrefupdates = true
++	ignorecase = true
++	precomposeunicode = true
+diff --git a/git/githistory/fixtures/octopus-merge.git/index b/git/githistory/fixtures/octopus-merge.git/index
+new file mode 100644
+index 0000000000000000000000000000000000000000..a68f76852db7a134dff118ce9dae4888b0128aa3
+GIT binary patch
+literal 281
+zcmZ?q402{*U|<4b=19Y7bAdDijAmqDU|}$NJcogyaR~zh<5!@R2oN*srM`c((Dm-}
+zcYzm6gl7Kmc)Gt-kAXE&ucV>`q#dpw&7Aq@<|N;^eT7FkM6ZM`a=BO+&tu`f<sJ;I
+zNyz5pLCpix5cfQKj%E()wm&{e-03&tr&`6x2pOze9lLem1_sWI)SR4ruvsBNuC73H
+zBpHkq47l{I`cBS`cAf3GEj=!%w9m38&X9S<jY8wP(nTK*i#kkIw1^h?yMSdY09yM`
+A2mk;8
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/logs/HEAD b/git/githistory/fixtures/octopus-merge.git/logs/HEAD
+new file mode 100644
+index 0000000..b43ff78
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/logs/HEAD
+@@ -0,0 +1,8 @@
++0000000000000000000000000000000000000000 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496421999 -0600	commit (initial): initial commit
++8be6d64cddab01f53381e9feafe50d95ca5e6629 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496422012 -0600	checkout: moving from master to branch-a
++8be6d64cddab01f53381e9feafe50d95ca5e6629 251e6b3461a3b5adc6bab694d5ae1abc878edf85 Taylor Blau <me@ttaylorr.com> 1496422020 -0600	commit: a.txt: initial
++251e6b3461a3b5adc6bab694d5ae1abc878edf85 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496422026 -0600	checkout: moving from branch-a to master
++8be6d64cddab01f53381e9feafe50d95ca5e6629 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496422029 -0600	checkout: moving from master to branch-b
++8be6d64cddab01f53381e9feafe50d95ca5e6629 15805fe2044dc1a0508853e93d1a230bd94636be Taylor Blau <me@ttaylorr.com> 1496422035 -0600	commit: b.txt: initial
++15805fe2044dc1a0508853e93d1a230bd94636be 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496422041 -0600	checkout: moving from branch-b to master
++8be6d64cddab01f53381e9feafe50d95ca5e6629 6c9ccaeb45446e3fa88cd5848a940fd34c18192b Taylor Blau <me@ttaylorr.com> 1496422044 -0600	merge branch-a branch-b: Merge made by the 'octopus' strategy.
+diff --git a/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/branch-a b/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/branch-a
+new file mode 100644
+index 0000000..1ac57fc
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/branch-a
+@@ -0,0 +1,2 @@
++0000000000000000000000000000000000000000 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496422012 -0600	branch: Created from HEAD
++8be6d64cddab01f53381e9feafe50d95ca5e6629 251e6b3461a3b5adc6bab694d5ae1abc878edf85 Taylor Blau <me@ttaylorr.com> 1496422020 -0600	commit: a.txt: initial
+diff --git a/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/branch-b b/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/branch-b
+new file mode 100644
+index 0000000..e93a5df
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/branch-b
+@@ -0,0 +1,2 @@
++0000000000000000000000000000000000000000 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496422029 -0600	branch: Created from HEAD
++8be6d64cddab01f53381e9feafe50d95ca5e6629 15805fe2044dc1a0508853e93d1a230bd94636be Taylor Blau <me@ttaylorr.com> 1496422035 -0600	commit: b.txt: initial
+diff --git a/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/master b/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/master
+new file mode 100644
+index 0000000..2d31494
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/logs/refs/heads/master
+@@ -0,0 +1,2 @@
++0000000000000000000000000000000000000000 8be6d64cddab01f53381e9feafe50d95ca5e6629 Taylor Blau <me@ttaylorr.com> 1496421999 -0600	commit (initial): initial commit
++8be6d64cddab01f53381e9feafe50d95ca5e6629 6c9ccaeb45446e3fa88cd5848a940fd34c18192b Taylor Blau <me@ttaylorr.com> 1496422044 -0600	merge branch-a branch-b: Merge made by the 'octopus' strategy.
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/04/df07b08ca746b3167d0f1d1514e2f39a52c16c b/git/githistory/fixtures/octopus-merge.git/objects/04/df07b08ca746b3167d0f1d1514e2f39a52c16c
+new file mode 100644
+index 0000000000000000000000000000000000000000..23f7802746e080d48441e42379d67c6b2af40ae1
+GIT binary patch
+literal 54
+zcmV-60LlM&0V^p=O;s>9XD~D{Ff%bx$Vkn}$=55XC}G(4$0vz9{bu}Bs~8y}gH@|z
+Mw=UcO080)KcQ%a`S^xk5
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/15/805fe2044dc1a0508853e93d1a230bd94636be b/git/githistory/fixtures/octopus-merge.git/objects/15/805fe2044dc1a0508853e93d1a230bd94636be
+new file mode 100644
+index 0000000000000000000000000000000000000000..7da82c9de2f213c285eca84c2daac71d356c631f
+GIT binary patch
+literal 159
+zcmV;Q0AT-k0hNwH3c@fD06pgw`GAsayJ;dK;v4+HcC*1i(@NQb{@&sbJPiyC3@@!!
+zwE+I0tB6H%82#um(vDadGx(4gh=FMs1}MdMC7TzmGOLZFgdBR#nMUUec3t$6ick@B
+zIUy5D2#^eI`dn7~pwG19KG9|`O>U|`v7UHoSL^!}dH~m<J-XnW+3mik@^@&)lfLzA
+N>s+<cWWEQgMv1<CO;Z2>
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/25/1e6b3461a3b5adc6bab694d5ae1abc878edf85 b/git/githistory/fixtures/octopus-merge.git/objects/25/1e6b3461a3b5adc6bab694d5ae1abc878edf85
+new file mode 100644
+index 0000000000000000000000000000000000000000..e058a4d370f39bbabe5f7485b40072a840136cb6
+GIT binary patch
+literal 160
+zcmV;R0AK%j0hNy12?8+?Mg2|{X~1QYO~#Fgh&9;2B$;4f9};FkyEoW@Uk487!cE(<
+zRMFO&gEVH%!Er7WOFSX?a!N7y5MAP_L_}|+hfo+s^`geB=qWO0bSY<wV2U5d$#5^I
+zu!kIcBF~66DB9(@HT|H^+;N|2*O!HFB0tfFv@KU{TtH_nSkOm60M%{3C;azN(I9U*
+O>$+B{G^;P0KSw44YD%gA
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/2e/65efe2a145dda7ee51d1741299f848e5bf752e b/git/githistory/fixtures/octopus-merge.git/objects/2e/65efe2a145dda7ee51d1741299f848e5bf752e
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e46ba4a32b0d9c687dbc65f4a2241a91250a71d
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(gN1>Ig((OCEph}s
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/2f/3a8ec99d5b459b41b6675e52758e397c5e3103 b/git/githistory/fixtures/octopus-merge.git/objects/2f/3a8ec99d5b459b41b6675e52758e397c5e3103
+new file mode 100644
+index 0000000000000000000000000000000000000000..a87f636c6625910be3d91229b351d157eb33c135
+GIT binary patch
+literal 107
+zcmV-x0F?iD0V^p=O;s>7FlI0`FfcPQQApG)sVHI4OMU-nq3hk{?*cED2+jQA@pONw
+z9#laRSV8iQ+gEs$L-b16BA1JG@jMppTkZi>kdc~`lMhz3?T=3qclyovsa7#ELI$f=
+N$8KG?0RSVuD%Q{(Fv$P_
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/5a/0581b158a81b8fc5d2169c2ac2ca7772ff13fd b/git/githistory/fixtures/octopus-merge.git/objects/5a/0581b158a81b8fc5d2169c2ac2ca7772ff13fd
+new file mode 100644
+index 0000000000000000000000000000000000000000..c010e4f045b9d8bb34cfa601c6857131163eaf41
+GIT binary patch
+literal 80
+zcmV-W0I&ae0V^p=O;s>AU@$Z=Ff%bxNYX2*C}Bvxar+97a)@3DTjX-FE}qB2eak(d
+m3Nli2a`M57w*B!*;!eLAKh-KmM#x~*>e#IdHvj<Z${XkYGb4=v
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/63/d8dbd40c23542e740659a7168a0ce3138ea748 b/git/githistory/fixtures/octopus-merge.git/objects/63/d8dbd40c23542e740659a7168a0ce3138ea748
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9051fff80f9972c98cda05b66725cedc1ecb517
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(gNcEMl_?kiEouZk
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/6c/9ccaeb45446e3fa88cd5848a940fd34c18192b b/git/githistory/fixtures/octopus-merge.git/objects/6c/9ccaeb45446e3fa88cd5848a940fd34c18192b
+new file mode 100644
+index 0000000..3e49869
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/objects/6c/9ccaeb45446e3fa88cd5848a940fd34c18192b
+@@ -0,0 +1,2 @@
++xïOªNƒ0§ˆW∏Ku»ˆz7^	!DO«Ï⁄Èí „+¯{z™yhf§©˚∫æüoF7Ûi)VôjF÷ïhF√4c1‡π¢A‡ﬁ§€v1)dää“*©(qn(Ekôãµ•‡o>b	∏X
++9∑%`(¡ZîAgRsrÁΩ˚g˘∏xë´ø[Ìaåo£ﬂ÷}Ω˜13ÂÙ5ÊOÅBpá{‹ˆÔ¢{≤˛b^ªlılÔ~˙a'ôºlÌOÍ‰>⁄[1
+\ No newline at end of file
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/8b/e6d64cddab01f53381e9feafe50d95ca5e6629 b/git/githistory/fixtures/octopus-merge.git/objects/8b/e6d64cddab01f53381e9feafe50d95ca5e6629
+new file mode 100644
+index 0000000..5022c79
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/objects/8b/e6d64cddab01f53381e9feafe50d95ca5e6629
+@@ -0,0 +1,3 @@
++xïçK
++1]Á}•;…$Dƒ3xÅû|0ê8zﬁﬁ†'pUPPÔ≈≠˜*@ﬁd‰hSAø‚9≤∑n5‰|¬Bâ≤Yx—ë\TºÀs‡wõ∏7ﬁ·“ÛM‰+∆)n˝
++dÉ≥öBpDá®¶ùwíˇU}U©‹‡∑†>1I84
+\ No newline at end of file
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/b6/fc4c620b67d95f953a5c1c1230aaab5db5a1b0 b/git/githistory/fixtures/octopus-merge.git/objects/b6/fc4c620b67d95f953a5c1c1230aaab5db5a1b0
+new file mode 100644
+index 0000000000000000000000000000000000000000..84b9ab53b45c3a3bfe59d82d9d88a9705929f953
+GIT binary patch
+literal 20
+ccmb<m^geacKgb~UgvZ&FC)pV!SFvyc09p|T)Bpeg
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/objects/e9/4edfabfb7605f7cb959b4ce8fb6652b509fe03 b/git/githistory/fixtures/octopus-merge.git/objects/e9/4edfabfb7605f7cb959b4ce8fb6652b509fe03
+new file mode 100644
+index 0000000000000000000000000000000000000000..af0b6ba366b1144ad592e18b6bb171741329d404
+GIT binary patch
+literal 80
+zcmV-W0I&ae0V^p=O;s>AU@$Z=Ff%bxNYpE-C}Ge`eg9~o>)qw=0xy;b&HUl<bbqNH
+mR6#~+PEI~p(Y8N6N!;l-<EL81$Osv%S{=J};RXPP!5=m{JtF%6
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/octopus-merge.git/refs/heads/branch-a b/git/githistory/fixtures/octopus-merge.git/refs/heads/branch-a
+new file mode 100644
+index 0000000..7ea0f14
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/refs/heads/branch-a
+@@ -0,0 +1 @@
++251e6b3461a3b5adc6bab694d5ae1abc878edf85
+diff --git a/git/githistory/fixtures/octopus-merge.git/refs/heads/branch-b b/git/githistory/fixtures/octopus-merge.git/refs/heads/branch-b
+new file mode 100644
+index 0000000..4cea6a4
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/refs/heads/branch-b
+@@ -0,0 +1 @@
++15805fe2044dc1a0508853e93d1a230bd94636be
+diff --git a/git/githistory/fixtures/octopus-merge.git/refs/heads/master b/git/githistory/fixtures/octopus-merge.git/refs/heads/master
+new file mode 100644
+index 0000000..6fc0863
+--- /dev/null
++++ b/git/githistory/fixtures/octopus-merge.git/refs/heads/master
+@@ -0,0 +1 @@
++6c9ccaeb45446e3fa88cd5848a940fd34c18192b
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/HEAD b/git/githistory/fixtures/repeated-subtrees.git/HEAD
+new file mode 100644
+index 0000000..cb089cd
+--- /dev/null
++++ b/git/githistory/fixtures/repeated-subtrees.git/HEAD
+@@ -0,0 +1 @@
++ref: refs/heads/master
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/config b/git/githistory/fixtures/repeated-subtrees.git/config
+new file mode 100644
+index 0000000..6c9406b
+--- /dev/null
++++ b/git/githistory/fixtures/repeated-subtrees.git/config
+@@ -0,0 +1,7 @@
++[core]
++	repositoryformatversion = 0
++	filemode = true
++	bare = false
++	logallrefupdates = true
++	ignorecase = true
++	precomposeunicode = true
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/index b/git/githistory/fixtures/repeated-subtrees.git/index
+new file mode 100644
+index 0000000000000000000000000000000000000000..69ff20248d1805df1cf33b99f5b3e19b70be0930
+GIT binary patch
+literal 248
+zcmZ?q402{*U|<5_NQ3qIK$-zYGcqu+Fc>Y(VPI%n!oa}z6(}VFQYW;tM|ocVWLrfu
+z@r656jcwh#)twnw6ZJ|eN<i8{`o)oHs5zx*<}fDTxP663IYh67EpoY77tdqizU3Ya
+zJjJC+DVat3NpRyBLV{dff#z8-7%3QXxnH?1ptSb*n=BDkUS&_Y;J8B?Um#i-3>6Hx
+v_V@}mu35U+toZuTD~C8Q%z1cz^>xNYvxTP?9Pi(&d85<vx1{x<o$0#)62nJ0
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/logs/HEAD b/git/githistory/fixtures/repeated-subtrees.git/logs/HEAD
+new file mode 100644
+index 0000000..f03ad9e
+--- /dev/null
++++ b/git/githistory/fixtures/repeated-subtrees.git/logs/HEAD
+@@ -0,0 +1,2 @@
++0000000000000000000000000000000000000000 0b4747509ab885114690ff291f8f108045b1d749 Taylor Blau <me@ttaylorr.com> 1496362788 -0600	commit (initial): initial commit
++0b4747509ab885114690ff291f8f108045b1d749 b9621d5d84b3174de020ad2c869f43b2f61f337f Taylor Blau <me@ttaylorr.com> 1496362801 -0600	commit: a.txt: changes
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/logs/refs/heads/master b/git/githistory/fixtures/repeated-subtrees.git/logs/refs/heads/master
+new file mode 100644
+index 0000000..f03ad9e
+--- /dev/null
++++ b/git/githistory/fixtures/repeated-subtrees.git/logs/refs/heads/master
+@@ -0,0 +1,2 @@
++0000000000000000000000000000000000000000 0b4747509ab885114690ff291f8f108045b1d749 Taylor Blau <me@ttaylorr.com> 1496362788 -0600	commit (initial): initial commit
++0b4747509ab885114690ff291f8f108045b1d749 b9621d5d84b3174de020ad2c869f43b2f61f337f Taylor Blau <me@ttaylorr.com> 1496362801 -0600	commit: a.txt: changes
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/0b/4747509ab885114690ff291f8f108045b1d749 b/git/githistory/fixtures/repeated-subtrees.git/objects/0b/4747509ab885114690ff291f8f108045b1d749
+new file mode 100644
+index 0000000..a68a735
+--- /dev/null
++++ b/git/githistory/fixtures/repeated-subtrees.git/objects/0b/4747509ab885114690ff291f8f108045b1d749
+@@ -0,0 +1,2 @@
++xïçA
++√ EªˆsÅ≠FÑzÜ^`úL©†d≤ËÌ+È	∫z‡˝O≠÷,`Ç=IgÜâ›àâìq∏Yr6!Öhxõ(jó»éOõÓÚj¯)˜Ç;,ïWëCÙµz„fo˝5ƒgÌµV√é;·øCïﬂY2¯-®/ÂÛ9i
+\ No newline at end of file
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/12/b98c239e8f933d213617a1b965333d478b2743 b/git/githistory/fixtures/repeated-subtrees.git/objects/12/b98c239e8f933d213617a1b965333d478b2743
+new file mode 100644
+index 0000000000000000000000000000000000000000..55decfd5bb5e90a1d993c2bf5494a5978aec659c
+GIT binary patch
+literal 17
+Ycmb<m^geacKgb}-!-R=}uZO7>05oU?DgXcg
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/2e/65efe2a145dda7ee51d1741299f848e5bf752e b/git/githistory/fixtures/repeated-subtrees.git/objects/2e/65efe2a145dda7ee51d1741299f848e5bf752e
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e46ba4a32b0d9c687dbc65f4a2241a91250a71d
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(gN1>Ig((OCEph}s
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/47/d4d71022adc7ec6a14250d23491e535ec228f4 b/git/githistory/fixtures/repeated-subtrees.git/objects/47/d4d71022adc7ec6a14250d23491e535ec228f4
+new file mode 100644
+index 0000000000000000000000000000000000000000..fad214fa7d6859947abb24b5549d85e6ad989e07
+GIT binary patch
+literal 83
+zcmV-Z0IdIb0V^p=O;s>6V=y!@Ff%bxNYpE-C}9xV*`qwKf3mHjnfSt;sm8YM-RjOJ
+p20)-tT$+@US;Vl%SFmx-(#2-Q*N<K~#Cc)P!}F`J0|0eB9C;RAD6s$l
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/5e/497ceceb14ad3c43bac781ed5c804bc67e8f3b b/git/githistory/fixtures/repeated-subtrees.git/objects/5e/497ceceb14ad3c43bac781ed5c804bc67e8f3b
+new file mode 100644
+index 0000000000000000000000000000000000000000..13f43fc0d9747ed6574c3bf47bdd38ff0ba6ca4a
+GIT binary patch
+literal 83
+zcmV-Z0IdIb0V^p=O;s>6V=y!@Ff%bxNYpE-C}Ge`eg9~o>)qw=0xy;b&HUl<bbqOy
+pi2)EO6qhEYWEL^(@fB=bvvjdp@%5uu4sl+X^YHxY>i{YFAg#3>Cl~+#
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/63/d8dbd40c23542e740659a7168a0ce3138ea748 b/git/githistory/fixtures/repeated-subtrees.git/objects/63/d8dbd40c23542e740659a7168a0ce3138ea748
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9051fff80f9972c98cda05b66725cedc1ecb517
+GIT binary patch
+literal 16
+Xcmb<m^geacKgb}(gNcEMl_?kiEouZk
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/b9/621d5d84b3174de020ad2c869f43b2f61f337f b/git/githistory/fixtures/repeated-subtrees.git/objects/b9/621d5d84b3174de020ad2c869f43b2f61f337f
+new file mode 100644
+index 0000000000000000000000000000000000000000..100a30c677a8db65eddabd9f36a9c68c73f3ca2a
+GIT binary patch
+literal 162
+zcmV;T0A2rh0hNwhYQsPb0Q<eC*bBr+vi2292suM8An$7HLL3)If%f(>xk0}M1_q|C
+z%kpiW2tRC7^_&{Fgg_*%CaqDBDL|u<3u+jHR-)Y5{m7<w^DuGZ6rjkIb3o)+pm!?R
+zb4SR)VZxTUIC<K<ZvHBNw;h+8JpJdQXS281hPo~%k6hvyDFgZgL;$zjeb4mYp_9RW
+Q?da<)_b+|87k{Wk28Jb2@&Et;
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/objects/bc/4d1181aca5a33673d7c5d4c209d09ce1cfabd7 b/git/githistory/fixtures/repeated-subtrees.git/objects/bc/4d1181aca5a33673d7c5d4c209d09ce1cfabd7
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1e071d1a99ca90eeea4844ce2af30d83a8c5b32
+GIT binary patch
+literal 49
+zcmb<m)YkO!4K*-JGcYkQFg6VIxTL*OBhh1D;cu?~qK-Ju=qE)R_2wNvRD0T%f%O;f
+FDgc+s64U?y
+
+literal 0
+HcmV?d00001
+
+diff --git a/git/githistory/fixtures/repeated-subtrees.git/refs/heads/master b/git/githistory/fixtures/repeated-subtrees.git/refs/heads/master
+new file mode 100644
+index 0000000..0babb36
+--- /dev/null
++++ b/git/githistory/fixtures/repeated-subtrees.git/refs/heads/master
+@@ -0,0 +1 @@
++b9621d5d84b3174de020ad2c869f43b2f61f337f
+diff --git a/git/githistory/fixtures_test.go b/git/githistory/fixtures_test.go
+new file mode 100644
+index 0000000..a8c622d
+--- /dev/null
++++ b/git/githistory/fixtures_test.go
+@@ -0,0 +1,215 @@
++package githistory
++
++import (
++	"encoding/hex"
++	"fmt"
++	"io"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/git-lfs/git-lfs/git/odb"
++	"github.com/stretchr/testify/assert"
++)
++
++// DatabaseFromFixture returns a *git/odb.ObjectDatabase instance that is safely
++// mutable and created from a template equivelant to the fixture that you
++// provided it.
++//
++// If any error was encountered, it will call t.Fatalf() immediately.
++func DatabaseFromFixture(t *testing.T, name string) *odb.ObjectDatabase {
++	path, err := copyToTmp(filepath.Join("fixtures", name))
++	if err != nil {
++		t.Fatalf("git/odb: could not copy fixture %s: %v", name, err)
++	}
++
++	db, err := odb.FromFilesystem(filepath.Join(path, "objects"))
++	if err != nil {
++		t.Fatalf("git/odb: could not create object database: %v", err)
++	}
++	return db
++}
++
++// AssertBlobContents asserts that the blob contents given by loading the path
++// starting from the root tree "tree" has the given "contents".
++func AssertBlobContents(t *testing.T, db *odb.ObjectDatabase, tree, path, contents string) {
++	// First, load the root tree.
++	root, err := db.Tree(HexDecode(t, tree))
++	if err != nil {
++		t.Fatalf("git/odb: cannot load tree: %s: %s", tree, err)
++	}
++
++	// Then, iterating through each part of the filepath (i.e., a/b/c.txt ->
++	// []string{"a", "b", "c.txt"}).
++	parts := strings.Split(path, string(os.PathSeparator))
++	for i := 0; i < len(parts)-1; i++ {
++		part := parts[i]
++
++		// Load the subtree given by that name.
++		var subtree *odb.Tree
++		for _, entry := range root.Entries {
++			if entry.Name != part {
++				continue
++			}
++
++			subtree, err = db.Tree(entry.Oid)
++			if err != nil {
++				t.Fatalf("git/odb: cannot load subtree %s: %s", filepath.Join(parts[:i]...), err)
++			}
++			break
++		}
++
++		if subtree == nil {
++			t.Fatalf("git/odb: subtree %s does not exist", path)
++		}
++
++		// And re-assign it to root, creating a sort of pseudo-recursion.
++		root = subtree
++	}
++
++	filename := parts[len(parts)-1]
++
++	// Find the blob given by the last entry in parts (the filename).
++	var blob *odb.Blob
++	for _, entry := range root.Entries {
++		if entry.Name == filename {
++			blob, err = db.Blob(entry.Oid)
++			if err != nil {
++				t.Fatalf("git/odb: cannot load blob %x: %s", entry.Oid, err)
++			}
++		}
++	}
++
++	// If we couldn't find the blob, fail immediately.
++	if blob == nil {
++		t.Fatalf("git/odb: blob at %s in %s does not exist", path, tree)
++	}
++
++	// Perform an assertion on the blob's contents.
++	got, err := ioutil.ReadAll(blob.Contents)
++	if err != nil {
++		t.Fatalf("git/odb: cannot read contents from blob %s: %s", path, err)
++	}
++
++	assert.Equal(t, contents, string(got))
++}
++
++// AssertCommitParent asserts that the given commit has a parent equivalent to
++// the one provided.
++func AssertCommitParent(t *testing.T, db *odb.ObjectDatabase, sha, parent string) {
++	commit, err := db.Commit(HexDecode(t, sha))
++	if err != nil {
++		t.Fatalf("git/odb: expected to read commit: %s, couldn't: %v", sha, err)
++	}
++
++	decoded, err := hex.DecodeString(parent)
++	if err != nil {
++		t.Fatalf("git/odb: expected to decode parent SHA: %s, couldn't: %v", parent, err)
++	}
++
++	assert.Contains(t, commit.ParentIDs, decoded,
++		"git/odb: expected parents of commit: %s to contain: %s", sha, parent)
++}
++
++// AssertCommitTree asserts that the given commit has a tree equivelant to the
++// one provided.
++func AssertCommitTree(t *testing.T, db *odb.ObjectDatabase, sha, tree string) {
++	commit, err := db.Commit(HexDecode(t, sha))
++	if err != nil {
++		t.Fatalf("git/odb: expected to read commit: %s, couldn't: %v", sha, err)
++	}
++
++	decoded, err := hex.DecodeString(tree)
++	if err != nil {
++		t.Fatalf("git/odb: expected to decode tree SHA: %s, couldn't: %v", tree, err)
++	}
++
++	assert.Equal(t, decoded, commit.TreeID, "git/odb: expected tree ID: %s (got: %x)", tree, commit.TreeID)
++}
++
++// HexDecode decodes the given ASCII hex-encoded string into []byte's, or fails
++// the test immediately if the given "sha" wasn't a valid hex-encoded sequence.
++func HexDecode(t *testing.T, sha string) []byte {
++	b, err := hex.DecodeString(sha)
++	if err != nil {
++		t.Fatalf("git/odb: could not decode string: %q, %v", sha, err)
++	}
++
++	return b
++}
++
++// copyToTmp copies the given fixutre to a folder in /tmp.
++func copyToTmp(fixture string) (string, error) {
++	p, err := ioutil.TempDir("", fmt.Sprintf("git-lfs-fixture-%s", filepath.Dir(fixture)))
++	if err != nil {
++		return "", err
++	}
++
++	if err = copyDir(fixture, p); err != nil {
++		return "", err
++	}
++	return p, nil
++}
++
++// copyDir copies a directory (and recursively all files and subdirectories)
++// from "from" to "to" preserving permissions and ownership.
++func copyDir(from, to string) error {
++	stat, err := os.Stat(from)
++	if err != nil {
++		return err
++	}
++
++	if err := os.MkdirAll(to, stat.Mode()); err != nil {
++		return err
++	}
++
++	entries, err := ioutil.ReadDir(from)
++	if err != nil {
++		return err
++	}
++
++	for _, entry := range entries {
++		sp := filepath.Join(from, entry.Name())
++		dp := filepath.Join(to, entry.Name())
++
++		if entry.IsDir() {
++			err = copyDir(sp, dp)
++		} else {
++			err = copyFile(sp, dp)
++		}
++
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// copyFile copies a file from "from" to "to" preserving permissions and
++// ownership.
++func copyFile(from, to string) error {
++	src, err := os.Open(from)
++	if err != nil {
++		return err
++	}
++	defer src.Close()
++
++	dst, err := os.Create(to)
++	if err != nil {
++		return err
++	}
++	defer dst.Close()
++
++	if _, err = io.Copy(dst, src); err != nil {
++		return err
++	}
++
++	stat, err := os.Stat(from)
++	if err != nil {
++		return err
++	}
++
++	return os.Chmod(to, stat.Mode())
++}
+diff --git a/git/githistory/rewriter.go b/git/githistory/rewriter.go
+new file mode 100644
+index 0000000..4f992dc
+--- /dev/null
++++ b/git/githistory/rewriter.go
+@@ -0,0 +1,416 @@
++package githistory
++
++import (
++	"encoding/hex"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++
++	"github.com/git-lfs/git-lfs/filepathfilter"
++	"github.com/git-lfs/git-lfs/git"
++	"github.com/git-lfs/git-lfs/git/odb"
++)
++
++// Rewriter allows rewriting topologically equivalent Git histories
++// between two revisions.
++type Rewriter struct {
++	// mu guards entries and commits (see below)
++	mu *sync.Mutex
++	// entries is a mapping of old tree entries to new (rewritten) ones.
++	// Since TreeEntry contains a []byte (and is therefore not a key-able
++	// type), a unique TreeEntry -> string function is used for map keys.
++	entries map[string]*odb.TreeEntry
++	// commits is a mapping of old commit SHAs to new ones, where the ASCII
++	// hex encoding of the SHA1 values are used as map keys.
++	commits map[string][]byte
++	// filter is an optional value used to specify which tree entries
++	// (blobs, subtrees) are modifiable given a BlobFn. If non-nil, this
++	// filter will cull out any unmodifiable subtrees and blobs.
++	filter *filepathfilter.Filter
++	// db is the *ObjectDatabase from which blobs, commits, and trees are
++	// loaded from.
++	db *odb.ObjectDatabase
++}
++
++// RewriteOptions is an options type given to the Rewrite() function.
++type RewriteOptions struct {
++	// Include is the list of refs of which commits reachable by that ref
++	// will be included.
++	Include []string
++	// Exclude is the list of refs of which commits reachable by that ref
++	// will be excluded.
++	Exclude []string
++
++	// BlobFn specifies a function to rewrite blobs.
++	//
++	// It is called once per unique, unchanged path. That is to say, if
++	// /a/foo and /a/bar contain identical contents, the BlobFn will be
++	// called twice: once for /a/foo and once for /a/bar, but no more on
++	// each blob for subsequent revisions, so long as each entry remains
++	// unchanged.
++	BlobFn BlobRewriteFn
++	// TreeCallbackFn specifies a function to rewrite trees after they have
++	// been reassembled by calling the above BlobFn on all existing tree
++	// entries.
++	TreeCallbackFn TreeCallbackFn
++}
++
++// blobFn returns a useable BlobRewriteFn, either the one that was given in the
++// *RewriteOptions, or a noopBlobFn.
++func (r *RewriteOptions) blobFn() BlobRewriteFn {
++	if r.BlobFn == nil {
++		return noopBlobFn
++	}
++	return r.BlobFn
++}
++
++// treeFn returns a useable TreeRewriteFn, either the one that was given in the
++// *RewriteOptions, or a noopTreeFn.
++func (r *RewriteOptions) treeFn() TreeCallbackFn {
++	if r.TreeCallbackFn == nil {
++		return noopTreeFn
++	}
++	return r.TreeCallbackFn
++}
++
++// BlobRewriteFn is a mapping function that takes a given blob and returns a
++// new, modified blob. If it returns an error, the new blob will not be written
++// and instead the error will be returned from the Rewrite() function.
++//
++// Invocations of an instance of BlobRewriteFn are not expected to store the
++// returned blobs in the *git/odb.ObjectDatabase.
++//
++// The path argument is given to be an absolute path to the tree entry being
++// rewritten, where the repository root is the root of the path given. For
++// instance, a file "b.txt" in directory "dir" would be given as "/dir/b.txt",
++// where as a file "a.txt" in the root would be given as "/a.txt".
++//
++// As above, the path separators are OS specific, and equivalent to the result
++// of filepath.Join(...) or os.PathSeparator.
++type BlobRewriteFn func(path string, b *odb.Blob) (*odb.Blob, error)
++
++// TreeCallbackFn specifies a function to call before writing a re-written tree
++// to the object database. The TreeCallbackFn can return a modified tree to be
++// written to the object database instead of one generated from calling BlobFn
++// on all of the tree entries.
++//
++// Trees returned from a TreeCallbackFn MUST have all objects referenced in the
++// entryset already written to the object database.
++//
++// TreeCallbackFn can be nil, and will therefore exhibit behavior equivalent to
++// only calling the BlobFn on existing tree entries.
++//
++// If the TreeCallbackFn returns an error, it will be returned from the
++// Rewrite() invocation.
++type TreeCallbackFn func(path string, t *odb.Tree) (*odb.Tree, error)
++
++type rewriterOption func(*Rewriter)
++
++var (
++	// WithFilter is an optional argument given to the NewRewriter
++	// constructor function to limit invocations of the BlobRewriteFn to
++	// only pathspecs that match the given *filepathfilter.Filter.
++	WithFilter = func(filter *filepathfilter.Filter) rewriterOption {
++		return func(r *Rewriter) {
++			r.filter = filter
++		}
++	}
++
++	// noopBlobFn is a no-op implementation of the BlobRewriteFn. It returns
++	// the blob that it was given, and returns no error.
++	noopBlobFn = func(path string, b *odb.Blob) (*odb.Blob, error) { return b, nil }
++	// noopTreeFn is a no-op implementation of the TreeRewriteFn. It returns
++	// the tree that it was given, and returns no error.
++	noopTreeFn = func(path string, t *odb.Tree) (*odb.Tree, error) { return t, nil }
++)
++
++// NewRewriter constructs a *Rewriter from the given *ObjectDatabase instance.
++func NewRewriter(db *odb.ObjectDatabase, opts ...rewriterOption) *Rewriter {
++	rewriter := &Rewriter{
++		mu:      new(sync.Mutex),
++		entries: make(map[string]*odb.TreeEntry),
++		commits: make(map[string][]byte),
++
++		db: db,
++	}
++
++	for _, opt := range opts {
++		opt(rewriter)
++	}
++	return rewriter
++}
++
++// Rewrite rewrites the range of commits given by *RewriteOptions.{Left,Right}
++// using the BlobRewriteFn to rewrite the individual blobs.
++func (r *Rewriter) Rewrite(opt *RewriteOptions) ([]byte, error) {
++	r.entries = make(map[string]*odb.TreeEntry)
++	r.commits = make(map[string][]byte)
++	// First, obtain a list of commits to rewrite.
++	commits, err := r.commitsToMigrate(opt)
++	if err != nil {
++		return nil, err
++	}
++
++	// Keep track of the last commit that we rewrote. Callers often want
++	// this so that they can perform a git-update-ref(1).
++	var tip []byte
++	for _, oid := range commits {
++		// Load the original commit to access the data necessary in
++		// order to rewrite it.
++		original, err := r.db.Commit(oid)
++		if err != nil {
++			return nil, err
++		}
++
++		// Rewrite the tree given at that commit.
++		rewrittenTree, err := r.rewriteTree(original.TreeID, string(os.PathSeparator), opt.blobFn(), opt.treeFn())
++		if err != nil {
++			return nil, err
++		}
++
++		// Create a new list of parents from the original commit to
++		// point at the rewritten parents in order to create a
++		// topologically equivalent DAG.
++		//
++		// This operation is safe since we are visiting the commits in
++		// reverse topological order and therefore have seen all parents
++		// before children (in other words, r.uncacheCommit(...) will
++		// always return a value, if the prospective parent is a part of
++		// the migration).
++		rewrittenParents := make([][]byte, 0, len(original.ParentIDs))
++		for _, originalParent := range original.ParentIDs {
++			rewrittenParent, ok := r.uncacheCommit(originalParent)
++			if !ok {
++				// If we haven't seen the parent before, this
++				// means that we're doing a partial migration
++				// and the parent that we're looking for isn't
++				// included.
++				//
++				// Use the original parent to properly link
++				// history across the migration boundary.
++				rewrittenParent = originalParent
++			}
++
++			rewrittenParents = append(rewrittenParents, rewrittenParent)
++		}
++
++		// Construct a new commit using the original header information,
++		// but the rewritten set of parents as well as root tree.
++		rewrittenCommit, err := r.db.WriteCommit(&odb.Commit{
++			Author:       original.Author,
++			Committer:    original.Committer,
++			ExtraHeaders: original.ExtraHeaders,
++			Message:      original.Message,
++
++			ParentIDs: rewrittenParents,
++			TreeID:    rewrittenTree,
++		})
++		if err != nil {
++			return nil, err
++		}
++
++		// Cache that commit so that we can reassign children of this
++		// commit.
++		r.cacheCommit(oid, rewrittenCommit)
++
++		// Move the tip forward.
++		tip = rewrittenCommit
++	}
++	return tip, err
++}
++
++// rewriteTree is a recursive function which rewrites a tree given by the ID
++// "sha" and path "path". It uses the given BlobRewriteFn to rewrite all blobs
++// within the tree, either calling that function or recurring down into subtrees
++// by re-assigning the SHA.
++//
++// Once it is done assembling the entries in a given subtree, it then calls the
++// TreeCallbackFn, "tfn" to perform a final traversal of the subtree before
++// saving it to the object database.
++//
++// It returns the new SHA of the rewritten tree, or an error if the tree was
++// unable to be rewritten.
++func (r *Rewriter) rewriteTree(sha []byte, path string, fn BlobRewriteFn, tfn TreeCallbackFn) ([]byte, error) {
++	tree, err := r.db.Tree(sha)
++	if err != nil {
++		return nil, err
++	}
++
++	entries := make([]*odb.TreeEntry, 0, len(tree.Entries))
++	for _, entry := range tree.Entries {
++		path := filepath.Join(path, entry.Name)
++
++		if entry.Type != odb.TreeObjectType && !r.filter.Allows(strings.TrimPrefix(path, string(os.PathSeparator))) {
++			entries = append(entries, entry)
++			continue
++		}
++
++		if cached := r.uncacheEntry(path, entry); cached != nil {
++			entries = append(entries, cached)
++			continue
++		}
++
++		var oid []byte
++
++		switch entry.Type {
++		case odb.BlobObjectType:
++			oid, err = r.rewriteBlob(entry.Oid, path, fn)
++		case odb.TreeObjectType:
++			oid, err = r.rewriteTree(entry.Oid, path, fn, tfn)
++		default:
++			oid = entry.Oid
++
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		entries = append(entries, r.cacheEntry(path, entry, &odb.TreeEntry{
++			Filemode: entry.Filemode,
++			Name:     entry.Name,
++			Type:     entry.Type,
++			Oid:      oid,
++		}))
++	}
++
++	rewritten, err := tfn(path, &odb.Tree{Entries: entries})
++	if err != nil {
++		return nil, err
++	}
++	return r.db.WriteTree(rewritten)
++}
++
++// rewriteBlob calls the given BlobRewriteFn "fn" on a blob given in the object
++// database by the SHA1 "from" []byte. It writes and returns the new blob SHA,
++// or an error if either the BlobRewriteFn returned one, or if the object could
++// not be loaded/saved.
++func (r *Rewriter) rewriteBlob(from []byte, path string, fn BlobRewriteFn) ([]byte, error) {
++	blob, err := r.db.Blob(from)
++	if err != nil {
++		return nil, err
++	}
++
++	defer blob.Close()
++	b, err := fn(path, blob)
++	if err != nil {
++		return nil, err
++	}
++
++	sha, err := r.db.WriteBlob(b)
++	if err != nil {
++		return nil, err
++	}
++
++	if blob != b {
++		// Close the source blob, so long as it is not equal to the
++		// rewritten blob. If the two are equal, as in the check above
++		// this comment, calling r.db.WriteBlob(b) will have already
++		// closed both "b" and "blob" since they are the same.
++		//
++		// Closing an *os.File twice causes an `os.ErrInvalid` to be
++		// returned.
++		if err = blob.Close(); err != nil {
++			return nil, err
++		}
++	}
++	return sha, nil
++}
++
++// commitsToMigrate returns an in-memory copy of a list of commits according to
++// the output of git-rev-list(1) (given the *RewriteOptions), where each
++// outputted commit is 20 bytes of raw SHA1.
++//
++// If any error was encountered, it will be returned.
++func (r *Rewriter) commitsToMigrate(opt *RewriteOptions) ([][]byte, error) {
++	scanner, err := git.NewRevListScanner(
++		opt.Include, opt.Exclude, r.scannerOpts())
++	if err != nil {
++		return nil, err
++	}
++
++	defer scanner.Close()
++	var commits [][]byte
++	for scanner.Scan() {
++		commits = append(commits, scanner.OID())
++	}
++
++	if err = scanner.Err(); err != nil {
++		return nil, err
++	}
++	if err = scanner.Close(); err != nil {
++		return nil, err
++	}
++	return commits, nil
++}
++
++// scannerOpts returns a *git.ScanRefsOptions instance to be given to the
++// *git.RevListScanner.
++//
++// If the database this *Rewriter is operating in a given root (not in memory)
++// it re-assigns the working directory to be there.
++func (r *Rewriter) scannerOpts() *git.ScanRefsOptions {
++	opts := &git.ScanRefsOptions{
++		Mode:        git.ScanRefsMode,
++		Order:       git.TopoRevListOrder,
++		Reverse:     true,
++		CommitsOnly: true,
++
++		SkippedRefs: make([]string, 0),
++		Mutex:       new(sync.Mutex),
++		Names:       make(map[string]string),
++	}
++
++	if root, ok := r.db.Root(); ok {
++		opts.WorkingDir = filepath.Dir(root)
++	}
++	return opts
++}
++
++// cacheEntry caches then given "from" entry so that it is always rewritten as
++// a *TreeEntry equivalent to "to".
++func (r *Rewriter) cacheEntry(path string, from, to *odb.TreeEntry) *odb.TreeEntry {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	r.entries[path+":"+r.entryKey(from)] = to
++
++	return to
++}
++
++// uncacheEntry returns a *TreeEntry that is cached from the given *TreeEntry
++// "from". That is to say, it returns the *TreeEntry that "from" should be
++// rewritten to, or nil if none could be found.
++func (r *Rewriter) uncacheEntry(path string, from *odb.TreeEntry) *odb.TreeEntry {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	return r.entries[path+":"+r.entryKey(from)]
++}
++
++// entryKey returns a unique key for a given *TreeEntry "e".
++func (r *Rewriter) entryKey(e *odb.TreeEntry) string {
++	return fmt.Sprintf("%s:%x", e.Name, e.Oid)
++}
++
++// cacheEntry caches then given "from" commit so that it is always rewritten as
++// a *git/odb.Commit equivalent to "to".
++func (r *Rewriter) cacheCommit(from, to []byte) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	r.commits[hex.EncodeToString(from)] = to
++}
++
++// uncacheCommit returns a *git/odb.Commit that is cached from the given
++// *git/odb.Commit "from". That is to say, it returns the *git/odb.Commit that
++// "from" should be rewritten to and true, or nil and false if none could be
++// found.
++func (r *Rewriter) uncacheCommit(from []byte) ([]byte, bool) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	c, ok := r.commits[hex.EncodeToString(from)]
++	return c, ok
++}
+diff --git a/git/githistory/rewriter_test.go b/git/githistory/rewriter_test.go
+new file mode 100644
+index 0000000..08ce23b
+--- /dev/null
++++ b/git/githistory/rewriter_test.go
+@@ -0,0 +1,307 @@
++package githistory
++
++import (
++	"encoding/hex"
++	"io"
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/git-lfs/git-lfs/filepathfilter"
++	"github.com/git-lfs/git-lfs/git/odb"
++	"github.com/stretchr/testify/assert"
++)
++
++func TestRewriterRewritesHistory(t *testing.T) {
++	db := DatabaseFromFixture(t, "linear-history.git")
++	r := NewRewriter(db)
++
++	tip, err := r.Rewrite(&RewriteOptions{Include: []string{"refs/heads/master"},
++		BlobFn: func(path string, b *odb.Blob) (*odb.Blob, error) {
++			contents, err := ioutil.ReadAll(b.Contents)
++			if err != nil {
++				return nil, err
++			}
++
++			n, err := strconv.Atoi(string(contents))
++			if err != nil {
++				return nil, err
++			}
++
++			rewritten := strconv.Itoa(n + 1)
++
++			return &odb.Blob{
++				Contents: strings.NewReader(rewritten),
++				Size:     int64(len(rewritten)),
++			}, nil
++		},
++	})
++
++	assert.Nil(t, err)
++
++	tree1 := "ad0aebd16e34cf047820994ea7538a6d4a111082"
++	tree2 := "6e07bd31cb70c4add2c973481ad4fa38b235ca69"
++	tree3 := "c5decfe1fcf39b8c489f4a0bf3b3823676339f80"
++
++	// After rewriting, the HEAD state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob bf0d87ab1b2b0ec1a11a3973d2845b42413d9767   hello.txt
++
++	AssertCommitTree(t, db, hex.EncodeToString(tip), tree1)
++
++	AssertBlobContents(t, db, tree1, "hello.txt", "4")
++
++	// After rewriting, the HEAD~1 state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob e440e5c842586965a7fb77deda2eca68612b1f53   hello.txt
++
++	AssertCommitParent(t, db, hex.EncodeToString(tip), "4aaa3f49ffeabbb874250fe13ffeb8c683aba650")
++	AssertCommitTree(t, db, "4aaa3f49ffeabbb874250fe13ffeb8c683aba650", tree2)
++
++	AssertBlobContents(t, db, tree2, "hello.txt", "3")
++
++	// After rewriting, the HEAD~2 state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob d8263ee9860594d2806b0dfd1bfd17528b0ba2a4   hello.txt
++
++	AssertCommitParent(t, db, "4aaa3f49ffeabbb874250fe13ffeb8c683aba650", "24a341e1ff75addc22e336a8d87f82ba56b86fcf")
++	AssertCommitTree(t, db, "24a341e1ff75addc22e336a8d87f82ba56b86fcf", tree3)
++
++	AssertBlobContents(t, db, tree3, "hello.txt", "2")
++}
++
++func TestRewriterRewritesOctopusMerges(t *testing.T) {
++	db := DatabaseFromFixture(t, "octopus-merge.git")
++	r := NewRewriter(db)
++
++	tip, err := r.Rewrite(&RewriteOptions{Include: []string{"refs/heads/master"},
++		BlobFn: func(path string, b *odb.Blob) (*odb.Blob, error) {
++			return &odb.Blob{
++				Contents: io.MultiReader(b.Contents, strings.NewReader("_new")),
++				Size:     b.Size + int64(len("_new")),
++			}, nil
++		},
++	})
++
++	assert.Nil(t, err)
++
++	tree := "8a56716daa78325c3d0433cc163890969810b0da"
++
++	// After rewriting, the HEAD state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob 309f7fc2bfd9ae77b4131cf9cbcc3b548c42ca57    a.txt
++	//   100644 blob 70470dc26cb3eef54fe3dcba53066f7ca7c495c0    b.txt
++	//   100644 blob f2557f74fd5b60f959baf77091782089761e2dc3    hello.txt
++
++	AssertCommitTree(t, db, hex.EncodeToString(tip), tree)
++
++	AssertBlobContents(t, db, tree, "a.txt", "a_new")
++	AssertBlobContents(t, db, tree, "b.txt", "b_new")
++	AssertBlobContents(t, db, tree, "hello.txt", "hello_new")
++
++	// And should contain the following parents:
++	//
++	//   parent 1fe2b9577d5610e8d8fb2c3030534036fb648393
++	//   parent ca447959bdcd20253d69b227bcc7c2e1d3126d5c
++
++	AssertCommitParent(t, db, hex.EncodeToString(tip), "1fe2b9577d5610e8d8fb2c3030534036fb648393")
++	AssertCommitParent(t, db, hex.EncodeToString(tip), "ca447959bdcd20253d69b227bcc7c2e1d3126d5c")
++
++	// And each of those parents should contain the root commit as their own
++	// parent:
++
++	AssertCommitParent(t, db, "1fe2b9577d5610e8d8fb2c3030534036fb648393", "9237567f379b3c83ddf53ad9a2ae3755afb62a09")
++	AssertCommitParent(t, db, "ca447959bdcd20253d69b227bcc7c2e1d3126d5c", "9237567f379b3c83ddf53ad9a2ae3755afb62a09")
++}
++
++func TestRewriterDoesntVisitUnchangedSubtrees(t *testing.T) {
++	db := DatabaseFromFixture(t, "repeated-subtrees.git")
++	r := NewRewriter(db)
++
++	seen := make(map[string]int)
++
++	_, err := r.Rewrite(&RewriteOptions{Include: []string{"refs/heads/master"},
++		BlobFn: func(path string, b *odb.Blob) (*odb.Blob, error) {
++			seen[path] = seen[path] + 1
++
++			return b, nil
++		},
++	})
++
++	assert.Nil(t, err)
++
++	assert.Equal(t, 2, seen[root("a.txt")])
++	assert.Equal(t, 1, seen[root(filepath.Join("subdir", "b.txt"))])
++}
++
++func TestRewriterVisitsUniqueEntriesWithIdenticalContents(t *testing.T) {
++	db := DatabaseFromFixture(t, "identical-blobs.git")
++	r := NewRewriter(db)
++
++	tip, err := r.Rewrite(&RewriteOptions{Include: []string{"refs/heads/master"},
++		BlobFn: func(path string, b *odb.Blob) (*odb.Blob, error) {
++			if path == root("b.txt") {
++				return b, nil
++			}
++
++			return &odb.Blob{
++				Contents: strings.NewReader("changed"),
++				Size:     int64(len("changed")),
++			}, nil
++		},
++	})
++
++	assert.Nil(t, err)
++
++	tree := "bbbe0a7676523ae02234bfe874784ca2380c2d4b"
++
++	AssertCommitTree(t, db, hex.EncodeToString(tip), tree)
++
++	// After rewriting, the HEAD state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob 21fb1eca31e64cd3914025058b21992ab76edcf9    a.txt
++	//   100644 blob 94f3610c08588440112ed977376f26a8fba169b0    b.txt
++
++	AssertBlobContents(t, db, tree, "a.txt", "changed")
++	AssertBlobContents(t, db, tree, "b.txt", "original")
++}
++
++func TestRewriterIgnoresPathsThatDontMatchFilter(t *testing.T) {
++	include := []string{"*.txt"}
++	exclude := []string{"subdir/**/*.txt"}
++
++	filter := filepathfilter.New(include, exclude)
++
++	db := DatabaseFromFixture(t, "non-repeated-subtrees.git")
++	r := NewRewriter(db, WithFilter(filter))
++
++	seen := make(map[string]int)
++
++	_, err := r.Rewrite(&RewriteOptions{Include: []string{"refs/heads/master"},
++		BlobFn: func(path string, b *odb.Blob) (*odb.Blob, error) {
++			seen[path] = seen[path] + 1
++
++			return b, nil
++		},
++	})
++
++	assert.Nil(t, err)
++	assert.Equal(t, 1, seen[root("a.txt")])
++	assert.Equal(t, 0, seen[root(filepath.Join("subdir", "b.txt"))])
++}
++
++func TestRewriterAllowsAdditionalTreeEntries(t *testing.T) {
++	db := DatabaseFromFixture(t, "linear-history.git")
++	r := NewRewriter(db)
++
++	extra, err := db.WriteBlob(&odb.Blob{
++		Contents: strings.NewReader("extra\n"),
++		Size:     int64(len("extra\n")),
++	})
++	assert.Nil(t, err)
++
++	tip, err := r.Rewrite(&RewriteOptions{Include: []string{"refs/heads/master"},
++		BlobFn: func(path string, b *odb.Blob) (*odb.Blob, error) {
++			return b, nil
++		},
++
++		TreeCallbackFn: func(path string, tr *odb.Tree) (*odb.Tree, error) {
++			return &odb.Tree{
++				Entries: append(tr.Entries, &odb.TreeEntry{
++					Name:     "extra.txt",
++					Filemode: 0100644,
++					Oid:      extra,
++				}),
++			}, nil
++		},
++	})
++
++	assert.Nil(t, err)
++
++	tree1 := "40c2eb627a3b8e84b82a47a973d32960f3898b6a"
++	tree2 := "d7a5bcb69f2cd2652a014663a948952ea603c2c0"
++	tree3 := "45b752554d128f85bf23d7c3ddf48c47cbc345c8"
++
++	// After rewriting, the HEAD state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob e440e5c842586965a7fb77deda2eca68612b1f53    hello.txt
++	//   100644 blob 0f2287157f7cb0dd40498c7a92f74b6975fa2d57    extra.txt
++
++	AssertCommitTree(t, db, hex.EncodeToString(tip), tree1)
++
++	AssertBlobContents(t, db, tree1, "hello.txt", "3")
++	AssertBlobContents(t, db, tree1, "extra.txt", "extra\n")
++
++	// After rewriting, the HEAD~1 state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob d8263ee9860594d2806b0dfd1bfd17528b0ba2a4    hello.txt
++	//   100644 blob 0f2287157f7cb0dd40498c7a92f74b6975fa2d57    extra.txt
++
++	AssertCommitParent(t, db, hex.EncodeToString(tip), "45af5deb9a25bc4069b15c1f5bdccb0340978707")
++	AssertCommitTree(t, db, "45af5deb9a25bc4069b15c1f5bdccb0340978707", tree2)
++
++	AssertBlobContents(t, db, tree2, "hello.txt", "2")
++	AssertBlobContents(t, db, tree2, "extra.txt", "extra\n")
++
++	// After rewriting, the HEAD~2 state of the repository should contain a
++	// tree identical to:
++	//
++	//   100644 blob 56a6051ca2b02b04ef92d5150c9ef600403cb1de    hello.txt
++	//   100644 blob 0f2287157f7cb0dd40498c7a92f74b6975fa2d57    extra.txt
++
++	AssertCommitParent(t, db, "45af5deb9a25bc4069b15c1f5bdccb0340978707", "99f6bd7cd69b45494afed95b026f3e450de8304f")
++	AssertCommitTree(t, db, "99f6bd7cd69b45494afed95b026f3e450de8304f", tree3)
++
++	AssertBlobContents(t, db, tree3, "hello.txt", "1")
++	AssertBlobContents(t, db, tree3, "extra.txt", "extra\n")
++}
++
++func TestHistoryRewriterUseOriginalParentsForPartialMigration(t *testing.T) {
++	db := DatabaseFromFixture(t, "linear-history-with-tags.git")
++	r := NewRewriter(db)
++
++	tip, err := r.Rewrite(&RewriteOptions{
++		Include: []string{"refs/heads/master"},
++		Exclude: []string{"refs/tags/middle"},
++
++		BlobFn: func(path string, b *odb.Blob) (*odb.Blob, error) {
++			return b, nil
++		},
++	})
++
++	// After rewriting, the rewriter should have only modified the latest
++	// commit (HEAD), and excluded the first two, both reachable by
++	// refs/tags/middle.
++	//
++	// This should modify one commit, and appropriately link the parent as
++	// follows:
++	//
++	//   tree 20ecedad3e74a113695fe5f00ab003694e2e1e9c
++	//   parent 228afe30855933151f7a88e70d9d88314fd2f191
++	//   author Taylor Blau <me@ttaylorr.com> 1496954214 -0600
++	//   committer Taylor Blau <me@ttaylorr.com> 1496954214 -0600
++	//
++	//   some.txt: c
++
++	expectedParent := "228afe30855933151f7a88e70d9d88314fd2f191"
++
++	assert.NoError(t, err)
++	AssertCommitParent(t, db, hex.EncodeToString(tip), expectedParent)
++}
++
++func root(path string) string {
++	if !strings.HasPrefix(path, string(os.PathSeparator)) {
++		path = string(os.PathSeparator) + path
++	}
++	return path
++}
+diff --git a/git/object_scanner.go b/git/object_scanner.go
+index 88e6ec2..9a2a059 100644
+--- a/git/object_scanner.go
++++ b/git/object_scanner.go
+@@ -53,7 +53,12 @@ type ObjectScanner struct {
+ //
+ // Otherwise, an `*ObjectScanner` is returned with no error.
+ func NewObjectScanner() (*ObjectScanner, error) {
++	return NewObjectScannerIn("")
++}
++
++func NewObjectScannerIn(directory string) (*ObjectScanner, error) {
+ 	cmd := exec.Command("git", "cat-file", "--batch")
++	cmd.Dir = directory
+ 	stdout, err := cmd.StdoutPipe()
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "open stdout")
+@@ -69,10 +74,12 @@ func NewObjectScanner() (*ObjectScanner, error) {
+ 	}
+ 
+ 	closeFn := func() error {
++		defer stdout.Close()
+ 		if err := stdin.Close(); err != nil {
+ 			return err
+ 		}
+ 
++		io.Copy(ioutil.Discard, stdout)
+ 		msg, _ := ioutil.ReadAll(stderr)
+ 		if err = cmd.Wait(); err != nil {
+ 			return errors.Errorf("Error in git cat-file --batch: %v %v", err, string(msg))
+@@ -133,7 +140,9 @@ func (s *ObjectScanner) Scan(oid string) bool {
+ // it will be returned, otherwise nil.
+ func (s *ObjectScanner) Close() error {
+ 	if s.closeFn != nil {
+-		return s.closeFn()
++		close := s.closeFn
++		s.closeFn = nil
++		return close()
+ 	}
+ 	return nil
+ }
+diff --git a/git/odb/blob.go b/git/odb/blob.go
+index d954ec1..faf8d55 100644
+--- a/git/odb/blob.go
++++ b/git/odb/blob.go
+@@ -1,6 +1,10 @@
+ package odb
+ 
+-import "io"
++import (
++	"bytes"
++	"fmt"
++	"io"
++)
+ 
+ // Blob represents a Git object of type "blob".
+ type Blob struct {
+@@ -16,6 +20,14 @@ type Blob struct {
+ 	closeFn func() error
+ }
+ 
++// NewBlobFromBytes returns a new *Blob that yields the data given.
++func NewBlobFromBytes(contents []byte) *Blob {
++	return &Blob{
++		Contents: bytes.NewReader(contents),
++		Size:     int64(len(contents)),
++	}
++}
++
+ // Type implements Object.ObjectType by returning the correct object type for
+ // Blobs, BlobObjectType.
+ func (b *Blob) Type() ObjectType { return BlobObjectType }
+@@ -44,7 +56,10 @@ func (b *Blob) Decode(r io.Reader, size int64) (n int, err error) {
+ //
+ // Otherwise, the number of bytes written will be returned.
+ func (b *Blob) Encode(to io.Writer) (n int, err error) {
+-	nn, err := io.Copy(to, b.Contents)
++	if b.Size < 0 {
++		return 0, fmt.Errorf("git/odb: negative blob size")
++	}
++	nn, err := io.CopyN(to, b.Contents, b.Size)
+ 
+ 	return int(nn), err
+ }
+@@ -55,5 +70,7 @@ func (b *Blob) Close() error {
+ 	if b.closeFn == nil {
+ 		return nil
+ 	}
+-	return b.closeFn()
++	close := b.closeFn
++	b.closeFn = nil
++	return close()
+ }
+diff --git a/git/odb/blob_test.go b/git/odb/blob_test.go
+index a06353f..ac33604 100644
+--- a/git/odb/blob_test.go
++++ b/git/odb/blob_test.go
+@@ -15,6 +15,19 @@ func TestBlobReturnsCorrectObjectType(t *testing.T) {
+ 	assert.Equal(t, BlobObjectType, new(Blob).Type())
+ }
+ 
++func TestBlobFromString(t *testing.T) {
++	given := []byte("example")
++	glen := len(given)
++
++	b := NewBlobFromBytes(given)
++
++	assert.EqualValues(t, glen, b.Size)
++
++	contents, err := ioutil.ReadAll(b.Contents)
++	assert.NoError(t, err)
++	assert.Equal(t, given, contents)
++}
++
+ func TestBlobEncoding(t *testing.T) {
+ 	const contents = "Hello, world!\n"
+ 
+diff --git a/git/odb/commit.go b/git/odb/commit.go
+index a48af35..bc43aa2 100644
+--- a/git/odb/commit.go
++++ b/git/odb/commit.go
+@@ -1,10 +1,11 @@
+ package odb
+ 
+ import (
+-	"bufio"
++	"bytes"
+ 	"encoding/hex"
+ 	"fmt"
+ 	"io"
++	"io/ioutil"
+ 	"strings"
+ 	"time"
+ )
+@@ -32,7 +33,7 @@ const (
+ // String implements the fmt.Stringer interface and formats a Signature as
+ // expected in the Git commit internal object format. For instance:
+ //
+-//  Taylor Blau <ttaylorr@github.com> 1494258422 -0600
++//	Taylor Blau <ttaylorr@github.com> 1494258422 -0600
+ func (s *Signature) String() string {
+ 	at := s.When.Unix()
+ 	zone := s.When.Format(formatTimeZoneOnly)
+@@ -91,58 +92,61 @@ func (c *Commit) Type() ObjectType { return CommitObjectType }
+ // If any error was encountered along the way, that will be returned, along with
+ // the number of bytes read up to that point.
+ func (c *Commit) Decode(from io.Reader, size int64) (n int, err error) {
+-	var finishedHeaders bool
+-	var messageParts []string
+-
+-	s := bufio.NewScanner(from)
+-	for s.Scan() {
+-		text := s.Text()
+-		n = n + len(text+"\n")
+-
+-		if len(s.Text()) == 0 {
+-			finishedHeaders = true
++	if size < 0 {
++		return 0, fmt.Errorf("git/odb: negative commit size")
++	}
++	data, err := ioutil.ReadAll(io.LimitReader(from, size))
++	n = len(data)
++	if err != nil {
++		return n, err
++	}
++	if int64(n) != size {
++		return n, io.ErrUnexpectedEOF
++	}
++	separator := bytes.Index(data, []byte("\n\n"))
++	if separator < 0 {
++		return n, fmt.Errorf("git/odb: missing commit message separator")
++	}
++	*c = Commit{}
++	for _, line := range strings.Split(string(data[:separator]), "\n") {
++		if strings.HasPrefix(line, " ") && len(c.ExtraHeaders) > 0 {
++			c.ExtraHeaders[len(c.ExtraHeaders)-1].V += "\n" + line
+ 			continue
+ 		}
+-
+-		fields := strings.Fields(text)
+-		if len(fields) > 0 {
+-			switch fields[0] {
+-			case "tree":
+-				id, err := hex.DecodeString(fields[1])
+-				if err != nil {
+-					panic(1)
+-					return n, err
+-				}
++		fields := strings.SplitN(line, " ", 2)
++		if len(fields) != 2 {
++			return n, fmt.Errorf("git/odb: malformed commit header")
++		}
++		key, value := fields[0], fields[1]
++		switch key {
++		case "tree", "parent":
++			id, err := hex.DecodeString(value)
++			if err != nil {
++				return n, err
++			}
++			if len(id) != 20 {
++				return n, fmt.Errorf("git/odb: invalid commit object ID")
++			}
++			if key == "tree" {
+ 				c.TreeID = id
+-			case "parent":
+-				id, err := hex.DecodeString(fields[1])
+-				if err != nil {
+-					return n, err
+-				}
++			} else {
+ 				c.ParentIDs = append(c.ParentIDs, id)
+-			case "author":
+-				c.Author = strings.Join(fields[1:], " ")
+-			case "committer":
+-				c.Committer = strings.Join(fields[1:], " ")
+-			default:
+-				if finishedHeaders {
+-					messageParts = append(messageParts, s.Text())
+-				} else {
+-					c.ExtraHeaders = append(c.ExtraHeaders, &ExtraHeader{
+-						K: fields[0],
+-						V: strings.Join(fields[1:], " "),
+-					})
+-				}
+ 			}
++		case "author":
++			c.Author = value
++		case "committer":
++			c.Committer = value
++		default:
++			c.ExtraHeaders = append(c.ExtraHeaders, &ExtraHeader{K: key, V: value})
+ 		}
+ 	}
+-
+-	c.Message = strings.Join(messageParts, "\n")
+-
+-	if err = s.Err(); err != nil {
+-		return n, err
++	if len(c.TreeID) != 20 {
++		return n, fmt.Errorf("git/odb: missing commit tree")
+ 	}
+-	return n, err
++	// The public Message omits one terminal LF; Encode restores that LF.
++	// All other bytes, including blank paragraphs and trailing blank lines, remain.
++	c.Message = strings.TrimSuffix(string(data[separator+2:]), "\n")
++	return n, nil
+ }
+ 
+ // Encode encodes the commit's contents to the given io.Writer, "w". If there was
+diff --git a/git/odb/commit_test.go b/git/odb/commit_test.go
+index 2990cf2..3358ce6 100644
+--- a/git/odb/commit_test.go
++++ b/git/odb/commit_test.go
+@@ -83,6 +83,33 @@ func TestCommitDecoding(t *testing.T) {
+ 	assert.Equal(t, "initial commit", commit.Message)
+ }
+ 
++func TestCommitDecodingWithMessageKeywordPrefix(t *testing.T) {
++	author := &Signature{Name: "John Doe", Email: "john@example.com", When: time.Now()}
++	committer := &Signature{Name: "Jane Doe", Email: "jane@example.com", When: time.Now()}
++
++	treeId := []byte("aaaaaaaaaaaaaaaaaaaa")
++	treeIdAscii := hex.EncodeToString(treeId)
++
++	from := new(bytes.Buffer)
++	fmt.Fprintf(from, "author %s\n", author)
++	fmt.Fprintf(from, "committer %s\n", committer)
++	fmt.Fprintf(from, "tree %s\n", hex.EncodeToString(treeId))
++	fmt.Fprintf(from, "\ntree <- initial commit\n")
++
++	flen := from.Len()
++
++	commit := new(Commit)
++	n, err := commit.Decode(from, int64(flen))
++
++	assert.NoError(t, err)
++	assert.Equal(t, flen, n)
++
++	assert.Equal(t, author.String(), commit.Author)
++	assert.Equal(t, committer.String(), commit.Committer)
++	assert.Equal(t, treeIdAscii, hex.EncodeToString(commit.TreeID))
++	assert.Equal(t, "tree <- initial commit", commit.Message)
++}
++
+ func assertLine(t *testing.T, buf *bytes.Buffer, wanted string, args ...interface{}) {
+ 	got, err := buf.ReadString('\n')
+ 
+diff --git a/git/odb/file_storer.go b/git/odb/file_storer.go
+index 522f616..c8a6453 100644
+--- a/git/odb/file_storer.go
++++ b/git/odb/file_storer.go
+@@ -6,8 +6,6 @@ import (
+ 	"io/ioutil"
+ 	"os"
+ 	"path/filepath"
+-
+-	"github.com/pkg/errors"
+ )
+ 
+ // fileStorer implements the storer interface by writing to the .git/objects
+@@ -38,33 +36,41 @@ func (fs *fileStorer) Open(sha []byte) (f io.ReadWriteCloser, err error) {
+ // written, along with any error encountered in copying the given io.Reader, "r"
+ // into the object database on disk at a path given by "sha".
+ //
+-// If the file already exists, could not be created, or opened, an error will be
+-// returned.
+-func (fs *fileStorer) Store(sha []byte, r io.Reader) (n int64, err error) {
+-	tmp, err := ioutil.TempFile("", "")
+-	if err != nil {
++// If the file could not be created, or opened, an error will be returned.
++func (fs *fileStorer) Store(sha []byte, reader io.Reader) (count int64, err error) {
++	path := fs.path(sha)
++	directory := filepath.Dir(path)
++	if _, statErr := os.Stat(path); statErr == nil {
++		_, err = io.Copy(ioutil.Discard, reader)
+ 		return 0, err
++	} else if !os.IsNotExist(statErr) {
++		return 0, statErr
+ 	}
+-
+-	n, err = io.Copy(tmp, r)
++	if err = os.MkdirAll(directory, 0755); err != nil {
++		return 0, err
++	}
++	temporary, err := ioutil.TempFile(directory, "pending-")
+ 	if err != nil {
+-		return n, err
++		return 0, err
+ 	}
+-
+-	path := fs.path(sha)
+-
+-	if _, err := os.Stat(path); os.IsExist(err) {
+-		return n, errors.Errorf("git/odb: file storer cannot copy into file %q, which already exists", path)
++	defer os.Remove(temporary.Name())
++	count, copyErr := io.Copy(temporary, reader)
++	closeErr := temporary.Close()
++	if copyErr != nil {
++		return count, copyErr
+ 	}
+-
+-	if err = os.Rename(tmp.Name(), path); err != nil {
+-		return n, err
++	if closeErr != nil {
++		return count, closeErr
+ 	}
+-
+-	if err = tmp.Close(); err != nil {
+-		return n, err
++	if err = os.Link(temporary.Name(), path); os.IsExist(err) {
++		return 0, nil
+ 	}
+-	return n, nil
++	return count, err
++}
++
++// Root gives the absolute (fully-qualified) path to the file storer on disk.
++func (fs *fileStorer) Root() string {
++	return fs.root
+ }
+ 
+ // open opens a given file.
+diff --git a/git/odb/memory_storer.go b/git/odb/memory_storer.go
+index fa7c592..bf292da 100644
+--- a/git/odb/memory_storer.go
++++ b/git/odb/memory_storer.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"sync"
+ )
+ 
+@@ -36,18 +37,24 @@ func newMemoryStorer(m map[string]io.ReadWriter) *memoryStorer {
+ 
+ // Store implements the storer.Store function and copies the data given in "r"
+ // into an object entry in the memory. If an object given by that SHA "sha" is
+-// already indexed in the database, Store will panic().
++// already indexed in the database, Store preserves the existing object.
+ func (ms *memoryStorer) Store(sha []byte, r io.Reader) (n int64, err error) {
+ 	ms.mu.Lock()
+ 	defer ms.mu.Unlock()
+ 
+ 	key := fmt.Sprintf("%x", sha)
+-	if _, ok := ms.fs[key]; ok {
+-		panic(fmt.Sprintf("git/odb: memory storage create %x, already exists", sha))
+-	}
+ 
+-	ms.fs[key] = &bufCloser{new(bytes.Buffer)}
+-	return io.Copy(ms.fs[key], r)
++	if _, exists := ms.fs[key]; exists {
++		_, err := io.Copy(io.Discard, r)
++		return 0, err
++	}
++	buffer := new(bytes.Buffer)
++	count, err := io.Copy(buffer, r)
++	if err != nil {
++		return count, err
++	}
++	ms.fs[key] = &bufCloser{buffer}
++	return count, nil
+ }
+ 
+ // Open implements the storer.Open function, and returns a io.ReadWriteCloser
+@@ -59,7 +66,10 @@ func (ms *memoryStorer) Open(sha []byte) (f io.ReadWriteCloser, err error) {
+ 
+ 	key := fmt.Sprintf("%x", sha)
+ 	if _, ok := ms.fs[key]; !ok {
+-		panic(fmt.Sprintf("git/odb: memory storage cannot open %x, doesn't exist", sha))
++		return nil, os.ErrNotExist
++	}
++	if buffer, ok := ms.fs[key].ReadWriter.(*bytes.Buffer); ok {
++		return &bufCloser{bytes.NewBuffer(append([]byte(nil), buffer.Bytes()...))}, nil
+ 	}
+ 	return ms.fs[key], nil
+ }
+diff --git a/git/odb/object_db.go b/git/odb/object_db.go
+index 3f1bc31..3df8ff5 100644
+--- a/git/odb/object_db.go
++++ b/git/odb/object_db.go
+@@ -2,8 +2,17 @@ package odb
+ 
+ import (
+ 	"bytes"
++	"encoding/hex"
++	"fmt"
+ 	"io"
+ 	"io/ioutil"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++
++	"github.com/git-lfs/git-lfs/errors"
++	"github.com/git-lfs/git-lfs/git"
+ )
+ 
+ // ObjectDatabase enables the reading and writing of objects against a storage
+@@ -11,16 +20,47 @@ import (
+ type ObjectDatabase struct {
+ 	// s is the storage backend which opens/creates/reads/writes.
+ 	s storer
++
++	// closed is a uint32 managed by sync/atomic's <X>Uint32 methods. It
++	// yields a value of 0 if the *ObjectDatabase it is stored upon is open,
++	// and a value of 1 if it is closed.
++	closed uint32
++	// objectScanner is the running instance of `*git.ObjectScanner` used to
++	// scan packed objects not found in .git/objects/xx/... directly.
++	objectScanner *git.ObjectScanner
+ }
+ 
+ // FromFilesystem constructs an *ObjectDatabase instance that is backed by a
+ // directory on the filesystem. Specifically, this should point to:
+ //
+-//  /absolute/repo/path/.git/objects
++//	/absolute/repo/path/.git/objects
+ func FromFilesystem(root string) (*ObjectDatabase, error) {
+ 	return &ObjectDatabase{s: newFileStorer(root)}, nil
+ }
+ 
++// Close closes the *ObjectDatabase, freeing any open resources (namely: the
++// `*git.ObjectScanner instance), and returning any errors encountered in
++// closing them.
++//
++// If Close() has already been called, this function will return an error.
++func FromMemory() *ObjectDatabase {
++	return &ObjectDatabase{s: newMemoryStorer(nil)}
++}
++
++func (o *ObjectDatabase) Close() error {
++	if !atomic.CompareAndSwapUint32(&o.closed, 0, 1) {
++		return errors.New("git/odb: *ObjectDatabase already closed")
++	}
++
++	if o.objectScanner == nil {
++		return nil
++	}
++	if err := o.objectScanner.Close(); err != nil {
++		return err
++	}
++	return nil
++}
++
+ // Blob returns a *Blob as identified by the SHA given, or an error if one was
+ // encountered.
+ func (o *ObjectDatabase) Blob(sha []byte) (*Blob, error) {
+@@ -55,18 +95,21 @@ func (o *ObjectDatabase) Commit(sha []byte) (*Commit, error) {
+ 
+ // WriteBlob stores a *Blob on disk and returns the SHA it is uniquely
+ // identified by, or an error if one was encountered.
+-func (o *ObjectDatabase) WriteBlob(b *Blob) ([]byte, error) {
+-	buf, err := ioutil.TempFile("", "")
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer buf.Close()
+-
+-	sha, _, err := o.encodeBuffer(b, buf)
++func (o *ObjectDatabase) WriteBlob(blob *Blob) (oid []byte, err error) {
++	defer func() {
++		closeErr := blob.Close()
++		if err == nil {
++			err = closeErr
++		}
++	}()
++	buffer, err := ioutil.TempFile("", "odb-blob-")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return sha, nil
++	defer os.Remove(buffer.Name())
++	defer buffer.Close()
++	oid, _, err = o.encodeBuffer(blob, buffer)
++	return oid, err
+ }
+ 
+ // WriteTree stores a *Tree on disk and returns the SHA it is uniquely
+@@ -89,6 +132,22 @@ func (o *ObjectDatabase) WriteCommit(c *Commit) ([]byte, error) {
+ 	return sha, nil
+ }
+ 
++// Root returns the filesystem root that this *ObjectDatabase works within, if
++// backed by a fileStorer (constructed by FromFilesystem). If so, it returns
++// the fully-qualified path on a disk and a value of true.
++//
++// Otherwise, it returns empty-string and a value of false.
++func (o *ObjectDatabase) Root() (string, bool) {
++	type rooter interface {
++		Root() string
++	}
++
++	if root, ok := o.s.(rooter); ok {
++		return root.Root(), true
++	}
++	return "", false
++}
++
+ // encode encodes and saves an object to the storage backend and uses an
+ // in-memory buffer to calculate the object's encoded body.
+ func (d *ObjectDatabase) encode(object Object) (sha []byte, n int64, err error) {
+@@ -107,6 +166,7 @@ func (d *ObjectDatabase) encodeBuffer(object Object, buf io.ReadWriter) (sha []b
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
++	defer os.Remove(tmp.Name())
+ 	defer tmp.Close()
+ 
+ 	to := NewObjectWriter(tmp)
+@@ -128,43 +188,108 @@ func (d *ObjectDatabase) encodeBuffer(object Object, buf io.ReadWriter) (sha []b
+ 		return nil, 0, err
+ 	}
+ 
++	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
++		return nil, 0, err
++	}
+ 	return d.save(to.Sha(), tmp)
+ }
+ 
+ // save writes the given buffer to the location given by the storer "o.s" as
+ // identified by the sha []byte.
+ func (o *ObjectDatabase) save(sha []byte, buf io.Reader) ([]byte, int64, error) {
++	if atomic.LoadUint32(&o.closed) == 1 {
++		return nil, 0, errors.New("git/odb: database closed")
++	}
+ 	n, err := o.s.Store(sha, buf)
+ 
+ 	return sha, n, err
+ }
+ 
+-// decode decodes an object given by the sha "sha []byte" into the given object
+-// "into", or returns an error if one was encountered.
+-func (o *ObjectDatabase) decode(sha []byte, into Object) error {
++// open gives an `*ObjectReader` for the given loose object keyed by the given
++// "sha" []byte, or an error.
++func (o *ObjectDatabase) open(sha []byte) (*ObjectReader, error) {
++	if atomic.LoadUint32(&o.closed) == 1 {
++		return nil, errors.New("git/odb: cannot use closed *git.ObjectScanner")
++	}
+ 	f, err := o.s.Open(sha)
+ 	if err != nil {
+-		return err
++		if !os.IsNotExist(err) {
++			// If there was some other issue beyond not being able
++			// to find the object, return that immediately and don't
++			// try and fallback to the *git.ObjectScanner.
++			return nil, err
++		}
++
++		// Otherwise, if the file simply couldn't be found, attempt to
++		// load its contents from the *git.ObjectScanner by leveraging
++		// `git-cat-file --batch`.
++		if atomic.LoadUint32(&o.closed) == 1 {
++			return nil, errors.New("git/odb: cannot use closed *git.ObjectScanner")
++		}
++
++		if o.objectScanner == nil {
++			root, ok := o.Root()
++			if !ok {
++				return nil, os.ErrNotExist
++			}
++			scanner, err := git.NewObjectScannerIn(filepath.Dir(filepath.Clean(root)))
++			if err != nil {
++				return nil, err
++			}
++			o.objectScanner = scanner
++		}
++		if !o.objectScanner.Scan(hex.EncodeToString(sha)) {
++			return nil, o.objectScanner.Err()
++		}
++
++		return NewUncompressedObjectReader(io.MultiReader(
++			// Git object header:
++			strings.NewReader(fmt.Sprintf("%s %d\x00",
++				o.objectScanner.Type(), o.objectScanner.Size(),
++			)),
++
++			// Git object (uncompressed) contents:
++			o.objectScanner.Contents(),
++		))
+ 	}
+ 
+-	r, err := NewObjectReadCloser(f)
++	return NewObjectReadCloser(f)
++}
++
++// decode decodes an object given by the sha "sha []byte" into the given object
++// "into", or returns an error if one was encountered.
++//
++// Ordinarily, it closes the object's underlying io.ReadCloser (if it implements
++// the `io.Closer` interface), but skips this if the "into" Object is of type
++// BlobObjectType. Blob's don't exhaust the buffer completely (they instead
++// maintain a handle on the blob's contents via an io.LimitedReader) and
++// therefore cannot be closed until signaled explicitly by git/odb.Blob.Close().
++func (o *ObjectDatabase) decode(sha []byte, into Object) (err error) {
++	r, err := o.open(sha)
+ 	if err != nil {
+ 		return err
+ 	}
+-
++	owned := true
++	defer func() {
++		if owned {
++			closeErr := r.Close()
++			if err == nil {
++				err = closeErr
++			}
++		}
++	}()
+ 	typ, size, err := r.Header()
+ 	if err != nil {
+ 		return err
+-	} else if typ != into.Type() {
++	}
++	if typ != into.Type() {
+ 		return &UnexpectedObjectType{Got: typ, Wanted: into.Type()}
+ 	}
+-
+ 	if _, err = into.Decode(r, size); err != nil {
+ 		return err
+ 	}
+-
+-	if err = r.Close(); err != nil {
+-		return err
++	if into.Type() == BlobObjectType {
++		owned = false
+ 	}
+ 	return nil
+ }
+diff --git a/git/odb/object_db_test.go b/git/odb/object_db_test.go
+index 7c11375..a3ae5c4 100644
+--- a/git/odb/object_db_test.go
++++ b/git/odb/object_db_test.go
+@@ -11,6 +11,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/git-lfs/git-lfs/git"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ )
+@@ -167,3 +168,59 @@ func TestWriteCommit(t *testing.T) {
+ 	assert.Equal(t, expected, hex.EncodeToString(sha))
+ 	assert.NotNil(t, fs.fs[hex.EncodeToString(sha)])
+ }
++
++func TestReadingAMissingObject(t *testing.T) {
++	sha, _ := hex.DecodeString("af5626b4a114abcb82d63db7c8082c3c4756e51b")
++	out := strings.NewReader(fmt.Sprintf("%x blob 14\nHello, world!\n", sha))
++
++	db := &ObjectDatabase{
++		s:             newMemoryStorer(nil),
++		objectScanner: git.NewObjectScannerFrom(out),
++	}
++
++	blob, err := db.Blob(sha)
++
++	assert.Nil(t, err)
++	assert.EqualValues(t, 14, blob.Size)
++
++	contents, err := ioutil.ReadAll(blob.Contents)
++	assert.Nil(t, err)
++	assert.Equal(t, "Hello, world!\n", string(contents))
++}
++
++func TestReadingAMissingObjectAfterClose(t *testing.T) {
++	sha, _ := hex.DecodeString("af5626b4a114abcb82d63db7c8082c3c4756e51b")
++
++	db := &ObjectDatabase{
++		s:      newMemoryStorer(nil),
++		closed: 1,
++	}
++
++	blob, err := db.Blob(sha)
++	assert.EqualError(t, err, "git/odb: cannot use closed *git.ObjectScanner")
++	assert.Nil(t, blob)
++}
++
++func TestClosingAnObjectDatabaseMoreThanOnce(t *testing.T) {
++	db, err := FromFilesystem("/tmp")
++	assert.Nil(t, err)
++
++	assert.Nil(t, db.Close())
++	assert.EqualError(t, db.Close(), "git/odb: *ObjectDatabase already closed")
++}
++
++func TestObjectDatabaseRootWithRoot(t *testing.T) {
++	db, err := FromFilesystem("/foo/bar/baz")
++	assert.Nil(t, err)
++
++	root, ok := db.Root()
++	assert.Equal(t, "/foo/bar/baz", root)
++	assert.True(t, ok)
++}
++
++func TestObjectDatabaseRootWithoutRoot(t *testing.T) {
++	root, ok := new(ObjectDatabase).Root()
++
++	assert.Equal(t, "", root)
++	assert.False(t, ok)
++}
+diff --git a/git/odb/object_reader.go b/git/odb/object_reader.go
+index ff1e08c..c19c31d 100644
+--- a/git/odb/object_reader.go
++++ b/git/odb/object_reader.go
+@@ -45,7 +45,14 @@ func NewObjectReader(r io.Reader) (*ObjectReader, error) {
+ 	return NewObjectReadCloser(ioutil.NopCloser(r))
+ }
+ 
+-// NewReader takes a given io.Reader that yields zlib-compressed data, and
++// NewObjectReader takes a given io.Reader that yields uncompressed data and
++// returns an *ObjectReader wrapping it, or an error if one occurred during
++// construction time.
++func NewUncompressedObjectReader(r io.Reader) (*ObjectReader, error) {
++	return NewUncompressedObjectReadCloser(ioutil.NopCloser(r))
++}
++
++// NewObjectReadCloser takes a given io.Reader that yields zlib-compressed data, and
+ // returns an *ObjectReader wrapping it, or an error if one occurred during
+ // construction time.
+ //
+@@ -54,23 +61,36 @@ func NewObjectReader(r io.Reader) (*ObjectReader, error) {
+ func NewObjectReadCloser(r io.ReadCloser) (*ObjectReader, error) {
+ 	zr, err := zlib.NewReader(r)
+ 	if err != nil {
++		r.Close()
+ 		return nil, err
+ 	}
+ 
+ 	return &ObjectReader{
+ 		r: bufio.NewReader(zr),
+ 		closeFn: func() error {
+-			if err := zr.Close(); err != nil {
+-				return err
+-			}
+-			if err := r.Close(); err != nil {
+-				return err
++			zerr := zr.Close()
++			rerr := r.Close()
++			if zerr != nil {
++				return zerr
+ 			}
+-			return nil
++			return rerr
+ 		},
+ 	}, nil
+ }
+ 
++// NewUncompressObjectReadCloser takes a given io.Reader that yields
++// uncompressed data, and returns an *ObjectReader wrapping it, or an error if
++// one occurred during construction time.
++//
++// It also calls the Close() function given by the implementation "r" of the
++// type io.Closer.
++func NewUncompressedObjectReadCloser(r io.ReadCloser) (*ObjectReader, error) {
++	return &ObjectReader{
++		r:       bufio.NewReader(r),
++		closeFn: r.Close,
++	}, nil
++}
++
+ // Header returns information about the Object's header, or an error if one
+ // occurred while reading the data.
+ //
+@@ -135,5 +155,7 @@ func (r *ObjectReader) Close() error {
+ 	if r.closeFn == nil {
+ 		return nil
+ 	}
+-	return r.closeFn()
++	close := r.closeFn
++	r.closeFn = nil
++	return close()
+ }
+diff --git a/git/odb/tree.go b/git/odb/tree.go
+index 10c7130..95b61fa 100644
+--- a/git/odb/tree.go
++++ b/git/odb/tree.go
+@@ -26,34 +26,42 @@ func (t *Tree) Type() ObjectType { return TreeObjectType }
+ // If any error was encountered along the way, that will be returned, along with
+ // the number of bytes read up to that point.
+ func (t *Tree) Decode(from io.Reader, size int64) (n int, err error) {
+-	buf := bufio.NewReader(from)
++	if size < 0 {
++		return 0, fmt.Errorf("git/odb: negative tree size")
++	}
++	limited := &io.LimitedReader{R: from, N: size}
++	buf := bufio.NewReader(limited)
+ 
+ 	var entries []*TreeEntry
+ 	for {
+ 		modes, err := buf.ReadString(' ')
++		n += len(modes)
+ 		if err != nil {
+-			if err == io.EOF {
++			if err == io.EOF && len(modes) == 0 && int64(n) == size {
+ 				break
+ 			}
+ 			return n, err
+ 		}
+-		n += len(modes)
+ 		modes = strings.TrimSuffix(modes, " ")
+ 
+-		mode, _ := strconv.ParseInt(modes, 8, 32)
++		mode, err := strconv.ParseInt(modes, 8, 32)
++		if err != nil {
++			return n, err
++		}
+ 
+ 		fname, err := buf.ReadString('\x00')
++		n += len(fname)
+ 		if err != nil {
+ 			return n, err
+ 		}
+-		n += len(fname)
+ 		fname = strings.TrimSuffix(fname, "\x00")
+ 
+ 		var sha [20]byte
+-		if _, err = buf.Read(sha[:]); err != nil {
++		read, err := io.ReadFull(buf, sha[:])
++		n += read
++		if err != nil {
+ 			return n, err
+ 		}
+-		n += 20
+ 
+ 		var typ ObjectType
+ 		switch mode & syscall.S_IFMT {
+@@ -72,7 +80,7 @@ func (t *Tree) Decode(from io.Reader, size int64) (n int, err error) {
+ 				// panic.
+ 				typ = CommitObjectType
+ 			} else {
+-				panic(fmt.Sprintf("git/odb: unknown object type: %q %q", modes, fname))
++				return n, fmt.Errorf("git/odb: unknown object type: %q %q", modes, fname)
+ 			}
+ 		}
+ 
+diff --git a/git/odb/tree_test.go b/git/odb/tree_test.go
+index bdbf02f..6c51eb1 100644
+--- a/git/odb/tree_test.go
++++ b/git/odb/tree_test.go
+@@ -1,6 +1,7 @@
+ package odb
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"fmt"
+ 	"strconv"
+@@ -101,6 +102,30 @@ func TestTreeDecoding(t *testing.T) {
+ 	}, tree.Entries[3])
+ }
+ 
++func TestTreeDecodingShaBoundary(t *testing.T) {
++	var from bytes.Buffer
++
++	fmt.Fprintf(&from, "%s %s\x00%s",
++		strconv.FormatInt(int64(0100644), 8),
++		"a.dat", []byte("aaaaaaaaaaaaaaaaaaaa"))
++
++	flen := from.Len()
++
++	tree := new(Tree)
++	n, err := tree.Decode(bufio.NewReaderSize(&from, flen-2), int64(flen))
++
++	assert.Nil(t, err)
++	assert.Equal(t, flen, n)
++
++	require.Len(t, tree.Entries, 1)
++	assert.Equal(t, &TreeEntry{
++		Name:     "a.dat",
++		Type:     BlobObjectType,
++		Oid:      []byte("aaaaaaaaaaaaaaaaaaaa"),
++		Filemode: 0100644,
++	}, tree.Entries[0])
++}
++
+ func assertTreeEntry(t *testing.T, buf *bytes.Buffer,
+ 	name string, typ ObjectType, oid []byte, mode int32) {
+ 
+diff --git a/git/rev_list_scanner.go b/git/rev_list_scanner.go
+new file mode 100644
+index 0000000..970cf3e
+--- /dev/null
++++ b/git/rev_list_scanner.go
+@@ -0,0 +1,365 @@
++package git
++
++import (
++	"bufio"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"io/ioutil"
++	"os/exec"
++	"regexp"
++	"strings"
++	"sync"
++
++	"github.com/git-lfs/git-lfs/errors"
++	"github.com/rubyist/tracerx"
++)
++
++// ScanningMode is a constant type that allows for variation in the range of
++// commits to scan when given to the `*git.RevListScanner` type.
++type ScanningMode int
++
++const (
++	// ScanRefsMode will scan between two refspecs.
++	ScanRefsMode ScanningMode = iota
++	// ScanAllMode will scan all history.
++	ScanAllMode
++	// ScanLeftToRemoteMode will scan the difference between any included
++	// SHA1s and a remote tracking ref.
++	ScanLeftToRemoteMode
++)
++
++// RevListOrder is a constant type that allows for variation in the ordering of
++// revisions given by the *RevListScanner below.
++type RevListOrder int
++
++const (
++	// DefaultRevListOrder is the zero-value for this type and yields the
++	// results as given by git-rev-list(1) without any `--<t>-order`
++	// argument given. By default: reverse chronological order.
++	DefaultRevListOrder RevListOrder = iota
++	// DateRevListOrder gives the revisions such that no parents are shown
++	// before children, and otherwise in commit timestamp order.
++	DateRevListOrder
++	// AuthorDateRevListOrder gives the revisions such that no parents are
++	// shown before children, and otherwise in author date timestamp order.
++	AuthorDateRevListOrder
++	// TopoRevListOrder gives the revisions such that they appear in
++	// topological order.
++	TopoRevListOrder
++)
++
++// Flag returns the command-line flag to be passed to git-rev-list(1) in order
++// to order the output according to the given RevListOrder. It returns both the
++// flag ("--date-order", "--topo-order", etc) and a bool, whether or not to
++// append the flag (for instance, DefaultRevListOrder requires no flag).
++//
++// Unsupported values leave ordering disabled.
++func (o RevListOrder) Flag() (string, bool) {
++	switch o {
++	case DefaultRevListOrder:
++		return "", false
++	case DateRevListOrder:
++		return "--date-order", true
++	case AuthorDateRevListOrder:
++		return "--author-date-order", true
++	case TopoRevListOrder:
++		return "--topo-order", true
++	default:
++		return "", false
++	}
++}
++
++// ScanRefsOptions is an "options" type that is used to configure a scan
++// operation on the `*git.RevListScanner` instance when given to the function
++// `NewRevListScanner()`.
++type ScanRefsOptions struct {
++	// Mode is the scan mode to apply, see above.
++	Mode ScanningMode
++	// Remote is the current remote to scan against, if using
++	// ScanLeftToRemoveMode.
++	Remote string
++	// SkipDeletedBlobs specifies whether or not to traverse into commit
++	// ancestry (revealing potentially deleted (unreferenced) blobs, trees,
++	// or commits.
++	SkipDeletedBlobs bool
++	// Order specifies the order in which revisions are yielded from the
++	// output of `git-rev-list(1)`. For more information, see the above
++	// documentation on the RevListOrder type.
++	Order RevListOrder
++	// CommitsOnly specifies whether or not the *RevListScanner should
++	// return only commits, or all objects in range by performing a
++	// traversal of the graph. By default, false: show all objects.
++	CommitsOnly bool
++	// WorkingDir specifies the working directory in which to run
++	// git-rev-list(1). If this is an empty string, (has len(WorkingDir) ==
++	// 0), it is equivalent to running in os.Getwd().
++	WorkingDir string
++	// Reverse specifies whether or not to give the revisions in reverse
++	// order.
++	Reverse bool
++
++	// SkippedRefs provides a list of refs to ignore.
++	SkippedRefs []string
++	// Mutex guards names.
++	Mutex *sync.Mutex
++	// Names maps Git object IDs (encoded as hex using
++	// hex.EncodeString()) to their names, i.e., a directory name
++	// (fully-qualified) for trees, or a pathspec for blob tree entries.
++	Names map[string]string
++}
++
++// GetName returns the name associated with a given blob/tree sha and "true" if
++// it exists, or ("", false) if it doesn't.
++//
++// GetName is guarded by a use of o.Mutex, and is goroutine safe.
++func (o *ScanRefsOptions) GetName(sha string) (string, bool) {
++	o.Mutex.Lock()
++	defer o.Mutex.Unlock()
++
++	name, ok := o.Names[sha]
++	return name, ok
++}
++
++// SetName sets the name associated with a given blob/tree sha.
++//
++// SetName is guarded by a use of o.Mutex, and is therefore goroutine safe.
++func (o *ScanRefsOptions) SetName(sha, name string) {
++	o.Mutex.Lock()
++	defer o.Mutex.Unlock()
++
++	o.Names[sha] = name
++}
++
++// RevListScanner is a Scanner type that parses through results of the `git
++// rev-list` command.
++type RevListScanner struct {
++	// s is a buffered scanner feeding from the output (stdout) of
++	// git-rev-list(1) invocation.
++	s *bufio.Scanner
++	// closeFn is an optional type returning an error yielded by closing any
++	// resources held by an open (running) instance of the *RevListScanner
++	// type.
++	closeFn func() error
++
++	// name is the name of the most recently read object.
++	name string
++	// oid is the oid of the most recently read object.
++	oid []byte
++	// err is the most recently encountered error.
++	err error
++}
++
++var (
++	// ambiguousRegex is a regular expression matching the output of stderr
++	// when ambiguous refnames are encountered.
++	ambiguousRegex = regexp.MustCompile(`warning: refname (.*) is ambiguous`)
++
++	// z40 is a regular expression matching the empty blob/commit/tree
++	// SHA: "0000000000000000000000000000000000000000".
++	z40 = regexp.MustCompile(`\^?0{40}`)
++)
++
++// NewRevListScanner instantiates a new RevListScanner instance scanning all
++// revisions reachable by refs contained in "include" and not reachable by any
++// refs included in "excluded", using the *ScanRefsOptions "opt" configuration.
++//
++// It returns a new *RevListScanner instance, or an error if one was
++// encountered. Upon returning, the `git-rev-list(1)` instance is already
++// running, and Scan() may be called immediately.
++func NewRevListScanner(include, excluded []string, opt *ScanRefsOptions) (*RevListScanner, error) {
++	stdin, args, err := revListArgs(include, excluded, opt)
++	if err != nil {
++		return nil, err
++	}
++
++	cmd := exec.Command("git", args...)
++	if len(opt.WorkingDir) > 0 {
++		cmd.Dir = opt.WorkingDir
++	}
++
++	cmd.Stdin = stdin
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		return nil, err
++	}
++	stderr, err := cmd.StderrPipe()
++	if err != nil {
++		return nil, err
++	}
++
++	tracerx.Printf("run_command: git %s", strings.Join(args, " "))
++	if err := cmd.Start(); err != nil {
++		return nil, err
++	}
++
++	return &RevListScanner{
++		s: bufio.NewScanner(stdout),
++		closeFn: func() error {
++			stdout.Close()
++			msg, _ := ioutil.ReadAll(stderr)
++
++			// First check if there was a non-zero exit code given
++			// when Wait()-ing on the command execution.
++			if err := cmd.Wait(); err != nil {
++				return errors.Errorf("Error in git %s: %v %s",
++					strings.Join(args, " "), err, msg)
++			}
++
++			// If the command exited cleanly, but found an ambiguous
++			// refname, promote that to an error and return it.
++			//
++			// `git-rev-list(1)` does not treat ambiguous refnames
++			// as fatal (non-zero exit status), but we do.
++			if am := ambiguousRegex.FindSubmatch(msg); len(am) > 1 {
++				return errors.Errorf("ref %s is ambiguous", am[1])
++			}
++			return nil
++		},
++	}, nil
++}
++
++// revListArgs returns the arguments for a given included and excluded set of
++// SHA1s, and ScanRefsOptions instance.
++//
++// In order, it returns the contents of stdin as an io.Reader, the args passed
++// to git as a []string, and any error encountered in generating those if one
++// occurred.
++func revListArgs(include, exclude []string, opt *ScanRefsOptions) (io.Reader, []string, error) {
++	var stdin io.Reader
++	args := []string{"rev-list"}
++	if !opt.CommitsOnly {
++		args = append(args, "--objects")
++	}
++
++	if opt.Reverse {
++		args = append(args, "--reverse")
++	}
++
++	if orderFlag, ok := opt.Order.Flag(); ok {
++		args = append(args, orderFlag)
++	}
++
++	switch opt.Mode {
++	case ScanRefsMode:
++		if opt.SkipDeletedBlobs {
++			args = append(args, "--no-walk")
++		} else {
++			args = append(args, "--do-walk")
++		}
++
++		args = append(args, includeExcludeShas(include, exclude)...)
++	case ScanAllMode:
++		args = append(args, "--all")
++	case ScanLeftToRemoteMode:
++		if len(opt.SkippedRefs) == 0 {
++			args = append(args, includeExcludeShas(include, exclude)...)
++			args = append(args, "--not", "--remotes="+opt.Remote)
++		} else {
++			args = append(args, "--stdin")
++			stdin = strings.NewReader(strings.Join(
++				append(includeExcludeShas(include, exclude), opt.SkippedRefs...), "\n"),
++			)
++		}
++	default:
++		return nil, nil, errors.Errorf("unknown scan type: %d", opt.Mode)
++	}
++	return stdin, append(args, "--"), nil
++}
++
++func includeExcludeShas(include, exclude []string) []string {
++	include = nonZeroShas(include)
++	exclude = nonZeroShas(exclude)
++
++	args := make([]string, 0, len(include)+len(exclude))
++
++	for _, i := range include {
++		args = append(args, i)
++	}
++
++	for _, x := range exclude {
++		args = append(args, fmt.Sprintf("^%s", x))
++	}
++
++	return args
++}
++
++func nonZeroShas(all []string) []string {
++	nz := make([]string, 0, len(all))
++
++	for _, sha := range all {
++		if len(sha) > 0 && !z40.MatchString(sha) {
++			nz = append(nz, sha)
++		}
++	}
++	return nz
++}
++
++// Name is an optional field that gives the name of the object (if the object is
++// a tree, blob).
++//
++// It can be called before or after Scan(), but will return "" if called
++// before.
++func (s *RevListScanner) Name() string { return s.name }
++
++// OID is the hex-decoded bytes of the object's ID.
++//
++// It can be called before or after Scan(), but will return "" if called
++// before.
++func (s *RevListScanner) OID() []byte { return s.oid }
++
++// Err returns the last encountered error (or nil) after a call to Scan().
++//
++// It SHOULD be called, checked and handled after a call to Scan().
++func (s *RevListScanner) Err() error { return s.err }
++
++// Scan scans the next entry given by git-rev-list(1), and returns true/false
++// indicating if there are more results to scan.
++func (s *RevListScanner) Scan() bool {
++	var err error
++	s.oid, s.name, err = s.scan()
++
++	if err != nil {
++		if err != io.EOF {
++			s.err = err
++		}
++		return false
++	}
++	return len(s.oid) > 0
++}
++
++// Close closes the RevListScanner by freeing any resources held by the
++// instance while running, and returns any error encountered while doing so.
++func (s *RevListScanner) Close() error {
++	if s.closeFn == nil {
++		return nil
++	}
++	close := s.closeFn
++	s.closeFn = nil
++	return close()
++}
++
++// scan provides the internal implementation of scanning a line of text from the
++// output of `git-rev-list(1)`.
++func (s *RevListScanner) scan() ([]byte, string, error) {
++	if !s.s.Scan() {
++		return nil, "", s.s.Err()
++	}
++
++	line := s.s.Text()
++	if len(line) < 40 {
++		return nil, "", nil
++	}
++
++	sha1, err := hex.DecodeString(line[:40])
++	if err != nil {
++		return nil, "", err
++	}
++
++	var name string
++	if len(line) > 40 {
++		name = line[41:]
++	}
++
++	return sha1, name, nil
++}
+diff --git a/git/rev_list_scanner_test.go b/git/rev_list_scanner_test.go
+new file mode 100644
+index 0000000..ab29417
+--- /dev/null
++++ b/git/rev_list_scanner_test.go
+@@ -0,0 +1,213 @@
++package git
++
++import (
++	"bufio"
++	"encoding/hex"
++	"errors"
++	"io/ioutil"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++type ArgsTestCase struct {
++	Include []string
++	Exclude []string
++	Opt     *ScanRefsOptions
++
++	ExpectedStdin string
++	ExpectedArgs  []string
++	ExpectedErr   string
++}
++
++func (c *ArgsTestCase) Assert(t *testing.T) {
++	stdin, args, err := revListArgs(c.Include, c.Exclude, c.Opt)
++
++	if len(c.ExpectedErr) > 0 {
++		assert.EqualError(t, err, c.ExpectedErr)
++	} else {
++		assert.Nil(t, err)
++	}
++
++	require.Equal(t, len(c.ExpectedArgs), len(args))
++	for i := 0; i < len(c.ExpectedArgs); i++ {
++		assert.Equal(t, c.ExpectedArgs[i], args[i],
++			"element #%d not equal: wanted %q, got %q", i, c.ExpectedArgs[i], args[i])
++	}
++
++	if stdin != nil {
++		b, err := ioutil.ReadAll(stdin)
++		assert.Nil(t, err)
++
++		assert.Equal(t, c.ExpectedStdin, string(b))
++	} else if len(c.ExpectedStdin) > 0 {
++		t.Errorf("git: expected stdin contents %s, got none", c.ExpectedStdin)
++	}
++}
++
++var (
++	s1 = "decafdecafdecafdecafdecafdecafdecafdecaf"
++	s2 = "cafecafecafecafecafecafecafecafecafecafe"
++)
++
++func TestRevListArgs(t *testing.T) {
++	for desc, c := range map[string]*ArgsTestCase{
++		"scan refs deleted, left and right": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:             ScanRefsMode,
++				SkipDeletedBlobs: false,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--do-walk", s1, "^" + s2, "--"},
++		},
++		"scan refs not deleted, left and right": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:             ScanRefsMode,
++				SkipDeletedBlobs: true,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--no-walk", s1, "^" + s2, "--"},
++		},
++		"scan refs deleted, left only": {
++			Include: []string{s1}, Opt: &ScanRefsOptions{
++				Mode:             ScanRefsMode,
++				SkipDeletedBlobs: false,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--do-walk", s1, "--"},
++		},
++		"scan refs not deleted, left only": {
++			Include: []string{s1}, Opt: &ScanRefsOptions{
++				Mode:             ScanRefsMode,
++				SkipDeletedBlobs: true,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--no-walk", s1, "--"},
++		},
++		"scan all": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode: ScanAllMode,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--all", "--"},
++		},
++		"scan left to remote, no skipped refs": {
++			Include: []string{s1}, Opt: &ScanRefsOptions{
++				Mode:        ScanLeftToRemoteMode,
++				Remote:      "origin",
++				SkippedRefs: []string{},
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", s1, "--not", "--remotes=origin", "--"},
++		},
++		"scan left to remote, skipped refs": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:        ScanLeftToRemoteMode,
++				Remote:      "origin",
++				SkippedRefs: []string{"a", "b", "c"},
++			},
++			ExpectedArgs:  []string{"rev-list", "--objects", "--stdin", "--"},
++			ExpectedStdin: s1 + "\n^" + s2 + "\na\nb\nc",
++		},
++		"scan unknown type": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode: ScanningMode(-1),
++			},
++			ExpectedErr: "unknown scan type: -1",
++		},
++		"scan date order": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:  ScanRefsMode,
++				Order: DateRevListOrder,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--date-order", "--do-walk", s1, "^" + s2, "--"},
++		},
++		"scan author date order": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:  ScanRefsMode,
++				Order: AuthorDateRevListOrder,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--author-date-order", "--do-walk", s1, "^" + s2, "--"},
++		},
++		"scan topo order": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:  ScanRefsMode,
++				Order: TopoRevListOrder,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--topo-order", "--do-walk", s1, "^" + s2, "--"},
++		},
++		"scan commits only": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:        ScanRefsMode,
++				CommitsOnly: true,
++			},
++			ExpectedArgs: []string{"rev-list", "--do-walk", s1, "^" + s2, "--"},
++		},
++		"scan reverse": {
++			Include: []string{s1}, Exclude: []string{s2}, Opt: &ScanRefsOptions{
++				Mode:    ScanRefsMode,
++				Reverse: true,
++			},
++			ExpectedArgs: []string{"rev-list", "--objects", "--reverse", "--do-walk", s1, "^" + s2, "--"},
++		},
++	} {
++		t.Run(desc, c.Assert)
++	}
++}
++
++func TestRevListScannerCallsClose(t *testing.T) {
++	var called uint32
++	err := errors.New("Hello world")
++
++	s := &RevListScanner{
++		closeFn: func() error {
++			atomic.AddUint32(&called, 1)
++			return err
++		},
++	}
++
++	got := s.Close()
++
++	assert.EqualValues(t, 1, atomic.LoadUint32(&called))
++	assert.Equal(t, err, got)
++}
++
++func TestRevListScannerTreatsCloseFnAsOptional(t *testing.T) {
++	s := &RevListScanner{
++		closeFn: nil,
++	}
++
++	defer func() { assert.Nil(t, recover()) }()
++
++	assert.Nil(t, s.Close())
++}
++
++func TestRevListScannerParsesLinesWithNames(t *testing.T) {
++	given := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa name.dat"
++	s := &RevListScanner{
++		s: bufio.NewScanner(strings.NewReader(given)),
++	}
++
++	assert.True(t, s.Scan())
++	assert.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", hex.EncodeToString(s.OID()))
++	assert.Equal(t, "name.dat", s.Name())
++	assert.Nil(t, s.Err())
++
++	assert.False(t, s.Scan())
++	assert.Equal(t, "", s.Name())
++	assert.Nil(t, s.OID())
++	assert.Nil(t, s.Err())
++}
++
++func TestRevListScannerParsesLinesWithoutName(t *testing.T) {
++	given := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++	s := &RevListScanner{
++		s: bufio.NewScanner(strings.NewReader(given)),
++	}
++
++	assert.True(t, s.Scan())
++	assert.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", hex.EncodeToString(s.OID()))
++	assert.Nil(t, s.Err())
++
++	assert.False(t, s.Scan())
++	assert.Equal(t, "", s.Name())
++	assert.Nil(t, s.OID())
++	assert.Nil(t, s.Err())
++}
+diff --git a/lfs/gitscanner_refs.go b/lfs/gitscanner_refs.go
+index 296b225..dca8674 100644
+--- a/lfs/gitscanner_refs.go
++++ b/lfs/gitscanner_refs.go
+@@ -1,13 +1,10 @@
+ package lfs
+ 
+ import (
+-	"bufio"
+-	"errors"
+-	"fmt"
+-	"io/ioutil"
++	"encoding/hex"
+ 	"regexp"
+-	"strconv"
+-	"strings"
++
++	"github.com/git-lfs/git-lfs/git"
+ )
+ 
+ var z40 = regexp.MustCompile(`\^?0{40}`)
+@@ -44,7 +41,7 @@ func scanRefsToChan(scanner *GitScanner, pointerCb GitScannerFoundPointer, refLe
+ 		panic("no scan ref options")
+ 	}
+ 
+-	revs, err := revListShas(refLeft, refRight, opt)
++	revs, err := revListShas([]string{refLeft, refRight}, nil, opt)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -92,100 +89,43 @@ func scanRefsToChan(scanner *GitScanner, pointerCb GitScannerFoundPointer, refLe
+ // revListShas uses git rev-list to return the list of object sha1s
+ // for the given ref. If all is true, ref is ignored. It returns a
+ // channel from which sha1 strings can be read.
+-func revListShas(refLeft, refRight string, opt *ScanRefsOptions) (*StringChannelWrapper, error) {
+-	refArgs := []string{"rev-list", "--objects"}
+-	var stdin []string
+-	switch opt.ScanMode {
+-	case ScanRefsMode:
+-		if opt.SkipDeletedBlobs {
+-			refArgs = append(refArgs, "--no-walk")
+-		} else {
+-			refArgs = append(refArgs, "--do-walk")
+-		}
++func revListShas(include, exclude []string, opt *ScanRefsOptions) (*StringChannelWrapper, error) {
++	scanner, err := git.NewRevListScanner(include, exclude, &git.ScanRefsOptions{
++		Mode:             git.ScanningMode(opt.ScanMode),
++		Remote:           opt.RemoteName,
++		SkipDeletedBlobs: opt.SkipDeletedBlobs,
++		SkippedRefs:      opt.skippedRefs,
++		Mutex:            opt.mutex,
++		Names:            opt.nameMap,
++	})
+ 
+-		refArgs = append(refArgs, refLeft)
+-		if refRight != "" && !z40.MatchString(refRight) {
+-			refArgs = append(refArgs, refRight)
+-		}
+-	case ScanAllMode:
+-		refArgs = append(refArgs, "--all")
+-	case ScanLeftToRemoteMode:
+-		args, commits := revListArgsRefVsRemote(refLeft, opt.RemoteName, opt.skippedRefs)
+-		refArgs = append(refArgs, args...)
+-		if len(commits) > 0 {
+-			stdin = commits
+-		}
+-	default:
+-		return nil, errors.New("scanner: unknown scan type: " + strconv.Itoa(int(opt.ScanMode)))
+-	}
+-
+-	// Use "--" at the end of the command to disambiguate arguments as refs,
+-	// so Git doesn't complain about ambiguity if you happen to also have a
+-	// file named "master".
+-	refArgs = append(refArgs, "--")
+-
+-	cmd, err := startCommand("git", refArgs...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	if len(stdin) > 0 {
+-		cmd.Stdin.Write([]byte(strings.Join(stdin, "\n")))
+-	}
+-
+-	cmd.Stdin.Close()
+-
+ 	revs := make(chan string, chanBufSize)
+-	errchan := make(chan error, 5) // may be multiple errors
++	errs := make(chan error, 5) // may be multiple errors
+ 
+ 	go func() {
+-		scanner := bufio.NewScanner(cmd.Stdout)
+ 		for scanner.Scan() {
+-			line := strings.TrimSpace(scanner.Text())
+-			if len(line) < 40 {
+-				continue
++			sha := hex.EncodeToString(scanner.OID())
++			if name := scanner.Name(); len(name) > 0 {
++				opt.SetName(sha, name)
+ 			}
++			revs <- sha
++		}
+ 
+-			sha1 := line[0:40]
+-			if len(line) > 40 {
+-				opt.SetName(sha1, line[41:len(line)])
+-			}
+-			revs <- sha1
++		if err = scanner.Err(); err != nil {
++			errs <- err
+ 		}
+ 
+-		stderr, _ := ioutil.ReadAll(cmd.Stderr)
+-		err := cmd.Wait()
+-		if err != nil {
+-			errchan <- fmt.Errorf("Error in git rev-list --objects: %v %v", err, string(stderr))
+-		} else {
+-			// Special case detection of ambiguous refs; lower level commands like
+-			// git rev-list do not return non-zero exit codes in this case, just warn
+-			ambiguousRegex := regexp.MustCompile(`warning: refname (.*) is ambiguous`)
+-			if match := ambiguousRegex.FindStringSubmatch(string(stderr)); match != nil {
+-				// Promote to fatal & exit
+-				errchan <- fmt.Errorf("Error: ref %s is ambiguous", match[1])
+-			}
++		if err = scanner.Close(); err != nil {
++			errs <- err
+ 		}
++
+ 		close(revs)
+-		close(errchan)
++		close(errs)
+ 	}()
+ 
+-	return NewStringChannelWrapper(revs, errchan), nil
+-}
+-
+-// Get additional arguments needed to limit 'git rev-list' to just the changes
+-// in refTo that are also not on remoteName.
+-//
+-// Returns a slice of string command arguments, and a slice of string git
+-// commits to pass to `git rev-list` via STDIN.
+-func revListArgsRefVsRemote(refTo, remoteName string, skippedRefs []string) ([]string, []string) {
+-	if len(skippedRefs) < 1 {
+-		// Safe to use cached
+-		return []string{refTo, "--not", "--remotes=" + remoteName}, nil
+-	}
+-
+-	// Use only the non-missing refs as 'from' points
+-	commits := make([]string, 1, len(skippedRefs)+1)
+-	commits[0] = refTo
+-	return []string{"--stdin"}, append(commits, skippedRefs...)
++	return NewStringChannelWrapper(revs, errs), nil
+ }
+diff --git a/lfsapi/auth.go b/lfsapi/auth.go
+index e0b7627..b50b4be 100644
+--- a/lfsapi/auth.go
++++ b/lfsapi/auth.go
+@@ -85,15 +85,15 @@ func (c *Client) doWithCreds(req *http.Request, credHelper CredentialHelper, cre
+ //
+ // There are three URLs in play, that make this a little confusing.
+ //
+-// 1. The request URL, which should be something like "https://git.com/repo.git/info/lfs/objects/batch"
+-// 2. The LFS API URL, which should be something like "https://git.com/repo.git/info/lfs"
+-//    This URL used for the "lfs.URL.access" git config key, which determines
+-//    what kind of auth the LFS server expects. Could be BasicAccess, NTLMAccess,
+-//    or NoneAccess, in which the Git Credential Helper step is skipped. We do
+-//    not want to prompt the user for a password to fetch public repository data.
+-// 3. The Git Remote URL, which should be something like "https://git.com/repo.git"
+-//    This URL is used for the Git Credential Helper. This way existing https
+-//    Git remote credentials can be re-used for LFS.
++//  1. The request URL, which should be something like "https://git.com/repo.git/info/lfs/objects/batch"
++//  2. The LFS API URL, which should be something like "https://git.com/repo.git/info/lfs"
++//     This URL used for the "lfs.URL.access" git config key, which determines
++//     what kind of auth the LFS server expects. Could be BasicAccess, NTLMAccess,
++//     or NoneAccess, in which the Git Credential Helper step is skipped. We do
++//     not want to prompt the user for a password to fetch public repository data.
++//  3. The Git Remote URL, which should be something like "https://git.com/repo.git"
++//     This URL is used for the Git Credential Helper. This way existing https
++//     Git remote credentials can be re-used for LFS.
+ func getCreds(credHelper CredentialHelper, netrcFinder NetrcFinder, ef EndpointFinder, remote string, req *http.Request) (Endpoint, Access, Creds, *url.URL, error) {
+ 	operation := getReqOperation(req)
+ 	apiEndpoint := ef.Endpoint(operation, remote)
+@@ -215,7 +215,12 @@ func getCredURLForAPI(ef EndpointFinder, operation, remote string, apiEndpoint E
+ 
+ 	if len(remote) > 0 {
+ 		if u := ef.GitRemoteURL(remote, operation == "upload"); u != "" {
+-			schemedUrl, _ := prependEmptySchemeIfAbsent(u)
++			schemedUrl, absent := prependEmptySchemeIfAbsent(u)
++			// SCP-style SSH remotes cannot supply HTTP endpoint credentials.
++			// Do not parse their repository name as a URL port.
++			if absent {
++				return apiURL, nil
++			}
+ 
+ 			gitRemoteURL, err := url.Parse(schemedUrl)
+ 			if err != nil {
+diff --git a/test/test-migrate-fixtures.sh b/test/test-migrate-fixtures.sh
+new file mode 100755
+index 0000000..40e1d6d
+--- /dev/null
++++ b/test/test-migrate-fixtures.sh
+@@ -0,0 +1,160 @@
++#!/usr/bin/env bash
++
++# assert_ref_unmoved ensures that the previous and current SHA1 of a given ref
++# is equal by string comparison:
++#
++#   assert_ref_unmoved "HEAD" "$previous_sha" "$current_sha"
++#
++# If the two are unequal (the ref has moved), a message is printed to stderr and
++# the program exits.
++assert_ref_unmoved() {
++  local name="$1"
++  local prev_sha="$2"
++  local current_sha="$3"
++
++  if [ "$prev_sha" != "$current_sha" ]; then
++    echo >&2 "$name should not have moved (from: $prev_sha, to: $current_sha)"
++    exit 1
++  fi
++}
++
++# setup_single_remote_branch creates a repository as follows:
++#
++#     B
++#    / \
++#   A   refs/heads/my-feature
++#    \
++#     refs/heads/master
++#
++# - Commit 'A' has 120, 140 bytes of data in a.txt, and a.md, respectively.
++#
++# - Commit 'B' has 30 bytes of data in a.txt, and includes commit 'A' as a
++#   parent.
++setup_multiple_local_branches() {
++  set -e
++
++  reponame="migrate-info-multiple-local-branches"
++
++  remove_and_create_local_repo "$reponame"
++
++  base64 < /dev/urandom | head -c 120 > a.txt
++  base64 < /dev/urandom | head -c 140 > a.md
++
++  git add a.txt a.md
++  git commit -m "initial commit"
++
++  git checkout -b my-feature
++
++  base64 < /dev/urandom | head -c 30 > a.md
++
++  git add a.md
++  git commit -m "add an additional 30 bytes to a.md"
++
++  git checkout master
++}
++
++# setup_single_remote_branch creates a repository as follows:
++#
++#   A---B
++#    \   \
++#     \   refs/heads/master
++#      \
++#       refs/remotes/origin/master
++#
++# - Commit 'A' has 120, 140 bytes of data in a.txt, and a.md, respectively. It
++#   is the latest commit pushed to the remote 'origin'.
++#
++# - Commit 'B' has 30, 50 bytes of data in a.txt, and a.md, respectively.
++setup_single_remote_branch() {
++  set -e
++
++  reponame="migrate-info-single-remote-branch"
++
++  remove_and_create_remote_repo "$reponame"
++
++  base64 < /dev/urandom | head -c 120 > a.txt
++  base64 < /dev/urandom | head -c 140 > a.md
++
++  git add a.txt a.md
++  git commit -m "initial commit"
++
++  git push origin master
++
++  base64 < /dev/urandom | head -c 30 > a.txt
++  base64 < /dev/urandom | head -c 50 > a.md
++
++  git add a.md a.txt
++  git commit -m "add an additional 30, 50 bytes to a.{txt,md}"
++}
++
++# setup_multiple_remote_branches creates a repository as follows:
++#
++#         C
++#        / \
++#   A---B   refs/heads/my-feature
++#    \   \
++#     \   refs/heads/master
++#      \
++#       refs/remotes/origin/master
++#
++# - Commit 'A' has 10, 11 bytes of data in a.txt, and a.md, respectively. It is
++#   the latest commit pushed to the remote 'origin'.
++#
++# - Commit 'B' has 20, 21 bytes of data in a.txt, and a.md, respectively.
++#
++# - Commit 'C' has 30, 31 bytes of data in a.txt, and a.md, respectively. It is
++#   the latest commit on refs/heads/my-feature.
++setup_multiple_remote_branches() {
++  set -e
++
++  reponame="migrate-info-exclude-remote-refs-given-branch"
++
++  remove_and_create_remote_repo "$reponame"
++
++  base64 < /dev/urandom | head -c 10 > a.txt
++  base64 < /dev/urandom | head -c 11 > a.md
++  git add a.txt a.md
++  git commit -m "add 10, 11 bytes, a.{txt,md}"
++
++  git push origin master
++
++  base64 < /dev/urandom | head -c 20 > a.txt
++  base64 < /dev/urandom | head -c 21 > a.md
++  git add a.txt a.md
++  git commit -m "add 20, 21 bytes, a.{txt,md}"
++
++  git checkout -b my-feature
++
++  base64 < /dev/urandom | head -c 30 > a.txt
++  base64 < /dev/urandom | head -c 31 > a.md
++  git add a.txt a.md
++  git commit -m "add 30, 31 bytes, a.{txt,md}"
++
++  git checkout master
++}
++
++# remove_and_create_local_repo removes, creates, and checks out a local
++# repository given by a particular name:
++#
++#   remove_and_create_local_repo "$reponame"
++remove_and_create_local_repo() {
++  local reponame="$1"
++
++  rm -rf "$reponame" || true
++
++  git init "$reponame"
++  cd "$reponame"
++}
++
++# remove_and_create_remote_repo removes, creates, and checks out a remote
++# repository both locally and on the gitserver, given by a particular name:
++#
++#   remove_and_create_remote_repo "$reponame"
++remove_and_create_remote_repo() {
++  local reponame="$1"
++
++  rm -rf "$reponame" "$REMOTEDIR/$reponame.git" || true
++
++  setup_remote_repo "$reponame"
++  clone_repo "$reponame" "$reponame"
++}
+diff --git a/test/test-migrate-info.sh b/test/test-migrate-info.sh
+new file mode 100755
+index 0000000..a3fcbcd
+--- /dev/null
++++ b/test/test-migrate-info.sh
+@@ -0,0 +1,239 @@
++#!/usr/bin/env bash
++
++. "test/test-migrate-fixtures.sh"
++. "test/testlib.sh"
++
++begin_test "migrate info (default branch)"
++(
++  set -e
++
++  setup_multiple_local_branches
++
++  original_head="$(git rev-parse HEAD)"
++
++  diff -u <(git lfs migrate info --above=0b 2>&1) <(cat <<-EOF
++	*.md 	140 B	1/1 files(s)	100%
++	*.txt	120 B	1/1 files(s)	100%
++	EOF)
++
++  migrated_head="$(git rev-parse HEAD)"
++
++  assert_ref_unmoved "HEAD" "$original_head" "$migrated_head"
++)
++end_test
++
++begin_test "migrate info (given branch)"
++(
++  set -e
++
++  setup_multiple_local_branches
++
++  original_master="$(git rev-parse refs/heads/master)"
++  original_feature="$(git rev-parse refs/heads/my-feature)"
++
++  diff -u <(git lfs migrate info --above=0b my-feature 2>&1) <(cat <<-EOF
++	*.md 	170 B	2/2 files(s)	100%
++	*.txt	120 B	1/1 files(s)	100%
++	EOF)
++
++  migrated_master="$(git rev-parse refs/heads/master)"
++  migrated_feature="$(git rev-parse refs/heads/my-feature)"
++
++  assert_ref_unmoved "refs/heads/master" "$original_master" "$migrated_master"
++  assert_ref_unmoved "refs/heads/my-feature" "$original_feature" "$migrated_feature"
++)
++end_test
++
++begin_test "migrate info (default branch with filter)"
++(
++  set -e
++
++  setup_multiple_local_branches
++
++  original_head="$(git rev-parse HEAD)"
++
++  diff -u <(git lfs migrate info --above=0b --include "*.md" 2>&1) <(cat <<-EOF
++	*.md	140 B	1/1 files(s)	100%
++	EOF)
++
++  migrated_head="$(git rev-parse HEAD)"
++
++  assert_ref_unmoved "refs/heads/master" "$original_head" "$migrated_head"
++)
++end_test
++
++begin_test "migrate info (given branch with filter)"
++(
++  set -e
++
++  setup_multiple_local_branches
++
++  original_master="$(git rev-parse refs/heads/master)"
++  original_feature="$(git rev-parse refs/heads/my-feature)"
++
++  diff -u <(git lfs migrate info --above=0b --include "*.md" my-feature 2>&1) <(cat <<-EOF
++	*.md	170 B	2/2 files(s)	100%
++	EOF)
++
++  migrated_master="$(git rev-parse refs/heads/master)"
++  migrated_feature="$(git rev-parse refs/heads/my-feature)"
++
++  assert_ref_unmoved "refs/heads/master" "$original_master" "$migrated_master"
++  assert_ref_unmoved "refs/heads/my-feature" "$original_feature" "$migrated_feature"
++)
++end_test
++
++begin_test "migrate info (default branch, exclude remote refs)"
++(
++  set -e
++
++  setup_single_remote_branch
++
++  git show-ref
++
++  original_remote="$(git rev-parse refs/remotes/origin/master)"
++  original_master="$(git rev-parse refs/heads/master)"
++
++  diff -u <(git lfs migrate info --above=0b 2>&1) <(cat <<-EOF
++	*.md 	50 B	1/1 files(s)	100%
++	*.txt	30 B	1/1 files(s)	100%
++	EOF)
++
++  migrated_remote="$(git rev-parse refs/remotes/origin/master)"
++  migrated_master="$(git rev-parse refs/heads/master)"
++
++  assert_ref_unmoved "refs/heads/master" "$original_master" "$migrated_master"
++  assert_ref_unmoved "refs/remotes/origin/master" "$original_remote" "$migrated_remote"
++)
++end_test
++
++begin_test "migrate info (given branch, exclude remote refs)"
++(
++  set -e
++
++  setup_multiple_remote_branches
++
++  original_remote="$(git rev-parse refs/remotes/origin/master)"
++  original_master="$(git rev-parse refs/heads/master)"
++  original_feature="$(git rev-parse refs/heads/my-feature)"
++
++  diff -u <(git lfs migrate info --above=0b my-feature 2>&1) <(cat <<-EOF
++	*.md 	52 B	2/2 files(s)	100%
++	*.txt	50 B	2/2 files(s)	100%
++	EOF)
++
++  migrated_remote="$(git rev-parse refs/remotes/origin/master)"
++  migrated_master="$(git rev-parse refs/heads/master)"
++  migrated_feature="$(git rev-parse refs/heads/my-feature)"
++
++  assert_ref_unmoved "refs/remotes/origin/master" "$original_remote" "$migrated_remote"
++  assert_ref_unmoved "refs/heads/master" "$original_master" "$migrated_master"
++  assert_ref_unmoved "refs/heads/my-feature" "$original_feature" "$migrated_feature"
++)
++end_test
++
++begin_test "migrate info (include/exclude ref)"
++(
++  set -e
++
++  setup_multiple_remote_branches
++
++  original_master="$(git rev-parse refs/heads/master)"
++  original_feature="$(git rev-parse refs/heads/my-feature)"
++
++  diff -u <(git lfs migrate info \
++    --above=0b \
++    --include-ref=refs/heads/my-feature \
++    --exclude-ref=refs/heads/master 2>&1) <(cat <<-EOF
++	*.md 	31 B	1/1 files(s)	100%
++	*.txt	30 B	1/1 files(s)	100%
++	EOF)
++
++  migrated_master="$(git rev-parse refs/heads/master)"
++  migrated_feature="$(git rev-parse refs/heads/my-feature)"
++
++  assert_ref_unmoved "refs/heads/master" "$original_master" "$migrated_master"
++  assert_ref_unmoved "refs/heads/my-feature" "$original_feature" "$migrated_feature"
++)
++end_test
++
++begin_test "migrate info (include/exclude ref with filter)"
++(
++  set -e
++
++  setup_multiple_remote_branches
++
++  original_master="$(git rev-parse refs/heads/master)"
++  original_feature="$(git rev-parse refs/heads/my-feature)"
++
++  diff -u <(git lfs migrate info \
++    --above=0b \
++    --include="*.txt" \
++    --include-ref=refs/heads/my-feature \
++    --exclude-ref=refs/heads/master 2>&1) <(cat <<-EOF
++	*.txt	30 B	1/1 files(s)	100%
++	EOF)
++
++  migrated_master="$(git rev-parse refs/heads/master)"
++  migrated_feature="$(git rev-parse refs/heads/my-feature)"
++
++  assert_ref_unmoved "refs/heads/master" "$original_master" "$migrated_master"
++  assert_ref_unmoved "refs/heads/my-feature" "$original_feature" "$migrated_feature"
++)
++end_test
++
++begin_test "migrate info (above threshold)"
++(
++  set -e
++
++  setup_multiple_local_branches
++
++  original_head="$(git rev-parse HEAD)"
++
++  diff -u <(git lfs migrate info --above=130B 2>&1) <(cat <<-EOF
++	*.md 	140 B	1/1 files(s)	100%
++	*.txt	0 B  	0/1 files(s)	  0%
++	EOF)
++
++  migrated_head="$(git rev-parse HEAD)"
++
++  assert_ref_unmoved "HEAD" "$original_head" "$migrated_head"
++)
++end_test
++
++begin_test "migrate info (above threshold, top)"
++(
++  set -e
++
++  setup_multiple_local_branches
++
++  original_head="$(git rev-parse HEAD)"
++
++  diff -u <(git lfs migrate info --above=130B --top=1 2>&1) <(cat <<-EOF
++	*.md	140 B	1/1 files(s)	100%
++	EOF)
++
++  migrated_head="$(git rev-parse HEAD)"
++
++  assert_ref_unmoved "HEAD" "$original_head" "$migrated_head"
++)
++end_test
++
++begin_test "migrate info (given unit)"
++(
++  set -e
++
++  setup_multiple_local_branches
++
++  original_head="$(git rev-parse HEAD)"
++
++  diff -u <(git lfs migrate info --above=0b --unit=kb 2>&1) <(cat <<-EOF
++	*.md 	0.1	1/1 files(s)	100%
++	*.txt	0.1	1/1 files(s)	100%
++	EOF)
++
++  migrated_head="$(git rev-parse HEAD)"
++
++  assert_ref_unmoved "HEAD" "$original_head" "$migrated_head"
++)
++end_test
+diff --git a/test/test-status.sh b/test/test-status.sh
+index 7c5e3b6..263a944 100755
+--- a/test/test-status.sh
++++ b/test/test-status.sh
+@@ -85,6 +85,32 @@ A  file2.dat"
+ )
+ end_test
+ 
++begin_test "status --json"
++(
++  set -e
++
++  mkdir repo-3
++  cd repo-3
++  git init
++  git lfs track "*.dat"
++  echo "some data" > file1.dat
++  git add file1.dat
++  git commit -m "file1.dat"
++
++  echo "other data" > file1.dat
++
++  expected='{"files":{"file1.dat":{"status":"M"}}}'
++  [ "$expected" = "$(git lfs status --json)" ]
++
++  git add file1.dat
++  git commit -m "file1.dat changed"
++  git mv file1.dat file2.dat
++
++  expected='{"files":{"file2.dat":{"status":"R","from":"file1.dat"}}}'
++  [ "$expected" = "$(git lfs status --json)" ]
++)
++end_test
++
+ 
+ begin_test "status: outside git repository"
+ (
+diff --git a/tools/cygwin_windows.go b/tools/cygwin_windows.go
+index 96e9f95..a587cd3 100644
+--- a/tools/cygwin_windows.go
++++ b/tools/cygwin_windows.go
+@@ -1,3 +1,4 @@
++//go:build windows
+ // +build windows
+ 
+ package tools
+@@ -43,7 +44,7 @@ func isCygwin() bool {
+ 		return false
+ 	}
+ 
+-	if bytes.Contains(out, []byte("CYGWIN")) {
++	if bytes.Contains(out, []byte("CYGWIN")) || bytes.Contains(out, []byte("MSYS")) {
+ 		cygwinState = cygwinStateEnabled
+ 	} else {
+ 		cygwinState = cygwinStateDisabled
+diff --git a/tools/humanize/humanize.go b/tools/humanize/humanize.go
+new file mode 100644
+index 0000000..6777bf4
+--- /dev/null
++++ b/tools/humanize/humanize.go
+@@ -0,0 +1,123 @@
++package humanize
++
++import (
++	"fmt"
++	"math"
++	"strconv"
++	"strings"
++	"unicode"
++
++	"github.com/git-lfs/git-lfs/errors"
++)
++
++const (
++	Byte = 1 << (iota * 10)
++	Kibibyte
++	Mebibyte
++	Gibibyte
++	Tebibyte
++	Pebibyte
++
++	Kilobyte = 1000 * Byte
++	Megabyte = 1000 * Kilobyte
++	Gigabyte = 1000 * Megabyte
++	Terabyte = 1000 * Gigabyte
++	Petabyte = 1000 * Terabyte
++)
++
++var bytesTable = map[string]uint64{
++	"b": Byte,
++
++	"kib": Kibibyte,
++	"mib": Mebibyte,
++	"gib": Gibibyte,
++	"tib": Tebibyte,
++	"pib": Pebibyte,
++
++	"kb": Kilobyte,
++	"mb": Megabyte,
++	"gb": Gigabyte,
++	"tb": Terabyte,
++	"pb": Petabyte,
++}
++
++// ParseBytes parses a given human-readable bytes or ibytes string into a number
++// of bytes, or an error if the string was unable to be parsed.
++func ParseBytes(str string) (uint64, error) {
++	var sep int
++	for _, r := range str {
++		if !(unicode.IsDigit(r) || r == '.' || r == ',') {
++			break
++		}
++
++		sep = sep + 1
++	}
++
++	f, err := strconv.ParseFloat(strings.Replace(str[:sep], ",", "", -1), 64)
++	if err != nil {
++		return 0, err
++	}
++
++	m, err := ParseByteUnit(str[sep:])
++	if err != nil {
++		return 0, err
++	}
++
++	f = f * float64(m)
++	if f >= math.MaxUint64 {
++		return 0, errors.New("number of bytes too large")
++	}
++	return uint64(f), nil
++}
++
++// ParseByteUnit returns the number of bytes in a given unit of storage, or an
++// error, if that unit is unrecognized.
++func ParseByteUnit(str string) (uint64, error) {
++	str = strings.TrimSpace(str)
++	str = strings.ToLower(str)
++
++	if u, ok := bytesTable[str]; ok {
++		return u, nil
++	}
++	return 0, errors.Errorf("unknown unit: %q", str)
++}
++
++var sizes = []string{"B", "KB", "MB", "GB", "TB", "PB"}
++
++// FormatBytes outputs the given number of bytes "s" as a human-readable string,
++// rounding to the nearest half within .01.
++func FormatBytes(s uint64) string {
++	var e float64
++	if s == 0 {
++		e = 0
++	} else {
++		e = math.Floor(log(float64(s), 1000))
++	}
++	if e > float64(len(sizes)-1) {
++		e = float64(len(sizes) - 1)
++	}
++
++	unit := uint64(math.Pow(1000, e))
++	suffix := sizes[int(e)]
++
++	return fmt.Sprintf("%s %s",
++		FormatBytesUnit(s, unit), suffix)
++}
++
++// FormatBytesUnit outputs the given number of bytes "s" as a quantity of the
++// given units "u" to the nearest half within .01.
++func FormatBytesUnit(s, u uint64) string {
++	rounded := math.Floor(float64(s)/float64(u)*10+.5) / 10
++
++	format := "%.0f"
++	if rounded < 10 && u > 1 {
++		format = "%.1f"
++	}
++
++	return fmt.Sprintf(format, rounded)
++}
++
++// log takes the log base "b" of "n" (\log_b{n})
++func log(n, b float64) float64 {
++	return math.Log(n) / math.Log(b)
++}
+diff --git a/tools/humanize/humanize_test.go b/tools/humanize/humanize_test.go
+new file mode 100644
+index 0000000..9287086
+--- /dev/null
++++ b/tools/humanize/humanize_test.go
+@@ -0,0 +1,234 @@
++package humanize_test
++
++import (
++	"math"
++	"testing"
++
++	"github.com/git-lfs/git-lfs/tools/humanize"
++	"github.com/stretchr/testify/assert"
++)
++
++type ParseBytesTestCase struct {
++	Given    string
++	Expected uint64
++	Err      error
++}
++
++func (c *ParseBytesTestCase) Assert(t *testing.T) {
++	got, err := humanize.ParseBytes(c.Given)
++	if c.Err == nil {
++		assert.NoError(t, err, "unexpected error: %s", err)
++		assert.EqualValues(t, c.Expected, got)
++	} else {
++		assert.Equal(t, c.Err, err)
++	}
++}
++
++type FormatBytesTestCase struct {
++	Given    uint64
++	Expected string
++}
++
++func (c *FormatBytesTestCase) Assert(t *testing.T) {
++	assert.Equal(t, c.Expected, humanize.FormatBytes(c.Given))
++}
++
++type ParseByteUnitTestCase struct {
++	Given    string
++	Expected uint64
++	Err      string
++}
++
++func (c *ParseByteUnitTestCase) Assert(t *testing.T) {
++	got, err := humanize.ParseByteUnit(c.Given)
++	if len(c.Err) == 0 {
++		assert.NoError(t, err, "unexpected error: %s", err)
++		assert.EqualValues(t, c.Expected, got)
++	} else {
++		assert.EqualError(t, err, c.Err)
++	}
++}
++
++type FormatBytesUnitTestCase struct {
++	Given    uint64
++	Unit     uint64
++	Expected string
++}
++
++func (c *FormatBytesUnitTestCase) Assert(t *testing.T) {
++	assert.Equal(t, c.Expected, humanize.FormatBytesUnit(c.Given, c.Unit))
++}
++
++func TestParseBytes(t *testing.T) {
++	for desc, c := range map[string]*ParseBytesTestCase{
++		"parse byte":     {"10B", uint64(10 * math.Pow(2, 0)), nil},
++		"parse kibibyte": {"20KIB", uint64(20 * math.Pow(2, 10)), nil},
++		"parse mebibyte": {"30MIB", uint64(30 * math.Pow(2, 20)), nil},
++		"parse gibibyte": {"40GIB", uint64(40 * math.Pow(2, 30)), nil},
++		"parse tebibyte": {"50TIB", uint64(50 * math.Pow(2, 40)), nil},
++		"parse pebibyte": {"60PIB", uint64(60 * math.Pow(2, 50)), nil},
++
++		"parse byte (lowercase)":     {"10b", uint64(10 * math.Pow(2, 0)), nil},
++		"parse kibibyte (lowercase)": {"20kib", uint64(20 * math.Pow(2, 10)), nil},
++		"parse mebibyte (lowercase)": {"30mib", uint64(30 * math.Pow(2, 20)), nil},
++		"parse gibibyte (lowercase)": {"40gib", uint64(40 * math.Pow(2, 30)), nil},
++		"parse tebibyte (lowercase)": {"50tib", uint64(50 * math.Pow(2, 40)), nil},
++		"parse pebibyte (lowercase)": {"60pib", uint64(60 * math.Pow(2, 50)), nil},
++
++		"parse byte (with space)":     {"10 B", uint64(10 * math.Pow(2, 0)), nil},
++		"parse kibibyte (with space)": {"20 KIB", uint64(20 * math.Pow(2, 10)), nil},
++		"parse mebibyte (with space)": {"30 MIB", uint64(30 * math.Pow(2, 20)), nil},
++		"parse gibibyte (with space)": {"40 GIB", uint64(40 * math.Pow(2, 30)), nil},
++		"parse tebibyte (with space)": {"50 TIB", uint64(50 * math.Pow(2, 40)), nil},
++		"parse pebibyte (with space)": {"60 PIB", uint64(60 * math.Pow(2, 50)), nil},
++
++		"parse byte (with space, lowercase)":     {"10 b", uint64(10 * math.Pow(2, 0)), nil},
++		"parse kibibyte (with space, lowercase)": {"20 kib", uint64(20 * math.Pow(2, 10)), nil},
++		"parse mebibyte (with space, lowercase)": {"30 mib", uint64(30 * math.Pow(2, 20)), nil},
++		"parse gibibyte (with space, lowercase)": {"40 gib", uint64(40 * math.Pow(2, 30)), nil},
++		"parse tebibyte (with space, lowercase)": {"50 tib", uint64(50 * math.Pow(2, 40)), nil},
++		"parse pebibyte (with space, lowercase)": {"60 pib", uint64(60 * math.Pow(2, 50)), nil},
++
++		"parse kilobyte": {"20KB", uint64(20 * math.Pow(10, 3)), nil},
++		"parse megabyte": {"30MB", uint64(30 * math.Pow(10, 6)), nil},
++		"parse gigabyte": {"40GB", uint64(40 * math.Pow(10, 9)), nil},
++		"parse terabyte": {"50TB", uint64(50 * math.Pow(10, 12)), nil},
++		"parse petabyte": {"60PB", uint64(60 * math.Pow(10, 15)), nil},
++
++		"parse kilobyte (lowercase)": {"20kb", uint64(20 * math.Pow(10, 3)), nil},
++		"parse megabyte (lowercase)": {"30mb", uint64(30 * math.Pow(10, 6)), nil},
++		"parse gigabyte (lowercase)": {"40gb", uint64(40 * math.Pow(10, 9)), nil},
++		"parse terabyte (lowercase)": {"50tb", uint64(50 * math.Pow(10, 12)), nil},
++		"parse petabyte (lowercase)": {"60pb", uint64(60 * math.Pow(10, 15)), nil},
++
++		"parse kilobyte (with space)": {"20 KB", uint64(20 * math.Pow(10, 3)), nil},
++		"parse megabyte (with space)": {"30 MB", uint64(30 * math.Pow(10, 6)), nil},
++		"parse gigabyte (with space)": {"40 GB", uint64(40 * math.Pow(10, 9)), nil},
++		"parse terabyte (with space)": {"50 TB", uint64(50 * math.Pow(10, 12)), nil},
++		"parse petabyte (with space)": {"60 PB", uint64(60 * math.Pow(10, 15)), nil},
++
++		"parse kilobyte (with space, lowercase)": {"20 kb", uint64(20 * math.Pow(10, 3)), nil},
++		"parse megabyte (with space, lowercase)": {"30 mb", uint64(30 * math.Pow(10, 6)), nil},
++		"parse gigabyte (with space, lowercase)": {"40 gb", uint64(40 * math.Pow(10, 9)), nil},
++		"parse terabyte (with space, lowercase)": {"50 tb", uint64(50 * math.Pow(10, 12)), nil},
++		"parse petabyte (with space, lowercase)": {"60 pb", uint64(60 * math.Pow(10, 15)), nil},
++	} {
++		t.Run(desc, c.Assert)
++	}
++}
++
++func TestFormatBytes(t *testing.T) {
++	for desc, c := range map[string]*FormatBytesTestCase{
++		"format bytes":     {uint64(1 * math.Pow(10, 0)), "1 B"},
++		"format kilobytes": {uint64(1 * math.Pow(10, 3)), "1.0 KB"},
++		"format megabytes": {uint64(1 * math.Pow(10, 6)), "1.0 MB"},
++		"format gigabytes": {uint64(1 * math.Pow(10, 9)), "1.0 GB"},
++		"format petabytes": {uint64(1 * math.Pow(10, 12)), "1.0 TB"},
++		"format terabytes": {uint64(1 * math.Pow(10, 15)), "1.0 PB"},
++
++		"format kilobytes under": {uint64(1.49 * math.Pow(10, 3)), "1.5 KB"},
++		"format megabytes under": {uint64(1.49 * math.Pow(10, 6)), "1.5 MB"},
++		"format gigabytes under": {uint64(1.49 * math.Pow(10, 9)), "1.5 GB"},
++		"format petabytes under": {uint64(1.49 * math.Pow(10, 12)), "1.5 TB"},
++		"format terabytes under": {uint64(1.49 * math.Pow(10, 15)), "1.5 PB"},
++
++		"format kilobytes over": {uint64(1.51 * math.Pow(10, 3)), "1.5 KB"},
++		"format megabytes over": {uint64(1.51 * math.Pow(10, 6)), "1.5 MB"},
++		"format gigabytes over": {uint64(1.51 * math.Pow(10, 9)), "1.5 GB"},
++		"format petabytes over": {uint64(1.51 * math.Pow(10, 12)), "1.5 TB"},
++		"format terabytes over": {uint64(1.51 * math.Pow(10, 15)), "1.5 PB"},
++
++		"format kilobytes exact": {uint64(1.3 * math.Pow(10, 3)), "1.3 KB"},
++		"format megabytes exact": {uint64(1.3 * math.Pow(10, 6)), "1.3 MB"},
++		"format gigabytes exact": {uint64(1.3 * math.Pow(10, 9)), "1.3 GB"},
++		"format petabytes exact": {uint64(1.3 * math.Pow(10, 12)), "1.3 TB"},
++		"format terabytes exact": {uint64(1.3 * math.Pow(10, 15)), "1.3 PB"},
++	} {
++		t.Run(desc, c.Assert)
++	}
++}
++
++func TestParseByteUnit(t *testing.T) {
++	for desc, c := range map[string]*ParseByteUnitTestCase{
++		"parse byte":     {"B", uint64(math.Pow(2, 0)), ""},
++		"parse kibibyte": {"KIB", uint64(math.Pow(2, 10)), ""},
++		"parse mebibyte": {"MIB", uint64(math.Pow(2, 20)), ""},
++		"parse gibibyte": {"GIB", uint64(math.Pow(2, 30)), ""},
++		"parse tebibyte": {"TIB", uint64(math.Pow(2, 40)), ""},
++		"parse pebibyte": {"PIB", uint64(math.Pow(2, 50)), ""},
++
++		"parse byte (lowercase)":     {"b", uint64(math.Pow(2, 0)), ""},
++		"parse kibibyte (lowercase)": {"kib", uint64(math.Pow(2, 10)), ""},
++		"parse mebibyte (lowercase)": {"mib", uint64(math.Pow(2, 20)), ""},
++		"parse gibibyte (lowercase)": {"gib", uint64(math.Pow(2, 30)), ""},
++		"parse tebibyte (lowercase)": {"tib", uint64(math.Pow(2, 40)), ""},
++		"parse pebibyte (lowercase)": {"pib", uint64(math.Pow(2, 50)), ""},
++
++		"parse byte (with space)":     {" B", uint64(math.Pow(2, 0)), ""},
++		"parse kibibyte (with space)": {" KIB", uint64(math.Pow(2, 10)), ""},
++		"parse mebibyte (with space)": {" MIB", uint64(math.Pow(2, 20)), ""},
++		"parse gibibyte (with space)": {" GIB", uint64(math.Pow(2, 30)), ""},
++		"parse tebibyte (with space)": {" TIB", uint64(math.Pow(2, 40)), ""},
++		"parse pebibyte (with space)": {" PIB", uint64(math.Pow(2, 50)), ""},
++
++		"parse byte (with space, lowercase)":     {" b", uint64(math.Pow(2, 0)), ""},
++		"parse kibibyte (with space, lowercase)": {" kib", uint64(math.Pow(2, 10)), ""},
++		"parse mebibyte (with space, lowercase)": {" mib", uint64(math.Pow(2, 20)), ""},
++		"parse gibibyte (with space, lowercase)": {" gib", uint64(math.Pow(2, 30)), ""},
++		"parse tebibyte (with space, lowercase)": {" tib", uint64(math.Pow(2, 40)), ""},
++		"parse pebibyte (with space, lowercase)": {" pib", uint64(math.Pow(2, 50)), ""},
++
++		"parse kilobyte": {"KB", uint64(math.Pow(10, 3)), ""},
++		"parse megabyte": {"MB", uint64(math.Pow(10, 6)), ""},
++		"parse gigabyte": {"GB", uint64(math.Pow(10, 9)), ""},
++		"parse terabyte": {"TB", uint64(math.Pow(10, 12)), ""},
++		"parse petabyte": {"PB", uint64(math.Pow(10, 15)), ""},
++
++		"parse kilobyte (lowercase)": {"kb", uint64(math.Pow(10, 3)), ""},
++		"parse megabyte (lowercase)": {"mb", uint64(math.Pow(10, 6)), ""},
++		"parse gigabyte (lowercase)": {"gb", uint64(math.Pow(10, 9)), ""},
++		"parse terabyte (lowercase)": {"tb", uint64(math.Pow(10, 12)), ""},
++		"parse petabyte (lowercase)": {"pb", uint64(math.Pow(10, 15)), ""},
++
++		"parse kilobyte (with space)": {" KB", uint64(math.Pow(10, 3)), ""},
++		"parse megabyte (with space)": {" MB", uint64(math.Pow(10, 6)), ""},
++		"parse gigabyte (with space)": {" GB", uint64(math.Pow(10, 9)), ""},
++		"parse terabyte (with space)": {" TB", uint64(math.Pow(10, 12)), ""},
++		"parse petabyte (with space)": {" PB", uint64(math.Pow(10, 15)), ""},
++
++		"parse kilobyte (with space, lowercase)": {"kb", uint64(math.Pow(10, 3)), ""},
++		"parse megabyte (with space, lowercase)": {"mb", uint64(math.Pow(10, 6)), ""},
++		"parse gigabyte (with space, lowercase)": {"gb", uint64(math.Pow(10, 9)), ""},
++		"parse terabyte (with space, lowercase)": {"tb", uint64(math.Pow(10, 12)), ""},
++		"parse petabyte (with space, lowercase)": {"pb", uint64(math.Pow(10, 15)), ""},
++
++		"parse unknown unit": {"imag", 0, "unknown unit: \"imag\""},
++	} {
++		t.Run(desc, c.Assert)
++	}
++}
++
++func TestFormatBytesUnit(t *testing.T) {
++	for desc, c := range map[string]*FormatBytesUnitTestCase{
++		"format bytes":     {uint64(1 * math.Pow(10, 0)), humanize.Byte, "1"},
++		"format kilobytes": {uint64(1 * math.Pow(10, 3)), humanize.Byte, "1000"},
++		"format megabytes": {uint64(1 * math.Pow(10, 6)), humanize.Byte, "1000000"},
++		"format gigabytes": {uint64(1 * math.Pow(10, 9)), humanize.Byte, "1000000000"},
++		"format petabytes": {uint64(1 * math.Pow(10, 12)), humanize.Byte, "1000000000000"},
++		"format terabytes": {uint64(1 * math.Pow(10, 15)), humanize.Byte, "1000000000000000"},
++
++		"format kilobytes under": {uint64(1.49 * math.Pow(10, 3)), humanize.Byte, "1490"},
++		"format megabytes under": {uint64(1.49 * math.Pow(10, 6)), humanize.Byte, "1490000"},
++		"format gigabytes under": {uint64(1.49 * math.Pow(10, 9)), humanize.Byte, "1490000000"},
++		"format petabytes under": {uint64(1.49 * math.Pow(10, 12)), humanize.Byte, "1490000000000"},
++		"format terabytes under": {uint64(1.49 * math.Pow(10, 15)), humanize.Byte, "1490000000000000"},
++
++		"format kilobytes over": {uint64(1.51 * math.Pow(10, 3)), humanize.Byte, "1510"},
++		"format megabytes over": {uint64(1.51 * math.Pow(10, 6)), humanize.Byte, "1510000"},
++		"format gigabytes over": {uint64(1.51 * math.Pow(10, 9)), humanize.Byte, "1510000000"},
++		"format petabytes over": {uint64(1.51 * math.Pow(10, 12)), humanize.Byte, "1510000000000"},
++		"format terabytes over": {uint64(1.51 * math.Pow(10, 15)), humanize.Byte, "1510000000000000"},
++	} {
++		t.Run(desc, c.Assert)
++	}
++}
+diff --git a/tools/humanize/package.go b/tools/humanize/package.go
+new file mode 100644
+index 0000000..d7b480d
+--- /dev/null
++++ b/tools/humanize/package.go
+@@ -0,0 +1,5 @@
++// package humanize is designed to parse and format "humanized" versions of
++// numbers with units.
++//
++// Based on: github.com/dustin/go-humanize.
++package humanize
+diff --git a/tools/math.go b/tools/math.go
+index 89baf75..79520f7 100644
+--- a/tools/math.go
++++ b/tools/math.go
+@@ -18,6 +18,11 @@ func MaxInt(a, b int) int {
+ 	return b
+ }
+ 
++// ClampInt returns the integer "n" bounded between "min" and "max".
++func ClampInt(n, min, max int) int {
++	return MinInt(min, MaxInt(max, n))
++}
++
+ // MinInt64 returns the smaller of two `int`s, "a", or "b".
+ func MinInt64(a, b int64) int64 {
+ 	if a < b {
+diff --git a/tools/math_test.go b/tools/math_test.go
+index 17340db..25c9a2d 100644
+--- a/tools/math_test.go
++++ b/tools/math_test.go
+@@ -13,3 +13,15 @@ func MinIntPicksTheSmallerInt(t *testing.T) {
+ func MaxIntPicksTheBiggertInt(t *testing.T) {
+ 	assert.Equal(t, 1, MaxInt(-1, 1))
+ }
++
++func ClampDiscardsIntsLowerThanMin(t *testing.T) {
++	assert.Equal(t, 0, ClampInt(-1, 0, 1))
++}
++
++func ClampDiscardsIntsGreaterThanMax(t *testing.T) {
++	assert.Equal(t, 1, ClampInt(2, 0, 1))
++}
++
++func ClampAcceptsIntsWithinBounds(t *testing.T) {
++	assert.Equal(t, 1, ClampInt(1, 0, 2))
++}
+diff --git a/tools/str_tools.go b/tools/str_tools.go
+index 05bf901..5a224c7 100644
+--- a/tools/str_tools.go
++++ b/tools/str_tools.go
+@@ -1,6 +1,9 @@
+ package tools
+ 
+-import "regexp"
++import (
++	"regexp"
++	"strings"
++)
+ 
+ var (
+ 	// quoteFieldRe greedily matches between matching pairs of '', "", or
+@@ -13,10 +16,12 @@ var (
+ // pairs of quotation delimeters.
+ //
+ // For instance, the quoted fields of the string "foo bar 'baz etc'" would be:
+-//   []string{"foo", "bar", "baz etc"}
++//
++//	[]string{"foo", "bar", "baz etc"}
+ //
+ // Whereas the same argument given to strings.Fields, would return:
+-//   []string{"foo", "bar", "'baz", "etc'"}
++//
++//	[]string{"foo", "bar", "'baz", "etc'"}
+ func QuotedFields(s string) []string {
+ 	submatches := quoteFieldRe.FindAllStringSubmatch(s, -1)
+ 	out := make([]string, 0, len(submatches))
+@@ -42,3 +47,58 @@ func QuotedFields(s string) []string {
+ 
+ 	return out
+ }
++
++// Ljust returns a copied string slice where each element is left justified to
++// match the width of the longest element in the set.
++func Ljust(strs []string) []string {
++	llen := len(Longest(strs))
++
++	dup := make([]string, len(strs), cap(strs))
++	copy(dup, strs)
++
++	for i, str := range strs {
++		width := MaxInt(0, llen-len(str))
++		padding := strings.Repeat(" ", width)
++
++		dup[i] = str + padding
++	}
++
++	return dup
++}
++
++// Rjust returns a copied string slice where each element is right justified to
++// match the width of the longest element in the set.
++func Rjust(strs []string) []string {
++	llen := len(Longest(strs))
++
++	dup := make([]string, len(strs), cap(strs))
++	copy(dup, strs)
++
++	for i, str := range strs {
++		width := MaxInt(0, llen-len(str))
++		padding := strings.Repeat(" ", width)
++
++		dup[i] = padding + str
++	}
++
++	return dup
++}
++
++// Longest returns the longest element in the string slice in O(n) time and O(1)
++// space. If strs is empty or nil, an empty string will be returned.
++func Longest(strs []string) string {
++	if len(strs) == 0 {
++		return ""
++	}
++
++	var longest string
++	var llen int
++	for _, str := range strs {
++		if len(str) >= llen {
++			longest = str
++			llen = len(longest)
++		}
++	}
++
++	return longest
++}
+diff --git a/tools/str_tools_test.go b/tools/str_tools_test.go
+index 2ee69e2..6f803db 100644
+--- a/tools/str_tools_test.go
++++ b/tools/str_tools_test.go
+@@ -70,3 +70,45 @@ func TestQuotedFields(t *testing.T) {
+ 		c.Assert(t)
+ 	}
+ }
++
++func TestLongestReturnsEmptyStringGivenEmptySet(t *testing.T) {
++	assert.Equal(t, "", Longest(nil))
++}
++
++func TestLongestReturnsLongestString(t *testing.T) {
++	assert.Equal(t, "longest", Longest([]string{"short", "longer", "longest"}))
++}
++
++func TestLongestReturnsLastStringGivenSameLength(t *testing.T) {
++	assert.Equal(t, "baz", Longest([]string{"foo", "bar", "baz"}))
++}
++
++func TestRjustRightJustifiesString(t *testing.T) {
++	unjust := []string{
++		"short",
++		"longer",
++		"longest",
++	}
++	expected := []string{
++		"  short",
++		" longer",
++		"longest",
++	}
++
++	assert.Equal(t, expected, Rjust(unjust))
++}
++
++func TestLjustLeftJustifiesString(t *testing.T) {
++	unjust := []string{
++		"short",
++		"longer",
++		"longest",
++	}
++	expected := []string{
++		"short  ",
++		"longer ",
++		"longest",
++	}
++
++	assert.Equal(t, expected, Ljust(unjust))
++}

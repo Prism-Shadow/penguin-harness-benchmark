@@ -1,0 +1,13 @@
+import React from 'react';
+export const Switch = (p: any) => React.createElement('input', { type: 'checkbox', checked: p.selected, onChange: () => p.onChange?.(!p.selected) });
+export const Button = (p: any) => React.createElement('button', { ...p, onClick: p.onClick }, p.children);
+export const Dialog = (p: any) => React.createElement('div', p, p.children);
+export const DialogBody = (p: any) => React.createElement('div', p, p.children);
+export const DialogContent = (p: any) => React.createElement('div', p, p.children);
+export const DialogHeader = (p: any) => React.createElement('header', p, p.children);
+export const ListItem = (p: any) => React.createElement('div', p, p.children);
+export const ListItemContent = (p: any) => React.createElement('div', p, p.children);
+export const ListItemDescription = (p: any) => React.createElement('span', p, p.children);
+export const ListItemLeading = (p: any) => React.createElement('div', p, p.children);
+export const ListItemTitle = (p: any) => React.createElement('span', p, p.children);
+export const symbols = {};

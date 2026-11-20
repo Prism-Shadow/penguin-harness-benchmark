@@ -1,0 +1,118 @@
+diff --git a/src/commands/apphosting-backends-create.ts b/src/commands/apphosting-backends-create.ts
+index 252c60c9..d3d1abf8 100644
+--- a/src/commands/apphosting-backends-create.ts
++++ b/src/commands/apphosting-backends-create.ts
+@@ -4,6 +4,8 @@ import { needProjectId } from "../projectUtils";
+ import requireInteractive from "../requireInteractive";
+ import { doSetup } from "../apphosting";
+ import { ensureApiEnabled } from "../gcp/apphosting";
++import { APPHOSTING_TOS_ID } from "../gcp/firedata";
++import { requireTosAcceptance } from "../requireTosAcceptance";
+ 
+ export const command = new Command("apphosting:backends:create")
+   .description("create a Firebase App Hosting backend")
+@@ -23,6 +25,7 @@ export const command = new Command("apphosting:backends:create")
+   )
+   .before(ensureApiEnabled)
+   .before(requireInteractive)
++  .before(requireTosAcceptance(APPHOSTING_TOS_ID))
+   .action(async (options: Options) => {
+     const projectId = needProjectId(options);
+     const webApp = options.app;
+diff --git a/src/gcp/firedata.ts b/src/gcp/firedata.ts
+new file mode 100644
+index 00000000..a226cc73
+--- /dev/null
++++ b/src/gcp/firedata.ts
+@@ -0,0 +1,50 @@
++import { Client } from "../apiv2";
++import { firedataOrigin } from "../api";
++import { FirebaseError } from "../error";
++
++const client = new Client({ urlPrefix: firedataOrigin(), auth: true, apiVersion: "v1" });
++
++export const APPHOSTING_TOS_ID = "APP_HOSTING_TOS";
++export const APP_CHECK_TOS_ID = "APP_CHECK";
++
++export type TosId = typeof APPHOSTING_TOS_ID | typeof APP_CHECK_TOS_ID;
++
++export type AcceptanceStatus = null | "ACCEPTED" | "TERMS_UPDATED";
++
++export interface TosAcceptanceStatus {
++  status: AcceptanceStatus;
++}
++
++export interface ServiceTosStatus {
++  tosId: TosId;
++  serviceStatus: TosAcceptanceStatus;
++}
++
++export interface GetTosStatusResponse {
++  perServiceStatus: ServiceTosStatus[];
++}
++
++/**
++ * Fetches the Terms of Service status for the logged in user.
++ */
++export async function getTosStatus(): Promise<GetTosStatusResponse> {
++  const res = await client.get<GetTosStatusResponse>("accessmanagement/tos:getStatus");
++  return res.body;
++}
++
++/** Returns the AcceptanceStatus for a given product. */
++export function getAcceptanceStatus(
++  response: GetTosStatusResponse,
++  tosId: TosId,
++): AcceptanceStatus {
++  const perServiceStatus = response.perServiceStatus.find((tosStatus) => tosStatus.tosId === tosId);
++  if (perServiceStatus === undefined) {
++    throw new FirebaseError(`Missing terms of service status for  product: ${tosId}`);
++  }
++  return perServiceStatus.serviceStatus.status;
++}
++
++/** Returns true if a product's ToS has been accepted. */
++export function isProductTosAccepted(response: GetTosStatusResponse, tosId: TosId): boolean {
++  return getAcceptanceStatus(response, tosId) === "ACCEPTED";
++}
+diff --git a/src/requireTosAcceptance.ts b/src/requireTosAcceptance.ts
+new file mode 100644
+index 00000000..210c131c
+--- /dev/null
++++ b/src/requireTosAcceptance.ts
+@@ -0,0 +1,35 @@
++import type { Options } from "./options";
++
++import { FirebaseError } from "./error";
++import { APPHOSTING_TOS_ID, TosId, getTosStatus, isProductTosAccepted } from "./gcp/firedata";
++import { consoleOrigin } from "./api";
++
++const consoleLandingPage = new Map<TosId, string>([
++  [APPHOSTING_TOS_ID, `${consoleOrigin()}/project/_/apphosting`],
++]);
++
++/**
++ * Returns a function that checks product terms of service. Useful for Command `before` hooks.
++ *
++ * Example:
++ *   new Command(...)
++ *     .description(...)
++ *     .before(requireTosAcceptance(APPHOSTING_TOS_ID)) ;
++ *
++ * Note: When supporting new products, be sure to update `consoleLandingPage` above to avoid surfacing
++ * generic ToS error messages.
++ **/
++export function requireTosAcceptance(tosId: TosId): (options: Options) => Promise<void> {
++  return () => requireTos(tosId);
++}
++
++async function requireTos(tosId: TosId): Promise<void> {
++  const res = await getTosStatus();
++  if (isProductTosAccepted(res, tosId)) {
++    return;
++  }
++  const console = consoleLandingPage.get(tosId) || consoleOrigin();
++  throw new FirebaseError(
++    `Your account has not accepted the required Terms of Service for this action. Please accept the Terms of Service and try again. ${console}`,
++  );
++}

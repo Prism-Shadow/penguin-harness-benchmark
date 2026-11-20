@@ -1,0 +1,427 @@
+diff --git a/UndertaleModLib/Compiler/AssemblyWriter.cs b/UndertaleModLib/Compiler/AssemblyWriter.cs
+index e1e0f9c650954212da7d625f115f510153454581..58ba075cd475bec4b0c4d92b31dd6508e23666ad 100644
+--- a/UndertaleModLib/Compiler/AssemblyWriter.cs
++++ b/UndertaleModLib/Compiler/AssemblyWriter.cs
+@@ -271,6 +271,8 @@ namespace UndertaleModLib.Compiler
+                                     Name = childName,
+                                     Code = childEntry
+                                 };
++                                // If we don't set IsConstructor, the game will crash when creating the struct
++                                if (patch.Name.StartsWith("___struct___")) childScript.IsConstructor = true;
+                                 compileContext.Data.Scripts.Add(childScript);
+ 
+                                 UndertaleFunction childFunction = new()
+@@ -1182,6 +1184,30 @@ namespace UndertaleModLib.Compiler
+                 cw.typeStack.Push(DataType.Variable);
+             }
+ 
++            private static void AssembleStructDef(CodeWriter cw, Parser.Statement str)
++            {
++                List<Parser.Statement> leaked = str.Children[0].Children;
++                // Just push these leaked variables onto the stack
++                // We need to do this in reverse since function arguments
++                // are parsed in reverse stack order
++                for (int i = leaked.Count - 1; i >= 0; i--)
++                {
++                    Parser.Statement statement = leaked[i];
++                    AssembleExpression(cw, statement);
++                }
++
++                AssembleStatement(cw, str.Children[1]);
++
++                cw.funcPatches.Add(new FunctionPatch()
++                {
++                    Target = cw.EmitRef(Opcode.Call, DataType.Int32),
++                    Name = "@@NewGMLObject@@",
++                    Offset = cw.offset * 4,
++                    ArgCount = leaked.Count + 1
++                });
++                cw.typeStack.Push(DataType.Variable);
++            }
++
+             private static void AssembleExpression(CodeWriter cw, Parser.Statement e, Parser.Statement funcDefName = null)
+             {
+                 switch (e.Kind)
+@@ -1267,6 +1293,9 @@ namespace UndertaleModLib.Compiler
+                     case Parser.Statement.StatementKind.ExprFunctionCall:
+                         AssembleFunctionCall(cw, e); // the return value in this case must be used
+                         break;
++                    case Parser.Statement.StatementKind.ExprStruct:
++                        AssembleStructDef(cw, e);
++                        break;
+                     case Parser.Statement.StatementKind.ExprVariableRef:
+                     case Parser.Statement.StatementKind.ExprSingleVariable:
+                         AssembleVariablePush(cw, e);
+@@ -1278,6 +1307,8 @@ namespace UndertaleModLib.Compiler
+                                 AssemblyWriterError(cw, "Malformed function assignment.", e.Token);
+                                 break;
+                             }
++
++                            bool isStructDef = funcDefName.Text.StartsWith("___struct___");
+                             
+                             Patch startPatch = Patch.StartHere(cw);
+                             Patch endPatch = Patch.Start();
+@@ -1322,8 +1353,20 @@ namespace UndertaleModLib.Compiler
+                                 ArgCount = -1
+                             });
+                             cw.Emit(Opcode.Conv, DataType.Int32, DataType.Variable);
+-                            cw.Emit(Opcode.PushI, DataType.Int16).Value = (short)-1;
+-                            cw.Emit(Opcode.Conv, DataType.Int32, DataType.Variable);
++                            if (isStructDef)
++                            {
++                                cw.funcPatches.Add(new FunctionPatch()
++                                {
++                                    Target = cw.EmitRef(Opcode.Call, DataType.Int32),
++                                    Name = "@@NullObject@@",
++                                    ArgCount = 0
++                                });
++                            } 
++                            else
++                            {
++                                cw.Emit(Opcode.PushI, DataType.Int16).Value = (short)-1;
++                                cw.Emit(Opcode.Conv, DataType.Int32, DataType.Variable);
++                            }
+                             cw.funcPatches.Add(new FunctionPatch()
+                             {
+                                 Target = cw.EmitRef(Opcode.Call, DataType.Int32),
+@@ -1332,7 +1375,10 @@ namespace UndertaleModLib.Compiler
+                             });
+                             cw.typeStack.Push(DataType.Variable);
+                             cw.Emit(Opcode.Dup, DataType.Variable).Extra = 0;
+-                            cw.Emit(Opcode.PushI, DataType.Int16).Value = (short)-1; // todo: -6 sometimes?
++                            if (isStructDef)
++                                cw.Emit(Opcode.PushI, DataType.Int16).Value = (short)-16;
++                            else
++                                cw.Emit(Opcode.PushI, DataType.Int16).Value = (short)-1; // todo: -6 sometimes?
+                         }
+                         break;
+                     case Parser.Statement.StatementKind.ExprBinaryOp:
+@@ -2197,15 +2243,16 @@ namespace UndertaleModLib.Compiler
+                 }
+                 else if (s.Kind == Parser.Statement.StatementKind.ExprFuncName)
+                 {
++                    bool isStructDef = s.Text.StartsWith("___struct___");
+                     // Until further notice, I'm assuming this only comes up in 2.3 script definition.
+                     cw.varPatches.Add(new VariablePatch()
+                     {
+                         Target = cw.EmitRef(Opcode.Pop, DataType.Variable, DataType.Variable),
+                         Name = s.Text,
+-                        InstType = InstanceType.Self,
++                        InstType = isStructDef ? InstanceType.Static : InstanceType.Self,
+                         VarType = VariableType.StackTop
+                     });
+-                    cw.Emit(Opcode.Popz, DataType.Variable);
++                    if (!isStructDef) cw.Emit(Opcode.Popz, DataType.Variable);
+                 }
+                 else
+                 {
+diff --git a/UndertaleModLib/Compiler/Compiler.cs b/UndertaleModLib/Compiler/Compiler.cs
+index 6b261819c8f770af7cf74733a08d9b7c2e15e233..8a665ecf42eca9099d5cc96c2b9f95160363c6e2 100644
+--- a/UndertaleModLib/Compiler/Compiler.cs
++++ b/UndertaleModLib/Compiler/Compiler.cs
+@@ -33,6 +33,8 @@ namespace UndertaleModLib.Compiler
+         public string ResultError = null;
+         public List<UndertaleInstruction> ResultAssembly = null;
+ 
++        public List<string> FunctionsToObliterate = new();
++
+         public Compiler.MainThreadDelegate MainThreadDelegate = (f) => { f(); };
+ 
+         public CompileContext(UndertaleData data, UndertaleCode oldCode)
+@@ -55,6 +57,27 @@ namespace UndertaleModLib.Compiler
+                 {
+                     foreach (KeyValuePair<string, string> v in GlobalVars)
+                         Data?.Variables?.EnsureDefined(v.Key, UndertaleInstruction.InstanceType.Global, false, Data.Strings, Data);
++                    if (Data is not null)
++                    {
++                        foreach (string name in FunctionsToObliterate)
++                        {
++                            string scriptName = "gml_Script_" + name;
++                            UndertaleScript scriptObj = Data.Scripts.ByName(scriptName);
++                            if (scriptObj is not null)
++                                Data.Scripts.Remove(scriptObj);
++                            UndertaleCode codeObj = Data.Code.ByName(scriptName);
++                            if (codeObj is not null)
++                            {
++                                Data.Code.Remove(codeObj);
++                                OriginalCode.ChildEntries.Remove(codeObj);
++                            }
++                            UndertaleFunction functionObj = Data.Functions.ByName(scriptName);
++                            if (functionObj is not null)
++                                Data.Functions.Remove(functionObj);
++                            Data.KnownSubFunctions.Remove(name);
++                        }
++                        FunctionsToObliterate.Clear();
++                    }
+                 });
+             }
+ 
+@@ -76,6 +99,7 @@ namespace UndertaleModLib.Compiler
+ 
+             LastCompiledArgumentCount = 0;
+             userDefinedVariables.Clear();
++            FunctionsToObliterate.Clear();
+             if (redoAssets || assetIds.Count == 0)
+                 MakeAssetDictionary();
+         }
+diff --git a/UndertaleModLib/Compiler/Parser.cs b/UndertaleModLib/Compiler/Parser.cs
+index 971157d8364ba66a4af6f0fdeb70e25d6253503f..6d0d68e9369ae33b0e323f0f412ba8c9f6f7e884 100644
+--- a/UndertaleModLib/Compiler/Parser.cs
++++ b/UndertaleModLib/Compiler/Parser.cs
+@@ -17,6 +17,13 @@ namespace UndertaleModLib.Compiler
+             public static List<string> ErrorMessages = new List<string>();
+             private static bool hasError = false; // temporary variable that clears in several places
+ 
++            // Struct function names that haven't been used yet.
++            private static Queue<string> usableStructNames = new();
++
++            // Not really universally unique nor does it follow the UUID spec,
++            // it just needs to be unique in the same script.
++            private static int uuidCounter = 0;
++
+             public class ExpressionConstant
+             {
+                 public Kind kind = Kind.None;
+@@ -111,6 +118,7 @@ namespace UndertaleModLib.Compiler
+                     ExprConstant,
+                     ExprBinaryOp,
+                     ExprArray, // maybe?
++                    ExprStruct,
+                     ExprFunctionCall,
+                     ExprUnary,
+                     ExprConditional,
+@@ -429,7 +437,6 @@ namespace UndertaleModLib.Compiler
+                     remainingStageOne.Dequeue();
+                 }
+             }
+-
+             public static Statement ParseTokens(CompileContext context, List<Lexer.Token> tokens)
+             {
+                 // Basic initialization
+@@ -440,8 +447,17 @@ namespace UndertaleModLib.Compiler
+                     context.LocalVars["arguments"] = "arguments";
+                 context.GlobalVars.Clear();
+                 context.Enums.Clear();
++                context.FunctionsToObliterate.Clear();
++                uuidCounter = 0;
+                 hasError = false;
+ 
++                usableStructNames.Clear();
++                foreach (UndertaleCode child in context.OriginalCode.ChildEntries)
++                {
++                    if (child.Name.Content.StartsWith("gml_Script____struct___"))
++                        usableStructNames.Enqueue(child.Name.Content["gml_Script_".Length..]);
++                }
++
+                 // Ensuring an EOF exists
+                 if (tokens.Count == 0 || tokens[tokens.Count - 1].Kind != TokenKind.EOF)
+                     tokens.Add(new Lexer.Token(TokenKind.EOF));
+@@ -536,6 +552,12 @@ namespace UndertaleModLib.Compiler
+                 if (hasError)
+                     return null;
+ 
++                // Remove any unused struct functions
++                // (so that struct definitions can just be added and removed at any time, like arrays)
++                // This should be safe since struct functions should only be used in one place each
++                while (usableStructNames.Count > 0)
++                    context.FunctionsToObliterate.Add(usableStructNames.Dequeue());
++
+                 return rootBlock;
+             }
+ 
+@@ -669,6 +691,11 @@ namespace UndertaleModLib.Compiler
+                 {
+                     expressionMode = false;
+                     Statement s = remainingStageOne.Dequeue();
++                    // TODO: don't assume ___struct___ = a struct?
++                    // (GM does let you compile such functions, not sure if there
++                    // are any games out there that have such functions though)
++                    if (s.Text.StartsWith("___struct___"))
++                        ReportCodeError("Function names cannot start with ___struct___ (they are reserved for structs).", s.Token, false);
+                     destination = new Statement(Statement.StatementKind.ExprFuncName, s.Token) { ID = s.ID };
+                 }
+ 
+@@ -1495,8 +1522,9 @@ namespace UndertaleModLib.Compiler
+                             }
+                         }
+                     case TokenKind.OpenBlock:
+-                        // todo? maybe?
+-                        ReportCodeError("Unsupported syntax.", remainingStageOne.Dequeue().Token, true);
++                        if (context.Data.IsVersionAtLeast(2, 3))
++                            return ParseStructLiteral(context);
++                        ReportCodeError("Cannot use struct literal prior to GMS2.3.", remainingStageOne.Dequeue().Token, true);
+                         break;
+                     case TokenKind.Increment:
+                     case TokenKind.Decrement:
+@@ -1554,6 +1582,138 @@ namespace UndertaleModLib.Compiler
+                 return result;
+             }
+ 
++            // Example: {key: 123, key2: "asd"}
++            private static Statement ParseStructLiteral(CompileContext context)
++            {
++                Statement result = new Statement(Statement.StatementKind.ExprStruct,
++                                                EnsureTokenKind(TokenKind.OpenBlock)?.Token);
++
++                Statement nextStatement = remainingStageOne.Peek();
++                Statement procVar;
++
++                // Non-constants are passed to the function through arguments
++                // I call this leaking the variable
++                // (because the values "leak" out of the struct function in the assembly)
++                Statement leakedVars = new Statement();
++                result.Children.Add(leakedVars);
++
++                string varName;
++                // Check if we can reuse any struct functions
++                if (usableStructNames.Count > 0)
++                    varName = usableStructNames.Dequeue();
++                else
++                {
++                    // Create a new function
++                    int i = context.Data.Code.Count;
++                    do
++                    {
++                        varName = "___struct___" + context.OriginalCode.Name.Content +
++                            "__" + uuidCounter++.ToString();
++                        i++;
++                    } while (context.Data.KnownSubFunctions.ContainsKey(varName));
++                }
++
++                int ID = GetVariableID(context, varName, out _);
++                if (ID >= 0 && ID < 100000)
++                    procVar = new Statement(TokenKind.ProcVariable, nextStatement.Token, -1); // becomes self anyway?
++                else
++                    procVar = new Statement(TokenKind.ProcVariable, nextStatement.Token, ID);
++
++                Statement function = new Statement(Statement.StatementKind.FunctionDef, procVar.Token);
++                function.Text = varName;
++                Statement args = new Statement();
++                Statement destination = new Statement(Statement.StatementKind.ExprFuncName, result.Token)
++                    { ID = procVar.ID, Text = varName };
++                Statement body = new Statement();
++
++                function.Children.Add(args);
++                function.Children.Add(body);
++
++                Statement functionAssign = new Statement(Statement.StatementKind.Assign, new Lexer.Token(TokenKind.Assign));
++                functionAssign.Children.Add(destination);
++                functionAssign.Children.Add(new Statement(Statement.StatementKind.Token, functionAssign.Token));
++                functionAssign.Children.Add(function);
++
++                result.Children.Add(functionAssign);
++
++                // this is a total mess
++                int argumentsID = context.GetAssetIndexByName("argument");
++                Lexer.Token varToken = new Lexer.Token(TokenKind.ProcVariable);
++                varToken.Content = "argument";
++                Statement argumentsVar = new Statement(TokenKind.ProcVariable, varToken);
++                argumentsVar.ID = argumentsID;
++
++                while (!hasError && remainingStageOne.Count > 0 && !IsNextToken(TokenKind.CloseBlock, TokenKind.EOF))
++                {
++                    if (!IsNextToken(TokenKind.ProcVariable))
++                    {
++                        if (remainingStageOne.Any())
++                            ReportCodeError("Expected variable name in inline struct.", remainingStageOne.Peek().Token, true);
++                        else
++                            ReportCodeError("Malformed struct literal.", false);
++                        break;
++                    }
++                    Statement variable = remainingStageOne.Dequeue();
++                    if (context.BuiltInList.Functions.ContainsKey(variable.Text) || context.scripts.Contains(variable.Text))
++                        ReportCodeError(string.Format("Struct variable name {0} cannot be used; a function or script already has the name.", variable.Text), variable.Token, false);
++                    if (context.assetIds.ContainsKey(variable.Text))
++                        ReportCodeError(string.Format("Struct variable name {0} cannot be used; a resource already has the name.", variable.Text), variable.Token, false);
++                    if (!IsNextTokenDiscard(TokenKind.Colon))
++                    {
++                        if (remainingStageOne.Any())
++                            ReportCodeError("Expected ':' after key in inline struct.", remainingStageOne.Peek().Token, true);
++                        else
++                            ReportCodeError("Malformed struct literal.", false);
++                        break;
++                    }
++
++                    Statement a = new Statement(Statement.StatementKind.Assign, variable.Token);
++                    body.Children.Add(a);
++
++                    Statement left = new Statement(variable) { Kind = Statement.StatementKind.ExprSingleVariable };
++                    left.ID = variable.ID;
++
++                    a.Children.Add(left);
++                    a.Children.Add(new Statement(TokenKind.Assign, a.Token));
++
++                    Statement expr = Optimize(context, ParseExpression(context));
++                    if (expr.Kind == Statement.StatementKind.ExprConstant)
++                    {
++                        // Constants can be inlined
++                        a.Children.Add(expr);
++                    }
++                    else
++                    {
++                        Statement argumentsAccess =
++                            new Statement(argumentsVar) { Kind = Statement.StatementKind.ExprSingleVariable };
++                        argumentsAccess.ID = argumentsVar.ID;
++                        Statement index = new Statement(Statement.StatementKind.ExprConstant, expr.Token);
++                        index.Constant = new ExpressionConstant((double)leakedVars.Children.Count);
++                        argumentsAccess.Children.Add(index);
++
++                        leakedVars.Children.Add(expr);
++                        a.Children.Add(argumentsAccess);
++                    }
++
++                    if (!IsNextTokenDiscard(TokenKind.Comma))
++                    {
++                        if (!IsNextToken(TokenKind.CloseBlock))
++                        {
++                            if (remainingStageOne.Any())
++                                ReportCodeError("Expected ',' or '}' after value in inline struct.", remainingStageOne.Peek().Token, true);
++                            else
++                                ReportCodeError("Malformed struct literal.", false);
++                            break;
++                        }
++                    }
++                }
++
++                if (EnsureTokenKind(TokenKind.CloseBlock) == null)
++                    return null;
++
++                return result;
++            }
++
+             public static Statement Optimize(CompileContext context, Statement s)
+             {
+                 // Process children (if we can)
+diff --git a/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs b/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs
+index e0bb21d1d276adaf5be63bc74002dedd33b7232b..a62cbd0e0e04ee6740a95a1b61c8372ca602ae83 100644
+--- a/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs
++++ b/UndertaleModLib/Decompiler/Instructions/Decompiler.AssignmentStatement.cs
+@@ -90,7 +90,7 @@ public static partial class Decompiler
+                 return functionVal.ToString(context);
+             }
+ 
+-            string varPrefix = (IsLocalVariable ? "var " : "");
++            string varPrefix = (IsLocalVariable && !context.DecompilingStruct) ? "var " : "";
+ 
+             // Check for possible ++, --, or operation equal (for single vars)
+             if (Value is ExpressionTwo two && (two.Argument1 is ExpressionVar) &&
+diff --git a/UndertaleModLib/Decompiler/Instructions/Decompiler.FunctionDefinition.cs b/UndertaleModLib/Decompiler/Instructions/Decompiler.FunctionDefinition.cs
+index 6fdc1d768c11dd7e6cf25c6b5548144e37829709..09a3af1c293463686137b88cbe62315220baa529 100644
+--- a/UndertaleModLib/Decompiler/Instructions/Decompiler.FunctionDefinition.cs
++++ b/UndertaleModLib/Decompiler/Instructions/Decompiler.FunctionDefinition.cs
+@@ -166,7 +166,6 @@ public static partial class Decompiler
+                         }
+                         sb.Append("\n");
+                     }
+-                    context.DecompilingStruct = oldDecompilingStruct;
+                     context.ArgumentReplacements = oldReplacements;
+                     context.IndentationLevel--;
+                     sb.Append(context.Indentation);
+@@ -176,6 +175,7 @@ public static partial class Decompiler
+                 }
+                 else
+                     sb.Append("{}");
++                context.DecompilingStruct = oldDecompilingStruct;
+             }
+             else
+             {

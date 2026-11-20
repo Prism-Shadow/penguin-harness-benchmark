@@ -1,0 +1,87 @@
+diff --git a/app/controllers/concerns/log_events.rb b/app/controllers/concerns/log_events.rb
+index 378a3e1d..a4c1dced 100644
+--- a/app/controllers/concerns/log_events.rb
++++ b/app/controllers/concerns/log_events.rb
+@@ -36,6 +36,8 @@ module LogEvents
+   end
+ 
+   def log_event(push, kind)
++    return if audit_log_limit_reached?(push.audit_logs)
++
+     ip = request.env["HTTP_X_FORWARDED_FOR"].blank? ? request.env["REMOTE_ADDR"] : request.env["HTTP_X_FORWARDED_FOR"]
+ 
+     # Limit retrieved values to 256 characters
+@@ -44,4 +46,10 @@ module LogEvents
+ 
+     push.audit_logs.create(kind: kind, user: current_user, ip:, user_agent:, referrer:)
+   end
++
++  private
++
++  def audit_log_limit_reached?(audit_logs_association)
++    audit_logs_association.reorder(nil).limit(1).offset(AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL - 1).exists?
++  end
+ end
+diff --git a/app/models/audit_log.rb b/app/models/audit_log.rb
+index 6c62a0bd..bdc4419e 100644
+--- a/app/models/audit_log.rb
++++ b/app/models/audit_log.rb
+@@ -1,6 +1,8 @@
+ # frozen_string_literal: true
+ 
+ class AuditLog < ApplicationRecord
++  MAX_AUDIT_LOGS_PER_PUSH_OR_PULL = 2000
++
+   enum :kind, [:creation, :view, :failed_view, :expire, :failed_passphrase, :admin_view, :owner_view, :edit], validate: true
+ 
+   belongs_to :push
+diff --git a/test/controllers/concerns/log_events_test.rb b/test/controllers/concerns/log_events_test.rb
+index 5a3a47f7..970a6909 100644
+--- a/test/controllers/concerns/log_events_test.rb
++++ b/test/controllers/concerns/log_events_test.rb
+@@ -356,4 +356,45 @@ class LogEventsTest < ActionController::TestCase
+       assert_equal kind.to_s, AuditLog.last.kind, "Expected kind #{kind} but got #{AuditLog.last.kind}"
+     end
+   end
++
++  def with_max_audit_logs_per_push_or_pull(value)
++    original_value = AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL
++    AuditLog.send(:remove_const, :MAX_AUDIT_LOGS_PER_PUSH_OR_PULL)
++    AuditLog.const_set(:MAX_AUDIT_LOGS_PER_PUSH_OR_PULL, value)
++
++    yield
++  ensure
++    AuditLog.send(:remove_const, :MAX_AUDIT_LOGS_PER_PUSH_OR_PULL)
++    AuditLog.const_set(:MAX_AUDIT_LOGS_PER_PUSH_OR_PULL, original_value)
++  end
++
++  test "log_event does not create audit log when push has max audit logs" do
++    with_max_audit_logs_per_push_or_pull(3) do
++      @request.env["REMOTE_ADDR"] = "203.0.113.195"
++      @request.env["HTTP_USER_AGENT"] = "Test Agent"
++
++      needed = AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL - @push.audit_logs.count
++      needed.times { @push.audit_logs.create!(kind: :view, ip: "127.0.0.1", user_agent: "Test", referrer: nil, user: @user) }
++      assert_equal AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL, @push.audit_logs.count, "push should have exactly max audit logs"
++
++      assert_no_difference("@push.audit_logs.count") do
++        @controller.log_event(@push, :view)
++      end
++    end
++  end
++
++  test "log_event still creates audit log when push has one fewer than max" do
++    with_max_audit_logs_per_push_or_pull(3) do
++      @request.env["REMOTE_ADDR"] = "203.0.113.195"
++      @request.env["HTTP_USER_AGENT"] = "Test Agent"
++
++      needed = (AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL - 1) - @push.audit_logs.count
++      needed.times { @push.audit_logs.create!(kind: :view, ip: "127.0.0.1", user_agent: "Test", referrer: nil, user: @user) }
++      assert_equal AuditLog::MAX_AUDIT_LOGS_PER_PUSH_OR_PULL - 1, @push.audit_logs.count
++
++      assert_difference("@push.audit_logs.count", 1) do
++        @controller.log_event(@push, :view)
++      end
++    end
++  end
+ end

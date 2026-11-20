@@ -1,0 +1,1715 @@
+diff --git a/ktorm-jackson/src/main/kotlin/org/ktorm/jackson/JsonSqlType.kt b/ktorm-jackson/src/main/kotlin/org/ktorm/jackson/JsonSqlType.kt
+index 617e5f1ec5b1b50517fa3a58835c3d5dc6357524..168cb61e3b8143576b17e9dee7d8bc4eccb1d6ff 100644
+--- a/ktorm-jackson/src/main/kotlin/org/ktorm/jackson/JsonSqlType.kt
++++ b/ktorm-jackson/src/main/kotlin/org/ktorm/jackson/JsonSqlType.kt
+@@ -58,9 +58,11 @@ public class JsonSqlType<T : Any>(
+     public val objectMapper: ObjectMapper,
+     public val javaType: JavaType
+ ) : SqlType<T>(Types.OTHER, "json") {
++    public constructor(typeRef: TypeReference<T>) : this(sharedObjectMapper, typeRef)
+     public constructor(
++        objectMapper: ObjectMapper,
+         typeRef: TypeReference<T>
+-    ) : this(sharedObjectMapper, sharedObjectMapper.constructType(typeRef.referencedType))
++    ) : this(objectMapper, objectMapper.constructType(typeRef.referencedType))
+ 
+     // Access postgresql API by reflection, because it is not a JDK 9 module,
+     // we are not able to require it in module-info.java.
+diff --git a/ktorm-ksp-compiler/ktorm-ksp-compiler.gradle.kts b/ktorm-ksp-compiler/ktorm-ksp-compiler.gradle.kts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d440ca62921cb1f05425b2e6527bd038c5a5664
+--- /dev/null
++++ b/ktorm-ksp-compiler/ktorm-ksp-compiler.gradle.kts
+@@ -0,0 +1,20 @@
++
++plugins {
++    id("ktorm.base")
++    id("ktorm.publish")
++    id("ktorm.source-header-check")
++}
++
++dependencies {
++    implementation(project(":ktorm-core"))
++    implementation(project(":ktorm-ksp-annotations"))
++    implementation(project(":ktorm-ksp-spi"))
++    implementation("com.google.devtools.ksp:symbol-processing-api:1.7.22-1.0.8")
++    implementation("com.squareup:kotlinpoet-ksp:1.11.0")
++    implementation("com.facebook:ktfmt:0.40")
++    implementation("org.atteo:evo-inflector:1.3")
++    testImplementation("com.github.tschuchortdev:kotlin-compile-testing:1.4.8")
++    testImplementation("com.github.tschuchortdev:kotlin-compile-testing-ksp:1.4.8")
++    testImplementation("com.h2database:h2:1.4.198")
++    testImplementation("org.slf4j:slf4j-simple:1.7.25")
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b4f665efd09f7e64111e9b587fc4e8cc838903a
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/KtormProcessorProvider.kt
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler
++
++import com.facebook.ktfmt.format.Formatter
++import com.facebook.ktfmt.format.FormattingOptions
++import com.google.devtools.ksp.processing.*
++import com.google.devtools.ksp.symbol.KSAnnotated
++import com.google.devtools.ksp.symbol.KSClassDeclaration
++import com.google.devtools.ksp.symbol.KSFile
++import com.squareup.kotlinpoet.FileSpec
++import org.ktorm.ksp.annotation.Table
++import org.ktorm.ksp.compiler.generator.FileGenerator
++import org.ktorm.ksp.compiler.parser.MetadataParser
++import org.ktorm.ksp.compiler.util.isValid
++import org.ktorm.ksp.spi.TableMetadata
++import kotlin.reflect.jvm.jvmName
++
++public class KtormProcessorProvider : SymbolProcessorProvider {
++
++    override fun create(environment: SymbolProcessorEnvironment): SymbolProcessor {
++        for (generator in FileGenerator.extCodeGenerators) {
++            environment.logger.info("[ktorm-ksp-compiler] load ext generator: $generator")
++        }
++
++        return object : SymbolProcessor {
++            override fun process(resolver: Resolver): List<KSAnnotated> {
++                return doProcess(resolver, environment)
++            }
++        }
++    }
++
++    private fun doProcess(resolver: Resolver, environment: SymbolProcessorEnvironment): List<KSAnnotated> {
++        val (symbols, deferral) = resolver.getSymbolsWithAnnotation(Table::class.jvmName).partition { it.isValid() }
++
++        val parser = MetadataParser(resolver, environment)
++        for (symbol in symbols) {
++            if (symbol is KSClassDeclaration) {
++                val table = parser.parseTableMetadata(symbol)
++                generateFile(table, environment)
++            }
++        }
++
++        return deferral
++    }
++
++    private fun generateFile(table: TableMetadata, environment: SymbolProcessorEnvironment) {
++        // Generate file spec by kotlinpoet.
++        val fileSpec = FileGenerator.generate(table, environment)
++
++        // Beautify the generated code by facebook ktfmt.
++        val formattedCode = formatCode(fileSpec, environment.logger)
++
++        // Output the formatted code.
++        val dependencies = Dependencies(false, *table.getDependencyFiles().toTypedArray())
++        val file = environment.codeGenerator.createNewFile(dependencies, fileSpec.packageName, fileSpec.name)
++        file.writer(Charsets.UTF_8).use { it.write(formattedCode) }
++    }
++
++    private fun formatCode(fileSpec: FileSpec, logger: KSPLogger): String {
++        // Use the Kotlin official code style.
++        val options = FormattingOptions(style = FormattingOptions.Style.GOOGLE, maxWidth = 120, blockIndent = 4)
++
++        // Remove tailing commas in parameter lists.
++        val code = fileSpec.toString().replace(Regex(""",\s*\)"""), ")")
++
++        try {
++            return Formatter.format(options, code)
++        } catch (e: Exception) {
++            logger.exception(e)
++            return code
++        }
++    }
++
++    private fun TableMetadata.getDependencyFiles(): List<KSFile> {
++        val files = ArrayList<KSFile>()
++
++        val containingFile = entityClass.containingFile
++        if (containingFile != null) {
++            files += containingFile
++        }
++
++        for (column in columns) {
++            val ref = column.referenceTable
++            if (ref != null) {
++                files += ref.getDependencyFiles()
++            }
++        }
++
++        return files
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/AddFunctionGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/AddFunctionGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..163e5895e0140b8873b7df070bb851024ce328e2
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/AddFunctionGenerator.kt
+@@ -0,0 +1,192 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.squareup.kotlinpoet.*
++import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toClassName
++import org.ktorm.dsl.AliasRemover
++import org.ktorm.entity.EntitySequence
++import org.ktorm.expression.ColumnAssignmentExpression
++import org.ktorm.expression.InsertExpression
++import org.ktorm.ksp.spi.ColumnMetadata
++import org.ktorm.ksp.spi.TableMetadata
++import org.ktorm.schema.Column
++
++@OptIn(KotlinPoetKspPreview::class)
++internal object AddFunctionGenerator {
++
++    fun generate(table: TableMetadata): FunSpec {
++        val primaryKeys = table.columns.filter { it.isPrimaryKey }
++        val useGeneratedKey = primaryKeys.size == 1
++            && primaryKeys[0].entityProperty.isMutable
++            && primaryKeys[0].entityProperty.type.resolve().isMarkedNullable
++
++        val entityClass = table.entityClass.toClassName()
++        val tableClass = ClassName(table.entityClass.packageName.asString(), table.tableClassName)
++
++        return FunSpec.builder("add")
++            .addKdoc(kdoc(table, useGeneratedKey))
++            .receiver(EntitySequence::class.asClassName().parameterizedBy(entityClass, tableClass))
++            .addParameter("entity", entityClass)
++            .addParameter(ParameterSpec.builder("isDynamic", typeNameOf<Boolean>()).defaultValue("false").build())
++            .returns(Int::class.asClassName())
++            .addCode(checkForDml())
++            .addCode(addValFun())
++            .addCode(addAssignments(table, useGeneratedKey))
++            .addCode(createExpression())
++            .addCode(executeUpdate(useGeneratedKey, primaryKeys))
++            .build()
++    }
++
++    private fun kdoc(table: TableMetadata, useGeneratedKey: Boolean): String {
++        var kdoc = "" +
++            "Insert the given entity into this sequence and return the affected record number. " +
++            "If [isDynamic] is set to true, the generated SQL will include only the non-null columns. "
++
++        if (useGeneratedKey) {
++            val pk = table.columns.single { it.isPrimaryKey }
++            val pkName = table.entityClass.simpleName.asString() + "." + pk.entityProperty.simpleName.asString()
++
++            kdoc += "\n\n" +
++                "Note that this function will obtain the generated primary key from the database and fill it into " +
++                "the property [${pkName}] after the insertion completes. But this requires us not to set " +
++                "the primary key’s value beforehand, otherwise, if you do that, the given value will be " +
++                "inserted into the database, and no keys generated."
++        }
++
++        return kdoc
++    }
++
++    internal fun checkForDml(): CodeBlock {
++        val code = """
++            val isModified =
++                expression.where != null ||
++                    expression.groupBy.isNotEmpty() ||
++                    expression.having != null ||
++                    expression.isDistinct ||
++                    expression.orderBy.isNotEmpty() ||
++                    expression.offset != null ||
++                    expression.limit != null
++        
++            if (isModified) {
++                val msg =
++                    "Entity manipulation functions are not supported by this sequence object. " +
++                    "Please call on the origin sequence returned from database.sequenceOf(table)"
++                throw UnsupportedOperationException(msg)
++            }
++            
++            
++        """.trimIndent()
++
++        return CodeBlock.of(code)
++    }
++
++    internal fun addValFun(): CodeBlock {
++        val code = """
++            fun <T : Any> MutableList<%1T<*>>.addVal(column: %2T<T>, value: T?, isDynamic: Boolean) {
++                if (!isDynamic || value != null) {
++                    this += %1T(column.asExpression(), column.wrapArgument(value))
++                }
++            }
++            
++            
++        """.trimIndent()
++
++        return CodeBlock.of(code, ColumnAssignmentExpression::class.asClassName(), Column::class.asClassName())
++    }
++
++    private fun addAssignments(table: TableMetadata, useGeneratedKey: Boolean): CodeBlock {
++        return buildCodeBlock {
++            addStatement("val assignments = ArrayList<%T<*>>()", ColumnAssignmentExpression::class.asClassName())
++
++            for (column in table.columns) {
++                val forceDynamic = useGeneratedKey
++                    && column.isPrimaryKey && column.entityProperty.type.resolve().isMarkedNullable
++
++                addStatement(
++                    "assignments.addVal(sourceTable.%N, entity.%N, %L)",
++                    column.columnPropertyName,
++                    column.entityProperty.simpleName.asString(),
++                    if (forceDynamic) "isDynamic·=·true" else "isDynamic"
++                )
++            }
++
++            add("\n")
++
++            beginControlFlow("if (assignments.isEmpty())")
++            addStatement("return 0")
++            endControlFlow()
++
++            add("\n")
++        }
++    }
++
++    private fun createExpression(): CodeBlock {
++        val code = """
++            val expression = database.dialect.createExpressionVisitor(%T).visit(
++                %T(sourceTable.asExpression(), assignments)
++            )
++            
++              
++        """.trimIndent()
++
++        return CodeBlock.of(code, AliasRemover::class.asClassName(), InsertExpression::class.asClassName())
++    }
++
++    private fun executeUpdate(useGeneratedKey: Boolean, primaryKeys: List<ColumnMetadata>): CodeBlock {
++        return buildCodeBlock {
++            if (!useGeneratedKey) {
++                addStatement("return database.executeUpdate(expression)")
++            } else {
++                // If the primary key value is manually specified, not obtain the generated key.
++                beginControlFlow("if (entity.%N != null)", primaryKeys[0].entityProperty.simpleName.asString())
++                addStatement("return database.executeUpdate(expression)")
++
++                // Else obtain the generated key value.
++                nextControlFlow("else")
++                addNamed(
++                    format = """
++                        val (effects, rowSet) = database.executeUpdateAndRetrieveKeys(expression)
++                        if (rowSet.next()) {
++                            // TODO: use CachedRowSet.getGeneratedKey
++                            val generatedKey = sourceTable.%columnName:N.sqlType.getResult(rowSet, 1)
++                            if (generatedKey != null) {
++                                if (database.logger.isDebugEnabled()) {
++                                    database.logger.debug("Generated Key: ${'$'}generatedKey")
++                                }
++                                
++                                entity.%propertyName:N = generatedKey
++                            }
++                        }
++                        
++                        return effects
++                        
++                    """.trimIndent(),
++
++                    arguments = mapOf(
++                        "columnName" to primaryKeys[0].columnPropertyName,
++                        "propertyName" to primaryKeys[0].entityProperty.simpleName.asString()
++                    )
++                )
++
++                endControlFlow()
++            }
++        }
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/ComponentFunctionGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/ComponentFunctionGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..59a6f61e8eca70c9fa8e73f8809eeffa2c564bf4
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/ComponentFunctionGenerator.kt
+@@ -0,0 +1,45 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.google.devtools.ksp.isAbstract
++import com.squareup.kotlinpoet.FunSpec
++import com.squareup.kotlinpoet.KModifier
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toClassName
++import com.squareup.kotlinpoet.ksp.toTypeName
++import org.ktorm.ksp.spi.TableMetadata
++
++@OptIn(KotlinPoetKspPreview::class)
++internal object ComponentFunctionGenerator {
++
++    fun generate(table: TableMetadata): Sequence<FunSpec> {
++        return table.entityClass.getAllProperties()
++            .filter { it.isAbstract() }
++            .filterNot { it.simpleName.asString() in setOf("entityClass", "properties") }
++            .mapIndexed { i, prop ->
++                FunSpec.builder("component${i + 1}")
++                    .addKdoc("Return the value of [%L.%L]. ",
++                        table.entityClass.simpleName.asString(), prop.simpleName.asString())
++                    .addModifiers(KModifier.OPERATOR)
++                    .receiver(table.entityClass.toClassName())
++                    .returns(prop.type.resolve().toTypeName())
++                    .addCode("return·this.%N", prop.simpleName.asString())
++                    .build()
++            }
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/CopyFunctionGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/CopyFunctionGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4ef8cb4629c397d3871d65aef16b63f999cf303
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/CopyFunctionGenerator.kt
+@@ -0,0 +1,39 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.squareup.kotlinpoet.FunSpec
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toClassName
++import org.ktorm.ksp.spi.TableMetadata
++
++@OptIn(KotlinPoetKspPreview::class)
++internal object CopyFunctionGenerator {
++
++    fun generate(table: TableMetadata): FunSpec {
++        return FunSpec.builder("copy")
++            .addKdoc(
++                "Return a deep copy of this entity (which has the same property values and tracked statuses), " +
++                "and alter the specified property values. "
++            )
++            .receiver(table.entityClass.toClassName())
++            .addParameters(PseudoConstructorFunctionGenerator.buildParameters(table).asIterable())
++            .returns(table.entityClass.toClassName())
++            .addCode(PseudoConstructorFunctionGenerator.buildFunctionBody(table, isCopy = true))
++            .build()
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/EntitySequencePropertyGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/EntitySequencePropertyGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..0aedb86d5f772519f3b30c563b83148e4d564bfb
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/EntitySequencePropertyGenerator.kt
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.squareup.kotlinpoet.*
++import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toClassName
++import org.ktorm.database.Database
++import org.ktorm.entity.EntitySequence
++import org.ktorm.ksp.spi.TableMetadata
++
++@OptIn(KotlinPoetKspPreview::class)
++internal object EntitySequencePropertyGenerator {
++
++    fun generate(table: TableMetadata): PropertySpec {
++        val entityClass = table.entityClass.toClassName()
++        val tableClass = ClassName(table.entityClass.packageName.asString(), table.tableClassName)
++        val entitySequenceType = EntitySequence::class.asClassName().parameterizedBy(entityClass, tableClass)
++
++        return PropertySpec.builder(table.entitySequenceName, entitySequenceType)
++            .addKdoc("Return the default entity sequence of [%L].", table.tableClassName)
++            .receiver(Database::class.asClassName())
++            .getter(
++                FunSpec.getterBuilder()
++                    .addStatement(
++                        "return·this.%M(%N)",
++                        MemberName("org.ktorm.entity", "sequenceOf", true),
++                        table.tableClassName)
++                    .build())
++            .build()
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/FileGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/FileGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd3e2d14487e191e4e55faf21d02117358bddbc6
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/FileGenerator.kt
+@@ -0,0 +1,77 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
++import com.google.devtools.ksp.symbol.ClassKind
++import com.squareup.kotlinpoet.AnnotationSpec
++import com.squareup.kotlinpoet.FileSpec
++import org.ktorm.ksp.spi.ExtCodeGenerator
++import org.ktorm.ksp.spi.TableMetadata
++import java.util.*
++
++internal object FileGenerator {
++    val extCodeGenerators = ServiceLoader.load(ExtCodeGenerator::class.java).toList()
++
++    fun generate(table: TableMetadata, environment: SymbolProcessorEnvironment): FileSpec {
++        val fileSpec = FileSpec.builder(table.entityClass.packageName.asString(), table.tableClassName)
++            .addFileComment("Auto-generated by ktorm-ksp-compiler, DO NOT EDIT!")
++            .addAnnotation(
++                AnnotationSpec.builder(Suppress::class).addMember("%S", "RedundantVisibilityModifier").build())
++            .addType(TableClassGenerator.generate(table, environment))
++            .addProperty(EntitySequencePropertyGenerator.generate(table))
++
++        if (table.entityClass.classKind == ClassKind.INTERFACE) {
++            fileSpec.addFunction(PseudoConstructorFunctionGenerator.generate(table))
++            fileSpec.addFunction(CopyFunctionGenerator.generate(table))
++
++            for (func in ComponentFunctionGenerator.generate(table)) {
++                fileSpec.addFunction(func)
++            }
++        } else {
++            fileSpec.addFunction(AddFunctionGenerator.generate(table))
++
++            if (table.columns.any { it.isPrimaryKey }) {
++                fileSpec.addFunction(UpdateFunctionGenerator.generate(table))
++            }
++        }
++
++        for (generator in extCodeGenerators) {
++            val desc = "Code generated by ext generator: $generator"
++
++            for (type in generator.generateTypes(table, environment)) {
++                fileSpec.addType(
++                    type.toBuilder().addKdoc(if (type.kdoc.isEmpty()) desc else "\n\n$desc").build()
++                )
++            }
++
++            for (property in generator.generateProperties(table, environment)) {
++                fileSpec.addProperty(
++                    property.toBuilder().addKdoc(if (property.kdoc.isEmpty()) desc else "\n\n$desc").build()
++                )
++            }
++
++            for (function in generator.generateFunctions(table, environment)) {
++                fileSpec.addFunction(
++                    function.toBuilder().addKdoc(if (function.kdoc.isEmpty()) desc else "\n\n$desc").build()
++                )
++            }
++        }
++
++        return fileSpec.build()
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/PseudoConstructorFunctionGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/PseudoConstructorFunctionGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..840f25ea0962d4e627fb9e172cba20ba3b5f0220
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/PseudoConstructorFunctionGenerator.kt
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.google.devtools.ksp.isAbstract
++import com.squareup.kotlinpoet.*
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toClassName
++import com.squareup.kotlinpoet.ksp.toTypeName
++import org.ktorm.entity.Entity
++import org.ktorm.ksp.annotation.Undefined
++import org.ktorm.ksp.compiler.util.*
++import org.ktorm.ksp.spi.TableMetadata
++
++@OptIn(KotlinPoetKspPreview::class)
++internal object PseudoConstructorFunctionGenerator {
++
++    fun generate(table: TableMetadata): FunSpec {
++        return FunSpec.builder(table.entityClass.simpleName.asString())
++            .addKdoc(
++                "Create an entity of [%L] and specify the initial values for each property, " +
++                "properties that doesn't have an initial value will leave unassigned. ",
++                table.entityClass.simpleName.asString()
++            )
++            .addParameters(buildParameters(table).asIterable())
++            .returns(table.entityClass.toClassName())
++            .addCode(buildFunctionBody(table))
++            .build()
++    }
++
++    internal fun buildParameters(table: TableMetadata): Sequence<ParameterSpec> {
++        return table.entityClass.getAllProperties()
++            .filter { it.isAbstract() }
++            .filterNot { it.simpleName.asString() in setOf("entityClass", "properties") }
++            .map { prop ->
++                val propName = prop.simpleName.asString()
++                val propType = prop.type.resolve().makeNullable().toTypeName()
++
++                ParameterSpec.builder(propName, propType)
++                    .defaultValue("%T.of()", Undefined::class.asClassName())
++                    .build()
++            }
++    }
++
++    internal fun buildFunctionBody(table: TableMetadata, isCopy: Boolean = false): CodeBlock = buildCodeBlock {
++        if (isCopy) {
++            addStatement("val·entity·=·this.copy()")
++        } else {
++            addStatement("val·entity·=·%T.create<%T>()", Entity::class.asClassName(), table.entityClass.toClassName())
++        }
++
++        for (prop in table.entityClass.getAllProperties()) {
++            if (!prop.isAbstract() || prop.simpleName.asString() in setOf("entityClass", "properties")) {
++                continue
++            }
++
++            val propName = prop.simpleName.asString()
++            val propType = prop.type.resolve()
++            if (propType.isInline()) {
++                beginControlFlow(
++                    "if·((%N·as·Any?)·!==·(%T.of<%T>()·as·Any?))",
++                    propName, Undefined::class.asClassName(), propType.makeNotNullable().toTypeName()
++                )
++            } else {
++                beginControlFlow(
++                    "if·(%N·!==·%T.of<%T>())",
++                    propName, Undefined::class.asClassName(), propType.makeNotNullable().toTypeName()
++                )
++            }
++
++            var statement: String
++            if (prop.isMutable) {
++                statement = "entity.%1N·=·%1N"
++            } else {
++                statement = "entity[%1S]·=·%1N"
++            }
++
++            if (!propType.isMarkedNullable) {
++                statement += "·?:·error(\"`%1L` should not be null.\")"
++            }
++
++            addStatement(statement, propName)
++            endControlFlow()
++        }
++
++        addStatement("return entity")
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/TableClassGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/TableClassGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7cd7e6943977dc5be6e424ee8d8f481caedb32f9
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/TableClassGenerator.kt
+@@ -0,0 +1,220 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
++import com.google.devtools.ksp.symbol.ClassKind
++import com.squareup.kotlinpoet.*
++import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toClassName
++import org.ktorm.dsl.QueryRowSet
++import org.ktorm.ksp.compiler.util.getKotlinType
++import org.ktorm.ksp.compiler.util.getRegisteringCodeBlock
++import org.ktorm.ksp.spi.TableMetadata
++import org.ktorm.schema.BaseTable
++import org.ktorm.schema.Column
++import org.ktorm.schema.Table
++
++@OptIn(KotlinPoetKspPreview::class)
++internal object TableClassGenerator {
++
++    fun generate(table: TableMetadata, environment: SymbolProcessorEnvironment): TypeSpec {
++        return TypeSpec.classBuilder(table.tableClassName)
++            .addKdoc("Table %L. %L", table.name, table.entityClass.docString?.trimIndent().orEmpty())
++            .addModifiers(KModifier.OPEN)
++            .primaryConstructor(FunSpec.constructorBuilder().addParameter("alias", typeNameOf<String?>()).build())
++            .configureSuperClass(table)
++            .configureColumnProperties(table)
++            .configureDoCreateEntityFunction(table, environment.options)
++            .configureAliasedFunction(table)
++            .configureCompanionObject(table)
++            .build()
++    }
++
++    private fun TypeSpec.Builder.configureSuperClass(table: TableMetadata): TypeSpec.Builder {
++        if (table.entityClass.classKind == ClassKind.INTERFACE) {
++            superclass(Table::class.asClassName().parameterizedBy(table.entityClass.toClassName()))
++        } else {
++            superclass(BaseTable::class.asClassName().parameterizedBy(table.entityClass.toClassName()))
++        }
++
++        addSuperclassConstructorParameter("%S", table.name)
++        addSuperclassConstructorParameter("alias")
++
++        if (table.catalog != null) {
++            addSuperclassConstructorParameter("catalog·=·%S", table.catalog!!)
++        }
++
++        if (table.schema != null) {
++            addSuperclassConstructorParameter("schema·=·%S", table.schema!!)
++        }
++
++        return this
++    }
++
++    private fun TypeSpec.Builder.configureColumnProperties(table: TableMetadata): TypeSpec.Builder {
++        for (column in table.columns) {
++            val columnType = Column::class.asClassName().parameterizedBy(column.getKotlinType())
++            val propertySpec = PropertySpec.builder(column.columnPropertyName, columnType)
++                .addKdoc("Column %L. %L", column.name, column.entityProperty.docString?.trimIndent().orEmpty())
++                .initializer(buildCodeBlock {
++                    add(column.getRegisteringCodeBlock())
++
++                    if (column.isPrimaryKey) {
++                        add(".primaryKey()")
++                    }
++
++                    if (table.entityClass.classKind == ClassKind.INTERFACE) {
++                        if (column.isReference) {
++                            val pkg = column.referenceTable!!.entityClass.packageName.asString()
++                            val name = column.referenceTable!!.tableClassName
++                            val propName = column.entityProperty.simpleName.asString()
++                            add(".references(%T)·{·it.%N·}", ClassName(pkg, name), propName)
++                        } else {
++                            add(".bindTo·{·it.%N·}", column.entityProperty.simpleName.asString())
++                        }
++                    }
++                })
++                .build()
++
++            addProperty(propertySpec)
++        }
++
++        return this
++    }
++
++    private fun TypeSpec.Builder.configureDoCreateEntityFunction(
++        table: TableMetadata, options: Map<String, String>
++    ): TypeSpec.Builder {
++        if (table.entityClass.classKind == ClassKind.INTERFACE) {
++            return this
++        }
++
++        val func = FunSpec.builder("doCreateEntity")
++            .addKdoc("Create an entity object from the specific row of query results.")
++            .addModifiers(KModifier.OVERRIDE)
++            .addParameter("row", QueryRowSet::class.asTypeName())
++            .addParameter("withReferences", Boolean::class.asTypeName())
++            .returns(table.entityClass.toClassName())
++            .addCode(buildCodeBlock { buildDoCreateEntityFunctionBody(table, options) })
++            .build()
++
++        addFunction(func)
++        return this
++    }
++
++    private fun CodeBlock.Builder.buildDoCreateEntityFunctionBody(table: TableMetadata, options: Map<String, String>) {
++        val constructorParams = table.entityClass.primaryConstructor!!.parameters.associateBy { it.name!!.asString() }
++
++        val hasDefaultValues = table.columns
++            .mapNotNull { constructorParams[it.entityProperty.simpleName.asString()] }
++            .any { it.hasDefault }
++
++        if (hasDefaultValues && options["ktorm.allowReflection"] == "true") {
++            addStatement(
++                "val constructor = %T::class.%M!!",
++                table.entityClass.toClassName(),
++                MemberName("kotlin.reflect.full", "primaryConstructor", true)
++            )
++
++            add("«val args = mapOf(")
++
++            for (column in table.columns) {
++                val propName = column.entityProperty.simpleName.asString()
++                if (propName in constructorParams) {
++                    add(
++                        "constructor.%M(%S)!! to row[this.%N],",
++                        MemberName("kotlin.reflect.full", "findParameterByName", true),
++                        propName,
++                        column.columnPropertyName
++                    )
++                }
++            }
++
++            add(")\n»")
++            addStatement("// Filter optional arguments out to make default values work.")
++
++            if (table.columns.all { it.entityProperty.simpleName.asString() in constructorParams }) {
++                addStatement("return constructor.callBy(args.filterNot { (k, v) -> k.isOptional && v == null })")
++            } else {
++                addStatement("val entity = constructor.callBy(args.filterNot { (k, v) -> k.isOptional && v == null })")
++            }
++        } else {
++            if (table.columns.all { it.entityProperty.simpleName.asString() in constructorParams }) {
++                add("«return·%T(", table.entityClass.toClassName())
++            } else {
++                add("«val·entity·=·%T(", table.entityClass.toClassName())
++            }
++
++            for (column in table.columns) {
++                val parameter = constructorParams[column.entityProperty.simpleName.asString()] ?: continue
++                if (parameter.type.resolve().isMarkedNullable) {
++                    add("%N·=·row[this.%N],", parameter.name!!.asString(), column.columnPropertyName)
++                } else {
++                    add("%N·=·row[this.%N]!!,", parameter.name!!.asString(), column.columnPropertyName)
++                }
++            }
++
++            add(")\n»")
++        }
++
++        for (column in table.columns) {
++            val propName = column.entityProperty.simpleName.asString()
++            if (propName in constructorParams) {
++                continue
++            }
++
++            if (column.entityProperty.type.resolve().isMarkedNullable) {
++                addStatement("entity.%N·=·row[this.%N]", propName, column.columnPropertyName)
++            } else {
++                addStatement("entity.%N·=·row[this.%N]!!", propName, column.columnPropertyName)
++            }
++        }
++
++        if (table.columns.any { it.entityProperty.simpleName.asString() !in constructorParams }) {
++            addStatement("return·entity")
++        }
++    }
++
++    private fun TypeSpec.Builder.configureAliasedFunction(table: TableMetadata): TypeSpec.Builder {
++        val func = FunSpec.builder("aliased")
++            .addKdoc(
++                "Return a new-created table object with all properties (including the table name and columns " +
++                "and so on) being copied from this table, but applying a new alias given by the parameter."
++            )
++            .addModifiers(KModifier.OVERRIDE)
++            .addParameter("alias", typeNameOf<String>())
++            .returns(ClassName(table.entityClass.packageName.asString(), table.tableClassName))
++            .addCode("return %L(alias)", table.tableClassName)
++            .build()
++
++        addFunction(func)
++        return this
++    }
++
++    private fun TypeSpec.Builder.configureCompanionObject(table: TableMetadata): TypeSpec.Builder {
++        val companion = TypeSpec.companionObjectBuilder(null)
++            .addKdoc("The default table object of %L.", table.name)
++            .superclass(ClassName(table.entityClass.packageName.asString(), table.tableClassName))
++            .addSuperclassConstructorParameter(CodeBlock.of("alias·=·%S", table.alias))
++            .build()
++
++        addType(companion)
++        return this
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/UpdateFunctionGenerator.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/UpdateFunctionGenerator.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bc1e0bf07ccf6228a8303e80d30875ec744fc5f
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/generator/UpdateFunctionGenerator.kt
+@@ -0,0 +1,126 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.generator
++
++import com.squareup.kotlinpoet.*
++import com.squareup.kotlinpoet.ParameterizedTypeName.Companion.parameterizedBy
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toClassName
++import org.ktorm.dsl.AliasRemover
++import org.ktorm.entity.EntitySequence
++import org.ktorm.expression.ColumnAssignmentExpression
++import org.ktorm.expression.UpdateExpression
++import org.ktorm.ksp.compiler.util.*
++import org.ktorm.ksp.spi.TableMetadata
++
++@OptIn(KotlinPoetKspPreview::class)
++internal object UpdateFunctionGenerator {
++
++    fun generate(table: TableMetadata): FunSpec {
++        val kdoc = "" +
++            "Update the given entity to the database and return the affected record number. " +
++            "If [isDynamic] is set to true, the generated SQL will include only the non-null columns. "
++
++        val entityClass = table.entityClass.toClassName()
++        val tableClass = ClassName(table.entityClass.packageName.asString(), table.tableClassName)
++
++        return FunSpec.builder("update")
++            .addKdoc(kdoc)
++            .receiver(EntitySequence::class.asClassName().parameterizedBy(entityClass, tableClass))
++            .addParameter("entity", entityClass)
++            .addParameter(ParameterSpec.builder("isDynamic", typeNameOf<Boolean>()).defaultValue("false").build())
++            .returns(Int::class.asClassName())
++            .addCode(AddFunctionGenerator.checkForDml())
++            .addCode(AddFunctionGenerator.addValFun())
++            .addCode(addAssignments(table))
++            .addCode(buildConditions(table))
++            .addCode(createExpression())
++            .addStatement("return database.executeUpdate(expression)")
++            .build()
++    }
++
++    private fun addAssignments(table: TableMetadata): CodeBlock {
++        return buildCodeBlock {
++            addStatement("val assignments = ArrayList<%T<*>>()", ColumnAssignmentExpression::class.asClassName())
++
++            for (column in table.columns) {
++                if (column.isPrimaryKey) {
++                    continue
++                }
++
++                addStatement(
++                    "assignments.addVal(sourceTable.%N, entity.%N, isDynamic)",
++                    column.columnPropertyName,
++                    column.entityProperty.simpleName.asString(),
++                )
++            }
++
++            add("\n")
++
++            beginControlFlow("if (assignments.isEmpty())")
++            addStatement("return 0")
++            endControlFlow()
++
++            add("\n")
++        }
++    }
++
++    private fun buildConditions(table: TableMetadata): CodeBlock {
++        return buildCodeBlock {
++            add("«val conditions = listOf(")
++
++            for (column in table.columns) {
++                if (!column.isPrimaryKey) {
++                    continue
++                }
++
++                val condition: String
++                if (column.entityProperty.type.resolve().isMarkedNullable) {
++                    condition = "sourceTable.%N·%M·entity.%N!!,"
++                } else {
++                    condition = "sourceTable.%N·%M·entity.%N,"
++                }
++
++                add(
++                    condition,
++                    column.columnPropertyName,
++                    MemberName("org.ktorm.dsl", "eq", true),
++                    column.entityProperty.simpleName.asString()
++                )
++            }
++
++            add(")\n»")
++        }
++    }
++
++    private fun createExpression(): CodeBlock {
++        val code = """
++            val expression = database.dialect.createExpressionVisitor(%T).visit(
++                %T(sourceTable.asExpression(), assignments, conditions.%M().asExpression())
++            )
++            
++              
++        """.trimIndent()
++
++        return CodeBlock.of(
++            code,
++            AliasRemover::class.asClassName(),
++            UpdateExpression::class.asClassName(),
++            MemberName("org.ktorm.dsl", "combineConditions", true)
++        )
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1f94b8e7d1be885ea90608599d52707c900f96d
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/parser/MetadataParser.kt
+@@ -0,0 +1,296 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.parser
++
++import com.google.devtools.ksp.*
++import com.google.devtools.ksp.processing.Resolver
++import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
++import com.google.devtools.ksp.symbol.*
++import com.google.devtools.ksp.symbol.ClassKind.*
++import org.ktorm.entity.Entity
++import org.ktorm.ksp.annotation.*
++import org.ktorm.ksp.compiler.util.*
++import org.ktorm.ksp.spi.CodingNamingStrategy
++import org.ktorm.ksp.spi.ColumnMetadata
++import org.ktorm.ksp.spi.DatabaseNamingStrategy
++import org.ktorm.ksp.spi.TableMetadata
++import org.ktorm.schema.TypeReference
++import java.lang.reflect.InvocationTargetException
++import java.util.*
++import kotlin.reflect.jvm.jvmName
++
++@OptIn(KspExperimental::class)
++internal class MetadataParser(_resolver: Resolver, _environment: SymbolProcessorEnvironment) {
++    private val resolver = _resolver
++    private val options = _environment.options
++    private val databaseNamingStrategy = loadDatabaseNamingStrategy()
++    private val codingNamingStrategy = loadCodingNamingStrategy()
++    private val tablesCache = HashMap<String, TableMetadata>()
++
++    private fun loadDatabaseNamingStrategy(): DatabaseNamingStrategy {
++        val name = options["ktorm.dbNamingStrategy"] ?: "lower-snake-case"
++        if (name == "lower-snake-case") {
++            return LowerSnakeCaseDatabaseNamingStrategy
++        }
++        if (name == "upper-snake-case") {
++            return UpperSnakeCaseDatabaseNamingStrategy
++        }
++
++        try {
++            val cls = Class.forName(name)
++            return (cls.kotlin.objectInstance ?: cls.getDeclaredConstructor().newInstance()) as DatabaseNamingStrategy
++        } catch (e: InvocationTargetException) {
++            throw e.targetException
++        }
++    }
++
++    private fun loadCodingNamingStrategy(): CodingNamingStrategy {
++        val name = options["ktorm.codingNamingStrategy"] ?: return DefaultCodingNamingStrategy
++
++        try {
++            val cls = Class.forName(name)
++            return (cls.kotlin.objectInstance ?: cls.getDeclaredConstructor().newInstance()) as CodingNamingStrategy
++        } catch (e: InvocationTargetException) {
++            throw e.targetException
++        }
++    }
++
++    fun parseTableMetadata(cls: KSClassDeclaration): TableMetadata {
++        val r = tablesCache[cls.qualifiedName!!.asString()]
++        if (r != null) {
++            return r
++        }
++
++        if (cls.classKind != CLASS && cls.classKind != INTERFACE) {
++            val name = cls.qualifiedName!!.asString()
++            throw IllegalStateException("$name is expected to be a class or interface but actually ${cls.classKind}.")
++        }
++
++        if (cls.classKind == INTERFACE && !cls.isSubclassOf<Entity<*>>()) {
++            val name = cls.qualifiedName!!.asString()
++            throw IllegalStateException("$name must extends from org.ktorm.entity.Entity.")
++        }
++
++        val table = cls.getAnnotationsByType(Table::class).first()
++        val tableDef = TableMetadata(
++            entityClass = cls,
++            name = table.name.ifEmpty { databaseNamingStrategy.getTableName(cls) },
++            alias = table.alias.takeIf { it.isNotEmpty() },
++            catalog = table.catalog.ifEmpty { options["ktorm.catalog"] }?.takeIf { it.isNotEmpty() },
++            schema = table.schema.ifEmpty { options["ktorm.schema"] }?.takeIf { it.isNotEmpty() },
++            tableClassName = table.className.ifEmpty { codingNamingStrategy.getTableClassName(cls) },
++            entitySequenceName = table.entitySequenceName.ifEmpty { codingNamingStrategy.getEntitySequenceName(cls) },
++            ignoreProperties = table.ignoreProperties.toSet(),
++            columns = ArrayList()
++        )
++
++        for (property in cls.getProperties(tableDef.ignoreProperties)) {
++            if (property.isAnnotationPresent(References::class)) {
++                (tableDef.columns as MutableList) += parseRefColumnMetadata(property, tableDef)
++            } else {
++                (tableDef.columns as MutableList) += parseColumnMetadata(property, tableDef)
++            }
++        }
++
++        tablesCache[cls.qualifiedName!!.asString()] = tableDef
++        return tableDef
++    }
++
++    private fun KSClassDeclaration.getProperties(ignoreProperties: Set<String>): Sequence<KSPropertyDeclaration> {
++        val constructorParams = HashSet<String>()
++        if (classKind == CLASS) {
++            primaryConstructor?.parameters?.mapTo(constructorParams) { it.name!!.asString() }
++        }
++
++        return this.getAllProperties()
++            .filterNot { it.simpleName.asString() in ignoreProperties }
++            .filterNot { it.isAnnotationPresent(Ignore::class) }
++            .filterNot { classKind == CLASS && !it.hasBackingField }
++            .filterNot { classKind == INTERFACE && !it.isAbstract() }
++            .filterNot { classKind == INTERFACE && it.simpleName.asString() in setOf("entityClass", "properties") }
++            .sortedByDescending { it.simpleName.asString() in constructorParams }
++    }
++
++    private fun parseColumnMetadata(property: KSPropertyDeclaration, table: TableMetadata): ColumnMetadata {
++        val column = property.getAnnotationsByType(Column::class).firstOrNull()
++
++        var name = column?.name
++        if (name.isNullOrEmpty()) {
++            name = databaseNamingStrategy.getColumnName(table.entityClass, property)
++        }
++
++        var propertyName = column?.propertyName
++        if (propertyName.isNullOrEmpty()) {
++            propertyName = codingNamingStrategy.getColumnPropertyName(table.entityClass, property)
++        }
++
++        return ColumnMetadata(
++            entityProperty = property,
++            table = table,
++            name = name,
++            isPrimaryKey = property.isAnnotationPresent(PrimaryKey::class),
++            sqlType = parseColumnSqlType(property),
++            isReference = false,
++            referenceTable = null,
++            columnPropertyName = propertyName
++        )
++    }
++
++    private fun parseColumnSqlType(property: KSPropertyDeclaration): KSType {
++        var sqlType = property.annotations
++            .filter { it.annotationType.resolve().getJvmName() == Column::class.jvmName }
++            .flatMap { it.arguments }
++            .filter { it.name?.asString() == Column::sqlType.name }
++            .map { it.value as KSType? }
++            .singleOrNull()
++
++        if (sqlType?.getJvmName() == Nothing::class.jvmName) {
++            sqlType = null
++        }
++
++        if (sqlType == null) {
++            sqlType = property.getSqlType(resolver)
++        }
++
++        if (sqlType == null) {
++            val name = property.qualifiedName?.asString()
++            throw IllegalArgumentException(
++                "Parse sqlType error for property $name: cannot infer sqlType, please specify manually."
++            )
++        }
++
++        val declaration = sqlType.declaration as KSClassDeclaration
++        if (declaration.classKind != OBJECT) {
++            if (declaration.isAbstract()) {
++                val name = property.qualifiedName?.asString()
++                throw IllegalArgumentException(
++                    "Parse sqlType error for property $name: the sqlType class cannot be abstract."
++                )
++            }
++
++            val hasConstructor = declaration.getConstructors()
++                .filter { it.parameters.size == 1 }
++                .filter { it.parameters[0].type.resolve().getJvmName() == TypeReference::class.jvmName }
++                .any()
++
++            if (!hasConstructor) {
++                val name = property.qualifiedName?.asString()
++                throw IllegalArgumentException(
++                    "Parse sqlType error for property $name: the sqlType class must be a Kotlin singleton object or" +
++                    "a normal class with a constructor that accepts a single org.ktorm.schema.TypeReference argument."
++                )
++            }
++        }
++
++        return sqlType
++    }
++
++    private fun parseRefColumnMetadata(property: KSPropertyDeclaration, table: TableMetadata): ColumnMetadata {
++        if (property.isAnnotationPresent(Column::class)) {
++            val n = property.qualifiedName?.asString()
++            throw IllegalStateException(
++                "Parse ref column error for property $n: @Column and @References cannot be used together."
++            )
++        }
++
++        if (table.entityClass.classKind != INTERFACE) {
++            val n = property.qualifiedName?.asString()
++            throw IllegalStateException(
++                "Parse ref column error for property $n: @References can only be used in interface-based entities."
++            )
++        }
++
++        val refEntityClass = property.type.resolve().declaration as KSClassDeclaration
++        table.checkCircularRef(refEntityClass)
++
++        if (refEntityClass.classKind != INTERFACE) {
++            val n = property.qualifiedName?.asString()
++            throw IllegalStateException(
++                "Parse ref column error for property $n: the referenced entity class must be an interface."
++            )
++        }
++
++        if (!refEntityClass.isAnnotationPresent(Table::class)) {
++            val n = property.qualifiedName?.asString()
++            throw IllegalStateException(
++                "Parse ref column error for property $n: the referenced entity class must be annotated with @Table."
++            )
++        }
++
++        val referenceTable = parseTableMetadata(refEntityClass)
++        val primaryKeys = referenceTable.columns.filter { it.isPrimaryKey }
++        if (primaryKeys.isEmpty()) {
++            val n = property.qualifiedName?.asString()
++            throw IllegalStateException(
++                "Parse ref column error for property $n: the referenced table doesn't have a primary key."
++            )
++        }
++
++        if (primaryKeys.size > 1) {
++            val n = property.qualifiedName?.asString()
++            throw IllegalStateException(
++                "Parse ref column error for property $n: the referenced table cannot have compound primary keys."
++            )
++        }
++
++        val reference = property.getAnnotationsByType(References::class).first()
++        var name = reference.name
++        if (name.isEmpty()) {
++            name = databaseNamingStrategy.getRefColumnName(table.entityClass, property, referenceTable)
++        }
++
++        var propertyName = reference.propertyName
++        if (propertyName.isEmpty()) {
++            propertyName = codingNamingStrategy.getRefColumnPropertyName(table.entityClass, property, referenceTable)
++        }
++
++        return ColumnMetadata(
++            entityProperty = property,
++            table = table,
++            name = name,
++            isPrimaryKey = property.isAnnotationPresent(PrimaryKey::class),
++            sqlType = primaryKeys[0].sqlType,
++            isReference = true,
++            referenceTable = referenceTable,
++            columnPropertyName = propertyName
++        )
++    }
++
++    private fun TableMetadata.checkCircularRef(ref: KSClassDeclaration, stack: LinkedList<String> = LinkedList()) {
++        val className = this.entityClass.qualifiedName?.asString()
++        val refClassName = ref.qualifiedName?.asString()
++
++        stack.push(refClassName)
++
++        if (className == refClassName) {
++            val route = stack.asReversed().joinToString(separator = " --> ")
++            throw IllegalStateException(
++                "Circular reference is not allowed, current table: $className, reference route: $route."
++            )
++        }
++
++        val refTable = ref.getAnnotationsByType(Table::class).firstOrNull()
++        for (property in ref.getProperties(refTable?.ignoreProperties?.toSet() ?: emptySet())) {
++            if (property.isAnnotationPresent(References::class)) {
++                val propType = property.type.resolve().declaration as KSClassDeclaration
++                checkCircularRef(propType, stack)
++            }
++        }
++
++        stack.pop()
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/KspExtensions.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/KspExtensions.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..bad91180cb5344da2e29aa44b4ba73c2d722cc2d
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/KspExtensions.kt
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.util
++
++import com.google.devtools.ksp.KspExperimental
++import com.google.devtools.ksp.isAnnotationPresent
++import com.google.devtools.ksp.symbol.*
++import com.google.devtools.ksp.visitor.KSValidateVisitor
++import kotlin.reflect.jvm.jvmName
++
++/**
++ * Check if the given symbol is valid.
++ */
++internal fun KSNode.isValid(): Boolean {
++    // Custom visitor to avoid stack overflow, see https://github.com/google/ksp/issues/1114
++    val visitor = object : KSValidateVisitor({ _, _ -> true }) {
++        private val stack = LinkedHashSet<KSType>()
++
++        private fun validateType(type: KSType): Boolean {
++            if (!stack.add(type)) {
++                // Skip if the type already in the stack, avoid infinite recursion.
++                return true
++            }
++
++            try {
++                return !type.isError && !type.arguments.any { it.type?.accept(this, null) == false }
++            } finally {
++                stack.remove(type)
++            }
++        }
++
++        override fun visitTypeReference(typeReference: KSTypeReference, data: KSNode?): Boolean {
++            return validateType(typeReference.resolve())
++        }
++
++        override fun visitValueArgument(valueArgument: KSValueArgument, data: KSNode?): Boolean {
++            fun visitValue(value: Any?): Boolean = when (value) {
++                is KSType -> this.validateType(value)
++                is KSAnnotation -> this.visitAnnotation(value, data)
++                is List<*> -> value.all { visitValue(it) }
++                else -> true
++            }
++
++            return visitValue(valueArgument.value)
++        }
++    }
++
++    return this.accept(visitor, null)
++}
++
++/**
++ * Check if this class is a subclass of [T].
++ */
++internal inline fun <reified T : Any> KSClassDeclaration.isSubclassOf(): Boolean {
++    return findSuperTypeReference(T::class.jvmName) != null
++}
++
++/**
++ * Find the specific super type reference for this class.
++ */
++internal fun KSClassDeclaration.findSuperTypeReference(name: String): KSTypeReference? {
++    for (superType in this.superTypes) {
++        val ksType = superType.resolve()
++
++        if (ksType.getJvmName() == name) {
++            return superType
++        }
++
++        val result = (ksType.declaration as KSClassDeclaration).findSuperTypeReference(name)
++        if (result != null) {
++            return result
++        }
++    }
++
++    return null
++}
++
++/**
++ * Check if this type is an inline class.
++ */
++@OptIn(KspExperimental::class)
++internal fun KSType.isInline(): Boolean {
++    val declaration = declaration as KSClassDeclaration
++    return declaration.isAnnotationPresent(JvmInline::class) && declaration.modifiers.contains(Modifier.VALUE)
++}
++
++/**
++ * Return the JVM class name of [this] type.
++ */
++internal fun KSType.getJvmName(): String? {
++    return declaration.qualifiedName?.asString()
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/Namings.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/Namings.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e0b715d939efb302e43e2a7900455771cb5a785a
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/Namings.kt
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.util
++
++import com.google.devtools.ksp.symbol.KSClassDeclaration
++import com.google.devtools.ksp.symbol.KSPropertyDeclaration
++import org.atteo.evo.inflector.English
++import org.ktorm.ksp.spi.CodingNamingStrategy
++import org.ktorm.ksp.spi.DatabaseNamingStrategy
++import org.ktorm.ksp.spi.TableMetadata
++
++internal object LowerSnakeCaseDatabaseNamingStrategy : DatabaseNamingStrategy {
++
++    override fun getTableName(c: KSClassDeclaration): String {
++        return CamelCase.toLowerSnakeCase(c.simpleName.asString())
++    }
++
++    override fun getColumnName(c: KSClassDeclaration, prop: KSPropertyDeclaration): String {
++        return CamelCase.toLowerSnakeCase(prop.simpleName.asString())
++    }
++
++    override fun getRefColumnName(c: KSClassDeclaration, prop: KSPropertyDeclaration, ref: TableMetadata): String {
++        val pk = ref.columns.single { it.isPrimaryKey }
++        return CamelCase.toLowerSnakeCase(prop.simpleName.asString()) + "_" + pk.name
++    }
++}
++
++internal object UpperSnakeCaseDatabaseNamingStrategy : DatabaseNamingStrategy {
++
++    override fun getTableName(c: KSClassDeclaration): String {
++        return CamelCase.toUpperSnakeCase(c.simpleName.asString())
++    }
++
++    override fun getColumnName(c: KSClassDeclaration, prop: KSPropertyDeclaration): String {
++        return CamelCase.toUpperSnakeCase(prop.simpleName.asString())
++    }
++
++    override fun getRefColumnName(c: KSClassDeclaration, prop: KSPropertyDeclaration, ref: TableMetadata): String {
++        val pk = ref.columns.single { it.isPrimaryKey }
++        return CamelCase.toUpperSnakeCase(prop.simpleName.asString()) + "_" + pk.name
++    }
++}
++
++internal object DefaultCodingNamingStrategy : CodingNamingStrategy {
++
++    override fun getTableClassName(c: KSClassDeclaration): String {
++        return English.plural(c.simpleName.asString())
++    }
++
++    override fun getEntitySequenceName(c: KSClassDeclaration): String {
++        return CamelCase.toFirstLowerCamelCase(English.plural(c.simpleName.asString()))
++    }
++
++    override fun getColumnPropertyName(c: KSClassDeclaration, prop: KSPropertyDeclaration): String {
++        return prop.simpleName.asString()
++    }
++
++    override fun getRefColumnPropertyName(
++        c: KSClassDeclaration, prop: KSPropertyDeclaration, ref: TableMetadata
++    ): String {
++        val pk = ref.columns.single { it.isPrimaryKey }
++        return prop.simpleName.asString() + pk.columnPropertyName.replaceFirstChar { it.uppercase() }
++    }
++}
++
++internal object CamelCase {
++    // Matches boundaries between words, for example (abc|Def), (ABC|Def)
++    private val boundaries = listOf(Regex("([a-z])([A-Z])"), Regex("([A-Z])([A-Z][a-z])"))
++
++    fun toLowerSnakeCase(name: String): String {
++        return boundaries.fold(name) { s, regex -> s.replace(regex, "$1_$2") }.lowercase()
++    }
++
++    fun toUpperSnakeCase(name: String): String {
++        return boundaries.fold(name) { s, regex -> s.replace(regex, "$1_$2") }.uppercase()
++    }
++
++    fun toFirstLowerCamelCase(name: String): String {
++        val i = boundaries.mapNotNull { regex -> regex.find(name) }.minOfOrNull { it.range.first } ?: 0
++        return name.substring(0, i + 1).lowercase() + name.substring(i + 1)
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/SqlTypeMappings.kt b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/SqlTypeMappings.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f304fc4bc086e3ff24821b7586518d1d58b091d
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/kotlin/org/ktorm/ksp/compiler/util/SqlTypeMappings.kt
+@@ -0,0 +1,123 @@
++/*
++ * Copyright 2018-2023 the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.ktorm.ksp.compiler.util
++
++import com.google.devtools.ksp.getClassDeclarationByName
++import com.google.devtools.ksp.processing.Resolver
++import com.google.devtools.ksp.symbol.ClassKind
++import com.google.devtools.ksp.symbol.KSClassDeclaration
++import com.google.devtools.ksp.symbol.KSPropertyDeclaration
++import com.google.devtools.ksp.symbol.KSType
++import com.squareup.kotlinpoet.CodeBlock
++import com.squareup.kotlinpoet.MemberName
++import com.squareup.kotlinpoet.TypeName
++import com.squareup.kotlinpoet.ksp.KotlinPoetKspPreview
++import com.squareup.kotlinpoet.ksp.toTypeName
++import org.ktorm.ksp.spi.ColumnMetadata
++import org.ktorm.schema.*
++
++internal fun KSPropertyDeclaration.getSqlType(resolver: Resolver): KSType? {
++    val propType = this.type.resolve()
++    if ((propType.declaration as KSClassDeclaration).classKind == ClassKind.ENUM_CLASS) {
++        return resolver.getClassDeclarationByName<EnumSqlType<*>>()?.asType(emptyList())
++    }
++
++    val sqlType = when (propType.getJvmName()) {
++        "kotlin.Boolean" -> BooleanSqlType::class
++        "kotlin.Int" -> IntSqlType::class
++        "kotlin.Short" -> ShortSqlType::class
++        "kotlin.Long" -> LongSqlType::class
++        "kotlin.Float" -> FloatSqlType::class
++        "kotlin.Double" -> DoubleSqlType::class
++        "kotlin.String" -> VarcharSqlType::class
++        "kotlin.ByteArray" -> BytesSqlType::class
++        "java.math.BigDecimal" -> DecimalSqlType::class
++        "java.sql.Timestamp" -> TimestampSqlType::class
++        "java.sql.Date" -> DateSqlType::class
++        "java.sql.Time" -> TimeSqlType::class
++        "java.time.Instant" -> InstantSqlType::class
++        "java.time.LocalDateTime" -> LocalDateTimeSqlType::class
++        "java.time.LocalDate" -> LocalDateSqlType::class
++        "java.time.LocalTime" -> LocalTimeSqlType::class
++        "java.time.MonthDay" -> MonthDaySqlType::class
++        "java.time.YearMonth" -> YearMonthSqlType::class
++        "java.time.Year" -> YearSqlType::class
++        "java.util.UUID" -> UuidSqlType::class
++        else -> null
++    }
++
++    return sqlType?.qualifiedName?.let { resolver.getClassDeclarationByName(it)?.asType(emptyList()) }
++}
++
++@OptIn(KotlinPoetKspPreview::class)
++internal fun ColumnMetadata.getRegisteringCodeBlock(): CodeBlock {
++    val sqlTypeName = sqlType.getJvmName()
++    val registerFun = when (sqlTypeName) {
++        "org.ktorm.schema.BooleanSqlType" -> MemberName("org.ktorm.schema", "boolean", true)
++        "org.ktorm.schema.IntSqlType" -> MemberName("org.ktorm.schema", "int", true)
++        "org.ktorm.schema.ShortSqlType" -> MemberName("org.ktorm.schema", "short", true)
++        "org.ktorm.schema.LongSqlType" -> MemberName("org.ktorm.schema", "long", true)
++        "org.ktorm.schema.FloatSqlType" -> MemberName("org.ktorm.schema", "float", true)
++        "org.ktorm.schema.DoubleSqlType" -> MemberName("org.ktorm.schema", "double", true)
++        "org.ktorm.schema.DecimalSqlType" -> MemberName("org.ktorm.schema", "decimal", true)
++        "org.ktorm.schema.VarcharSqlType" -> MemberName("org.ktorm.schema", "varchar", true)
++        "org.ktorm.schema.TextSqlType" -> MemberName("org.ktorm.schema", "text", true)
++        "org.ktorm.schema.BlobSqlType" -> MemberName("org.ktorm.schema", "blob", true)
++        "org.ktorm.schema.BytesSqlType" -> MemberName("org.ktorm.schema", "bytes", true)
++        "org.ktorm.schema.TimestampSqlType" -> MemberName("org.ktorm.schema", "jdbcTimestamp", true)
++        "org.ktorm.schema.DateSqlType" -> MemberName("org.ktorm.schema", "jdbcDate", true)
++        "org.ktorm.schema.TimeSqlType" -> MemberName("org.ktorm.schema", "jdbcTime", true)
++        "org.ktorm.schema.InstantSqlType" -> MemberName("org.ktorm.schema", "timestamp", true)
++        "org.ktorm.schema.LocalDateTimeSqlType" -> MemberName("org.ktorm.schema", "datetime", true)
++        "org.ktorm.schema.LocalDateSqlType" -> MemberName("org.ktorm.schema", "date", true)
++        "org.ktorm.schema.LocalTimeSqlType" -> MemberName("org.ktorm.schema", "time", true)
++        "org.ktorm.schema.MonthDaySqlType" -> MemberName("org.ktorm.schema", "monthDay", true)
++        "org.ktorm.schema.YearMonthSqlType" -> MemberName("org.ktorm.schema", "yearMonth", true)
++        "org.ktorm.schema.YearSqlType" -> MemberName("org.ktorm.schema", "year", true)
++        "org.ktorm.schema.UuidSqlType" -> MemberName("org.ktorm.schema", "uuid", true)
++        else -> null
++    }
++
++    if (registerFun != null) {
++        return CodeBlock.of("%M(%S)", registerFun, name)
++    }
++
++    if (sqlTypeName == "org.ktorm.schema.EnumSqlType") {
++        return CodeBlock.of("%M<%T>(%S)", MemberName("org.ktorm.schema", "enum", true), getKotlinType(), name)
++    }
++
++    if (sqlTypeName == "org.ktorm.jackson.JsonSqlType") {
++        return CodeBlock.of("%M<%T>(%S)", MemberName("org.ktorm.jackson", "json", true), getKotlinType(), name)
++    }
++
++    val declaration = sqlType.declaration as KSClassDeclaration
++    if (declaration.classKind == ClassKind.OBJECT) {
++        return CodeBlock.of("registerColumn(%S,·%T)", name, sqlType.toTypeName())
++    } else {
++        // TODO: create SqlType by constructor
++        return CodeBlock.of("registerColumn(%S,·%T)", name, sqlType.toTypeName())
++    }
++}
++
++@OptIn(KotlinPoetKspPreview::class)
++internal fun ColumnMetadata.getKotlinType(): TypeName {
++    if (isReference) {
++        return referenceTable!!.columns.single { it.isPrimaryKey }.getKotlinType()
++    } else {
++        return entityProperty.type.resolve().makeNotNullable().toTypeName()
++    }
++}
+diff --git a/ktorm-ksp-compiler/src/main/resources/META-INF/services/com.google.devtools.ksp.processing.SymbolProcessorProvider b/ktorm-ksp-compiler/src/main/resources/META-INF/services/com.google.devtools.ksp.processing.SymbolProcessorProvider
+new file mode 100644
+index 0000000000000000000000000000000000000000..091bb5f7017a3319831df5f7ae2fabe40709ff30
+--- /dev/null
++++ b/ktorm-ksp-compiler/src/main/resources/META-INF/services/com.google.devtools.ksp.processing.SymbolProcessorProvider
+@@ -0,0 +1 @@
++org.ktorm.ksp.compiler.KtormProcessorProvider
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index b8d8ece63605de42d062b781087974c22e1f0fad..1a5d4b011493bceb0f5b5473d0e3000b5f8e522b 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -7,6 +7,7 @@ include("ktorm-core")
+ include("ktorm-global")
+ include("ktorm-jackson")
+ include("ktorm-ksp-annotations")
++include("ktorm-ksp-compiler")
+ include("ktorm-ksp-spi")
+ include("ktorm-support-mysql")
+ include("ktorm-support-oracle")
