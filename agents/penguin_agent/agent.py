@@ -27,6 +27,7 @@ Run from the task data checkout with ADAPTER_DIR set to the shared adapter direc
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import datetime as dt
 import hashlib
@@ -109,15 +110,17 @@ class PenguinOptions(InstalledAgentOptions):
         description=(
             "`penguin run --timeout` (30s / 5m / 2h or bare seconds), `task` to use "
             "Harbor's per-task budget minus abort/cleanup time without the 25m default ceiling, "
-            "or `unlimited` to wait until the Task finishes without a time limit. "
+            "`harbor` to let Harbor enforce its own deadline, or `unlimited` for no time limit. "
             "The `task` mode is unlimited when the task/job has no agent timeout. Unlimited requires "
-            "Harbor's agent timeout to be unset in both the job and task. When a finite timeout expires the "
-            "Task is aborted, its cost is read and the server is stopped. Harbor's agent "
-            "timeout (override_timeout_sec, or the task's, times the agent timeout "
-            f"multiplier) must be at least run_timeout + abort_wait_sec + {CLEANUP_MARGIN_SEC} s; "
+            "Harbor's agent timeout to be unset in both the job and task. A finite CLI soft timeout "
+            f"requires Harbor to leave abort_wait_sec + {CLEANUP_MARGIN_SEC} s for cleanup; "
             "an explicit value that breaks this is refused. Default: that agent timeout minus "
             f"abort_wait_sec and {CLEANUP_MARGIN_SEC} s, at most 25m (25m when Harbor sets none)."
         ),
+    )
+    reserved_timeout_tasks: set[str] = Field(
+        default_factory=set,
+        description="In a job using the Harbor deadline, task names that keep the adapter's reserved cleanup time.",
     )
     abort_wait_sec: int = Field(
         default=90,
@@ -197,8 +200,8 @@ class PenguinOptions(InstalledAgentOptions):
             raise ValueError(f"penguin_version {self.penguin_version!r} is not an npm version")
         if not _SEMVER.match(self.node_version):
             raise ValueError(f"node_version {self.node_version!r} must look like 24.18.0")
-        if self.run_timeout not in (None, "unlimited", "task") and not _DURATION.match(self.run_timeout):
-            raise ValueError(f"run_timeout {self.run_timeout!r} must be task, unlimited, 30s, 25m, 2h or 900")
+        if self.run_timeout not in (None, "unlimited", "task", "harbor") and not _DURATION.match(self.run_timeout):
+            raise ValueError(f"run_timeout {self.run_timeout!r} must be task, harbor, unlimited, 30s, 25m, 2h or 900")
         if self.max_turns is not None and self.max_turns != -1 and self.max_turns < 1:
             raise ValueError("max_turns must be a positive integer or -1")
         if self.time_budget_note is not None and not self.time_budget_note.strip():
@@ -455,11 +458,23 @@ class PenguinAgent(BaseInstalledAgent):
         effective = capped * float(multiplier)
         return effective, f"{source} {capped:g} s x {multiplier_name} {float(multiplier):g}"
 
+    def _timeout_mode(self) -> str | None:
+        mode = self.options.run_timeout
+        if mode == "harbor" and self.options.reserved_timeout_tasks:
+            config = self._trial_config() or {}
+            path = (config.get("task") or {}).get("path")
+            if not path:
+                raise ValueError("A per-task timeout policy requires the Harbor trial's task path")
+            if Path(path).name in self.options.reserved_timeout_tasks:
+                return "task"
+        return mode
+
     def run_timeout_sec(self) -> int | None:
-        """The soft timeout of `penguin run`; None means explicitly unlimited."""
-        if self.options.run_timeout == "unlimited":
+        """The CLI soft timeout, or None when the CLI should wait for completion."""
+        mode = self._timeout_mode()
+        if mode in ("unlimited", "harbor"):
             return None
-        if self.options.run_timeout == "task":
+        if mode == "task":
             config = self._trial_config()
             if config is None:
                 raise ValueError("run_timeout=task requires a readable Harbor trial config")
@@ -472,17 +487,21 @@ class PenguinAgent(BaseInstalledAgent):
             effective, _ = self.harbor_agent_timeout_sec()
             return (None if effective is None else
                     max(0, int(effective) - self.options.abort_wait_sec - CLEANUP_MARGIN_SEC))
-        if self.options.run_timeout is not None:
-            return duration_seconds(self.options.run_timeout)
+        if mode is not None:
+            return duration_seconds(mode)
         effective, _ = self.harbor_agent_timeout_sec()
         if effective is None:
             return DEFAULT_RUN_TIMEOUT_SEC
         return max(0, min(DEFAULT_RUN_TIMEOUT_SEC, int(effective) - self.options.abort_wait_sec - CLEANUP_MARGIN_SEC))
 
     def check_timeout_budget(self) -> None:
-        """Refuse a trial whose Harbor timeout would kill run.sh before its cleanup."""
+        """Check the Harbor deadline and any requested CLI soft timeout before setup."""
         run_timeout = self.run_timeout_sec()
         effective, how = self.harbor_agent_timeout_sec()
+        if self._timeout_mode() == "harbor":
+            if effective is None:
+                raise ValueError(f"run_timeout=harbor requires a finite Harbor agent timeout: {how}")
+            return
         if run_timeout is None:
             if effective is not None:
                 raise ValueError(
@@ -718,7 +737,35 @@ class PenguinAgent(BaseInstalledAgent):
             "PB_MAX_TURNS": "" if opts.max_turns is None else str(opts.max_turns),
         }
         # Nothing secret here: the credential reaches the server through the copied config.
-        await self.exec_as_agent(environment, command=f"bash {PREFIX}/run.sh", env=env)
+        harbor_deadline = self._timeout_mode() == "harbor"
+        if harbor_deadline:
+            env["PB_HARBOR_DEADLINE"] = "1"
+        run = self.exec_as_agent(environment, command=f"bash {PREFIX}/run.sh", env=env)
+        if not harbor_deadline:
+            await run
+            return
+
+        # Harbor cancels run() at the task deadline. Keep the container command attached
+        # while the CLI aborts its task and writes usage and traces before grading.
+        runner = asyncio.create_task(run)
+        try:
+            await asyncio.shield(runner)
+        except asyncio.CancelledError:
+            try:
+                interrupted = await self.exec_as_agent(
+                    environment, command=f"bash {PREFIX}/run.sh interrupt", env=env, timeout_sec=30,
+                )
+                await asyncio.wait_for(runner, timeout=opts.abort_wait_sec + CLEANUP_MARGIN_SEC)
+            except Exception as exc:
+                # Harbor grades agent timeouts and non-zero agent exits. An unconfirmed
+                # stop must tear down the environment instead of grading a live workspace.
+                raise RuntimeError("Could not stop Penguin and collect its output before grading") from exc
+            finally:
+                runner.cancel()
+                await asyncio.gather(runner, return_exceptions=True)
+            if (interrupted.stdout or "").startswith("completed "):
+                return
+            raise
 
     # -- results -------------------------------------------------------------------------
 
