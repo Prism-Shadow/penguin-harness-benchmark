@@ -1,9 +1,8 @@
 # Validation status — 2026-11-19
 
-The integration is a draft. One cell has now been trained and scored end to end on real GPUs,
-and the PenguinAgent install path has been exercised under Harbor with a real container
-runtime. The full 24-cell suite, the H100/Harbor production path and the four judges have not
-been run.
+One cell was trained and scored end to end on real GPUs. A separate Harbor run exercised
+the PenguinAgent install path with a real container runtime. The full 24-cell suite,
+the H100/Harbor production path and the four judges were outside this run.
 
 | Check | Result | Scope |
 | --- | --- | --- |
