@@ -49,6 +49,7 @@ function readOr(file, fallback) {
 // the Bearer token the server writes to <root>/api-token at every boot. Right after the
 // server reports ready the token file can still be empty, so the token is read fresh for
 // every attempt and a 401 is retried for a while, as the CLI itself re-reads it on a 401.
+// During initialization the server also returns 503 with Retry-After until it is ready.
 async function api(root, method, apiPath, body) {
   let last;
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -63,7 +64,7 @@ async function api(root, method, apiPath, body) {
         },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       });
-      if (last.status !== 401) return last;
+      if (last.status !== 401 && !(last.status === 503 && last.headers.has("retry-after"))) return last;
     }
     await sleep(500);
   }
