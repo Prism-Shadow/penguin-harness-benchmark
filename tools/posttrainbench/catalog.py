@@ -48,6 +48,7 @@ description = "Autonomous post-training of four base models on six benchmarks, w
 version = "0.1.0"
 last_update = "2026-11-16T00:00:00Z"
 status = "draft"
+data_url = "https://github.com/aisa-group/PostTrainBench"
 references = ["https://arxiv.org/abs/2603.08640", "https://github.com/aisa-group/PostTrainBench"]
 
 [author]
