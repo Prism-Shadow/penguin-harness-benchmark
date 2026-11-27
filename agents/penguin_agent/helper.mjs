@@ -10,6 +10,11 @@
 //   node helper.mjs set-max-turns <data root> <projectId> <agentId> <n>
 //       Sets the Agent's max_turns through the local server and reads it back. Prints one
 //       JSON line; exits 1 when the value read back differs.
+//   node helper.mjs wait-project <data root> <projectId> <timeout seconds>
+//       Waits until GET /api/projects/<id>/usage answers 200, then prints one JSON line;
+//       exits 1 when the wait runs out. The server accepts requests before its startup
+//       provisioning has inserted the Project row, so a run that starts on the first
+//       "running" answer can still hear 404.
 //   node helper.mjs redact <.project_config.toml> <dir>
 //       Replaces every api_key value found in the config with "[REDACTED]" in all regular
 //       files under <dir>. Prints one JSON line with counts; never prints a key.
@@ -95,6 +100,31 @@ async function setMaxTurns(root, projectId, agentId, value) {
   }
   out(result);
   if (result.max_turns !== result.requested) process.exitCode = 1;
+}
+
+// The server's listener is up before seedAdmin() has adopted the Project, so the first
+// "running" answer does not mean /api/projects/<id> is reachable yet. Poll that one route
+// until it answers 200; the CLI's own retry window is shorter than the provisioning can take.
+async function waitProject(root, projectId, timeoutSeconds) {
+  const started = Date.now();
+  const deadline = started + Number(timeoutSeconds) * 1000;
+  const result = { ok: false, status: 0, elapsed_ms: 0 };
+  while (Date.now() < deadline) {
+    try {
+      const res = await api(root, "GET", `/api/projects/${encodeURIComponent(projectId)}/usage`);
+      result.status = res.status;
+      if (res.status === 200) {
+        result.ok = true;
+        break;
+      }
+    } catch (err) {
+      result.error = err instanceof Error ? err.message : String(err);
+    }
+    await sleep(500);
+  }
+  result.elapsed_ms = Date.now() - started;
+  out(result);
+  if (!result.ok) process.exitCode = 1;
 }
 
 async function abort(root, sessionId, waitSeconds) {
@@ -205,6 +235,9 @@ switch (command) {
     break;
   case "set-max-turns":
     await setMaxTurns(args[0], args[1], args[2], args[3]);
+    break;
+  case "wait-project":
+    await waitProject(args[0], args[1], args[2] ?? "30");
     break;
   case "redact":
     redact(args[0], args[1]);

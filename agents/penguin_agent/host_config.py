@@ -81,6 +81,18 @@ def project_id(explicit: str | None = None) -> str:
     return project
 
 
+def project_config_path(root: str | None, project_name: str) -> Path:
+    """The Project's config file: `<root>/projects/<Project>/.project_config.toml` on
+    PenguinHarness 0.2.20 and later, else the pre-0.2.20 `<root>/<Project>/.project_config.toml`.
+    A data root written by 0.2.20 keeps a link at the old path, so the modern file is preferred
+    whenever it exists; an older data root has no `projects/` level and falls back."""
+    base = data_root(root)
+    modern = base / "projects" / project_name / ".project_config.toml"
+    if modern.is_file():
+        return modern
+    return base / project_name / ".project_config.toml"
+
+
 def _present(value: Any) -> str | None:
     """A non-blank string, else None: blank and absent mean the same for a connection field."""
     return value if isinstance(value, str) and value.strip() else None
@@ -176,7 +188,7 @@ def read_model(
     to "model", "provider" or "none", and "host_config" to "providers" (a file written by a
     release after 0.2.13) or "rows" (a 0.2.13 file)."""
     project_name = project_id(project)
-    path = data_root(root) / project_name / ".project_config.toml"
+    path = project_config_path(root, project_name)
     hint = (
         "Configure the model in this machine's PenguinHarness first (the Web App's model "
         f"settings, or `penguin config model add --project-id {project_name} --provider "
