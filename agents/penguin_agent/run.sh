@@ -47,6 +47,14 @@ for _ in $(seq 1 60); do
   kill -0 "$SERVER_PID" 2>/dev/null || break
   sleep 1
 done
+if [ "$SERVER_READY" = true ]; then
+  # The listener answers "running" before seedAdmin() has inserted the Project row; the CLI's
+  # own retry window is shorter than that can take, so wait for the Project itself.
+  if ! "$NODE" "$HELPER" wait-project "$PENGUIN_HOME" "$PB_PROJECT" 30 \
+    >"$OUT/penguin/wait-project.json" 2>&1; then
+    SERVER_READY=false
+  fi
+fi
 
 STARTED_MS="$(now_ms)"
 RUN_RC=3
@@ -108,7 +116,7 @@ done
 kill -9 "$SERVER_PID" 2>/dev/null
 
 # 6. Keep the Traces and server logs, never the config: the data root stays outside /logs.
-PROJECT_DIR="$PENGUIN_HOME/$PB_PROJECT"
+PROJECT_DIR="$PENGUIN_HOME/projects/$PB_PROJECT"
 for TRACES in "$PROJECT_DIR"/agents/*/traces; do
   [ -d "$TRACES" ] || continue
   AGENT_NAME="$(basename "$(dirname "$TRACES")")"
@@ -130,6 +138,7 @@ if [ "$RUN_RC" -ne 0 ]; then
   echo "penguin run exited with status $RUN_RC ($STATUS); last lines of its stderr:" >&2
   tail -n 40 "$OUT/penguin-run.stderr" >&2 2>/dev/null
   [ "$SERVER_READY" = true ] || tail -n 40 "$OUT/penguin/server.log" >&2 2>/dev/null
+  [ "$SERVER_READY" = true ] || tail -n 5 "$OUT/penguin/wait-project.json" >&2 2>/dev/null
   [ "$STATUS" = "config_failed" ] && cat "$OUT/penguin/max-turns.json" >&2 2>/dev/null
 fi
 exit "$RUN_RC"

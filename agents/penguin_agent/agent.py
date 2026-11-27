@@ -59,6 +59,7 @@ NODE_DIR = PREFIX / "node"
 NPM_PREFIX = PREFIX / "npm"
 PENGUIN_BIN = PREFIX / "bin" / "penguin"
 DATA_ROOT = PREFIX / "home"
+PROJECTS_DIR = DATA_ROOT / "projects"
 INSTRUCTION_PATH = PREFIX / "instruction.md"
 ASSETS = Path(__file__).resolve().parent
 ASSET_FILES = ("node_install.sh", "run.sh", "helper.mjs")
@@ -539,9 +540,13 @@ class PenguinAgent(BaseInstalledAgent):
         # The throw-away data root, owned by the user the agent runs as.
         ids = await self.exec_as_agent(environment, command="id -u && id -g")
         uid, gid = (ids.stdout or "").split()[:2]
-        project_dir = DATA_ROOT / opts.project_id
+        project_dir = PROJECTS_DIR / opts.project_id
         await self.exec_as_root(
-            environment, command=f"rm -rf {DATA_ROOT} && mkdir -p {project_dir}"
+            environment,
+            command=(
+                f"rm -rf {DATA_ROOT} && mkdir -p {project_dir} && "
+                f"ln -s projects/{opts.project_id} {DATA_ROOT}/{opts.project_id}"
+            ),
         )
         with tempfile.TemporaryDirectory(prefix="penguin-agent-") as tmp:
             local = Path(tmp) / "project_config.toml"
@@ -661,7 +666,7 @@ class PenguinAgent(BaseInstalledAgent):
         if not tarball.is_file():
             raise ValueError(f"agent_state_tar {tarball} is not a file")
         opts = self.options
-        state_dir = DATA_ROOT / opts.project_id / "agents" / opts.agent_id / "agent_state"
+        state_dir = PROJECTS_DIR / opts.project_id / "agents" / opts.agent_id / "agent_state"
         remote = PREFIX / "agent-state.tar.gz"
         await environment.upload_file(tarball, str(remote))
         logs = self.environment_logs_dir
